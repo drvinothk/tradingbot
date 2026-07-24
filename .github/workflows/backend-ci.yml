@@ -1,0 +1,84 @@
+name: backend-ci
+
+on:
+  push:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+  pull_request:
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-ci.yml"
+
+jobs:
+  lint-test-migrate:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: trading_bot
+          POSTGRES_PASSWORD: trading_bot_ci
+          POSTGRES_DB: trading_bot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_NAME: trading_bot
+      DB_USER: trading_bot
+      DB_PASSWORD: trading_bot_ci
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
+      APP_ENV: local
+      APP_SECRET_KEY: ci-only-not-a-real-secret
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy app
+        continue-on-error: true # tighten once Phase 1+ domain models stabilize
+
+      - name: Import boundary check (import-linter)
+        run: |
+          if [ -f setup.cfg ] || [ -f .importlinter ]; then lint-imports; else echo "no import-linter contract yet, skipping"; fi
+
+      - name: Run migrations against ephemeral Postgres
+        run: alembic upgrade head
+
+      - name: Run tests
+        run: pytest --cov=app --cov-report=term-missing

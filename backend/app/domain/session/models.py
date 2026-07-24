@@ -1,0 +1,94 @@
+"""Trading session & safe-operating-mode domain. A `TradingSession` is a
+single trading day for one broker account; `mode` is governed exclusively by
+the state machine in app.core.modes — nothing should ever write `mode`
+directly except that module's guarded transition function.
+"""
+
+from __future__ import annotations
+
+import enum
+import uuid
+from datetime import datetime, time
+
+from sqlalchemy import DateTime, ForeignKey, Numeric, String, Time
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
+
+
+class SafeMode(enum.StrEnum):
+    PAPER_ONLY = "paper_only"
+    PAPER_PLUS_GUARDED_LIVE = "paper_plus_guarded_live"
+    LIVE_ENABLED = "live_enabled"
+    DEGRADED_MODE = "degraded_mode"
+    RECONCILIATION_LOCK = "reconciliation_lock"
+    KILL_SWITCH = "kill_switch"
+
+
+class TradingSessionStatus(enum.StrEnum):
+    ACTIVE = "active"
+    ENDED = "ended"
+
+
+class FundingMode(enum.StrEnum):
+    CASH = "cash"
+    MTF = "mtf"
+
+
+class EntriesPausedReason(enum.StrEnum):
+    DAILY_TARGET_REACHED = "daily_target_reached"
+    ADMIN_PAUSE = "admin_pause"
+
+
+class TransitionTriggerType(enum.StrEnum):
+    MANUAL = "manual"
+    SYSTEM = "system"
+    RISK = "risk"
+    RECONCILIATION = "reconciliation"
+
+
+class TradingSession(Base, UUIDPkMixin, TimestampMixin):
+    __tablename__ = "trading_sessions"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
+    broker_account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("broker_accounts.id"))
+    started_by_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+
+    mode: Mapped[SafeMode] = mapped_column(String(30), default=SafeMode.PAPER_ONLY)
+    status: Mapped[TradingSessionStatus] = mapped_column(
+        String(20), default=TradingSessionStatus.ACTIVE
+    )
+    prior_mode: Mapped[SafeMode | None] = mapped_column(
+        String(30), nullable=True, doc="Remembered for degraded_mode recovery"
+    )
+
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cutoff_time: Mapped[time] = mapped_column(Time, default=time(15, 20))
+
+    # Daily plan — pre-filled from risk_limit_configs, editable at session
+    # start. Field names deliberately match risk_limit_configs 1:1.
+    budget_amount: Mapped[float] = mapped_column(Numeric(14, 2))
+    daily_target_profit: Mapped[float] = mapped_column(Numeric(14, 2))
+    daily_loss_cap: Mapped[float] = mapped_column(Numeric(14, 2))
+    funding_mode: Mapped[FundingMode] = mapped_column(String(10), default=FundingMode.CASH)
+
+    # Not degraded_mode — reaching a profit target is a goal, not a fault.
+    entries_paused_reason: Mapped[EntriesPausedReason | None] = mapped_column(
+        String(30), nullable=True
+    )
+
+
+class SessionModeTransition(Base, UUIDPkMixin):
+    __tablename__ = "session_mode_transitions"
+
+    trading_session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trading_sessions.id"))
+    from_mode: Mapped[SafeMode | None] = mapped_column(String(30), nullable=True)
+    to_mode: Mapped[SafeMode] = mapped_column(String(30))
+    trigger_type: Mapped[TransitionTriggerType] = mapped_column(String(20))
+    triggered_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reason: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
