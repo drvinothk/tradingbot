@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
+from app.config.settings import get_settings
 from app.core.db.session import get_db
 from app.core.security.deps import SESSION_COOKIE_NAME, get_current_user
 from app.core.security.passwords import verify_password
@@ -70,7 +71,13 @@ def login(
         key=SESSION_COOKIE_NAME,
         value=raw_token,
         httponly=True,
-        secure=True,
+        # Secure cookies are only sent by browsers over HTTPS. Stage 1 (this
+        # phase) serves plain http://127.0.0.1 — a hardcoded secure=True
+        # would make the browser silently drop the cookie, breaking login,
+        # even though curl-based testing wouldn't catch it (curl doesn't
+        # enforce the Secure attribute the way a real browser does). Stage
+        # 2+ (cloud, HTTPS-only per the security posture) always sets it.
+        secure=get_settings().app.env != "local",
         samesite="lax",
     )
     return user

@@ -70,8 +70,7 @@ jobs:
         run: ruff check .
 
       - name: Type check (mypy)
-        run: mypy app
-        continue-on-error: true # tighten once Phase 1+ domain models stabilize
+        run: mypy app tests
 
       - name: Import boundary check (import-linter)
         run: |

@@ -18,7 +18,7 @@ from app.config.settings import get_settings
 from app.core.db.session import get_db
 from app.core.modes import ModeTransitionError, enter_kill_switch
 from app.core.security.rbac import require_permission
-from app.domain.identity.models import User
+from app.domain.identity.models import BrokerAccount, User
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
@@ -46,21 +46,40 @@ class SessionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class KillSwitchRequest(BaseModel):
+    reason: str = "manual kill switch"
+
+
 @router.post("", response_model=SessionOut)
 def create_session(
     body: CreateSessionRequest,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("session.start")),
 ) -> TradingSession:
+    broker_account = (
+        db.query(BrokerAccount)
+        .filter(
+            BrokerAccount.id == body.broker_account_id,
+            BrokerAccount.workspace_id == user.workspace_id,
+        )
+        .one_or_none()
+    )
+    if broker_account is None:
+        # Validated explicitly rather than letting an unknown/foreign
+        # broker_account_id fall through to the FK constraint — that would
+        # otherwise surface as an unhandled 500 (IntegrityError) instead of
+        # a clean 404.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Broker account not found")
+
     defaults = get_settings().risk_defaults
     trading_session = TradingSession(
         id=uuid.uuid4(),
         workspace_id=user.workspace_id,
-        broker_account_id=body.broker_account_id,
+        broker_account_id=broker_account.id,
         started_by_user_id=user.id,
         mode=SafeMode.PAPER_ONLY,
         started_at=datetime.now(UTC),
-        budget_amount=body.budget_amount or defaults.daily_loss_cap,
+        budget_amount=body.budget_amount or defaults.default_budget,
         daily_target_profit=body.daily_target_profit or defaults.daily_target_profit,
         daily_loss_cap=body.daily_loss_cap or defaults.daily_loss_cap,
         funding_mode=body.funding_mode,
@@ -71,8 +90,15 @@ def create_session(
     return trading_session
 
 
-def _get_session_or_404(db: Session, session_id: uuid.UUID) -> TradingSession:
-    trading_session = db.query(TradingSession).filter(TradingSession.id == session_id).one_or_none()
+def _get_session_or_404(db: Session, user: User, session_id: uuid.UUID) -> TradingSession:
+    trading_session = (
+        db.query(TradingSession)
+        .filter(
+            TradingSession.id == session_id,
+            TradingSession.workspace_id == user.workspace_id,
+        )
+        .one_or_none()
+    )
     if trading_session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
     return trading_session
@@ -84,20 +110,20 @@ def get_session(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("strategy.view")),
 ) -> TradingSession:
-    return _get_session_or_404(db, session_id)
+    return _get_session_or_404(db, user, session_id)
 
 
 @router.post("/{session_id}/kill-switch", response_model=SessionOut)
 def trigger_kill_switch(
     session_id: uuid.UUID,
-    reason: str = "manual kill switch",
+    body: KillSwitchRequest,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("session.stop")),
 ) -> TradingSession:
-    trading_session = _get_session_or_404(db, session_id)
+    trading_session = _get_session_or_404(db, user, session_id)
     try:
         enter_kill_switch(
-            db, trading_session, TransitionTriggerType.MANUAL, actor_user=user, reason=reason
+            db, trading_session, TransitionTriggerType.MANUAL, actor_user=user, reason=body.reason
         )
     except ModeTransitionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
@@ -116,7 +142,7 @@ def stub_place_order(
     only to prove the mode gate actually blocks order placement, not just
     that the mode value changes in the DB.
     """
-    trading_session = _get_session_or_404(db, session_id)
+    trading_session = _get_session_or_404(db, user, session_id)
     if trading_session.mode == SafeMode.KILL_SWITCH:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Engine is in kill_switch — no orders may be placed"

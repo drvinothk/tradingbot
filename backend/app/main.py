@@ -99,7 +99,23 @@ async def lifespan(app: FastAPI):
     app.state.singleton_connection = singleton_connection
     logger.info("Process singleton lock acquired.")
 
-    _run_startup_recovery_check()
+    # If anything between here and `yield` raises, the cleanup code after
+    # `yield` never runs — an async generator's post-yield code only
+    # executes once yield is actually reached, not on an exception before
+    # it. Postgres would still release a session-scoped advisory lock once
+    # the OS closes the socket on process exit, but that's relying on an
+    # implicit side effect rather than an explicit, logged release — this
+    # try/except makes the failure path do the same clean shutdown as the
+    # success path instead.
+    try:
+        _run_startup_recovery_check()
+    except Exception:
+        from app.core.locking import release_advisory_lock
+
+        release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
+        singleton_connection.close()
+        logger.exception("Startup failed after acquiring the singleton lock — released it.")
+        raise
 
     yield
 

@@ -24,11 +24,9 @@ Debug (run in foreground, no service manager involved):
 from __future__ import annotations
 
 import sys
-import threading
 from pathlib import Path
 
 import servicemanager
-import win32event
 import win32service
 import win32serviceutil
 
@@ -47,15 +45,16 @@ class TradingBotService(win32serviceutil.ServiceFramework):
 
     def __init__(self, args) -> None:
         super().__init__(args)
-        self.stop_event = win32event.CreateEvent(None, 0, 0, None)
-        self._server_thread: threading.Thread | None = None
         self._uvicorn_server = None
 
     def SvcStop(self) -> None:
+        # Shutdown is entirely driven by uvicorn's own should_exit flag —
+        # SvcDoRun blocks inside server.run() until it sees this, at which
+        # point that call returns and the service reports itself stopped.
+        # No separate wait-event is needed on top of that.
         self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
-        win32event.SetEvent(self.stop_event)
 
     def SvcDoRun(self) -> None:
         servicemanager.LogMsg(

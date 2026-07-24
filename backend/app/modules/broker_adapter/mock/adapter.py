@@ -12,6 +12,7 @@ from __future__ import annotations
 import random
 import threading
 import uuid
+import zlib
 from datetime import UTC, date, datetime
 
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
@@ -64,9 +65,15 @@ class MockBrokerAdapter(BrokerPort):
 
     def _price_for(self, contract_symbol: str) -> float:
         if contract_symbol not in self._prices:
-            # Deterministic-ish seed price by symbol so re-subscribing mid-run
-            # doesn't jump: hash the symbol into a plausible option-premium range.
-            base = 50.0 + (hash(contract_symbol) % 200)
+            # Deterministic seed price by symbol so re-subscribing mid-run
+            # doesn't jump: hash the symbol into a plausible option-premium
+            # range. Uses zlib.crc32, not Python's built-in hash() — str
+            # hashing is salted per-process (PYTHONHASHSEED) by default, so
+            # hash() would silently break the "same seed -> same prices"
+            # guarantee across separate runs, only appearing to work within
+            # a single process (which is exactly how the bug hid during
+            # testing: two adapters in the *same* test process agreed).
+            base = 50.0 + (zlib.crc32(contract_symbol.encode("utf-8")) % 200)
             self._prices[contract_symbol] = float(base)
         return self._prices[contract_symbol]
 
