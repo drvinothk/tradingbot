@@ -234,3 +234,71 @@ def test_kill_switch_accepts_reason_in_json_body(api_client: TestClient, seeded_
     )
     assert response.status_code == 200
     assert response.json()["mode"] == "kill_switch"
+
+
+def test_daily_plan_updates_session_and_is_audited(api_client: TestClient, seeded_admin, engine):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    create_resp = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    )
+    session_id = create_resp.json()["id"]
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/daily-plan",
+        json={
+            "budget_amount": 75000,
+            "daily_target_profit": 3000,
+            "daily_loss_cap": 1500,
+            "funding_mode": "mtf",
+        },
+    )
+    assert response.status_code == 200
+
+    from app.domain.audit.models import AuditEvent
+    from app.domain.session.models import TradingSession
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as verify_db:
+        row = verify_db.get(TradingSession, uuid.UUID(session_id))
+        assert row is not None
+        assert float(row.budget_amount) == 75000
+        assert float(row.daily_target_profit) == 3000
+        assert float(row.daily_loss_cap) == 1500
+        assert row.funding_mode == "mtf"
+
+        events = (
+            verify_db.query(AuditEvent)
+            .filter(
+                AuditEvent.trading_session_id == uuid.UUID(session_id),
+                AuditEvent.event_type == "daily_plan.updated",
+            )
+            .all()
+        )
+        assert len(events) == 1
+
+
+def test_daily_plan_rejects_non_positive_budget(api_client: TestClient, seeded_admin):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    create_resp = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    )
+    session_id = create_resp.json()["id"]
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/daily-plan",
+        json={
+            "budget_amount": 0,
+            "daily_target_profit": 3000,
+            "daily_loss_cap": 1500,
+            "funding_mode": "cash",
+        },
+    )
+    assert response.status_code == 422

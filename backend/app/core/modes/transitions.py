@@ -31,7 +31,13 @@ ALLOWED_TRANSITIONS: dict[SafeMode, dict[SafeMode, TransitionRule]] = {
             required_permission="livetrade.execute",
         ),
         SafeMode.KILL_SWITCH: TransitionRule(
-            allowed_triggers=frozenset({Trigger.MANUAL, Trigger.SYSTEM}),
+            # RISK alongside SYSTEM: a daily-loss-cap breach escalates
+            # straight to kill_switch regardless of safe-mode (see Phase 2's
+            # Risk Service) — paper_only is not exempt just because no real
+            # money is at stake; the discipline of the safety flow applies
+            # the same way it already does from the two live-adjacent modes
+            # below.
+            allowed_triggers=frozenset({Trigger.MANUAL, Trigger.SYSTEM, Trigger.RISK}),
             required_permission="session.stop",
         ),
     },

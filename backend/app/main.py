@@ -20,7 +20,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1 import auth, sessions
+from app.api.v1 import auth, sessions, strategies
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
 from app.domain.session.models import TradingSessionStatus
@@ -131,6 +131,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(sessions.router, prefix="/api/v1")
+    app.include_router(strategies.router, prefix="/api/v1")
 
     @app.get("/health")
     def health() -> dict:

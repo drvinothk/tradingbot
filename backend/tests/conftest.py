@@ -24,7 +24,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.config.settings import get_settings
 from app.core.db.base import Base
-from app.domain import audit, identity, session  # noqa: F401 - registers models on Base
+from app.domain import (  # noqa: F401 - registers models on Base
+    audit,
+    identity,
+    market,
+    ops,
+    risk,
+    session,
+    strategy,
+)
 from app.domain.identity.models import User, Workspace
 
 

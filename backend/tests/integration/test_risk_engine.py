@@ -1,0 +1,639 @@
+"""Risk Service tests against a real Postgres — advisory locks (the same
+LOCK_RISK_EVALUATION_QUEUE serialization used in production) aren't
+meaningfully testable against SQLite, matching test_state_machine.py's own
+reasoning for why these require a live DB.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, date, datetime, timedelta
+
+import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+
+from app.api.v1.strategies import _get_pending_approval_or_404
+from app.domain.audit.models import AuditEvent
+from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
+from app.domain.identity.models import Workspace as WorkspaceRow
+from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.ops.models import SystemAlert
+from app.domain.session.models import FundingMode, SafeMode, TradingSession
+from app.domain.strategy.models import (
+    ApprovalStatus,
+    ExecutionMode,
+    PendingTradeApproval,
+    Signal,
+    SignalSide,
+    StrategyConfig,
+    StrategyRun,
+    StrategyRunStatus,
+    TradeIntent,
+    TradeIntentStatus,
+)
+from app.modules.audit_service.service import verify_chain
+from app.modules.risk_engine.service import (
+    compute_pre_trade_analytics,
+    create_new_risk_limit_config_version,
+    evaluate_trade_intent,
+    get_active_risk_limit_config,
+    record_synthetic_outcome,
+)
+
+
+@pytest.fixture
+def broker_account(db: Session, workspace) -> BrokerAccount:
+    account = BrokerAccount(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_type=BrokerType.SHOONYA,
+        label="risk-test-account",
+        credentials_ref="config/credentials/shoonya.env",
+        status=BrokerAccountStatus.ACTIVE,
+    )
+    db.add(account)
+    db.flush()
+    return account
+
+
+@pytest.fixture
+def trading_session(db: Session, workspace, broker_account, user: User) -> TradingSession:
+    ts = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        started_at=datetime.now(UTC),
+        budget_amount=100_000,
+        daily_target_profit=2_000,
+        daily_loss_cap=1_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(ts)
+    db.flush()
+    return ts
+
+
+@pytest.fixture
+def instrument(db: Session) -> Instrument:
+    inst = Instrument(
+        id=uuid.uuid4(), symbol="NIFTY", exchange="NFO", lot_size=25, tick_size=0.05
+    )
+    db.add(inst)
+    db.flush()
+    return inst
+
+
+@pytest.fixture
+def option_contract(db: Session, instrument: Instrument) -> OptionContract:
+    contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 7, 30),
+        strike=22000,
+        option_type=OptionType.CE,
+        symbol="NIFTY26JUL22000CE",
+        broker_token="12345",
+    )
+    db.add(contract)
+    db.flush()
+    return contract
+
+
+@pytest.fixture
+def strategy_config(db: Session, workspace) -> StrategyConfig:
+    config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="test-strategy")
+    db.add(config)
+    db.flush()
+    return config
+
+
+@pytest.fixture
+def strategy_run(
+    db: Session, strategy_config: StrategyConfig, trading_session, user: User
+) -> StrategyRun:
+    run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(run)
+    db.flush()
+    return run
+
+
+def _make_trade_intent(
+    db: Session,
+    trading_session: TradingSession,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+    *,
+    entry_price: float = 80.0,
+    stop_price: float = 72.0,
+    target_price: float = 92.0,
+    qty_lots: int = 1,
+) -> TradeIntent:
+    now = datetime.now(UTC)
+    signal = Signal(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        strategy_config_id=strategy_run.strategy_config_id,
+        strategy_run_id=strategy_run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        side=SignalSide.BUY,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        qty_lots=qty_lots,
+        generated_at=now,
+    )
+    db.add(signal)
+    db.flush()
+
+    trade_intent = TradeIntent(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        signal_id=signal.id,
+        strategy_run_id=strategy_run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        idempotency_key=f"signal:{signal.id}",
+        side=SignalSide.BUY,
+        qty_lots=qty_lots,
+        entry_price=entry_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        status=TradeIntentStatus.PENDING_RISK,
+        created_at=now,
+    )
+    db.add(trade_intent)
+    db.flush()
+    return trade_intent
+
+
+def _dispatch(
+    db: Session,
+    trading_session: TradingSession,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+    **kwargs,
+) -> TradeIntent:
+    """Convenience: build + evaluate a trade intent, asserting it dispatches
+    cleanly — used by tests that need an *open position* as setup, not as
+    the thing under test."""
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract, **kwargs)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+    assert decision.decision == "approved", decision.reasons
+    assert trade_intent.status == TradeIntentStatus.DISPATCHED
+    return trade_intent
+
+
+# -- risk_limit_configs versioning -----------------------------------------
+
+
+def test_get_active_risk_limit_config_lazily_seeds_from_defaults(db: Session, workspace):
+    from app.config.settings import get_settings
+
+    config = get_active_risk_limit_config(db, workspace.id)
+    defaults = get_settings().risk_defaults
+
+    assert config.version == 1
+    assert config.is_active is True
+    assert config.max_concurrent_positions == defaults.max_concurrent_positions
+    assert config.max_trades_per_day == defaults.max_trades_per_day
+
+    again = get_active_risk_limit_config(db, workspace.id)
+    assert again.id == config.id
+
+
+def test_create_new_risk_limit_config_version_deactivates_previous(
+    db: Session, workspace, authorized_user
+):
+    v1 = get_active_risk_limit_config(db, workspace.id)
+    v2 = create_new_risk_limit_config_version(
+        db, workspace.id, actor_user=authorized_user, reason="tightening", max_trades_per_day=1
+    )
+
+    assert v2.version == v1.version + 1
+    assert v2.max_trades_per_day == 1
+    db.refresh(v1)
+    assert v1.is_active is False
+    assert get_active_risk_limit_config(db, workspace.id).id == v2.id
+
+
+# -- pre-trade analytics ----------------------------------------------------
+
+
+def test_compute_pre_trade_analytics_ce_capital_breakeven_and_pnl(
+    db: Session, option_contract: OptionContract
+):
+    analytics = compute_pre_trade_analytics(
+        db,
+        option_contract,
+        side=SignalSide.BUY,
+        qty_lots=2,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        funding_mode=FundingMode.CASH,
+    )
+
+    assert analytics.capital_required == pytest.approx(80.0 * 25 * 2)
+    assert analytics.breakeven_price == pytest.approx(22000 + 80.0)
+    assert analytics.pnl_scenarios["at_stop"] == pytest.approx((72.0 - 80.0) * 25 * 2)
+    assert analytics.pnl_scenarios["at_breakeven"] == pytest.approx(0.0)
+    assert analytics.pnl_scenarios["at_target"] == pytest.approx((92.0 - 80.0) * 25 * 2)
+    assert analytics.pnl_scenarios["stretch"] == pytest.approx((104.0 - 80.0) * 25 * 2)
+
+
+def test_compute_pre_trade_analytics_pe_breakeven_is_strike_minus_premium(
+    db: Session, instrument: Instrument
+):
+    pe_contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 7, 30),
+        strike=22000,
+        option_type=OptionType.PE,
+        symbol="NIFTY26JUL22000PE",
+    )
+    db.add(pe_contract)
+    db.flush()
+
+    analytics = compute_pre_trade_analytics(
+        db,
+        pe_contract,
+        side=SignalSide.BUY,
+        qty_lots=1,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        funding_mode=FundingMode.CASH,
+    )
+
+    assert analytics.breakeven_price == pytest.approx(22000 - 80.0)
+
+
+def test_compute_pre_trade_analytics_mtf_reduces_capital_required(
+    db: Session, option_contract: OptionContract
+):
+    cash = compute_pre_trade_analytics(
+        db, option_contract, side=SignalSide.BUY, qty_lots=1, entry_price=80.0,
+        stop_price=72.0, target_price=92.0, funding_mode=FundingMode.CASH,
+    )
+    mtf = compute_pre_trade_analytics(
+        db, option_contract, side=SignalSide.BUY, qty_lots=1, entry_price=80.0,
+        stop_price=72.0, target_price=92.0, funding_mode=FundingMode.MTF,
+    )
+
+    assert mtf.capital_required < cash.capital_required
+    assert mtf.capital_required == pytest.approx(cash.capital_required / 5)
+
+
+# -- evaluate_trade_intent: individual limit checks --------------------------
+
+
+def test_evaluate_trade_intent_approves_and_dispatches_in_auto_mode(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "approved"
+    assert decision.reasons == []
+    assert trade_intent.status == TradeIntentStatus.DISPATCHED
+    assert trade_intent.dispatched_at is not None
+
+
+def test_evaluate_trade_intent_rejects_when_mode_blocks_new_entries(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trading_session.mode = SafeMode.KILL_SWITCH
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert any(r.startswith("mode_blocks_new_entries") for r in decision.reasons)
+    assert trade_intent.status == TradeIntentStatus.RISK_REJECTED
+
+
+def test_evaluate_trade_intent_same_strike_locked(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    _dispatch(db, trading_session, strategy_run, option_contract)
+
+    second = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "same_strike_locked" in decision.reasons
+
+
+def test_evaluate_trade_intent_max_concurrent_positions(
+    db: Session, trading_session, strategy_run, instrument
+):
+    contracts = []
+    for i in range(3):
+        c = OptionContract(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            expiry_date=date(2026, 7, 30),
+            strike=22000 + i * 50,
+            option_type=OptionType.CE,
+            symbol=f"NIFTY26JUL{22000 + i * 50}CE",
+        )
+        db.add(c)
+        db.flush()
+        contracts.append(c)
+
+    # Default max_concurrent_positions is 2 (RiskDefaults) — first two open
+    # cleanly, the third (a different strike, so not same-strike-locked)
+    # should trip the concurrency cap instead.
+    _dispatch(db, trading_session, strategy_run, contracts[0])
+    _dispatch(db, trading_session, strategy_run, contracts[1])
+
+    third = _make_trade_intent(db, trading_session, strategy_run, contracts[2])
+    decision = evaluate_trade_intent(db, third, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "max_concurrent_positions_reached" in decision.reasons
+
+
+def test_evaluate_trade_intent_max_trades_per_day(
+    db: Session, workspace, authorized_user, trading_session, strategy_run, instrument
+):
+    create_new_risk_limit_config_version(
+        db,
+        workspace.id,
+        actor_user=authorized_user,
+        max_trades_per_day=1,
+        max_concurrent_positions=5,
+    )
+
+    c1 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22000, option_type=OptionType.CE, symbol="NIFTY26JUL22000CE-A",
+    )
+    c2 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22050, option_type=OptionType.CE, symbol="NIFTY26JUL22050CE-B",
+    )
+    db.add_all([c1, c2])
+    db.flush()
+
+    _dispatch(db, trading_session, strategy_run, c1)
+
+    second = _make_trade_intent(db, trading_session, strategy_run, c2)
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "max_trades_per_day_reached" in decision.reasons
+
+
+def test_evaluate_trade_intent_consecutive_loss_pause(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trading_session.consecutive_losses = 2  # RiskDefaults threshold is 2
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "consecutive_loss_pause_active" in decision.reasons
+
+
+def test_evaluate_trade_intent_per_trade_lot_cap_exceeded(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    # RiskDefaults.per_trade_lot_cap is 1.
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=2
+    )
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "per_trade_lot_cap_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_budget_exceeded(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trading_session.budget_amount = 1000  # 1 lot @ premium 80 * lot_size 25 = 2000 > 1000
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "budget_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_rejection_raises_system_alert(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trading_session.mode = SafeMode.KILL_SWITCH
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    alerts = (
+        db.query(SystemAlert).filter(SystemAlert.trading_session_id == trading_session.id).all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].category == "risk_limit_breach"
+
+
+def test_evaluate_trade_intent_approval_required_creates_pending_approval(
+    db: Session, trading_session, strategy_config, user: User, option_contract
+):
+    approval_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(approval_run)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, approval_run)
+
+    assert decision.decision == "approved"
+    assert trade_intent.status == TradeIntentStatus.PENDING_APPROVAL
+    pending = (
+        db.query(PendingTradeApproval)
+        .filter(PendingTradeApproval.trade_intent_id == trade_intent.id)
+        .one()
+    )
+    assert pending.capital_required == pytest.approx(float(decision.capital_required))
+
+
+# -- record_synthetic_outcome: P&L-driven triggers ---------------------------
+
+
+def test_record_synthetic_outcome_updates_running_totals(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+
+    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=150.0)
+
+    assert float(trading_session.cumulative_realized_pnl) == pytest.approx(150.0)
+    assert trading_session.consecutive_losses == 0
+
+
+def test_record_synthetic_outcome_increments_consecutive_losses(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=-50.0)
+
+    assert trading_session.consecutive_losses == 1
+
+
+def test_record_synthetic_outcome_breaching_loss_cap_triggers_kill_switch(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+
+    # daily_loss_cap is 1000 on the fixture session.
+    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=-1500.0)
+
+    assert trading_session.mode == SafeMode.KILL_SWITCH
+    alerts = db.query(SystemAlert).filter(
+        SystemAlert.trading_session_id == trading_session.id,
+        SystemAlert.category == "daily_loss_cap_breached",
+    ).all()
+    assert len(alerts) == 1
+
+
+def test_record_synthetic_outcome_hitting_target_sets_entries_paused(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+
+    # daily_target_profit is 2000 on the fixture session.
+    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=2500.0)
+
+    assert trading_session.entries_paused_reason == "daily_target_reached"
+    # Not a mode transition — reaching a target is a goal, not a fault.
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+
+def test_entries_paused_blocks_further_trade_intents(
+    db: Session, trading_session, strategy_run, option_contract, instrument
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=2500.0)
+    assert trading_session.entries_paused_reason == "daily_target_reached"
+
+    other_contract = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22100, option_type=OptionType.CE, symbol="NIFTY26JUL22100CE",
+    )
+    db.add(other_contract)
+    db.flush()
+
+    next_intent = _make_trade_intent(db, trading_session, strategy_run, other_contract)
+    decision = evaluate_trade_intent(db, next_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert any(r.startswith("entries_paused") for r in decision.reasons)
+
+
+# -- audit trail integrity ----------------------------------------------------
+
+
+def test_risk_decisions_are_fully_audited_and_chain_stays_intact(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    _dispatch(db, trading_session, strategy_run, option_contract)
+
+    events = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.trading_session_id == trading_session.id)
+        .all()
+    )
+    event_types = {e.event_type for e in events}
+    assert "signal.generated" not in event_types  # submit_signal not used by _dispatch directly
+    assert "risk_decision.approved.dispatched" in event_types
+
+    ok, broken_id = verify_chain(db)
+    assert ok, f"audit chain broken at {broken_id}"
+
+
+# -- trade-approval lookup: workspace scoping (IDOR regression) --------------
+
+
+def test_pending_approval_lookup_denies_cross_workspace_access(
+    db: Session, workspace, user, trading_session, strategy_run, option_contract
+):
+    """PendingTradeApproval has no workspace_id column of its own — the
+    lookup backing approve/reject must scope through TradeIntent instead.
+    Without it, any authenticated user could approve/reject another
+    workspace's pending trade just by knowing its UUID, unlike every other
+    lookup helper in app.api.v1.strategies, which all filter by
+    `user.workspace_id`.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    trade_intent.status = TradeIntentStatus.PENDING_APPROVAL
+    db.add(trade_intent)
+    db.flush()
+
+    approval = PendingTradeApproval(
+        id=uuid.uuid4(),
+        trade_intent_id=trade_intent.id,
+        strategy_run_id=strategy_run.id,
+        status=ApprovalStatus.PENDING,
+        capital_required=2000.0,
+        breakeven_price=22080.0,
+        pnl_scenarios={
+            "at_stop": -400.0,
+            "at_breakeven": 0.0,
+            "at_target": 600.0,
+            "stretch": 1200.0,
+        },
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    db.add(approval)
+    db.flush()
+
+    other_workspace = WorkspaceRow(id=uuid.uuid4(), name=f"other-{uuid.uuid4().hex[:8]}")
+    db.add(other_workspace)
+    db.flush()
+    other_user = User(
+        id=uuid.uuid4(),
+        workspace_id=other_workspace.id,
+        email=f"other-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash="not-checked-by-this-helper",
+        display_name="Other Workspace User",
+        is_active=True,
+    )
+    db.add(other_user)
+    db.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        _get_pending_approval_or_404(db, other_user, approval.id)
+    assert exc_info.value.status_code == 404
+
+    # Same-workspace access still works — this isn't just "always deny".
+    found = _get_pending_approval_or_404(db, user, approval.id)
+    assert found.id == approval.id

@@ -432,7 +432,7 @@ sync job against mock data.
 Done when: mock ticks/depth/chain/indicators flow end-to-end on schedule, queryable
 via API, with connectivity audit events and a simulated sync-job row.
 
-**Phase 2 — Shared strike-ranking engine + Risk Service** — 👈 next
+**Phase 2 — Shared strike-ranking engine + Risk Service** — ✅ done
 Strike-ranking engine (spread/volume/OI/premium-fit/depth, ATM±N configurable)
 against Phase 1's mock chain; Risk Service (margin/funds check stubbed, max
 concurrent positions [global], max trades/day, consecutive-loss pause, daily loss
@@ -447,6 +447,84 @@ Done when: synthetic TradeIntents are approved/rejected per configurable limits
 including the new budget/target checks, every decision carries a correct pre-trade
 analytics snapshot, all decisions audited, breaching a limit visibly blocks further
 approvals and raises an alert.
+
+*Phase 2 amendments (decisions made during implementation, not re-derivations of
+the design above):*
+- **`SyntheticTradeOutcome` + `trading_sessions.cumulative_realized_pnl` /
+  `consecutive_losses`** — Phase 3's real `trade_outcomes`/Position lifecycle
+  doesn't exist yet, so Risk Service's daily-loss-cap / daily-target-profit /
+  consecutive-loss checks had no real data to evaluate against. Added a
+  Phase-2-only `synthetic_trade_outcomes` table (deliberately named apart from
+  Phase 3's `trade_outcomes`) plus two running-total columns on
+  `trading_sessions`, updated by `risk_engine.service.record_synthetic_outcome`
+  after the synthetic strategy stub "closes" a dispatched TradeIntent with a
+  small synthetic P&L. Phase 3's real fill-driven P&L recording replaces this
+  call site; the table itself is never read by anything else.
+- **`system_alerts` pulled forward from the full Ops schema** — "breaching a
+  limit visibly blocks further approvals and raises an alert" needed somewhere
+  for that alert to land. Only `system_alerts` was built now; `metric_series`
+  and `scheduler_job_runs` stay deferred until a phase actually needs them.
+- **`signals`/`trade_intents.qty_lots` is a lot count, not raw quantity** —
+  matches the existing rule that lot size is always read server-side from
+  `option_contracts → instruments.lot_size`, never client/strategy-supplied.
+  Phase 3's Execution Service converts `qty_lots × lot_size` into the absolute
+  quantity `OrderRequest.qty` expects at dispatch time.
+- **Pre-trade analytics' "P&L at breakeven" is always `0.0`**, not computed
+  from `breakeven_price`. `breakeven_price` (strike ± premium) is a
+  held-to-expiry, underlying-scale figure; entry/stop/target are same-day
+  option-premium levels. The two aren't on the same price scale, so plugging
+  `breakeven_price` into the premium-delta P&L formula produced a nonsense
+  number — a scratch trade (exit at the entry premium) is 0 P&L by
+  definition, which is what the table now reports.
+- **Bug fix in `app/core/modes/transitions.py`**: `paper_only → kill_switch`
+  only allowed `MANUAL`/`SYSTEM` triggers, not `RISK` — found because Risk
+  Service's daily-loss-cap breach (a `RISK`-triggered transition, same as
+  from the two live-adjacent modes) failed against a `paper_only` session in
+  a real-Postgres test run. Per the build plan's own "no soft step-down on a
+  loss breach" rule, this should apply the same way regardless of safe-mode;
+  added `Trigger.RISK` to that edge, verified against
+  `tests/unit/test_transitions_table.py`'s structural invariants (none of
+  which forbid it) and the full existing state-machine test suite.
+
+*QC pass findings (post-implementation review, before Phase 3 started):*
+- **Bug fix: an approval-required trade never closed.** The auto-execute path
+  (`SyntheticStrategy.run_cycle`) synthetically closed a dispatched
+  TradeIntent immediately; `POST /trade-approvals/{id}/approve` dispatched
+  one too but never closed it — an approved trade sat `DISPATCHED` forever,
+  permanently holding a concurrency slot and a same-strike lock for the rest
+  of the session. Factored the close logic into one shared
+  `strategy_engine.service.close_dispatched_trade_intent_synthetically`, used
+  by both dispatch paths. Caught by a regression test that fails against the
+  old code and passes against the fix.
+- **Bug fix: trade-approval lookup wasn't workspace-scoped.**
+  `_get_pending_approval_or_404` did a bare `db.get()` with no ownership
+  check — every other lookup in `app/api/v1/strategies.py` filters by
+  `user.workspace_id`, this one didn't, so a user could approve/reject
+  another workspace's pending trade by knowing its UUID (`PendingTradeApproval`
+  has no `workspace_id` column of its own; fixed by joining through
+  `TradeIntent.workspace_id`). Also caught by a regression test that fails
+  against the old code.
+- **Bug fix: unlocked check-then-act in `start_strategy`.** "At most one
+  active run per strategy" was checked and inserted without the advisory-lock
+  discipline every other check-then-act in this codebase uses — two
+  concurrent start requests for the same strategy could both pass the check
+  before either committed. Wrapped in `LOCK_EXECUTION_SINGLETON` (reused
+  rather than a new named lock, same reasoning mode transitions already share
+  it for). Risk evaluation itself was never affected by this gap — it stays
+  correctly serialized under `LOCK_RISK_EVALUATION_QUEUE` regardless — but
+  the strategy-run bookkeeping wasn't, and the project's own stated #1
+  failure mode is exactly this class of unlocked check-then-act.
+- **Test-isolation bug in the new tests themselves**: an early version of the
+  approval-flow test committed `Instrument`/`OptionContract` rows (no
+  workspace scoping) to the shared test-DB engine without cleaning them up,
+  which broke unrelated Phase 1 tests (`test_instrument_sync.py`) that assume
+  a clean table — the exact trap CLAUDE.md's "Test DB isolation" convention
+  already warns about. Fixed with an explicit try/finally cleanup; full suite
+  re-run twice in a row afterward to confirm no leakage.
+- Added a direct test for `SyntheticStrategyRunner` itself (the actual
+  "on a timer" background-thread mechanism) — everything else only exercised
+  `run_cycle` directly, leaving the timer/threading wrapper with zero
+  coverage despite being literally what the Phase 2 build bullet asked for.
 
 **Phase 3 — Execution Service (paper only) + reconciliation + reporting v1**
 Execution Service with singleton lock + idempotency-before-dispatch, paper path only

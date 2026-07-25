@@ -7,7 +7,7 @@ wired in later via a credentials file.
 
 **Full build plan (architecture, schema, phase-by-phase spec): [docs/architecture/build-plan.md](docs/architecture/build-plan.md) — read this first for any non-trivial change.**
 
-## Status: Phase 0 + Phase 1 complete, Phase 2 next
+## Status: Phase 0 + Phase 1 + Phase 2 complete, Phase 3 next
 
 - ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
   operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
@@ -20,14 +20,25 @@ wired in later via a credentials file.
   Nifty/Bank Nifty universe generator, idempotent instrument-sync job (doubles as
   initial seed + daily refresh), Market Data ingestion service, VWAP/EMA9/EMA20
   indicator engine with bar aggregation.
-- 👈 **Phase 2 is next** — shared strike-ranking engine, Risk Service (limits, margin
-  check, pre-trade analytics), the daily-plan endpoint (budget/target/loss/funding-mode
-  entry), a synthetic strategy stub to prove the Signal→TradeIntent→RiskDecision→audit
-  path before real strategies exist. Full spec in the build plan under "Phase 2".
+- ✅ **Phase 2** — shared strike-ranking engine (ATM±N, spread/volume/OI/premium-fit/
+  depth scoring), Risk Service (versioned `risk_limit_configs`, margin stub,
+  concurrency/daily-trade/consecutive-loss/budget/same-strike checks, full audit +
+  `system_alerts` wiring), pre-trade analytics stored on every `risk_decisions` row,
+  the daily-plan endpoint, and a synthetic strategy stub (+ timer-driven runner)
+  proving the full Signal→TradeIntent→RiskDecision→audit loop. See the build plan's
+  Phase 2 section for the "Phase 2 amendments" (implementation-time decisions + the
+  `paper_only → kill_switch` transitions-table bug) and "QC pass findings" (a
+  post-implementation review found and fixed three more real bugs: an
+  approval-required trade that never closed, a trade-approval lookup that wasn't
+  workspace-scoped, and an unlocked check-then-act in strategy start) recorded
+  there.
+- 👈 **Phase 3 is next** — Execution Service (paper only) + reconciliation +
+  reporting v1. Full spec in the build plan under "Phase 3".
 
-A QC pass was done after Phase 1 (see git log) that found and fixed several real bugs
-— worth reading `git log -p` on that commit if touching auth, sessions, the mock
-adapter, or `main.py`'s lifespan, since the fixes encode non-obvious reasoning.
+QC passes were done after Phase 1 and after Phase 2 (see git log) that each found
+and fixed several real bugs — worth reading `git log -p` on those commits if
+touching auth, sessions, the mock adapter, `main.py`'s lifespan, or the risk/strategy
+modules, since the fixes encode non-obvious reasoning.
 
 ## Running it locally
 
@@ -56,7 +67,7 @@ BOOTSTRAP_ADMIN_EMAIL=admin@example.com BOOTSTRAP_ADMIN_PASSWORD="a-real-passwor
 **Tests**: `./.venv/Scripts/python -m pytest` — auto-creates and drops an isolated
 `<DB_NAME>_test` database (see `tests/conftest.py`); never touches the dev DB. Run
 `ruff check .` and `mypy app tests` before considering anything done — both are
-enforced in CI and kept at zero errors throughout Phase 0/1.
+enforced in CI and kept at zero errors throughout Phase 0/1/2.
 
 ## Conventions that matter (don't relitigate without reading the "why")
 
@@ -70,6 +81,10 @@ enforced in CI and kept at zero errors throughout Phase 0/1.
   `app/core/modes/transitions.py` and is covered by structural tests in
   `tests/unit/test_transitions_table.py` — if a change to that table breaks one of
   those tests, that's very likely a real safety regression, not a test to "fix".
+  (Phase 2 found and fixed a real gap here: `paper_only → kill_switch` didn't allow
+  a `RISK`-triggered transition, so Risk Service's daily-loss-cap breach couldn't
+  reach kill_switch from a `paper_only` session — added `Trigger.RISK` to that edge,
+  verified against every structural test in that file first.)
 - **If it's not in `audit_events`, it didn't happen.** Every safety-relevant action
   (auth, mode transitions, later: risk decisions, orders) goes through
   `app/modules/audit_service/service.py`'s `record_event`, which maintains a
@@ -80,7 +95,18 @@ enforced in CI and kept at zero errors throughout Phase 0/1.
   `LOCK_AUDIT_CHAIN`) exist because this system's #1 failure mode to avoid is a
   duplicate live order or two processes both believing they're the execution
   authority. Any new write path that could plausibly run twice needs to reason about
-  this explicitly, not assume it away.
+  this explicitly, not assume it away. Risk Service's `evaluate_trade_intent` reuses
+  the same pattern via `LOCK_RISK_EVALUATION_QUEUE` (also from `core/locking.py`) —
+  every TradeIntent is evaluated one at a time, never concurrently, which is what
+  actually makes the concurrency cap, daily-trade-count, budget-vs-committed-capital,
+  and same-strike checks race-free.
+- **`qty_lots`, not raw quantity**: `signals`/`trade_intents.qty_lots` is a count of
+  lots, never an absolute order quantity — lot size is always resolved server-side
+  from `option_contracts → instruments.lot_size` (Risk Service's
+  `compute_pre_trade_analytics`), matching the build plan's rule that a strategy or
+  client must never be able to supply the wrong lot size. Phase 3's Execution
+  Service is what multiplies `qty_lots × lot_size` into the absolute
+  `OrderRequest.qty`.
 - **`SessionLocal` has `autoflush=False`** (`core/db/session.py`) — a real bug was
   found and fixed in Phase 1 (`instrument_sync.py`) where a query ran before a
   preceding `db.add()` had been flushed, silently missing rows it should have seen.

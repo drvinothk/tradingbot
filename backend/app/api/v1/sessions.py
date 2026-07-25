@@ -11,20 +11,23 @@ import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.db.session import get_db
 from app.core.modes import ModeTransitionError, enter_kill_switch
 from app.core.security.rbac import require_permission
+from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import BrokerAccount, User
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
     TradingSession,
+    TradingSessionStatus,
     TransitionTriggerType,
 )
+from app.modules.audit_service.service import record_event
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -48,6 +51,13 @@ class SessionOut(BaseModel):
 
 class KillSwitchRequest(BaseModel):
     reason: str = "manual kill switch"
+
+
+class DailyPlanRequest(BaseModel):
+    budget_amount: float = Field(gt=0)
+    daily_target_profit: float = Field(gt=0)
+    daily_loss_cap: float = Field(gt=0)
+    funding_mode: FundingMode = FundingMode.CASH
 
 
 @router.post("", response_model=SessionOut)
@@ -85,6 +95,62 @@ def create_session(
         funding_mode=body.funding_mode,
     )
     db.add(trading_session)
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
+
+
+@router.post("/{session_id}/daily-plan", response_model=SessionOut)
+def set_daily_plan(
+    session_id: uuid.UUID,
+    body: DailyPlanRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> TradingSession:
+    """Sets budget/target/max-loss/funding-mode for the day — editable any
+    time the session is still active, not just at creation, since the plan
+    is meant to be revisable during the day (e.g. tightening the loss cap
+    after a rough morning), not a one-shot form.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    if trading_session.status != TradingSessionStatus.ACTIVE:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Trading session is not active")
+
+    previous = {
+        "budget_amount": float(trading_session.budget_amount),
+        "daily_target_profit": float(trading_session.daily_target_profit),
+        "daily_loss_cap": float(trading_session.daily_loss_cap),
+        "funding_mode": str(trading_session.funding_mode),
+    }
+
+    trading_session.budget_amount = body.budget_amount
+    trading_session.daily_target_profit = body.daily_target_profit
+    trading_session.daily_loss_cap = body.daily_loss_cap
+    trading_session.funding_mode = body.funding_mode
+    db.add(trading_session)
+    db.flush()
+
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.MANUAL_OVERRIDE,
+        event_type="daily_plan.updated",
+        entity_type="trading_session",
+        entity_id=trading_session.id,
+        trading_session_id=trading_session.id,
+        broker_account_id=trading_session.broker_account_id,
+        payload={
+            "previous": previous,
+            "new": {
+                "budget_amount": body.budget_amount,
+                "daily_target_profit": body.daily_target_profit,
+                "daily_loss_cap": body.daily_loss_cap,
+                "funding_mode": body.funding_mode.value,
+            },
+        },
+    )
     db.commit()
     db.refresh(trading_session)
     return trading_session

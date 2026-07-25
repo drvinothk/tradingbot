@@ -10,7 +10,7 @@ import enum
 import uuid
 from datetime import datetime, time
 
-from sqlalchemy import DateTime, ForeignKey, Numeric, String, Time
+from sqlalchemy import DateTime, ForeignKey, Integer, Numeric, String, Time
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -78,6 +78,15 @@ class TradingSession(Base, UUIDPkMixin, TimestampMixin):
     entries_paused_reason: Mapped[EntriesPausedReason | None] = mapped_column(
         String(30), nullable=True
     )
+
+    # Phase 2 addition: running totals Risk Service checks daily_loss_cap /
+    # daily_target_profit / consecutive_loss_pause_threshold against.
+    # Updated by risk_engine.service.record_synthetic_outcome for now (see
+    # that module's docstring) — Phase 3's real trade_outcomes recording
+    # will update these same two fields the same way, so nothing about this
+    # shape changes when the synthetic stand-in is replaced.
+    cumulative_realized_pnl: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    consecutive_losses: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class SessionModeTransition(Base, UUIDPkMixin):
