@@ -8,7 +8,6 @@ approvals plus raising an alert.
 
 from __future__ import annotations
 
-import random
 import time
 import uuid
 from contextlib import contextmanager
@@ -18,6 +17,7 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.audit.models import AuditEvent
+from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionChainSnapshot, OptionContract, OptionType
 from app.domain.market.models import QuoteTick as QuoteTickRow
@@ -28,7 +28,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    SyntheticTradeOutcome,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -177,9 +176,7 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
 ):
     _seed_market_data(db, instrument, option_contract)
 
-    strategy = SyntheticStrategy(
-        instrument_id=instrument.id, expiry_date=EXPIRY, rng=random.Random(42)
-    )
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
     decision = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
 
     assert decision is not None
@@ -190,12 +187,15 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     assert trade_intent is not None
     assert trade_intent.status == TradeIntentStatus.DISPATCHED
 
-    outcome = (
-        db.query(SyntheticTradeOutcome)
-        .filter(SyntheticTradeOutcome.trade_intent_id == trade_intent.id)
-        .one_or_none()
+    # Phase 3: run_cycle no longer synthetically closes the intent — it hands
+    # off to the real Execution Service, which opens an actual Position
+    # (still open; stop/target/trail exit is PositionManager's job, not
+    # run_cycle's).
+    position = (
+        db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one_or_none()
     )
-    assert outcome is not None, "run_cycle should synthetically close a dispatched intent"
+    assert position is not None, "run_cycle should dispatch to a real, open Position"
+    assert position.status == PositionStatus.OPEN
 
     events = (
         db.query(AuditEvent).filter(AuditEvent.trading_session_id == trading_session.id).all()
@@ -203,7 +203,8 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     event_types = {e.event_type for e in events}
     assert "signal.generated" in event_types
     assert "risk_decision.approved.dispatched" in event_types
-    assert "synthetic_trade_outcome.recorded" in event_types
+    assert "order.dispatched" in event_types
+    assert "position.opened" in event_types
 
     ok, broken_id = verify_chain(db)
     assert ok, f"audit chain broken at {broken_id}"
@@ -223,9 +224,7 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
         consecutive_loss_pause_threshold=100,
     )
 
-    strategy = SyntheticStrategy(
-        instrument_id=instrument.id, expiry_date=EXPIRY, rng=random.Random(7)
-    )
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
 
     first = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
     assert first is not None
@@ -378,9 +377,7 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
 
             _seed_market_data(db, instrument, option_contract)
 
-        strategy = SyntheticStrategy(
-            instrument_id=ids["instrument_id"], expiry_date=EXPIRY, rng=random.Random(11)
-        )
+        strategy = SyntheticStrategy(instrument_id=ids["instrument_id"], expiry_date=EXPIRY)
         runner = SyntheticStrategyRunner(
             strategy,
             ids["strategy_run_id"],
@@ -398,7 +395,20 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
                 .all()
             )
             assert len(intents) >= 1, "runner should have produced at least one TradeIntent"
-            assert all(i.status == TradeIntentStatus.DISPATCHED for i in intents)
+            # Phase 3: the first cycle's Position stays open for the rest of
+            # this short test window (nothing closes it), so later cycles
+            # correctly get same_strike_locked-rejected rather than each
+            # dispatching independently — only the first is expected to
+            # reach DISPATCHED.
+            assert any(i.status == TradeIntentStatus.DISPATCHED for i in intents)
+
+            position = (
+                verify_db.query(Position)
+                .filter(Position.trade_intent_id.in_([i.id for i in intents]))
+                .one_or_none()
+            )
+            assert position is not None, "runner's dispatched intent should open a real Position"
+            assert position.status == PositionStatus.OPEN
 
             events = (
                 verify_db.query(AuditEvent)
@@ -408,6 +418,16 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
             assert any(e.event_type == "signal.generated" for e in events)
     finally:
         with real_commit_factory() as cleanup_db:
+            from sqlalchemy import or_ as sa_or
+
+            from app.domain.broker.models import BrokerSyncState, ReconciliationRun
+            from app.domain.execution.models import (
+                Order,
+                OrderEvent,
+                StopPlan,
+                TradeOutcome,
+                TrailPlan,
+            )
             from app.domain.identity.models import BrokerAccount as BrokerAccountRow
             from app.domain.identity.models import User as UserRow
             from app.domain.identity.models import Workspace as WorkspaceRow
@@ -416,9 +436,51 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
             trade_intent_ids = cleanup_db.query(TradeIntent.id).filter(
                 TradeIntent.strategy_run_id == ids.get("strategy_run_id")
             )
-            cleanup_db.query(SyntheticTradeOutcome).filter(
-                SyntheticTradeOutcome.trade_intent_id.in_(trade_intent_ids)
+            position_ids = cleanup_db.query(Position.id).filter(
+                Position.trade_intent_id.in_(trade_intent_ids)
+            )
+            order_ids = [
+                row[0]
+                for row in cleanup_db.query(Order.id).filter(
+                    sa_or(
+                        Order.trade_intent_id.in_(trade_intent_ids),
+                        Order.position_id.in_(position_ids),
+                    )
+                )
+            ]
+            cleanup_db.query(OrderEvent).filter(OrderEvent.order_id.in_(order_ids)).delete(
+                synchronize_session=False
+            )
+            cleanup_db.query(TradeOutcome).filter(
+                TradeOutcome.position_id.in_(position_ids)
             ).delete(synchronize_session=False)
+            cleanup_db.query(StopPlan).filter(StopPlan.position_id.in_(position_ids)).delete(
+                synchronize_session=False
+            )
+            cleanup_db.query(TrailPlan).filter(TrailPlan.position_id.in_(position_ids)).delete(
+                synchronize_session=False
+            )
+            # orders <-> positions is a circular FK pair (see
+            # app/domain/execution/models.py). Break it via
+            # positions.closing_order_id, which is nullable — NOT via
+            # orders.position_id, which would leave an exit order (always
+            # trade_intent_id=NULL) with both FK columns null, violating
+            # ck_order_exactly_one_of_intent_or_position.
+            cleanup_db.query(Position).filter(Position.id.in_(position_ids)).update(
+                {"closing_order_id": None}, synchronize_session=False
+            )
+            # Exit orders (position_id set) are now unreferenced — safe to
+            # delete before the positions they point at.
+            cleanup_db.query(Order).filter(Order.position_id.in_(position_ids)).delete(
+                synchronize_session=False
+            )
+            cleanup_db.query(Position).filter(
+                Position.trade_intent_id.in_(trade_intent_ids)
+            ).delete(synchronize_session=False)
+            # Entry orders (trade_intent_id set) are now unreferenced.
+            cleanup_db.query(Order).filter(Order.trade_intent_id.in_(trade_intent_ids)).delete(
+                synchronize_session=False
+            )
             cleanup_db.query(RiskDecision).filter(
                 RiskDecision.trade_intent_id.in_(trade_intent_ids)
             ).delete(synchronize_session=False)
@@ -440,6 +502,16 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
                     StrategyConfig.id == ids["strategy_config_id"]
                 ).delete()
             if "instrument_id" in ids:
+                # Phase 3: dispatch_trade_intent/close_position each run an
+                # event-triggered reconciliation pass, which writes these —
+                # must go before OptionContract, which they reference.
+                cleanup_db.query(BrokerSyncState).filter(
+                    BrokerSyncState.option_contract_id.in_(
+                        cleanup_db.query(OptionContract.id).filter(
+                            OptionContract.instrument_id == ids["instrument_id"]
+                        )
+                    )
+                ).delete(synchronize_session=False)
                 cleanup_db.query(OptionContract).filter(
                     OptionContract.instrument_id == ids["instrument_id"]
                 ).delete()
@@ -452,6 +524,9 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
             if "trading_session_id" in ids:
                 from app.domain.ops.models import SystemAlert as SystemAlertRow
 
+                cleanup_db.query(ReconciliationRun).filter(
+                    ReconciliationRun.trading_session_id == ids["trading_session_id"]
+                ).delete()
                 cleanup_db.query(SystemAlertRow).filter(
                     SystemAlertRow.trading_session_id == ids["trading_session_id"]
                 ).delete()

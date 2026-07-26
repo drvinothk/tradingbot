@@ -3,16 +3,9 @@
 TradeIntent); `Signal`/`TradeIntent` are what every strategy — synthetic now,
 real from Phase 4 — is allowed to emit, per the shared `Strategy` interface
 in `app.modules.strategy_engine.interface` (no Order/Position access at any
-layer beneath it).
-
-`SyntheticTradeOutcome` is deliberately named apart from Phase 3's real
-`trade_outcomes` (realized_pnl/slippage/exit_reason against actual paper
-fills): Phase 2 has no Execution Service yet, so the synthetic strategy stub
-needs *some* way to close a dispatched TradeIntent and produce a P&L number
-for Risk Service's daily-loss-cap / daily-target-profit / consecutive-loss
-checks to actually have data to evaluate. This table is that stand-in only —
-see the Phase 2 amendment note in docs/architecture/build-plan.md. Phase 3
-introduces the real thing and this table is not read by anything after that.
+layer beneath it). A TradeIntent's own status lifecycle ends at `DISPATCHED`
+("handed to Execution Service") — what happens after that lives in
+`app.domain.execution`'s Order/Position/TradeOutcome chain, not here.
 """
 
 from __future__ import annotations
@@ -180,18 +173,3 @@ class PendingTradeApproval(Base, UUIDPkMixin):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (Index("ix_pending_trade_approvals_run", "strategy_run_id"),)
-
-
-class SyntheticTradeOutcome(Base, UUIDPkMixin):
-    """Phase-2-only stand-in for Phase 3's real `trade_outcomes` — see the
-    module docstring above. Never referenced by anything outside the
-    synthetic strategy stub and Risk Service's P&L-driven checks.
-    """
-
-    __tablename__ = "synthetic_trade_outcomes"
-
-    trade_intent_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("trade_intents.id"), unique=True
-    )
-    realized_pnl: Mapped[float] = mapped_column(Numeric(14, 2))
-    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

@@ -33,13 +33,21 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import verify_chain
+from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
+from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.risk_engine.service import (
     compute_pre_trade_analytics,
     create_new_risk_limit_config_version,
     evaluate_trade_intent,
     get_active_risk_limit_config,
-    record_synthetic_outcome,
+    record_trade_outcome_effects,
 )
+from app.modules.strategy_engine.service import expire_stale_pending_approvals
+
+
+@pytest.fixture
+def broker() -> MockBrokerAdapter:
+    return MockBrokerAdapter()
 
 
 @pytest.fixture
@@ -183,15 +191,18 @@ def _dispatch(
     trading_session: TradingSession,
     strategy_run: StrategyRun,
     option_contract: OptionContract,
+    broker: MockBrokerAdapter,
     **kwargs,
 ) -> TradeIntent:
-    """Convenience: build + evaluate a trade intent, asserting it dispatches
-    cleanly — used by tests that need an *open position* as setup, not as
-    the thing under test."""
+    """Convenience: build + evaluate + dispatch a trade intent (the same two
+    calls `strategy_engine.service.submit_signal` makes for the AUTO path),
+    asserting it goes all the way to an open Position — used by tests that
+    need an *open position* as setup, not as the thing under test."""
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract, **kwargs)
     decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
     assert decision.decision == "approved", decision.reasons
     assert trade_intent.status == TradeIntentStatus.DISPATCHED
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
     return trade_intent
 
 
@@ -328,9 +339,9 @@ def test_evaluate_trade_intent_rejects_when_mode_blocks_new_entries(
 
 
 def test_evaluate_trade_intent_same_strike_locked(
-    db: Session, trading_session, strategy_run, option_contract
+    db: Session, broker, trading_session, strategy_run, option_contract
 ):
-    _dispatch(db, trading_session, strategy_run, option_contract)
+    _dispatch(db, trading_session, strategy_run, option_contract, broker)
 
     second = _make_trade_intent(db, trading_session, strategy_run, option_contract)
     decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
@@ -340,7 +351,7 @@ def test_evaluate_trade_intent_same_strike_locked(
 
 
 def test_evaluate_trade_intent_max_concurrent_positions(
-    db: Session, trading_session, strategy_run, instrument
+    db: Session, broker, trading_session, strategy_run, instrument
 ):
     contracts = []
     for i in range(3):
@@ -359,8 +370,8 @@ def test_evaluate_trade_intent_max_concurrent_positions(
     # Default max_concurrent_positions is 2 (RiskDefaults) — first two open
     # cleanly, the third (a different strike, so not same-strike-locked)
     # should trip the concurrency cap instead.
-    _dispatch(db, trading_session, strategy_run, contracts[0])
-    _dispatch(db, trading_session, strategy_run, contracts[1])
+    _dispatch(db, trading_session, strategy_run, contracts[0], broker)
+    _dispatch(db, trading_session, strategy_run, contracts[1], broker)
 
     third = _make_trade_intent(db, trading_session, strategy_run, contracts[2])
     decision = evaluate_trade_intent(db, third, trading_session, strategy_run)
@@ -370,7 +381,7 @@ def test_evaluate_trade_intent_max_concurrent_positions(
 
 
 def test_evaluate_trade_intent_max_trades_per_day(
-    db: Session, workspace, authorized_user, trading_session, strategy_run, instrument
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run, instrument
 ):
     create_new_risk_limit_config_version(
         db,
@@ -391,7 +402,7 @@ def test_evaluate_trade_intent_max_trades_per_day(
     db.add_all([c1, c2])
     db.flush()
 
-    _dispatch(db, trading_session, strategy_run, c1)
+    _dispatch(db, trading_session, strategy_run, c1, broker)
 
     second = _make_trade_intent(db, trading_session, strategy_run, c2)
     decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
@@ -486,36 +497,104 @@ def test_evaluate_trade_intent_approval_required_creates_pending_approval(
     assert pending.capital_required == pytest.approx(float(decision.capital_required))
 
 
-# -- record_synthetic_outcome: P&L-driven triggers ---------------------------
+# -- expire_stale_pending_approvals: proactive expiry -------------------------
 
 
-def test_record_synthetic_outcome_updates_running_totals(
-    db: Session, trading_session, strategy_run, option_contract
+def test_expire_stale_pending_approvals_expires_past_window(
+    db: Session, trading_session, strategy_config, user: User, option_contract
 ):
-    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
+    approval_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(approval_run)
+    db.flush()
 
-    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=150.0)
+    trade_intent = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    evaluate_trade_intent(db, trade_intent, trading_session, approval_run)
+    pending = (
+        db.query(PendingTradeApproval)
+        .filter(PendingTradeApproval.trade_intent_id == trade_intent.id)
+        .one()
+    )
+    pending.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    db.add(pending)
+    db.flush()
+
+    expired = expire_stale_pending_approvals(db, trading_session)
+
+    assert len(expired) == 1
+    assert expired[0].id == pending.id
+    db.refresh(pending)
+    db.refresh(trade_intent)
+    assert pending.status == ApprovalStatus.EXPIRED
+    assert trade_intent.status == TradeIntentStatus.EXPIRED
+
+
+def test_expire_stale_pending_approvals_leaves_fresh_ones_alone(
+    db: Session, trading_session, strategy_config, user: User, option_contract
+):
+    approval_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(approval_run)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    evaluate_trade_intent(db, trade_intent, trading_session, approval_run)
+
+    expired = expire_stale_pending_approvals(db, trading_session)
+
+    assert expired == []
+    pending = (
+        db.query(PendingTradeApproval)
+        .filter(PendingTradeApproval.trade_intent_id == trade_intent.id)
+        .one()
+    )
+    assert pending.status == ApprovalStatus.PENDING
+    assert trade_intent.status == TradeIntentStatus.PENDING_APPROVAL
+
+
+# -- record_trade_outcome_effects: P&L-driven triggers -----------------------
+#
+# Phase 3 replaces record_synthetic_outcome with record_trade_outcome_effects
+# (see risk_engine.service's module docstring) — it no longer creates its own
+# outcome row (execution_engine.paper.service.close_position writes the real
+# TradeOutcome now) or takes a TradeIntent at all, just the trading_session
+# and a realized_pnl, so these tests no longer need a dispatched position as
+# setup. Coverage of the full dispatch -> close -> effects chain lives in
+# tests/integration/test_execution_paper_service.py.
+
+
+def test_record_trade_outcome_effects_updates_running_totals(db: Session, trading_session):
+    record_trade_outcome_effects(db, trading_session, realized_pnl=150.0)
 
     assert float(trading_session.cumulative_realized_pnl) == pytest.approx(150.0)
     assert trading_session.consecutive_losses == 0
 
 
-def test_record_synthetic_outcome_increments_consecutive_losses(
-    db: Session, trading_session, strategy_run, option_contract
-):
-    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
-    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=-50.0)
+def test_record_trade_outcome_effects_increments_consecutive_losses(db: Session, trading_session):
+    record_trade_outcome_effects(db, trading_session, realized_pnl=-50.0)
 
     assert trading_session.consecutive_losses == 1
 
 
-def test_record_synthetic_outcome_breaching_loss_cap_triggers_kill_switch(
-    db: Session, trading_session, strategy_run, option_contract
+def test_record_trade_outcome_effects_breaching_loss_cap_triggers_kill_switch(
+    db: Session, trading_session
 ):
-    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
-
     # daily_loss_cap is 1000 on the fixture session.
-    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=-1500.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0)
 
     assert trading_session.mode == SafeMode.KILL_SWITCH
     alerts = db.query(SystemAlert).filter(
@@ -525,13 +604,11 @@ def test_record_synthetic_outcome_breaching_loss_cap_triggers_kill_switch(
     assert len(alerts) == 1
 
 
-def test_record_synthetic_outcome_hitting_target_sets_entries_paused(
-    db: Session, trading_session, strategy_run, option_contract
+def test_record_trade_outcome_effects_hitting_target_sets_entries_paused(
+    db: Session, trading_session
 ):
-    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
-
     # daily_target_profit is 2000 on the fixture session.
-    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=2500.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0)
 
     assert trading_session.entries_paused_reason == "daily_target_reached"
     # Not a mode transition — reaching a target is a goal, not a fault.
@@ -541,8 +618,7 @@ def test_record_synthetic_outcome_hitting_target_sets_entries_paused(
 def test_entries_paused_blocks_further_trade_intents(
     db: Session, trading_session, strategy_run, option_contract, instrument
 ):
-    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract)
-    record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl=2500.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0)
     assert trading_session.entries_paused_reason == "daily_target_reached"
 
     other_contract = OptionContract(
@@ -563,9 +639,9 @@ def test_entries_paused_blocks_further_trade_intents(
 
 
 def test_risk_decisions_are_fully_audited_and_chain_stays_intact(
-    db: Session, trading_session, strategy_run, option_contract
+    db: Session, broker, trading_session, strategy_run, option_contract
 ):
-    _dispatch(db, trading_session, strategy_run, option_contract)
+    _dispatch(db, trading_session, strategy_run, option_contract, broker)
 
     events = (
         db.query(AuditEvent)

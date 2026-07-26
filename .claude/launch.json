@@ -1,0 +1,15 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend",
+      "runtimeExecutable": "C:\\Users\\drvin\\Trading Bot\\backend\\.venv\\Scripts\\python.exe",
+      "runtimeArgs": [
+        "-m", "uvicorn", "app.main:app",
+        "--app-dir", "C:\\Users\\drvin\\Trading Bot\\backend",
+        "--host", "127.0.0.1", "--port", "5000"
+      ],
+      "port": 5000
+    }
+  ]
+}

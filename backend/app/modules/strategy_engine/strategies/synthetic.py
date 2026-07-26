@@ -1,14 +1,11 @@
 """Phase 2's only strategy: proves Signal -> TradeIntent -> RiskDecision ->
 audit end-to-end before any real strategy exists (Phase 4). Each cycle picks
-the top-ranked ATM+/-N contract via the strike-ranking engine, proposes a
-trivial fixed-percent stop/target around the current premium, and — only
-when Risk actually dispatches it (auto mode, all limits clear) — immediately
-"closes" the position with a small synthetic P&L via
-`strategy_engine.service.close_dispatched_trade_intent_synthetically` (the
-same helper `POST /trade-approvals/{id}/approve` uses for the
-approval-required path), so the daily-loss-cap / daily-target-profit /
-consecutive-loss checks have real data to evaluate against. See that
-helper's docstring for why this stand-in exists.
+the top-ranked ATM+/-N contract via the strike-ranking engine and proposes a
+trivial fixed-percent stop/target around the current premium.
+`strategy_engine.service.submit_signal` handles everything from there,
+including — as of Phase 3 — real dispatch-to-Execution-Service when Risk
+approves it in auto mode; this module no longer needs to do anything once
+`submit_signal` returns.
 
 `SyntheticStrategyRunner` is the "on a timer" part (per the Phase 2 build
 plan bullet) — a background-thread loop mirroring
@@ -19,7 +16,6 @@ short-lived session since it runs off the request thread.
 from __future__ import annotations
 
 import logging
-import random
 import threading
 import uuid
 from collections.abc import Callable
@@ -36,13 +32,9 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    TradeIntent,
 )
 from app.modules.strategy_engine.interface import Strategy, TradeProposal
-from app.modules.strategy_engine.service import (
-    close_dispatched_trade_intent_synthetically,
-    submit_signal,
-)
+from app.modules.strategy_engine.service import submit_signal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
     rank_from_latest_snapshot,
@@ -63,12 +55,10 @@ class SyntheticStrategy(Strategy):
         instrument_id: uuid.UUID,
         expiry_date: date,
         ranking_config: StrikeRankingConfig = StrikeRankingConfig(),
-        rng: random.Random | None = None,
     ) -> None:
         self.instrument_id = instrument_id
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
-        self.rng = rng or random.Random()
 
     def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
         ranked = rank_from_latest_snapshot(
@@ -103,22 +93,7 @@ class SyntheticStrategy(Strategy):
         if proposal is None:
             return None
 
-        decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
-
-        trade_intent = db.get(TradeIntent, decision.trade_intent_id)
-        if trade_intent is not None:
-            # Deliberately not a real fill simulation (Phase 3's Execution
-            # Service against mock prices does that) — just enough win/loss
-            # variance, as a fraction of the capital Risk already computed,
-            # to exercise the consecutive-loss and daily-loss/target checks.
-            # No-ops if the intent didn't actually dispatch this cycle (e.g.
-            # approval-required — that path closes separately once a human
-            # approves it, via the same shared helper).
-            close_dispatched_trade_intent_synthetically(
-                db, trading_session, trade_intent, rng=self.rng
-            )
-
-        return decision
+        return submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
 
 
 class SyntheticStrategyRunner:

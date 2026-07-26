@@ -7,7 +7,7 @@ wired in later via a credentials file.
 
 **Full build plan (architecture, schema, phase-by-phase spec): [docs/architecture/build-plan.md](docs/architecture/build-plan.md) — read this first for any non-trivial change.**
 
-## Status: Phase 0 + Phase 1 + Phase 2 complete, Phase 3 next
+## Status: Phase 0-3 complete, Phase 4 next
 
 - ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
   operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
@@ -32,13 +32,29 @@ wired in later via a credentials file.
   approval-required trade that never closed, a trade-approval lookup that wasn't
   workspace-scoped, and an unlocked check-then-act in strategy start) recorded
   there.
-- 👈 **Phase 3 is next** — Execution Service (paper only) + reconciliation +
-  reporting v1. Full spec in the build plan under "Phase 3".
+- ✅ **Phase 3** — the real Order/Position/StopPlan/TrailPlan/TradeOutcome lifecycle
+  (paper, against `MockBrokerAdapter` via `BrokerPort.place_order`/`get_positions` —
+  not a separate tick-based simulator), `PositionManager` (per-session background
+  poller: stop/target/trail checks, EOD forced square-off, proactive
+  pending-approval expiry, periodic reconciliation), Reconciliation Service
+  (event-triggered from every dispatch/close + polling), Reporting v1 (daily
+  report + scorecard: win rate, avg win/loss, profit factor, max drawdown,
+  slippage, signal-vs-execution counts), and the startup-recovery hook doing real
+  work for the first time (resumes `PositionManager` for any session found
+  `ACTIVE` with an open position after a restart). See the build plan's Phase 3
+  section for the "Phase 3 amendments" (the paper-executes-through-BrokerPort
+  design decision, why `PositionManager` is started explicitly at strategy-start
+  rather than implicitly from dispatch) and "QC pass findings" (two real bugs in
+  the generic trailing-stop logic, a missing proactive approval-expiry sweep, and
+  a circular-FK test-cleanup trap) recorded there.
+- 👈 **Phase 4 is next** — ORB, VWAP Pullback, EMA Micro-pullback (paper, mock
+  data) — first major milestone. Full spec in the build plan under "Phase 4".
 
-QC passes were done after Phase 1 and after Phase 2 (see git log) that each found
-and fixed several real bugs — worth reading `git log -p` on those commits if
-touching auth, sessions, the mock adapter, `main.py`'s lifespan, or the risk/strategy
-modules, since the fixes encode non-obvious reasoning.
+QC passes were done after Phases 1, 2, and 3 (see git log) that each found and
+fixed several real bugs — worth reading `git log -p` on those commits if touching
+auth, sessions, the mock adapter, `main.py`'s lifespan, the risk/strategy modules,
+or the execution/reconciliation modules, since the fixes encode non-obvious
+reasoning.
 
 ## Running it locally
 
@@ -67,7 +83,7 @@ BOOTSTRAP_ADMIN_EMAIL=admin@example.com BOOTSTRAP_ADMIN_PASSWORD="a-real-passwor
 **Tests**: `./.venv/Scripts/python -m pytest` — auto-creates and drops an isolated
 `<DB_NAME>_test` database (see `tests/conftest.py`); never touches the dev DB. Run
 `ruff check .` and `mypy app tests` before considering anything done — both are
-enforced in CI and kept at zero errors throughout Phase 0/1/2.
+enforced in CI and kept at zero errors throughout Phase 0-3.
 
 ## Conventions that matter (don't relitigate without reading the "why")
 
@@ -130,6 +146,38 @@ enforced in CI and kept at zero errors throughout Phase 0/1/2.
 - **Secrets**: never in the tracked `.env`/`shoonya.env` — both are gitignored, only
   `.example` variants are tracked. `backend/app/config/settings.py` documents which
   env file backs which settings group.
+- **Paper execution goes through `BrokerPort`, not a separate simulator**:
+  `execution_engine/paper/service.py` calls `place_order`/`get_positions` on
+  whichever adapter `broker_adapter/composition.py`'s `get_broker()` resolves to
+  (`MockBrokerAdapter` through Phase 5) — this reuses Phase 1's already-built
+  order/position simulation and gives Reconciliation Service a genuine broker-side
+  book to diff against, so Phase 6's real-broker case is a DI swap, not a rewrite.
+- **`orders` ↔ `positions` is a circular FK pair**: an entry `Order` opens a
+  `Position`; the `Position`'s `closing_order_id` then points back at the exit
+  `Order`. Break the cycle via `positions.closing_order_id` (nullable) when
+  deleting either — never via `orders.position_id`, which would leave an exit
+  order (always `trade_intent_id=NULL`) with both FK columns null, violating
+  `ck_order_exactly_one_of_intent_or_position`. Got this wrong once during Phase 3
+  QC in a test cleanup block; same trap will resurface in any new test that closes
+  a position and then tries to clean up.
+- **`PositionManager` is started explicitly, not implicitly from dispatch.**
+  `execution_engine/paper/registry.ensure_position_manager_running` is called from
+  `api.v1.strategies.start_strategy` (and resumed from `app.main`'s
+  startup-recovery check) — deliberately *not* from inside
+  `dispatch_trade_intent` itself, because that function is called directly (with
+  a test-owned `broker=`) from unit/integration tests, and auto-starting a real
+  background thread there would spawn one per test run polling the *production*
+  DB via `PositionManager`'s default `session_scope`.
+- **Postgres session-level advisory locks are reentrant per session**: a second
+  `pg_advisory_lock(key)` call for a key the same session already holds returns
+  immediately and just increments an internal count (must be unlocked the same
+  number of times). This is what makes it safe for `dispatch_trade_intent`/
+  `close_position` (holding `LOCK_EXECUTION_SINGLETON`) to run an event-triggered
+  reconciliation pass that can itself call `transition_mode` (which acquires the
+  *same* lock) without deadlocking — but this only holds because nothing in this
+  codebase ever acquires `LOCK_RISK_EVALUATION_QUEUE` before
+  `LOCK_EXECUTION_SINGLETON`; keep that ordering invariant if you add a new
+  call path that touches both.
 
 ## Known open items
 
@@ -141,4 +189,7 @@ enforced in CI and kept at zero errors throughout Phase 0/1/2.
   section, but the exact rate limits weren't accessible programmatically from their
   docs site; worth a manual look before Phase 5's rate-limiter tuning.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
-  `main` branch, pushed and up to date as of the Phase 0+1 commit.
+  `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
+  Phase 3's changes are uncommitted in the working tree as of this note — check
+  `git log`/`git status` rather than trusting this line, and commit/push only
+  when explicitly asked to.

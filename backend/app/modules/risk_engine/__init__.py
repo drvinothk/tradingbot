@@ -5,7 +5,7 @@ from app.modules.risk_engine.service import (
     create_new_risk_limit_config_version,
     evaluate_trade_intent,
     get_active_risk_limit_config,
-    record_synthetic_outcome,
+    record_trade_outcome_effects,
 )
 
 __all__ = [
@@ -15,5 +15,5 @@ __all__ = [
     "create_new_risk_limit_config_version",
     "evaluate_trade_intent",
     "get_active_risk_limit_config",
-    "record_synthetic_outcome",
+    "record_trade_outcome_effects",
 ]

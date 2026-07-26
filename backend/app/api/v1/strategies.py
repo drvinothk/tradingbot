@@ -35,7 +35,8 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import record_event
-from app.modules.strategy_engine.service import close_dispatched_trade_intent_synthetically
+from app.modules.execution_engine.paper.registry import ensure_position_manager_running
+from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.strategy_engine.strategies.synthetic import (
     SyntheticStrategy,
     SyntheticStrategyRunner,
@@ -194,6 +195,14 @@ def start_strategy(
     runner.start()
     _RUNNERS[run.id] = runner
 
+    # PositionManager is per trading_session, not per strategy_run — a
+    # session that already has one running (e.g. a second strategy started
+    # against it) is left alone; ensure_position_manager_running no-ops in
+    # that case. It's deliberately not stopped by stop_strategy below: an
+    # already-open position from this run must keep being managed to its
+    # stop/target even after the strategy that opened it stops scanning.
+    ensure_position_manager_running(trading_session.id)
+
     return {"strategy_run_id": run.id, "status": run.status, "execution_mode": run.execution_mode}
 
 
@@ -349,13 +358,13 @@ def approve_trade_approval(
         entity_id=trade_intent.id,
     )
 
-    # Same Phase-2 synthetic close the auto-execute path uses (see that
-    # helper's docstring) — without this, an approved intent would sit
-    # DISPATCHED forever, permanently holding a concurrency slot and a
-    # same-strike lock for the rest of the session.
+    # Hands off to the real Execution Service, same as the auto-execute path
+    # (strategy_engine.service.submit_signal) — without this, an approved
+    # intent would sit DISPATCHED forever, permanently holding a concurrency
+    # slot and a same-strike lock for the rest of the session.
     trading_session = db.get(TradingSession, trade_intent.trading_session_id)
     if trading_session is not None:
-        close_dispatched_trade_intent_synthetically(db, trading_session, trade_intent)
+        dispatch_trade_intent(db, trading_session, trade_intent)
 
     db.commit()
     return {"ok": True, "trade_intent_status": trade_intent.status}

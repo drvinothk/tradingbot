@@ -8,9 +8,10 @@
    backend can never run alongside the first believing it's also the engine.
    This is fatal: refuse to start rather than risk two execution writers.
 3. Startup-recovery check — looks for any trading_session left ACTIVE with
-   open positions from a previous run (crash/reboot) and would resume
-   reconciliation + stop/trail management. No-op-safe in Phase 0 since
-   positions don't exist yet; Phase 3 is what actually exercises this path.
+   open positions from a previous run (crash/reboot), resumes each one's
+   `PositionManager` (so stop/trail management picks back up instead of the
+   process coming back up idle) and runs an immediate reconciliation pass
+   against the broker's own book, per Phase 3.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1 import auth, sessions, strategies
+from app.api.v1 import auth, execution, reports, sessions, strategies
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
 from app.domain.session.models import TradingSessionStatus
@@ -67,28 +68,64 @@ def _acquire_process_singleton_lock():
 
 
 def _run_startup_recovery_check() -> None:
-    """No-op-safe in Phase 0: there are no positions/orders tables yet, so
-    this only checks for sessions left ACTIVE and logs them. Phase 3 extends
-    this to actually trigger reconciliation + resume stop/trail management.
+    """For every trading_session left ACTIVE with at least one open Position
+    (the signature of a crash/reboot mid-position, not a clean shutdown):
+    resume its `PositionManager` — this is what actually closes the "comes
+    back up idle" gap the whole startup-recovery hook exists for — and run
+    one immediate reconciliation pass against the broker's own book, so a
+    stale local/broker mismatch from before the crash is caught right away
+    rather than waiting for the manager's own poll cadence.
+
+    A session with no open positions is left alone — nothing to resume.
     """
     from app.core.db.session import session_scope
+    from app.domain.broker.models import ReconciliationTrigger
+    from app.domain.execution.models import Position, PositionStatus
     from app.domain.session.models import TradingSession
+    from app.modules.broker_adapter.composition import get_broker
+    from app.modules.execution_engine.paper.registry import ensure_position_manager_running
+    from app.modules.reconciliation.service import run_reconciliation
 
     with session_scope() as db:
-        stale_active = (
+        active_sessions = (
             db.query(TradingSession)
             .filter(TradingSession.status == TradingSessionStatus.ACTIVE)
             .all()
         )
-        if stale_active:
+        if not active_sessions:
+            logger.info("Startup recovery check: no stale active sessions found.")
+            return
+
+        resumed = []
+        for trading_session in active_sessions:
+            has_open_position = (
+                db.query(Position.id)
+                .filter(
+                    Position.trading_session_id == trading_session.id,
+                    Position.status == PositionStatus.OPEN,
+                )
+                .first()
+                is not None
+            )
+            if not has_open_position:
+                continue
+
+            ensure_position_manager_running(trading_session.id)
+            run_reconciliation(db, get_broker(), trading_session, ReconciliationTrigger.EVENT)
+            resumed.append(trading_session.id)
+
+        if resumed:
             logger.warning(
-                "Found %d trading_session(s) still ACTIVE at startup — "
-                "Phase 3+ will resume reconciliation/position management here: %s",
-                len(stale_active),
-                [str(s.id) for s in stale_active],
+                "Resumed PositionManager + ran reconciliation for %d trading_session(s) "
+                "found ACTIVE with open positions at startup: %s",
+                len(resumed),
+                [str(s) for s in resumed],
             )
         else:
-            logger.info("Startup recovery check: no stale active sessions found.")
+            logger.info(
+                "Startup recovery check: %d active session(s) found, none with open positions.",
+                len(active_sessions),
+            )
 
 
 @asynccontextmanager
@@ -120,7 +157,9 @@ async def lifespan(app: FastAPI):
     yield
 
     from app.core.locking import release_advisory_lock
+    from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
 
+    stop_all_position_managers()
     release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
     singleton_connection.close()
     logger.info("Process singleton lock released; shutdown complete.")
@@ -132,6 +171,8 @@ def create_app() -> FastAPI:
     app.include_router(auth.router, prefix="/api/v1")
     app.include_router(sessions.router, prefix="/api/v1")
     app.include_router(strategies.router, prefix="/api/v1")
+    app.include_router(execution.router, prefix="/api/v1")
+    app.include_router(reports.router, prefix="/api/v1")
 
     @app.get("/health")
     def health() -> dict:

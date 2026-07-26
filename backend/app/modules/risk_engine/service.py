@@ -6,14 +6,24 @@ count, budget-vs-committed-capital, and same-strike lock are all
 check-then-act sequences that would otherwise race if two strategies'
 intents were evaluated in parallel.
 
+This module deliberately never imports `app.modules.execution_engine` —
+marking a TradeIntent `DISPATCHED` here is as far as Risk Service's
+responsibility goes; the caller (`strategy_engine.service.submit_signal` for
+the AUTO path, `api.v1.strategies.approve_trade_approval` for
+approval-required) is what actually calls
+`execution_engine.paper.service.dispatch_trade_intent` next, outside this
+module's `LOCK_RISK_EVALUATION_QUEUE` scope. Keeping this one-directional
+(execution_engine imports risk_engine for `record_trade_outcome_effects`,
+never the other way) avoids a circular import between the two.
+
 Two P&L-driven checks — daily_loss_cap and daily_target_profit — read
-`trading_sessions.cumulative_realized_pnl`/`consecutive_losses`, which
-Phase 2 has no real Execution Service to maintain yet. `record_synthetic_outcome`
-is the Phase-2-only function that updates them, called by the synthetic
-strategy stub after "closing" a dispatched TradeIntent — see
-`app.domain.strategy.models.SyntheticTradeOutcome`'s docstring and the Phase 2
-amendment note in docs/architecture/build-plan.md. Phase 3's real Execution
-Service replaces this call site with real fill-driven P&L, not this function.
+`trading_sessions.cumulative_realized_pnl`/`consecutive_losses`, updated by
+`record_trade_outcome_effects` below whenever a real `Position` closes (see
+`app.modules.execution_engine.paper.service.close_position`). Phase 2's
+`record_synthetic_outcome`/`SyntheticTradeOutcome` stand-in — the only way
+these counters had data to evaluate before a real Execution Service
+existed — is gone; this is its real replacement, same triggers, fed by an
+actual fill instead of a random P&L.
 """
 
 from __future__ import annotations
@@ -23,12 +33,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from sqlalchemy import or_ as sa_or
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
 from app.domain.audit.models import ActorType, EventCategory
+from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity, SystemAlert
@@ -46,7 +58,6 @@ from app.domain.strategy.models import (
     PendingTradeApproval,
     SignalSide,
     StrategyRun,
-    SyntheticTradeOutcome,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -246,15 +257,19 @@ def compute_pre_trade_analytics(
 
 
 def _open_trade_intents_query(db: Session, trading_session_id: uuid.UUID):
-    """Dispatched TradeIntents with no synthetic outcome yet — the Phase 2
-    proxy for "currently open position" (see module docstring)."""
+    """Dispatched TradeIntents whose resulting Position is still open, or
+    that are DISPATCHED but haven't reached `dispatch_trade_intent` yet (the
+    brief in-transaction window between Risk marking DISPATCHED and the
+    caller invoking Execution) — the real proxy for "currently open
+    position" that replaces Phase 2's SyntheticTradeOutcome stand-in.
+    """
     return (
         db.query(TradeIntent)
-        .outerjoin(SyntheticTradeOutcome, SyntheticTradeOutcome.trade_intent_id == TradeIntent.id)
+        .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.status == TradeIntentStatus.DISPATCHED,
-            SyntheticTradeOutcome.id.is_(None),
+            sa_or(Position.id.is_(None), Position.status == PositionStatus.OPEN),
         )
     )
 
@@ -263,12 +278,12 @@ def _open_committed_capital(db: Session, trading_session_id: uuid.UUID) -> Decim
     rows = (
         db.query(RiskDecision.capital_required)
         .join(TradeIntent, RiskDecision.trade_intent_id == TradeIntent.id)
-        .outerjoin(SyntheticTradeOutcome, SyntheticTradeOutcome.trade_intent_id == TradeIntent.id)
+        .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.status == TradeIntentStatus.DISPATCHED,
             RiskDecision.decision == RiskDecisionOutcome.APPROVED,
-            SyntheticTradeOutcome.id.is_(None),
+            sa_or(Position.id.is_(None), Position.status == PositionStatus.OPEN),
         )
         .all()
     )
@@ -280,14 +295,14 @@ def _same_strike_locked(
 ) -> bool:
     locked = (
         db.query(TradeIntent.id)
-        .outerjoin(SyntheticTradeOutcome, SyntheticTradeOutcome.trade_intent_id == TradeIntent.id)
+        .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.option_contract_id == option_contract_id,
             TradeIntent.status.in_(
                 [TradeIntentStatus.PENDING_APPROVAL, TradeIntentStatus.DISPATCHED]
             ),
-            SyntheticTradeOutcome.id.is_(None),
+            sa_or(Position.id.is_(None), Position.status == PositionStatus.OPEN),
         )
         .first()
     )
@@ -485,31 +500,30 @@ def evaluate_trade_intent(
         return decision
 
 
-def record_synthetic_outcome(
+def record_trade_outcome_effects(
     db: Session,
     trading_session: TradingSession,
-    trade_intent: TradeIntent,
     realized_pnl: float,
-) -> SyntheticTradeOutcome:
-    """Phase-2-only stand-in for closing a dispatched TradeIntent — see the
-    module docstring. Updates the session's running P&L/consecutive-loss
-    counters and applies the same two triggers described in the build plan's
-    "Daily trading plan" section: a loss-cap breach escalates straight to
-    kill_switch (no soft step-down), a target-profit hit sets
-    entries_paused_reason without touching the safety-mode state machine.
+) -> None:
+    """Called by `execution_engine.paper.service.close_position` right after
+    it writes a real `TradeOutcome` row — this function owns only the
+    session-level *effects* of that P&L (running totals + the two triggers
+    below), not the outcome row itself, since that now belongs to the
+    execution domain. Replaces Phase 2's `record_synthetic_outcome`
+    (formerly also responsible for creating the Phase-2-only
+    `SyntheticTradeOutcome` row) with the same triggers described in the
+    build plan's "Daily trading plan" section: a loss-cap breach escalates
+    straight to kill_switch (no soft step-down), a target-profit hit sets
+    `entries_paused_reason` without touching the safety-mode state machine.
+
+    Runs under `LOCK_RISK_EVALUATION_QUEUE` (not `LOCK_EXECUTION_SINGLETON`,
+    which the caller already holds) — deliberately a *different* lock than
+    the caller's, since these running totals are read by
+    `evaluate_trade_intent`'s own checks under this same lock and must stay
+    serialized against concurrent risk evaluations, not against concurrent
+    dispatches.
     """
-    if trade_intent.status != TradeIntentStatus.DISPATCHED:
-        raise ValueError("only a dispatched TradeIntent can be closed via record_synthetic_outcome")
-
     with advisory_lock(db, LOCK_RISK_EVALUATION_QUEUE):
-        outcome = SyntheticTradeOutcome(
-            id=uuid.uuid4(),
-            trade_intent_id=trade_intent.id,
-            realized_pnl=realized_pnl,
-            closed_at=_utcnow(),
-        )
-        db.add(outcome)
-
         new_cumulative = _dec(trading_session.cumulative_realized_pnl) + _dec(realized_pnl)
         trading_session.cumulative_realized_pnl = float(new_cumulative)
         trading_session.consecutive_losses = (
@@ -523,9 +537,7 @@ def record_synthetic_outcome(
             workspace_id=trading_session.workspace_id,
             actor_type=ActorType.SYSTEM,
             event_category=EventCategory.RISK_DECISION,
-            event_type="synthetic_trade_outcome.recorded",
-            entity_type="trade_intent",
-            entity_id=trade_intent.id,
+            event_type="trade_outcome.session_effects_applied",
             trading_session_id=trading_session.id,
             payload={
                 "realized_pnl": float(realized_pnl),
@@ -590,4 +602,3 @@ def record_synthetic_outcome(
             )
 
         db.flush()
-        return outcome

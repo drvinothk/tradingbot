@@ -3,11 +3,30 @@
 Service — this is the one place a Signal/TradeIntent pair gets created, so
 every strategy (synthetic now, ORB/VWAP/EMA from Phase 4) goes through
 identical bookkeeping.
+
+`submit_signal` also owns the AUTO-mode dispatch handoff: once
+`risk_engine.service.evaluate_trade_intent` returns with the TradeIntent
+marked DISPATCHED (auto-execute, all limits clear), this calls
+`execution_engine.paper.service.dispatch_trade_intent` — deliberately
+*after* `evaluate_trade_intent` has already released
+`LOCK_RISK_EVALUATION_QUEUE`, so that lock and `dispatch_trade_intent`'s own
+`LOCK_EXECUTION_SINGLETON` are never nested. The approval-required path's
+equivalent call lives in `api.v1.strategies.approve_trade_approval` instead,
+since that's a separate human-initiated request, not part of this cycle.
+
+`expire_stale_pending_approvals` is the proactive half of the approval
+workflow the build plan describes ("a background Scheduler job expires
+anything left pending past expires_at") — `api.v1.strategies.approve_trade_approval`
+only catches a stale approval lazily, as a side effect of someone clicking
+Approve on it after the window closed. Without this, an approval nobody
+ever clicks on sits `pending` forever instead of actually expiring on its
+own; `execution_engine.paper.position_manager.PositionManager` calls this
+once per poll cycle for its trading_session, alongside the EOD square-off
+and reconciliation checks it already runs there.
 """
 
 from __future__ import annotations
 
-import random
 import uuid
 from datetime import UTC, datetime
 
@@ -17,15 +36,17 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import (
+    ApprovalStatus,
+    PendingTradeApproval,
     Signal,
     StrategyConfig,
     StrategyRun,
-    SyntheticTradeOutcome,
     TradeIntent,
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import record_event
-from app.modules.risk_engine.service import evaluate_trade_intent, record_synthetic_outcome
+from app.modules.execution_engine.paper.service import dispatch_trade_intent
+from app.modules.risk_engine.service import evaluate_trade_intent
 from app.modules.strategy_engine.interface import TradeProposal
 
 
@@ -105,43 +126,61 @@ def submit_signal(
     db.add(trade_intent)
     db.flush()
 
-    return evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    # trade_intent.status is mutated in place by evaluate_trade_intent, so
+    # this reads the up-to-date value without a re-query. Approval-required
+    # dispatch happens separately, from api.v1.strategies.approve_trade_approval.
+    if trade_intent.status == TradeIntentStatus.DISPATCHED:
+        dispatch_trade_intent(db, trading_session, trade_intent)
+
+    return decision
 
 
-def close_dispatched_trade_intent_synthetically(
-    db: Session,
-    trading_session: TradingSession,
-    trade_intent: TradeIntent,
-    rng: random.Random | None = None,
-) -> SyntheticTradeOutcome | None:
-    """Phase-2-only: closes a just-dispatched TradeIntent with a small
-    synthetic P&L, sized as a fraction of the capital Risk already computed
-    for it. Shared by both dispatch paths — auto-execute
-    (`SyntheticStrategy.run_cycle`) and a human clicking Approve
-    (`POST /trade-approvals/{id}/approve`) — so a dispatched position never
-    sits open forever with no way to close it, silently occupying a
-    concurrency slot and a same-strike lock for the rest of the session. See
-    `SyntheticTradeOutcome`'s docstring for why this stand-in exists at all;
-    Phase 3's real Execution Service replaces every call site of this
-    function with real fill-driven exits.
-
-    Returns `None` (without raising) if the intent isn't actually dispatched
-    or has no RiskDecision to size the P&L against — closing a position
-    badly is not a reason to leave the caller with an unhandled exception.
+def expire_stale_pending_approvals(
+    db: Session, trading_session: TradingSession
+) -> list[PendingTradeApproval]:
+    """Finds every still-`pending` `PendingTradeApproval` for this session
+    whose `expires_at` has passed and expires it — both the approval and its
+    TradeIntent, audited the same way `approve_trade_approval`'s lazy check
+    does. An un-acted-on approval must never silently fire later once
+    conditions have moved on; this is what makes that actually true instead
+    of true-only-if-someone-happens-to-click-it-afterward.
     """
-    if trade_intent.status != TradeIntentStatus.DISPATCHED:
-        return None
-
-    risk_decision = (
-        db.query(RiskDecision)
-        .filter(RiskDecision.trade_intent_id == trade_intent.id)
-        .order_by(RiskDecision.created_at.desc())
-        .first()
+    now = _utcnow()
+    stale = (
+        db.query(PendingTradeApproval)
+        .join(StrategyRun, PendingTradeApproval.strategy_run_id == StrategyRun.id)
+        .filter(
+            StrategyRun.trading_session_id == trading_session.id,
+            PendingTradeApproval.status == ApprovalStatus.PENDING,
+            PendingTradeApproval.expires_at < now,
+        )
+        .all()
     )
-    if risk_decision is None:
-        return None
 
-    rng = rng or random.Random()
-    pnl_pct = rng.gauss(0.01, 0.05)
-    realized_pnl = round(float(risk_decision.capital_required) * pnl_pct, 2)
-    return record_synthetic_outcome(db, trading_session, trade_intent, realized_pnl)
+    expired: list[PendingTradeApproval] = []
+    for approval in stale:
+        trade_intent = db.get(TradeIntent, approval.trade_intent_id)
+        if trade_intent is None:
+            continue
+
+        approval.status = ApprovalStatus.EXPIRED
+        trade_intent.status = TradeIntentStatus.EXPIRED
+        db.add(approval)
+        db.add(trade_intent)
+        db.flush()
+
+        record_event(
+            db,
+            workspace_id=trading_session.workspace_id,
+            actor_type=ActorType.SYSTEM,
+            event_category=EventCategory.RISK_DECISION,
+            event_type="pending_trade_approval.expired",
+            entity_type="trade_intent",
+            entity_id=trade_intent.id,
+            trading_session_id=trading_session.id,
+        )
+        expired.append(approval)
+
+    return expired

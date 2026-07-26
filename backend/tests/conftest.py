@@ -26,6 +26,8 @@ from app.config.settings import get_settings
 from app.core.db.base import Base
 from app.domain import (  # noqa: F401 - registers models on Base
     audit,
+    broker,
+    execution,
     identity,
     market,
     ops,
@@ -83,6 +85,23 @@ def db(engine) -> Generator[Session, None, None]:
     db_session.close()
     transaction.rollback()
     connection.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_broker_singleton() -> Generator[None, None, None]:
+    """`app.modules.broker_adapter.composition.get_broker` lazily constructs
+    one process-wide `MockBrokerAdapter` — reset it to unset before and
+    after every test so each test gets a fresh adapter (no leftover
+    orders/positions from a previous test) rather than sharing state across
+    the whole suite. A test that wants a specific broker instance (a seeded
+    one, or a fake) calls `composition.set_broker(...)` itself; this fixture
+    only guarantees a clean slate either way.
+    """
+    from app.modules.broker_adapter import composition
+
+    composition.set_broker(None)
+    yield
+    composition.set_broker(None)
 
 
 @pytest.fixture

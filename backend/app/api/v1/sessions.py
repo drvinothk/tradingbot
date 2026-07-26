@@ -1,8 +1,6 @@
 """Trading session lifecycle + safe-mode control. The full daily-plan form
-(budget/target/loss/funding-mode entry) is Phase 2 work — this is the Phase 0
-minimal surface needed to prove the mode machine and kill switch end-to-end:
-create a session, read its mode, flip to kill_switch, and see a stub order
-call get blocked.
+(budget/target/loss/funding-mode entry) is Phase 2 work; Phase 3 adds manual
+square-off/reconcile triggers alongside the mode machine and kill switch.
 """
 
 from __future__ import annotations
@@ -19,6 +17,7 @@ from app.core.db.session import get_db
 from app.core.modes import ModeTransitionError, enter_kill_switch
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
+from app.domain.broker.models import ReconciliationTrigger
 from app.domain.identity.models import BrokerAccount, User
 from app.domain.session.models import (
     FundingMode,
@@ -28,6 +27,9 @@ from app.domain.session.models import (
     TransitionTriggerType,
 )
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.composition import get_broker
+from app.modules.reconciliation.service import run_reconciliation
+from app.modules.scheduler.eod_square_off import run_eod_square_off
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -198,19 +200,37 @@ def trigger_kill_switch(
     return trading_session
 
 
-@router.post("/{session_id}/stub-order")
-def stub_place_order(
+@router.post("/{session_id}/square-off")
+def manual_square_off(
     session_id: uuid.UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(require_permission("papertrade.execute")),
+    user: User = Depends(require_permission("session.stop")),
 ) -> dict:
-    """Placeholder standing in for Execution Service until Phase 3 — exists
-    only to prove the mode gate actually blocks order placement, not just
-    that the mode value changes in the DB.
+    """Manual trigger for the same EOD force-flatten `PositionManager` runs
+    automatically past `cutoff_time` — there's no live scheduler daemon
+    wired into `app.main` yet (every Scheduler job in this codebase so far
+    is callable-function-plus-test, same pattern here), so this is what
+    makes the phase's "done when" EOD criterion exercisable on demand
+    instead of waiting for real wall-clock IST to cross cutoff_time.
     """
     trading_session = _get_session_or_404(db, user, session_id)
-    if trading_session.mode == SafeMode.KILL_SWITCH:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, "Engine is in kill_switch — no orders may be placed"
-        )
-    return {"ok": True, "note": "stub only — real Execution Service arrives in Phase 3"}
+    outcomes = run_eod_square_off(db, get_broker(), trading_session)
+    db.commit()
+    return {"closed_count": len(outcomes)}
+
+
+@router.post("/{session_id}/reconcile")
+def manual_reconcile(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.stop")),
+) -> dict:
+    """Manual trigger for a reconciliation pass — `PositionManager` already
+    runs one periodically on its own poll cadence; this makes it
+    exercisable on demand (e.g. right after suspecting/injecting a
+    mismatch), same reasoning as `manual_square_off` above.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    run = run_reconciliation(db, get_broker(), trading_session, ReconciliationTrigger.EVENT)
+    db.commit()
+    return {"mismatches_found": run.mismatches_found, "action_taken": run.action_taken}

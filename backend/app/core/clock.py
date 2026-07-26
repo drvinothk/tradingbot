@@ -10,8 +10,20 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 
 import ntplib
+
+# India market hours (cutoff_time on trading_sessions, EOD square-off, etc.)
+# are wall-clock IST — everything else in this codebase is deliberately UTC
+# (see e.g. app.core.db.base.utcnow), so any comparison against a
+# session's cutoff_time must explicitly convert through this, not assume
+# datetime.now(UTC) is close enough.
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
 
 @dataclass(frozen=True)

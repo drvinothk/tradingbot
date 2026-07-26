@@ -1,0 +1,232 @@
+"""Execution domain: the real Order/OrderEvent/Position/StopPlan/TrailPlan/
+TradeOutcome lifecycle that Phase 3 introduces to replace Phase 2's
+`SyntheticTradeOutcome` stand-in (see `app.modules.strategy_engine.service`'s
+and `app.modules.risk_engine.service`'s module docstrings).
+
+An `Order` is either an *entry* order (`trade_intent_id` set, `position_id`
+null — created by `dispatch_trade_intent`) or an *exit* order (`position_id`
+set, `trade_intent_id` null — created by `close_position` to flatten a
+position on stop/target/trail/EOD/manual). Exactly one of the two is set,
+mirroring the existing exactly-one-of-two-FKs convention already used by
+`QuoteTick`/`IndicatorSnapshot` in `app.domain.market.models`.
+
+`qty` on `Order`/`Position` is always the absolute quantity
+(`qty_lots x instruments.lot_size`), resolved server-side by
+`execution_engine.paper.service` at dispatch time — never accepted from a
+caller, per the existing `qty_lots`-is-a-lot-count rule.
+"""
+
+from __future__ import annotations
+
+import enum
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.db.base import Base, UUIDPkMixin
+
+
+class OrderMode(enum.StrEnum):
+    PAPER = "paper"
+    LIVE = "live"
+
+
+class OrderSide(enum.StrEnum):
+    """Duplicates `app.domain.strategy.models.SignalSide` /
+    `app.modules.broker_adapter.base.contracts.OrderSide` deliberately —
+    matches this codebase's existing convention of each domain owning its
+    own copy of a shared value set rather than cross-importing another
+    bounded context's enum (e.g. `app.domain.market.models.OptionType`
+    already duplicates `broker_adapter.base.contracts.OptionType` the same
+    way).
+    """
+
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderType(enum.StrEnum):
+    MARKET = "market"
+    LIMIT = "limit"
+    SL_LIMIT = "sl_limit"
+    SL_MARKET = "sl_market"
+
+
+class OrderStatus(enum.StrEnum):
+    PENDING = "pending"
+    OPEN = "open"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+    MODIFY_PENDING = "modify_pending"
+    CANCEL_PENDING = "cancel_pending"
+
+
+class PositionStatus(enum.StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class StopPlanStatus(enum.StrEnum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    TRIGGERED = "triggered"
+    CANCELLED = "cancelled"
+
+
+class TrailPlanStatus(enum.StrEnum):
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+    TRIGGERED = "triggered"
+
+
+class ExitReason(enum.StrEnum):
+    STOP = "stop"
+    TARGET = "target"
+    TRAIL = "trail"
+    EOD_SQUARE_OFF = "eod_square_off"
+    MANUAL = "manual"
+
+
+class Order(Base, UUIDPkMixin):
+    __tablename__ = "orders"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
+    trading_session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trading_sessions.id"))
+    option_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("option_contracts.id"))
+
+    trade_intent_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("trade_intents.id"), nullable=True
+    )
+    # use_alter: orders <-> positions is a circular FK pair (an entry Order
+    # creates a Position, a Position's closing_order_id points back at the
+    # exit Order) — deferring this one via ALTER is what lets both
+    # Base.metadata.create_all (tests) and Alembic create the two tables at
+    # all.
+    position_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("positions.id", use_alter=True, name="fk_orders_position_id"),
+        nullable=True,
+    )
+
+    idempotency_key: Mapped[str] = mapped_column(String(120), unique=True)
+    mode: Mapped[OrderMode] = mapped_column(String(10), default=OrderMode.PAPER)
+    side: Mapped[OrderSide] = mapped_column(String(10))
+    order_type: Mapped[OrderType] = mapped_column(String(20), default=OrderType.MARKET)
+    qty: Mapped[int] = mapped_column(Integer)
+    limit_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    trigger_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+
+    status: Mapped[OrderStatus] = mapped_column(String(20), default=OrderStatus.PENDING)
+    filled_qty: Mapped[int] = mapped_column(Integer, default=0)
+    avg_fill_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    broker_order_id: Mapped[str] = mapped_column(String(60), default="")
+
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "(trade_intent_id IS NOT NULL) <> (position_id IS NOT NULL)",
+            name="ck_order_exactly_one_of_intent_or_position",
+        ),
+        Index("ix_orders_session", "trading_session_id"),
+        Index("ix_orders_trade_intent", "trade_intent_id"),
+        Index("ix_orders_position", "position_id"),
+    )
+
+
+class OrderEvent(Base, UUIDPkMixin):
+    __tablename__ = "order_events"
+
+    order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"))
+    event_type: Mapped[str] = mapped_column(String(40))
+    raw_payload: Mapped[dict] = mapped_column(JSONB, default=dict)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_order_events_order", "order_id"),)
+
+
+class Position(Base, UUIDPkMixin):
+    __tablename__ = "positions"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
+    trading_session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trading_sessions.id"))
+    option_contract_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("option_contracts.id"))
+    trade_intent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trade_intents.id"), unique=True)
+    opening_order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("orders.id"))
+    closing_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("orders.id"), nullable=True
+    )
+
+    side: Mapped[OrderSide] = mapped_column(String(10))
+    qty: Mapped[int] = mapped_column(Integer)
+    entry_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    status: Mapped[PositionStatus] = mapped_column(String(10), default=PositionStatus.OPEN)
+
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_positions_session_status", "trading_session_id", "status"),
+        Index("ix_positions_option_contract", "option_contract_id"),
+    )
+
+
+class StopPlan(Base, UUIDPkMixin):
+    __tablename__ = "stop_plans"
+
+    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"), unique=True)
+    stop_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    qty: Mapped[int] = mapped_column(Integer)
+    status: Mapped[StopPlanStatus] = mapped_column(String(20), default=StopPlanStatus.CONFIRMED)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TrailPlan(Base, UUIDPkMixin):
+    __tablename__ = "trail_plans"
+
+    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"), unique=True)
+    trail_type: Mapped[str] = mapped_column(String(40))
+    activation_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    trail_value: Mapped[float] = mapped_column(Numeric(12, 4))
+    current_stop_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    status: Mapped[TrailPlanStatus] = mapped_column(String(20), default=TrailPlanStatus.INACTIVE)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class TradeOutcome(Base, UUIDPkMixin):
+    __tablename__ = "trade_outcomes"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
+    trading_session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trading_sessions.id"))
+    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"), unique=True)
+    trade_intent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trade_intents.id"))
+
+    entry_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    exit_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    qty: Mapped[int] = mapped_column(Integer)
+    realized_pnl: Mapped[float] = mapped_column(Numeric(14, 2))
+    slippage: Mapped[float] = mapped_column(Numeric(14, 2))
+    exit_reason: Mapped[ExitReason] = mapped_column(String(20))
+    closed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_trade_outcomes_session", "trading_session_id"),
+        UniqueConstraint("position_id", name="uq_trade_outcome_position"),
+    )

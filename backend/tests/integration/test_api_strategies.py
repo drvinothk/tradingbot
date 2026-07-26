@@ -22,6 +22,7 @@ from sqlalchemy.orm import sessionmaker
 import app.api.v1.strategies as strategies_module
 from app.core.db.session import get_db
 from app.core.security.passwords import hash_password
+from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import (
     BrokerAccount,
     BrokerAccountStatus,
@@ -43,7 +44,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    SyntheticTradeOutcome,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -75,9 +75,22 @@ class _FakeRunner:
 
 @pytest.fixture(autouse=True)
 def fake_runner(monkeypatch):
+    """Also patches `ensure_position_manager_running` to a no-op recorder —
+    it defaults to `PositionManager`'s `session_scope`-bound background
+    thread, which would otherwise poll the *production* DB from this
+    isolated-test-engine request, the exact trap `_FakeRunner` above already
+    exists to avoid for `SyntheticStrategyRunner`.
+    """
     _FakeRunner.instances.clear()
     monkeypatch.setattr(strategies_module, "SyntheticStrategyRunner", _FakeRunner)
-    yield
+
+    position_manager_calls: list[uuid.UUID] = []
+    monkeypatch.setattr(
+        strategies_module,
+        "ensure_position_manager_running",
+        lambda trading_session_id: position_manager_calls.append(trading_session_id),
+    )
+    yield position_manager_calls
     strategies_module._RUNNERS.clear()
 
 
@@ -151,22 +164,69 @@ def seeded_admin(engine):
     yield ids
 
     with session_factory() as cleanup_db:
+        from sqlalchemy import or_ as sa_or
+
         from app.domain.audit.models import AuditEvent
+        from app.domain.broker.models import BrokerSyncState, ReconciliationRun
+        from app.domain.execution.models import Order, OrderEvent, StopPlan, TradeOutcome, TrailPlan
         from app.domain.identity.models import LoginSession
         from app.domain.ops.models import SystemAlert
         from app.domain.risk.models import RiskDecision, RiskLimitConfig
 
-        # Phase 2 additions: a test may have driven a full Signal ->
-        # TradeIntent -> RiskDecision -> (PendingTradeApproval |
-        # SyntheticTradeOutcome) chain through this workspace, none of which
-        # the original cleanup below knew about — delete leaf-first, same
-        # FK-safe-order reasoning as the rest of this fixture.
+        # Phase 2+3 additions: a test may have driven a full Signal ->
+        # TradeIntent -> RiskDecision -> (PendingTradeApproval | real
+        # Order/Position/.../TradeOutcome) chain through this workspace,
+        # none of which the original cleanup below knew about — delete
+        # leaf-first, same FK-safe-order reasoning as the rest of this
+        # fixture.
         trade_intent_ids = cleanup_db.query(TradeIntent.id).filter(
             TradeIntent.workspace_id == ids["workspace_id"]
         )
-        cleanup_db.query(SyntheticTradeOutcome).filter(
-            SyntheticTradeOutcome.trade_intent_id.in_(trade_intent_ids)
+        position_ids = cleanup_db.query(Position.id).filter(
+            Position.trade_intent_id.in_(trade_intent_ids)
+        )
+        order_ids = [
+            row[0]
+            for row in cleanup_db.query(Order.id).filter(
+                sa_or(
+                    Order.trade_intent_id.in_(trade_intent_ids),
+                    Order.position_id.in_(position_ids),
+                )
+            )
+        ]
+        cleanup_db.query(OrderEvent).filter(OrderEvent.order_id.in_(order_ids)).delete(
+            synchronize_session=False
+        )
+        cleanup_db.query(TradeOutcome).filter(
+            TradeOutcome.position_id.in_(position_ids)
         ).delete(synchronize_session=False)
+        cleanup_db.query(StopPlan).filter(StopPlan.position_id.in_(position_ids)).delete(
+            synchronize_session=False
+        )
+        cleanup_db.query(TrailPlan).filter(TrailPlan.position_id.in_(position_ids)).delete(
+            synchronize_session=False
+        )
+        # orders <-> positions is a circular FK pair (see
+        # app/domain/execution/models.py). Break it via
+        # positions.closing_order_id, which is nullable — NOT via
+        # orders.position_id, which would leave an exit order (always
+        # trade_intent_id=NULL) with both FK columns null, violating
+        # ck_order_exactly_one_of_intent_or_position.
+        cleanup_db.query(Position).filter(Position.id.in_(position_ids)).update(
+            {"closing_order_id": None}, synchronize_session=False
+        )
+        # Exit orders (position_id set) are now unreferenced — safe to
+        # delete before the positions they point at.
+        cleanup_db.query(Order).filter(Order.position_id.in_(position_ids)).delete(
+            synchronize_session=False
+        )
+        cleanup_db.query(Position).filter(
+            Position.trade_intent_id.in_(trade_intent_ids)
+        ).delete(synchronize_session=False)
+        # Entry orders (trade_intent_id set) are now unreferenced.
+        cleanup_db.query(Order).filter(Order.trade_intent_id.in_(trade_intent_ids)).delete(
+            synchronize_session=False
+        )
         cleanup_db.query(PendingTradeApproval).filter(
             PendingTradeApproval.trade_intent_id.in_(trade_intent_ids)
         ).delete(synchronize_session=False)
@@ -182,6 +242,15 @@ def seeded_admin(engine):
         ).delete()
         cleanup_db.query(RiskLimitConfig).filter(
             RiskLimitConfig.workspace_id == ids["workspace_id"]
+        ).delete()
+        # Phase 3: dispatch_trade_intent/close_position each run an
+        # event-triggered reconciliation pass, which writes these — not
+        # accounted for before that existed.
+        cleanup_db.query(BrokerSyncState).filter(
+            BrokerSyncState.workspace_id == ids["workspace_id"]
+        ).delete()
+        cleanup_db.query(ReconciliationRun).filter(
+            ReconciliationRun.workspace_id == ids["workspace_id"]
         ).delete()
 
         cleanup_db.query(AuditEvent).filter(
@@ -238,7 +307,9 @@ def test_create_strategy_then_duplicate_name_conflicts(api_client: TestClient, s
     assert second.status_code == 409
 
 
-def test_start_strategy_creates_run_and_stop_ends_it(api_client: TestClient, seeded_admin):
+def test_start_strategy_creates_run_and_stop_ends_it(
+    api_client: TestClient, seeded_admin, fake_runner
+):
     _login(api_client, seeded_admin)
     strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb"}).json()["id"]
     session_id = api_client.post(
@@ -258,6 +329,7 @@ def test_start_strategy_creates_run_and_stop_ends_it(api_client: TestClient, see
     assert start_resp.json()["status"] == "scanning"
     assert len(_FakeRunner.instances) == 1
     assert _FakeRunner.instances[0].started is True
+    assert fake_runner == [uuid.UUID(session_id)]
 
     # A second start while one is active must be rejected, not silently
     # spawn a second concurrent runner for the same strategy.
@@ -286,13 +358,15 @@ def test_approve_unknown_trade_approval_is_404(api_client: TestClient, seeded_ad
     assert response.status_code == 404
 
 
-def test_approving_a_pending_trade_synthetically_closes_it(
+def test_approving_a_pending_trade_dispatches_to_a_real_position(
     api_client: TestClient, seeded_admin, engine
 ):
     """Regression test: approving a trade must not leave it DISPATCHED
-    forever — that would permanently occupy a concurrency slot and a
-    same-strike lock for the rest of the session, since Phase 2 has no real
-    Execution Service to ever close it otherwise.
+    forever with nothing downstream — Phase 2 had no real Execution Service
+    to ever act on it (it stayed a bare status flip); Phase 3's
+    api.v1.strategies.approve_trade_approval now hands off to
+    execution_engine.paper.service.dispatch_trade_intent, which must produce
+    a real open Position, not just flip the TradeIntent's status.
     """
     _login(api_client, seeded_admin)
     session_id = api_client.post(
@@ -378,26 +452,75 @@ def test_approving_a_pending_trade_synthetically_closes_it(
         assert approve_resp.json()["trade_intent_status"] == TradeIntentStatus.DISPATCHED
 
         with session_factory() as verify_db:
-            outcome = (
-                verify_db.query(SyntheticTradeOutcome)
-                .filter(SyntheticTradeOutcome.trade_intent_id == trade_intent_id)
+            position = (
+                verify_db.query(Position)
+                .filter(Position.trade_intent_id == trade_intent_id)
                 .one_or_none()
             )
-            assert outcome is not None, (
-                "approved intent must be synthetically closed, not left open"
-            )
+            assert position is not None, "approved intent must dispatch to a real Position"
+            assert position.status == PositionStatus.OPEN
     finally:
         # Runs before seeded_admin's own (workspace-scoped) teardown, so the
         # trade_intent/signal chain this test created still exists at this
         # point — must be cleared here too, in FK-safe order, before
         # OptionContract/Instrument can be deleted.
         with session_factory() as cleanup_db:
+            from sqlalchemy import or_ as sa_or
+
+            from app.domain.broker.models import BrokerSyncState
+            from app.domain.execution.models import (
+                Order,
+                OrderEvent,
+                StopPlan,
+                TradeOutcome,
+                TrailPlan,
+            )
             from app.domain.risk.models import RiskDecision
 
             if trade_intent_id is not None:
-                cleanup_db.query(SyntheticTradeOutcome).filter(
-                    SyntheticTradeOutcome.trade_intent_id == trade_intent_id
-                ).delete()
+                position = (
+                    cleanup_db.query(Position)
+                    .filter(Position.trade_intent_id == trade_intent_id)
+                    .one_or_none()
+                )
+                if position is not None:
+                    order_ids = [
+                        row[0]
+                        for row in cleanup_db.query(Order.id).filter(
+                            sa_or(
+                                Order.trade_intent_id == trade_intent_id,
+                                Order.position_id == position.id,
+                            )
+                        )
+                    ]
+                    cleanup_db.query(OrderEvent).filter(
+                        OrderEvent.order_id.in_(order_ids)
+                    ).delete(synchronize_session=False)
+                    cleanup_db.query(TradeOutcome).filter(
+                        TradeOutcome.position_id == position.id
+                    ).delete()
+                    cleanup_db.query(StopPlan).filter(
+                        StopPlan.position_id == position.id
+                    ).delete()
+                    cleanup_db.query(TrailPlan).filter(
+                        TrailPlan.position_id == position.id
+                    ).delete()
+                    # orders <-> positions is a circular FK pair. Break it
+                    # via positions.closing_order_id, which is nullable —
+                    # NOT via orders.position_id, which would leave an exit
+                    # order (always trade_intent_id=NULL) with both FK
+                    # columns null, violating
+                    # ck_order_exactly_one_of_intent_or_position.
+                    cleanup_db.query(Position).filter(Position.id == position.id).update(
+                        {"closing_order_id": None}, synchronize_session=False
+                    )
+                    cleanup_db.query(Order).filter(Order.position_id == position.id).delete(
+                        synchronize_session=False
+                    )
+                    cleanup_db.query(Position).filter(Position.id == position.id).delete()
+                    cleanup_db.query(Order).filter(Order.trade_intent_id == trade_intent_id).delete(
+                        synchronize_session=False
+                    )
                 cleanup_db.query(PendingTradeApproval).filter(
                     PendingTradeApproval.trade_intent_id == trade_intent_id
                 ).delete()
@@ -407,6 +530,15 @@ def test_approving_a_pending_trade_synthetically_closes_it(
                 cleanup_db.query(TradeIntent).filter(TradeIntent.id == trade_intent_id).delete()
             cleanup_db.query(Signal).filter(
                 Signal.option_contract_id.in_(
+                    cleanup_db.query(OptionContract.id).filter(
+                        OptionContract.instrument_id == instrument_id
+                    )
+                )
+            ).delete(synchronize_session=False)
+            # Phase 3: the approve endpoint's dispatch_trade_intent call runs
+            # an event-triggered reconciliation pass, which writes these.
+            cleanup_db.query(BrokerSyncState).filter(
+                BrokerSyncState.option_contract_id.in_(
                     cleanup_db.query(OptionContract.id).filter(
                         OptionContract.instrument_id == instrument_id
                     )

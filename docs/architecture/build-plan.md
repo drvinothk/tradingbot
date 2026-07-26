@@ -526,7 +526,7 @@ the design above):*
   `run_cycle` directly, leaving the timer/threading wrapper with zero
   coverage despite being literally what the Phase 2 build bullet asked for.
 
-**Phase 3 — Execution Service (paper only) + reconciliation + reporting v1**
+**Phase 3 — Execution Service (paper only) + reconciliation + reporting v1** — ✅ done
 Execution Service with singleton lock + idempotency-before-dispatch, paper path only
 (simulated fills/stop/trail/exit against mock prices, zero Shoonya code); full
 Order/OrderEvent/Position/StopPlan/TrailPlan/TradeOutcome lifecycle; Reconciliation
@@ -535,16 +535,129 @@ Phase 6's real-broker case is additive, not a rewrite; Reporting v1 (daily repor
 scorecard: win rate, avg win/loss, profit factor, max drawdown, slippage,
 signal-vs-execution count) — this is the strategy graduation dashboard; the
 Approval-required path built end-to-end against the synthetic strategy stub
-(`pending_trade_approvals` lifecycle, approve/reject/expire, websocket push) since
-paper mode is the right place to prove out the approval workflow before real
-strategies exist.
+(`pending_trade_approvals` lifecycle, approve/reject/expire) since paper mode is
+the right place to prove out the approval workflow before real strategies exist.
+**Websocket push was not built** — there's no frontend yet to push to (the repo's
+`api/websocket/` package is still an empty stub); the approval workflow's DB-level
+lifecycle is fully proven via the API/tests instead. This is a real, deliberate
+scope gap, not an oversight — worth building alongside whichever phase first
+builds a frontend.
 Done when: the synthetic strategy runs a full paper lifecycle including EOD forced
 square-off, a scorecard renders real paper numbers, an injected inconsistency is
 correctly flagged by reconciliation, a manual test of Approval-required mode shows
 the trade preview, approves one intent, rejects another, and lets a third expire
 untouched, and — this is the first real test of the startup-recovery hook — killing
 the backend process mid-paper-position and restarting it resumes stop/trail
-management correctly instead of coming back up idle.
+management correctly instead of coming back up idle. All verified: full automated
+suite (integration tests for dispatch/close/stop/target/trail/EOD/reconciliation/
+reporting/startup-recovery) plus a manual live-server walkthrough (approve one,
+reject one, force-expire a third, inject a broker-side mismatch and see it
+flagged, kill and restart the process mid-open-position and see `PositionManager`
+resume).
+
+*Phase 3 amendments (decisions made during implementation, not re-derivations of
+the design above):*
+- **Paper execution routes through `BrokerPort.place_order`/`get_positions`,
+  not a separate tick-based simulator.** `execution_engine/paper/service.py`
+  calls the same order-placement/position-query methods a real adapter would,
+  against whichever adapter `broker_adapter/composition.py`'s `get_broker()`
+  resolves to (`MockBrokerAdapter` through Phase 5). This reuses Phase 1's
+  already-fully-built order/position simulation and — more importantly — gives
+  Reconciliation Service a genuine broker-side position book to diff local
+  `positions` against, rather than inventing one. Phase 5/6 become pure
+  dependency-injection swaps of `get_broker`'s resolution; Execution Service
+  itself doesn't change.
+- **A process-wide broker singleton is the actual composition root** the docs
+  already promised ("a composition-root in `main.py` decides whether `mock` or
+  `shoonya` gets injected") — `broker_adapter/composition.py`'s `get_broker()`,
+  lazily constructing one `MockBrokerAdapter` for the process. Meaningful only
+  because `LOCK_PROCESS_SINGLETON` already guarantees one process; same
+  reasoning `api.v1.strategies._RUNNERS`'s in-memory dict already relies on.
+- **`PositionManager` is started explicitly at strategy-start, not implicitly
+  from `dispatch_trade_intent`.** The natural-seeming hook (auto-start
+  management the moment a position opens) would spawn a real background
+  thread from inside unit/integration tests that call `dispatch_trade_intent`
+  directly with a test-owned broker — that thread would poll the *production*
+  DB via `PositionManager`'s default `session_scope`, the exact "background
+  thread silently queries the wrong database" trap
+  `strategy_engine.strategies.synthetic.SyntheticStrategyRunner` already had
+  to design around. Instead, `api.v1.strategies.start_strategy` starts it
+  (mirroring exactly where `SyntheticStrategyRunner` itself starts), and
+  `app.main`'s startup-recovery check resumes it after a crash.
+- **Reconciliation escalates to `reconciliation_lock` only from
+  `paper_plus_guarded_live`/`live_enabled`**, matching
+  `ALLOWED_TRANSITIONS` exactly (there is no `paper_only → reconciliation_lock`
+  edge). A `paper_only` mismatch is flagged (`SystemAlert` + a
+  `reconciliation_runs` row) but not mode-blocked, since there's no live
+  money at risk yet — free groundwork for Phase 6, not a Phase 3 behavior
+  change.
+- **One generic trailing-stop rule stands in for per-strategy trailing**,
+  since that arrives with real strategies in Phase 4: activates once
+  unrealized profit reaches 50% of the entry→target distance; once active,
+  locks in 50% of favorable movement beyond activation, monotonically
+  tightening only. Implemented as an independent level
+  (`trail_plans.current_stop_price`) that is *never* written back onto
+  `stop_plans.stop_price` — see QC finding below for why that distinction
+  matters.
+- **No live scheduler daemon exists for EOD square-off/reconciliation**,
+  consistent with every other periodic job in this codebase (the daily
+  instrument sync job is the same shape) — `PositionManager`'s own poll loop
+  covers both automatically per session, and `POST /sessions/{id}/square-off`
+  / `POST /sessions/{id}/reconcile` expose the same logic on demand for
+  manual testing.
+
+*QC pass findings (post-implementation review, before Phase 4 started):*
+- **Bug fix: trailing-stop logic fired a spurious exit on its own activation
+  tick.** `evaluate_open_position`'s trail-hit check used `price <=
+  new_trail_stop` (favorable side); on the exact tick the trail activates or
+  tightens, `new_trail_stop` is derived from that same `price`, so the two
+  are equal and a `<=` fires immediately instead of only once price later
+  pulls back through the level. Fixed to strict `<`/`>`. Caught by a direct
+  unit test exercising three ticks (activate, tighten, pull back) that failed
+  against the old code.
+- **Bug fix: the trail was silently turning every later exit into a "stop
+  hit".** The same function used to write the trailed level back onto
+  `stop_plans.stop_price`, which meant `evaluate_open_position`'s step-1 stop
+  check (checked before the trail step) started matching on the *trailed*
+  level too — a genuine `TRAIL` exit was misreported as `STOP`, making
+  `ExitReason.TRAIL` effectively unreachable once a trail had ever tightened.
+  Fixed by keeping the trailed level entirely in `trail_plans.current_stop_price`
+  and never touching `stop_plans.stop_price` after it's set at dispatch time.
+- **Bug fix: pending trade approvals never expired on their own.** The build
+  plan calls for "a background Scheduler job expires anything left pending
+  past `expires_at`"; only a lazy check inside
+  `api.v1.strategies.approve_trade_approval` existed (an approval only
+  actually flipped to `EXPIRED` if someone happened to click Approve on it
+  after the window closed) — found live, manually, when a genuinely stale
+  approval sat `pending` through several `PositionManager` poll cycles.
+  Added `strategy_engine.service.expire_stale_pending_approvals`, called by
+  `PositionManager` every cycle alongside its EOD/reconciliation checks;
+  verified both by unit tests and by re-confirming live that a backdated
+  `expires_at` actually flips to `EXPIRED` (approval + TradeIntent + audit
+  event) within one poll cycle of a manager running for that session.
+- **Bug fix (test-only): the `orders` ↔ `positions` circular-FK cleanup
+  pattern used across several test files' teardown broke as soon as a test
+  actually closed a position.** Nulling `orders.position_id` to break the
+  cycle is wrong for exit orders specifically — they always have
+  `trade_intent_id=NULL`, so nulling `position_id` too leaves both FK columns
+  null, violating `ck_order_exactly_one_of_intent_or_position`. Every
+  occurrence of this pattern (introduced earlier in the same phase, so not
+  yet exercised against a real closed position until QC) was fixed to break
+  the cycle via `positions.closing_order_id` (nullable) instead, deleting
+  exit orders before positions and entry orders after.
+- **Gap found (fixed): event-triggered reconciliation was never actually
+  wired in.** The approved design called for `dispatch_trade_intent`/
+  `close_position` to each run a reconciliation pass immediately after —
+  only `PositionManager`'s polling cadence existed. Added the event-triggered
+  call to both functions (safe to nest under the already-held
+  `LOCK_EXECUTION_SINGLETON`: Postgres session-level advisory locks are
+  reentrant per session, so a nested `transition_mode` call taking the same
+  lock cannot self-deadlock). This surfaced a second-order test-isolation
+  bug: two existing test files' cleanup blocks didn't know about the
+  `broker_sync_states` rows this now creates on every dispatch, so their
+  teardown started failing FK checks and corrupting shared test-DB state for
+  unrelated tests — fixed by adding the missing cleanup, same FK-safe-order
+  reasoning as everywhere else.
 
 **Phase 4 — ORB, VWAP Pullback, EMA Micro-pullback (paper, mock data) — first major milestone**
 The real shared Strategy interface, then the three confirmation-filter strategies

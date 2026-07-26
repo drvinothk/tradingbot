@@ -79,12 +79,10 @@ class TradingSession(Base, UUIDPkMixin, TimestampMixin):
         String(30), nullable=True
     )
 
-    # Phase 2 addition: running totals Risk Service checks daily_loss_cap /
-    # daily_target_profit / consecutive_loss_pause_threshold against.
-    # Updated by risk_engine.service.record_synthetic_outcome for now (see
-    # that module's docstring) — Phase 3's real trade_outcomes recording
-    # will update these same two fields the same way, so nothing about this
-    # shape changes when the synthetic stand-in is replaced.
+    # Running totals Risk Service checks daily_loss_cap / daily_target_profit
+    # / consecutive_loss_pause_threshold against. Updated by
+    # risk_engine.service.record_trade_outcome_effects whenever
+    # execution_engine.paper.service.close_position closes a real Position.
     cumulative_realized_pnl: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     consecutive_losses: Mapped[int] = mapped_column(Integer, default=0)
 
