@@ -152,6 +152,9 @@ def _make_trade_intent(
     stop_price: float = 72.0,
     target_price: float = 92.0,
     qty_lots: int = 1,
+    trail_activation_fraction: float | None = None,
+    trail_lock_fraction: float | None = None,
+    structure_level: float | None = None,
 ) -> TradeIntent:
     now = datetime.now(UTC)
     signal = Signal(
@@ -166,6 +169,9 @@ def _make_trade_intent(
         stop_price=stop_price,
         target_price=target_price,
         qty_lots=qty_lots,
+        trail_activation_fraction=trail_activation_fraction,
+        trail_lock_fraction=trail_lock_fraction,
+        structure_level=structure_level,
         generated_at=now,
     )
     db.add(signal)
@@ -184,6 +190,9 @@ def _make_trade_intent(
         entry_price=entry_price,
         stop_price=stop_price,
         target_price=target_price,
+        trail_activation_fraction=trail_activation_fraction,
+        trail_lock_fraction=trail_lock_fraction,
+        structure_level=structure_level,
         status=TradeIntentStatus.DISPATCHED,
         created_at=now,
         dispatched_at=now,
@@ -222,6 +231,26 @@ def test_dispatch_creates_order_position_stop_and_trail(
     assert float(trail_plan.activation_price) == pytest.approx(
         _price(order.avg_fill_price) + 6.0
     )
+
+
+def test_dispatch_uses_per_strategy_trail_fractions_when_set(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+        trail_activation_fraction=0.25, trail_lock_fraction=0.75,
+    )
+
+    order = dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one()
+
+    # 0.25 of the 12.0-wide entry->target distance, not the generic 0.5.
+    assert float(trail_plan.activation_price) == pytest.approx(
+        _price(order.avg_fill_price) + 3.0
+    )
+    assert float(trail_plan.trail_value) == pytest.approx(0.75)
 
 
 def test_dispatch_is_idempotent_on_trade_intent_key(
@@ -427,3 +456,82 @@ def test_evaluate_open_position_trail_activates_then_triggers(
     )
     assert outcome is not None
     assert outcome.exit_reason == ExitReason.TRAIL
+
+
+def test_evaluate_open_position_exits_on_structure_break(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    # structure_level=22000 for a BUY (CE) position: the underlying falling
+    # back below the opening-range low it broke out of invalidates the
+    # setup, independent of whether the option premium has hit its own stop.
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # Price is comfortably between stop and target on the premium side —
+    # only the underlying has broken structure.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21990.0
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+
+def test_evaluate_open_position_no_structure_break_exit_without_underlying_price(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # No underlying_price supplied (mirrors every pre-Phase-4 caller) — the
+    # structure-break check must be a no-op, not raise or false-trigger.
+    outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
+
+    assert outcome is None
+
+
+def test_evaluate_open_position_exits_on_spread_blowout(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # Price still comfortably between stop and target, but the spread has
+    # blown out well past SPREAD_BLOWOUT_PCT (0.30) of the current price.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, bid=70.0, ask=95.0
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.SPREAD_BLOWOUT
+
+
+def test_evaluate_open_position_no_spread_blowout_exit_within_tolerance(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, bid=81.5, ask=82.5
+    )
+
+    assert outcome is None

@@ -1,5 +1,5 @@
 """API-level tests for strategy lifecycle + trade-approval endpoints.
-`SyntheticStrategyRunner` is monkeypatched to a no-op stand-in for these
+`StrategyRunner` is monkeypatched to a no-op stand-in for these
 tests — the real runner spawns a background thread that talks to the
 *production* DB via the default `session_scope` (see its own docstring), not
 the isolated test database these tests use, so letting a real one start
@@ -75,20 +75,31 @@ class _FakeRunner:
 
 @pytest.fixture(autouse=True)
 def fake_runner(monkeypatch):
-    """Also patches `ensure_position_manager_running` to a no-op recorder —
-    it defaults to `PositionManager`'s `session_scope`-bound background
-    thread, which would otherwise poll the *production* DB from this
-    isolated-test-engine request, the exact trap `_FakeRunner` above already
-    exists to avoid for `SyntheticStrategyRunner`.
+    """Also patches `ensure_position_manager_running`, `ensure_ingestion_running`,
+    and `record_option_chain_snapshot` to no-op recorders — all three default
+    to `session_scope`-bound production-DB access (background threads for the
+    first two, a direct call for the third), which would otherwise touch the
+    *production* DB from this isolated-test-engine request, the exact trap
+    `_FakeRunner` above already exists to avoid for `StrategyRunner`.
     """
     _FakeRunner.instances.clear()
-    monkeypatch.setattr(strategies_module, "SyntheticStrategyRunner", _FakeRunner)
+    monkeypatch.setattr(strategies_module, "StrategyRunner", _FakeRunner)
 
     position_manager_calls: list[uuid.UUID] = []
     monkeypatch.setattr(
         strategies_module,
         "ensure_position_manager_running",
         lambda trading_session_id: position_manager_calls.append(trading_session_id),
+    )
+    monkeypatch.setattr(
+        strategies_module,
+        "ensure_ingestion_running",
+        lambda symbol, broker=None: None,
+    )
+    monkeypatch.setattr(
+        strategies_module,
+        "record_option_chain_snapshot",
+        lambda instrument_id, broker, symbol, expiry, session_factory=None: None,
     )
     yield position_manager_calls
     strategies_module._RUNNERS.clear()
@@ -308,7 +319,7 @@ def test_create_strategy_then_duplicate_name_conflicts(api_client: TestClient, s
 
 
 def test_start_strategy_creates_run_and_stop_ends_it(
-    api_client: TestClient, seeded_admin, fake_runner
+    api_client: TestClient, seeded_admin, fake_runner, engine
 ):
     _login(api_client, seeded_admin)
     strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb"}).json()["id"]
@@ -316,36 +327,59 @@ def test_start_strategy_creates_run_and_stop_ends_it(
         "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
     ).json()["id"]
 
-    start_resp = api_client.post(
-        f"/api/v1/strategies/{strategy_id}/start",
-        json={
-            "trading_session_id": session_id,
-            "instrument_id": str(uuid.uuid4()),
-            "expiry_date": date(2026, 7, 30).isoformat(),
-            "execution_mode": "auto",
-        },
-    )
-    assert start_resp.status_code == 200
-    assert start_resp.json()["status"] == "scanning"
-    assert len(_FakeRunner.instances) == 1
-    assert _FakeRunner.instances[0].started is True
-    assert fake_runner == [uuid.UUID(session_id)]
+    # Instrument/OptionContract have no workspace scoping (shared exchange-
+    # wide data), so seeded_admin's teardown can't clean this up generically
+    # — created and removed directly, in a try/finally so a failed assertion
+    # still cleans up (same pattern the approval test below uses).
+    instrument_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+    try:
+        with session_factory() as db:
+            db.add(
+                Instrument(
+                    id=instrument_id,
+                    symbol="NIFTY-START",
+                    exchange="NFO",
+                    lot_size=25,
+                    tick_size=0.05,
+                )
+            )
+            db.commit()
 
-    # A second start while one is active must be rejected, not silently
-    # spawn a second concurrent runner for the same strategy.
-    second_start = api_client.post(
-        f"/api/v1/strategies/{strategy_id}/start",
-        json={
-            "trading_session_id": session_id,
-            "instrument_id": str(uuid.uuid4()),
-            "expiry_date": date(2026, 7, 30).isoformat(),
-        },
-    )
-    assert second_start.status_code == 409
+        start_resp = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/start",
+            json={
+                "trading_session_id": session_id,
+                "instrument_id": str(instrument_id),
+                "expiry_date": date(2026, 7, 30).isoformat(),
+                "execution_mode": "auto",
+            },
+        )
+        assert start_resp.status_code == 200
+        assert start_resp.json()["status"] == "scanning"
+        assert len(_FakeRunner.instances) == 1
+        assert _FakeRunner.instances[0].started is True
+        assert fake_runner == [uuid.UUID(session_id)]
 
-    stop_resp = api_client.post(f"/api/v1/strategies/{strategy_id}/stop")
-    assert stop_resp.status_code == 200
-    assert _FakeRunner.instances[0].stopped is True
+        # A second start while one is active must be rejected, not silently
+        # spawn a second concurrent runner for the same strategy.
+        second_start = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/start",
+            json={
+                "trading_session_id": session_id,
+                "instrument_id": str(instrument_id),
+                "expiry_date": date(2026, 7, 30).isoformat(),
+            },
+        )
+        assert second_start.status_code == 409
+
+        stop_resp = api_client.post(f"/api/v1/strategies/{strategy_id}/stop")
+        assert stop_resp.status_code == 200
+        assert _FakeRunner.instances[0].stopped is True
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
 
     # Stopping again with nothing active is a clean 404, not a 500.
     stop_again = api_client.post(f"/api/v1/strategies/{strategy_id}/stop")

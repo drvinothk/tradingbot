@@ -75,6 +75,12 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
     name: Mapped[str] = mapped_column(String(120))
+    # "synthetic" | "orb" | "vwap_pullback" | "ema_micro_pullback" — which
+    # Strategy subclass api.v1.strategies.start_strategy instantiates. Not an
+    # enum.StrEnum column like the rest of this file's status fields because
+    # new strategy types are added by later phases (Phase 7/8) without a
+    # migration touching every existing row's constraint.
+    strategy_type: Mapped[str] = mapped_column(String(40), default="synthetic")
     params: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[StrategyStatus] = mapped_column(String(30), default=StrategyStatus.RESEARCH)
 
@@ -114,6 +120,17 @@ class Signal(Base, UUIDPkMixin):
     stop_price: Mapped[float] = mapped_column(Numeric(12, 4))
     target_price: Mapped[float] = mapped_column(Numeric(12, 4))
     qty_lots: Mapped[int] = mapped_column(Integer)
+    # Per-method trailing (see TradeProposal) — nullable so a strategy that
+    # doesn't set them (SyntheticStrategy) falls back to the generic 0.5/0.5
+    # Phase-3 rule at dispatch time, not a schema-level default here.
+    trail_activation_fraction: Mapped[float | None] = mapped_column(
+        Numeric(6, 4), nullable=True
+    )
+    trail_lock_fraction: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
+    # Underlying-index structural invalidation level (opening-range boundary /
+    # pullback-bar extreme / EMA9 value) — independent of stop_price/
+    # target_price, which are on the option premium. See StopPlan.structure_level.
+    structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
 
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -139,6 +156,13 @@ class TradeIntent(Base, UUIDPkMixin):
     entry_price: Mapped[float] = mapped_column(Numeric(12, 4))
     stop_price: Mapped[float] = mapped_column(Numeric(12, 4))
     target_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    # See Signal's identical trio above — this is the copy execution_engine
+    # actually reads at dispatch time (_open_position_from_fill).
+    trail_activation_fraction: Mapped[float | None] = mapped_column(
+        Numeric(6, 4), nullable=True
+    )
+    trail_lock_fraction: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
+    structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     status: Mapped[TradeIntentStatus] = mapped_column(
         String(20), default=TradeIntentStatus.PENDING_RISK
     )

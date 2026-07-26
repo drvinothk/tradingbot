@@ -73,13 +73,22 @@ from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderTy
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.reconciliation.service import run_reconciliation
 
-# Generic Phase-3 trailing rule — per-strategy trailing rules arrive Phase 4.
+# Generic Phase-3 trailing rule, used when a TradeIntent doesn't specify its
+# own (Phase 4's per-strategy override — see _open_position_from_fill).
 # Activates once unrealized profit reaches this fraction of the
 # entry->target distance; once active, the stop trails to lock in this
 # fraction of favorable movement beyond the activation point, monotonically
 # tightening only.
 TRAIL_ACTIVATION_FRACTION = Decimal("0.5")
 TRAIL_LOCK_FRACTION = Decimal("0.5")
+
+# Phase 4: generic spread-blowout exit — the same threshold for every
+# strategy regardless of structure_level (unlike the trail, this isn't
+# per-method). A wider threshold than StrikeRankingConfig.max_spread_pct
+# (0.15, an *entry* filter) deliberately: an open position shouldn't be
+# force-exited by the same bar the entry filter would merely have scored
+# lower, only once liquidity has genuinely dried up.
+SPREAD_BLOWOUT_PCT = Decimal("0.30")
 
 
 def _utcnow() -> datetime:
@@ -250,14 +259,28 @@ def _open_position_from_fill(
         position_id=position.id,
         stop_price=float(trade_intent.stop_price),
         qty=position.qty,
+        structure_level=trade_intent.structure_level,
         status=StopPlanStatus.CONFIRMED,
         created_at=now,
         updated_at=now,
     )
 
+    # Per-method trailing (Phase 4): a strategy that supplied its own
+    # activation/lock fractions on the TradeIntent overrides the generic
+    # Phase-3 0.5/0.5 rule; None (SyntheticStrategy, and any strategy that
+    # doesn't set them) falls back to it unchanged.
+    activation_fraction = (
+        _dec(trade_intent.trail_activation_fraction)
+        if trade_intent.trail_activation_fraction is not None
+        else TRAIL_ACTIVATION_FRACTION
+    )
+    lock_fraction = (
+        _dec(trade_intent.trail_lock_fraction)
+        if trade_intent.trail_lock_fraction is not None
+        else TRAIL_LOCK_FRACTION
+    )
     activation_distance = (
-        abs(_dec(trade_intent.target_price) - _dec(trade_intent.entry_price))
-        * TRAIL_ACTIVATION_FRACTION
+        abs(_dec(trade_intent.target_price) - _dec(trade_intent.entry_price)) * activation_fraction
     )
     activation_price = (
         entry_price + activation_distance
@@ -269,7 +292,7 @@ def _open_position_from_fill(
         position_id=position.id,
         trail_type="generic_activation_lock",
         activation_price=float(activation_price),
-        trail_value=float(TRAIL_LOCK_FRACTION),
+        trail_value=float(lock_fraction),
         current_stop_price=None,
         status=TrailPlanStatus.INACTIVE,
         updated_at=now,
@@ -459,12 +482,23 @@ def evaluate_open_position(
     position: Position,
     tick_price: float,
     broker: BrokerPort | None = None,
+    bid: float | None = None,
+    ask: float | None = None,
+    underlying_price: float | None = None,
 ) -> TradeOutcome | None:
-    """Checks stop/target/trail against `tick_price` and closes the position
+    """Checks stop/target/structure-break/spread-blowout/trail against
+    `tick_price` (plus, for the two Phase 4 checks, the option's own live
+    `bid`/`ask` and the *underlying's* current price) and closes the position
     if triggered; otherwise advances the trail plan per the generic Phase-3
     rule. Called by `PositionManager` on every price poll, and by
     `scheduler.eod_square_off` is *not* routed through here — EOD is an
     unconditional force-close regardless of where price sits.
+
+    `bid`/`ask`/`underlying_price` are optional: a position whose
+    `stop_plan.structure_level` is null (any strategy that doesn't set one,
+    e.g. SyntheticStrategy) simply never triggers the structure-break check
+    regardless, and callers that don't pass bid/ask (existing tests) just
+    skip the spread-blowout check the same way.
     """
     if position.status != PositionStatus.OPEN:
         return None
@@ -500,7 +534,45 @@ def evaluate_open_position(
             db, trading_session, position, ExitReason.TARGET, float(target_price), broker=broker
         )
 
-    # 3. Trail: activate once favorable move reaches the activation price;
+    # 3. Structure break: the underlying-index level (opening-range boundary
+    # / pullback extreme / EMA9) that justified this setup has been crossed
+    # unfavorably — exit even though the option premium hasn't hit its own
+    # stop yet. Skipped when either side of the comparison is unavailable
+    # (no structure_level set, or no underlying_price supplied).
+    if stop_plan.structure_level is not None and underlying_price is not None:
+        structure_level = _dec(stop_plan.structure_level)
+        underlying = _dec(underlying_price)
+        structure_broken = (
+            underlying < structure_level if favorable else underlying > structure_level
+        )
+        if structure_broken:
+            return close_position(
+                db,
+                trading_session,
+                position,
+                ExitReason.STRUCTURE_BREAK,
+                float(price),
+                broker=broker,
+            )
+
+    # 4. Spread blowout: the option's own liquidity has dried up past a
+    # tradeable width — exit at the current price rather than risk being
+    # stuck in an illiquid contract waiting for stop/target. Generic
+    # (SPREAD_BLOWOUT_PCT), not per-strategy, and skipped when bid/ask aren't
+    # supplied (existing tests that only pass tick_price).
+    if bid is not None and ask is not None and price > 0:
+        spread_pct = _dec(ask - bid) / price
+        if spread_pct > SPREAD_BLOWOUT_PCT:
+            return close_position(
+                db,
+                trading_session,
+                position,
+                ExitReason.SPREAD_BLOWOUT,
+                float(price),
+                broker=broker,
+            )
+
+    # 5. Trail: activate once favorable move reaches the activation price;
     # once active, tighten (never loosen) an independent trailing stop
     # (`trail_plan.current_stop_price`) to lock in TRAIL_LOCK_FRACTION of
     # movement beyond activation, and exit if price pulls back through it.

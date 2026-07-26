@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.modules.market_data.indicators import BarAggregator, EMACalculator, VWAPCalculator
+from app.modules.broker_adapter.base.contracts import Tick
+from app.modules.market_data.indicators import (
+    BarAggregator,
+    EMACalculator,
+    IndicatorEngine,
+    VWAPCalculator,
+)
 
 
 def _ts(seconds_offset: float) -> datetime:
@@ -109,3 +116,39 @@ class TestBarAggregator:
     def test_rejects_invalid_timeframe(self):
         with pytest.raises(ValueError):
             BarAggregator(timeframe_seconds=0)
+
+
+class TestIndicatorEngine:
+    def test_returns_no_bar_while_still_within_the_current_bucket(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        _, bar = engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=100.0, bid=99.9, ask=100.1, volume=10, oi=None, ts=_ts(0)),
+        )
+        assert bar is None
+
+    def test_returns_the_completed_bar_alongside_indicator_values(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(0)),
+        )
+        engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=105.0, bid=0, ask=0, volume=5, oi=None, ts=_ts(30)),
+        )
+        values, bar = engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=102.0, bid=0, ask=0, volume=20, oi=None, ts=_ts(61)),
+        )
+
+        assert "VWAP" in values
+        assert bar is not None
+        assert bar.open == 100.0
+        assert bar.high == 105.0
+        assert bar.close == 105.0  # last tick of the completed bucket
+        assert bar.volume == 15

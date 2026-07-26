@@ -1,9 +1,9 @@
 """`PositionManager`: a background-thread poller, same pattern as
-`strategy_engine.strategies.synthetic.SyntheticStrategyRunner` (daemon
+`strategy_engine.runner.StrategyRunner` (daemon
 thread, its own short-lived `session_scope()` per cycle, a `stop_event` for
 clean shutdown). One instance per `trading_session`, started by
 `api.v1.strategies.start_strategy` (mirroring exactly where
-`SyntheticStrategyRunner` itself gets started) and resumed by `app.main`'s
+`StrategyRunner` itself gets started) and resumed by `app.main`'s
 startup-recovery check after a restart — its job for the life of the
 session is: check every open Position's stop/target/trail against the
 current price, force a square-off once IST wall-clock passes
@@ -24,7 +24,7 @@ from app.core.clock import now_ist
 from app.core.db.session import session_scope
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import Position, PositionStatus
-from app.domain.market.models import OptionContract
+from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.composition import get_broker
@@ -74,7 +74,7 @@ class PositionManager:
         """One poll cycle, exposed separately from `_loop` so tests can
         drive it deterministically rather than sleeping on the background
         thread — same reasoning `SyntheticStrategy.run_cycle` is tested
-        directly, independent of `SyntheticStrategyRunner`'s timer.
+        directly, independent of `StrategyRunner`'s timer.
         """
         with self._session_factory() as db:
             trading_session = db.get(TradingSession, self.trading_session_id)
@@ -89,13 +89,34 @@ class PositionManager:
                 )
                 .all()
             )
+            # Cache underlying quotes within this cycle — multiple open
+            # positions (Phase 4: several concurrent strategy runs) commonly
+            # share the same underlying instrument, and this only ever needs
+            # its current price once per cycle regardless of how many
+            # positions reference it.
+            underlying_price_cache: dict[uuid.UUID, float] = {}
             for position in open_positions:
                 option_contract = db.get(OptionContract, position.option_contract_id)
                 if option_contract is None:
                     continue
                 tick = self._broker.get_quote(option_contract.symbol)
+
+                underlying_price = underlying_price_cache.get(option_contract.instrument_id)
+                if underlying_price is None:
+                    instrument = db.get(Instrument, option_contract.instrument_id)
+                    if instrument is not None:
+                        underlying_price = self._broker.get_quote(instrument.symbol).ltp
+                        underlying_price_cache[option_contract.instrument_id] = underlying_price
+
                 evaluate_open_position(
-                    db, trading_session, position, tick.ltp, broker=self._broker
+                    db,
+                    trading_session,
+                    position,
+                    tick.ltp,
+                    broker=self._broker,
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    underlying_price=underlying_price,
                 )
 
             # Local import: same load-time-cycle reasoning as

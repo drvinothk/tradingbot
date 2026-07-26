@@ -5,6 +5,12 @@ exactly one is set — VWAP/EMA indicators are computed on the *underlying*
 indicator engine needs underlying ticks stored the same way as option ticks.
 `DepthSnapshot` stays option-contract-only: the trading framework's market-
 depth signal is specifically about the option order book, not the index.
+`PriceBar` is instrument-only for the same reason `IndicatorSnapshot` is:
+Phase 4's strategies need real completed-candle O/H/L/C (opening-range,
+pullback, confirmation-candle structure), not just the EMA/VWAP scalar
+`IndicatorSnapshot` already carries — populated from the same completed `Bar`
+object `IndicatorEngine.on_tick` builds internally, which Phase 1-3 discarded
+once the EMA value was computed.
 """
 
 from __future__ import annotations
@@ -181,5 +187,30 @@ class IndicatorSnapshot(Base, UUIDPkMixin):
             "indicator_name",
             "timeframe",
             "ts",
+        ),
+    )
+
+
+class PriceBar(Base, UUIDPkMixin):
+    __tablename__ = "price_bars"
+
+    instrument_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("instruments.id"))
+    timeframe: Mapped[str] = mapped_column(String(10))
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    open: Mapped[float] = mapped_column(Numeric(12, 4))
+    high: Mapped[float] = mapped_column(Numeric(12, 4))
+    low: Mapped[float] = mapped_column(Numeric(12, 4))
+    close: Mapped[float] = mapped_column(Numeric(12, 4))
+    volume: Mapped[int] = mapped_column(Integer)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "instrument_id", "timeframe", "bucket_start", name="uq_price_bar_bucket"
+        ),
+        Index(
+            "ix_price_bars_instrument_timeframe_bucket",
+            "instrument_id",
+            "timeframe",
+            "bucket_start",
         ),
     )

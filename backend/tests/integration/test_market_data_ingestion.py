@@ -21,6 +21,7 @@ from app.domain.market.models import (
     Instrument,
     OptionChainSnapshot,
     OptionContract,
+    PriceBar,
     QuoteTick,
 )
 from app.modules.broker_adapter.base.contracts import Tick
@@ -107,6 +108,7 @@ def seeded_universe(db: Session, test_session_factory):
         cleanup_db.query(DepthSnapshot).delete()
         cleanup_db.query(OptionChainSnapshot).delete()
         cleanup_db.query(IndicatorSnapshot).delete()
+        cleanup_db.query(PriceBar).delete()
         cleanup_db.query(OptionContract).delete()
         cleanup_db.query(Instrument).delete()
 
@@ -204,6 +206,45 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
     assert "VWAP" in names_after_warmup
     # EMA20 shouldn't exist yet — only 9 bars have completed.
     assert "EMA20" not in names_after_warmup
+
+
+def test_completed_bars_are_persisted_for_underlying_instrument(
+    seeded_universe, test_session_factory, db: Session
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
+    service = MarketDataIngestionService(
+        broker,
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+    )
+    service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
+
+    base_ts = broker.get_quote(underlying_symbol).ts
+    service._on_tick(  # noqa: SLF001
+        Tick(underlying_symbol, ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=base_ts)
+    )
+    assert db.query(PriceBar).count() == 0  # no bucket boundary crossed yet
+
+    service._on_tick(  # noqa: SLF001
+        Tick(
+            underlying_symbol,
+            ltp=105.0,
+            bid=0,
+            ask=0,
+            volume=5,
+            oi=None,
+            ts=base_ts + timedelta(seconds=60),
+        )
+    )
+
+    bars = db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).all()
+    assert len(bars) == 1
+    assert float(bars[0].open) == 100.0
+    assert float(bars[0].close) == 100.0
+    assert bars[0].timeframe == "60s"
 
 
 def test_depth_only_persisted_for_option_contracts_not_underlying(

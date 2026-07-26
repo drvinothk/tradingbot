@@ -7,7 +7,15 @@
    entire lifetime via a dedicated connection, so a second instance of this
    backend can never run alongside the first believing it's also the engine.
    This is fatal: refuse to start rather than risk two execution writers.
-3. Startup-recovery check — looks for any trading_session left ACTIVE with
+3. Mock instrument universe sync — only when `get_broker()` resolves to
+   `MockBrokerAdapter` (a no-op once Phase 5's real Shoonya adapter is wired
+   in): syncs `instruments`/`option_contracts` DB rows from the same seeded
+   universe the broker singleton itself quotes against, so
+   `get_option_chain()`/strike ranking have something real to find against
+   the live server, not just in tests (which always construct their own
+   explicitly seeded adapter). See `broker_adapter.composition.get_broker`'s
+   own docstring for why this was missing until Phase 4's manual QC caught it.
+4. Startup-recovery check — looks for any trading_session left ACTIVE with
    open positions from a previous run (crash/reboot), resumes each one's
    `PositionManager` (so stop/trail management picks back up instead of the
    process coming back up idle) and runs an immediate reconciliation pass
@@ -65,6 +73,36 @@ def _acquire_process_singleton_lock():
             "refusing to start a second execution engine."
         )
     return connection
+
+
+def _sync_mock_instrument_universe() -> None:
+    """No-op once Phase 5's real Shoonya adapter is configured — that
+    adapter syncs its own instrument master from the exchange. For the mock
+    adapter, `get_broker()` already seeds a synthetic universe in-memory;
+    this just makes sure the DB's `instruments`/`option_contracts` rows match
+    what that same instance actually quotes, so `get_option_chain()` calls
+    against the live singleton (not a test's own explicitly seeded adapter)
+    resolve to something real.
+    """
+    from app.core.db.session import session_scope
+    from app.modules.broker_adapter.composition import get_broker
+    from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
+    from app.modules.scheduler.instrument_sync import sync_instrument_master
+
+    broker = get_broker()
+    if not isinstance(broker, MockBrokerAdapter):
+        return
+
+    with session_scope() as db:
+        log = sync_instrument_master(db, broker, ["NFO"])
+        logger.info(
+            "Mock instrument universe synced: status=%s instruments_updated=%d "
+            "contracts_added=%d contracts_expired=%d",
+            log.status,
+            log.instruments_updated,
+            log.contracts_added,
+            log.contracts_expired,
+        )
 
 
 def _run_startup_recovery_check() -> None:
@@ -145,6 +183,7 @@ async def lifespan(app: FastAPI):
     # try/except makes the failure path do the same clean shutdown as the
     # success path instead.
     try:
+        _sync_mock_instrument_universe()
         _run_startup_recovery_check()
     except Exception:
         from app.core.locking import release_advisory_lock

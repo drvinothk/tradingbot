@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 
 from app.modules.broker_adapter.base.contracts import Tick
-from app.modules.market_data.indicators.bar_aggregator import BarAggregator
+from app.modules.market_data.indicators.bar_aggregator import Bar, BarAggregator
 from app.modules.market_data.indicators.ema import EMACalculator
 from app.modules.market_data.indicators.vwap import VWAPCalculator
 
@@ -25,12 +25,15 @@ class IndicatorEngine:
         self._ema20: dict[uuid.UUID, EMACalculator] = {}
         self._vwap: dict[uuid.UUID, VWAPCalculator] = {}
 
-    def on_tick(self, instrument_id: uuid.UUID, tick: Tick) -> dict[str, float]:
-        """Feeds one tick for `instrument_id`. Returns only the indicator
-        values that actually changed on this call (e.g. `{"VWAP": ...}` most
-        ticks, plus `EMA9`/`EMA20` only on the tick that completes a bar) —
-        an empty dict means nothing new to persist yet (VWAP not warmed up,
-        which only happens on zero-volume ticks).
+    def on_tick(self, instrument_id: uuid.UUID, tick: Tick) -> tuple[dict[str, float], Bar | None]:
+        """Feeds one tick for `instrument_id`. Returns the indicator values
+        that actually changed on this call (e.g. `{"VWAP": ...}` most ticks,
+        plus `EMA9`/`EMA20` only on the tick that completes a bar — an empty
+        dict means nothing new to persist yet, which only happens on
+        zero-volume ticks before VWAP has warmed up), plus the just-completed
+        `Bar` on that same tick, else `None` — Phase 4's strategies persist
+        this via `market_data.ingestion` for real opening-range/pullback/
+        confirmation-candle structure, not just the EMA/VWAP scalars above.
         """
         results: dict[str, float] = {}
 
@@ -54,7 +57,7 @@ class IndicatorEngine:
             if ema20_value is not None:
                 results["EMA20"] = ema20_value
 
-        return results
+        return results, completed_bar
 
     def reset_session(self, instrument_id: uuid.UUID | None = None) -> None:
         """VWAP resets at the start of each trading day; EMA deliberately

@@ -33,10 +33,8 @@ from app.domain.strategy.models import (
 )
 from app.modules.audit_service.service import verify_chain
 from app.modules.risk_engine.service import create_new_risk_limit_config_version
-from app.modules.strategy_engine.strategies.synthetic import (
-    SyntheticStrategy,
-    SyntheticStrategyRunner,
-)
+from app.modules.strategy_engine.runner import StrategyRunner, run_cycle
+from app.modules.strategy_engine.strategies.synthetic import SyntheticStrategy
 
 EXPIRY = date(2026, 7, 30)
 
@@ -167,7 +165,7 @@ def test_run_cycle_with_no_market_data_yields_nothing(
     db: Session, instrument: Instrument, strategy_run, trading_session, strategy_config
 ):
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
     assert decision is None
 
 
@@ -177,7 +175,7 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     _seed_market_data(db, instrument, option_contract)
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
 
     assert decision is not None
     assert decision.decision == "approved"
@@ -196,6 +194,12 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     )
     assert position is not None, "run_cycle should dispatch to a real, open Position"
     assert position.status == PositionStatus.OPEN
+
+    # Phase 4: run_cycle refreshes strategy_run.status from ground truth —
+    # a real open Position means this run should now read IN_POSITION, not
+    # the SCANNING it started at.
+    db.refresh(strategy_run)
+    assert strategy_run.status == StrategyRunStatus.IN_POSITION
 
     events = (
         db.query(AuditEvent).filter(AuditEvent.trading_session_id == trading_session.id).all()
@@ -226,11 +230,11 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
 
-    first = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
+    first = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
     assert first is not None
     assert first.decision == "approved"
 
-    second = strategy.run_cycle(db, strategy_run, trading_session, strategy_config)
+    second = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
     assert second is not None
     assert second.decision == "rejected"
     assert "max_trades_per_day_reached" in second.reasons
@@ -252,7 +256,7 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
 @pytest.fixture
 def real_commit_factory(engine):
     """Mirrors core.db.session.session_scope's contract but bound to the
-    isolated test engine — SyntheticStrategyRunner runs its loop on a
+    isolated test engine — StrategyRunner runs its loop on a
     background thread, which needs its own real-commit session (the `db`
     fixture's rolled-back, single-connection transaction is invisible to any
     other connection, including a background thread's), same reasoning as
@@ -378,7 +382,7 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
             _seed_market_data(db, instrument, option_contract)
 
         strategy = SyntheticStrategy(instrument_id=ids["instrument_id"], expiry_date=EXPIRY)
-        runner = SyntheticStrategyRunner(
+        runner = StrategyRunner(
             strategy,
             ids["strategy_run_id"],
             interval_seconds=0.05,

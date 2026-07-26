@@ -21,6 +21,7 @@ from app.domain.market.models import DepthSnapshot as DepthSnapshotRow
 from app.domain.market.models import IndicatorSnapshot as IndicatorSnapshotRow
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
+from app.domain.market.models import PriceBar as PriceBarRow
 from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, Tick
@@ -106,7 +107,7 @@ class MarketDataIngestionService:
             )
 
             if kind == "instrument" and self._indicator_engine is not None:
-                updated = self._indicator_engine.on_tick(row_id, tick)
+                updated, completed_bar = self._indicator_engine.on_tick(row_id, tick)
                 for indicator_name, value in updated.items():
                     db.add(
                         IndicatorSnapshotRow(
@@ -116,6 +117,20 @@ class MarketDataIngestionService:
                             timeframe=f"{self._indicator_engine.timeframe_seconds}s",
                             value=value,
                             ts=tick.ts,
+                        )
+                    )
+                if completed_bar is not None:
+                    db.add(
+                        PriceBarRow(
+                            id=uuid.uuid4(),
+                            instrument_id=row_id,
+                            timeframe=f"{self._indicator_engine.timeframe_seconds}s",
+                            bucket_start=completed_bar.bucket_start,
+                            open=completed_bar.open,
+                            high=completed_bar.high,
+                            low=completed_bar.low,
+                            close=completed_bar.close,
+                            volume=completed_bar.volume,
                         )
                     )
 

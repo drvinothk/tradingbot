@@ -7,7 +7,7 @@ wired in later via a credentials file.
 
 **Full build plan (architecture, schema, phase-by-phase spec): [docs/architecture/build-plan.md](docs/architecture/build-plan.md) — read this first for any non-trivial change.**
 
-## Status: Phase 0-3 complete, Phase 4 next
+## Status: Phase 0-4 complete, Phase 5 next
 
 - ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
   operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
@@ -47,14 +47,34 @@ wired in later via a credentials file.
   rather than implicitly from dispatch) and "QC pass findings" (two real bugs in
   the generic trailing-stop logic, a missing proactive approval-expiry sweep, and
   a circular-FK test-cleanup trap) recorded there.
-- 👈 **Phase 4 is next** — ORB, VWAP Pullback, EMA Micro-pullback (paper, mock
-  data) — first major milestone. Full spec in the build plan under "Phase 4".
+- ✅ **Phase 4** — the real `Strategy` interface (`ConfirmationFilterStrategy`
+  template method) plus ORB, VWAP Pullback, and EMA Micro-pullback replacing
+  the Phase 2 synthetic stub, a generalized `StrategyRunner` (one implementation
+  for all four strategies, not a fourth bespoke copy), real OHLC candle
+  persistence (`price_bars`, previously discarded once EMA read it), per-method
+  trailing + structure-break/spread-blowout exits, `strategy_configs
+  .strategy_type` strategy-selection, and `GET /strategies/running`. All three
+  strategies run concurrently, across multiple sessions, in a mix of auto and
+  approval-required mode. See the build plan's Phase 4 section for the "Phase 4
+  amendments" (per-strategy entry logic, since no spec existed before this
+  phase; why `structure_level` lives on the existing `stop_plans` row, not a
+  new table) and "QC pass findings" — four real, non-obvious bugs, none of
+  them in the three strategies themselves: `migrations/env.py` missing 5 of 9
+  domain packages (would have dropped most of the Phase 2/3 schema on the next
+  autogenerate), market data ingestion never actually started outside tests
+  since Phase 1, `MockBrokerAdapter`'s single-callback-slot streaming design
+  silently dropping every underlying's ticks except whichever one subscribed
+  most recently, and `get_broker()`'s live singleton having no instrument
+  universe (fixed same-day, as a follow-up once QC surfaced it) — all
+  recorded there.
+- 👈 **Phase 5 is next** — Shoonya Broker Adapter (real integration, still no
+  live orders). Full spec in the build plan under "Phase 5".
 
-QC passes were done after Phases 1, 2, and 3 (see git log) that each found and
-fixed several real bugs — worth reading `git log -p` on those commits if touching
-auth, sessions, the mock adapter, `main.py`'s lifespan, the risk/strategy modules,
-or the execution/reconciliation modules, since the fixes encode non-obvious
-reasoning.
+QC passes were done after Phases 1, 2, 3, and 4 (see git log) that each found
+and fixed several real bugs — worth reading `git log -p` on those commits if
+touching auth, sessions, the mock adapter, `main.py`'s lifespan, the
+risk/strategy modules, the execution/reconciliation modules, or market data
+ingestion, since the fixes encode non-obvious reasoning.
 
 ## Running it locally
 
@@ -83,7 +103,7 @@ BOOTSTRAP_ADMIN_EMAIL=admin@example.com BOOTSTRAP_ADMIN_PASSWORD="a-real-passwor
 **Tests**: `./.venv/Scripts/python -m pytest` — auto-creates and drops an isolated
 `<DB_NAME>_test` database (see `tests/conftest.py`); never touches the dev DB. Run
 `ruff check .` and `mypy app tests` before considering anything done — both are
-enforced in CI and kept at zero errors throughout Phase 0-3.
+enforced in CI and kept at zero errors throughout Phase 0-4.
 
 ## Conventions that matter (don't relitigate without reading the "why")
 
@@ -178,6 +198,45 @@ enforced in CI and kept at zero errors throughout Phase 0-3.
   codebase ever acquires `LOCK_RISK_EVALUATION_QUEUE` before
   `LOCK_EXECUTION_SINGLETON`; keep that ordering invariant if you add a new
   call path that touches both.
+- **A broker connection is a single shared stream, not one per instrument.**
+  `BrokerPort.subscribe_quotes`'s own docstring says so ("Shoonya only
+  supports one connection per session"), and `MockBrokerAdapter` reflects that
+  literally — one `on_tick`/`on_depth` callback slot, overwritten on every
+  call. `market_data/registry.py`'s `ensure_ingestion_running` therefore
+  shares **one** `MarketDataIngestionService` instance across every underlying
+  for the whole process, extending its subscription (`.start([symbol])`,
+  which already accumulates `_symbol_map`) rather than constructing a new
+  service per instrument — the latter was Phase 4's first cut, and it
+  silently dropped every underlying's ticks except whichever one subscribed
+  most recently. Same "one shared thing, not one per caller" shape as
+  `broker_adapter.composition.get_broker()`'s own singleton.
+- **`structure_level` lives on the existing `stop_plans` row, not a new
+  table.** It's a second, independent invalidation level on the
+  *underlying's* own price (opening-range boundary / pullback extreme / EMA9
+  value) — distinct from `stop_price` (always on the option premium) but
+  conceptually the same "risk management before profit" category, checked in
+  `evaluate_open_position` after stop/target, before the trail step. `None`
+  for any strategy that doesn't set one (`SyntheticStrategy`).
+- **Real OHLC candles live in `price_bars`, populated from a `Bar` object
+  that already existed.** `IndicatorEngine.on_tick` always built a completed
+  `Bar` internally just to feed EMA9/EMA20, then discarded it once Phase 1-3
+  only needed the EMA/VWAP scalar. Phase 4's strategies need real
+  opening-range/pullback/confirmation-candle structure, so `on_tick` now
+  returns `(indicator_values, completed_bar)` and `market_data.ingestion`
+  persists the bar too — same instrument-only convention `indicator_snapshots`
+  already uses, same `f"{timeframe_seconds}s"` timeframe string.
+- **`TradingSession.cutoff_time` defaults to 15:20 IST — tests that build a
+  `TradingSession` without setting it explicitly, then exercise anything that
+  checks `now_ist().time() >= cutoff_time` (`PositionManager.run_once`,
+  `scheduler.eod_square_off`), pass only while real wall-clock IST stays
+  before that time.** Several test files' `trading_session` fixtures rely on
+  the column default; `test_position_manager.py`'s tests that expect a
+  position to stay OPEN started failing for real (not flaky — 100%
+  reproducible) once a session's work ran past 15:20 IST, and were fixed by
+  setting `cutoff_time=dt_time(23, 59)` explicitly in that fixture. Same trap
+  will resurface in any other test file exercising this code path if worked
+  on later in the day — set `cutoff_time` explicitly rather than trusting the
+  default.
 
 ## Known open items
 

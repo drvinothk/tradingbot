@@ -10,9 +10,9 @@ itself: that function is called directly (with an explicit test-owned
 auto-starting a real background thread there would spawn one per test run,
 each polling the *production* DB via `PositionManager`'s default
 `session_scope` — the exact "background thread silently queries the wrong
-database" trap `strategy_engine.strategies.synthetic.SyntheticStrategyRunner`
+database" trap `strategy_engine.runner.StrategyRunner`
 already had to design around. Starting a manager is instead the caller's
-explicit responsibility, at the same layer `SyntheticStrategyRunner` is
+explicit responsibility, at the same layer `StrategyRunner` is
 started from (the strategy-start API flow) — plus `app.main`'s
 startup-recovery check, which calls this for any session found with open
 positions after a restart, which is what actually resumes stop/trail

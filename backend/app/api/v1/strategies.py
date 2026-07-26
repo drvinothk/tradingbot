@@ -1,11 +1,11 @@
 """Strategy lifecycle + trade-approval decisions. `_RUNNERS` is a plain
 in-process dict, not a DB table — safe because this backend only ever runs
 as a single process (the process-singleton lock in app.main enforces that),
-so there is exactly one place a `SyntheticStrategyRunner` thread could be
-tracked. A restart loses the in-memory registry the same way it loses any
-other in-process thread; `strategy_runs` rows left non-stopped after a crash
-are the DB-visible signal of that, same shape as the existing
-startup-recovery check for trading_sessions.
+so there is exactly one place a `StrategyRunner` thread could be tracked. A
+restart loses the in-memory registry the same way it loses any other
+in-process thread; `strategy_runs` rows left non-stopped after a crash are
+the DB-visible signal of that, same shape as the existing startup-recovery
+check for trading_sessions.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
-from app.domain.market.models import QuoteTick
+from app.domain.market.models import Instrument, QuoteTick
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import (
     ApprovalStatus,
@@ -35,17 +35,25 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.composition import get_broker
 from app.modules.execution_engine.paper.registry import ensure_position_manager_running
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
-from app.modules.strategy_engine.strategies.synthetic import (
+from app.modules.market_data import record_option_chain_snapshot
+from app.modules.market_data.registry import ensure_ingestion_running
+from app.modules.strategy_engine.common_rules import get_open_position_for_run
+from app.modules.strategy_engine.interface import Strategy
+from app.modules.strategy_engine.runner import StrategyRunner
+from app.modules.strategy_engine.strategies import (
+    EMAMicroPullbackStrategy,
+    ORBStrategy,
     SyntheticStrategy,
-    SyntheticStrategyRunner,
+    VWAPPullbackStrategy,
 )
 
 router = APIRouter(tags=["strategies"])
 
 # strategy_run_id -> live runner thread. See module docstring.
-_RUNNERS: dict[uuid.UUID, SyntheticStrategyRunner] = {}
+_RUNNERS: dict[uuid.UUID, StrategyRunner] = {}
 
 # How much the underlying's premium may have moved since the intent was
 # generated before an Approve click is treated as stale — see the build
@@ -57,9 +65,66 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+ORB_PARAM_KEYS = {
+    "or_minutes",
+    "stop_pct",
+    "target_pct",
+    "trail_activation_fraction",
+    "trail_lock_fraction",
+}
+VWAP_PULLBACK_PARAM_KEYS = {
+    "pullback_tolerance_frac",
+    "stop_pct",
+    "target_pct",
+    "trail_activation_fraction",
+    "trail_lock_fraction",
+}
+EMA_MICRO_PULLBACK_PARAM_KEYS = VWAP_PULLBACK_PARAM_KEYS
+
+
+def _build_strategy(
+    strategy_config: StrategyConfig, instrument_id: uuid.UUID, expiry_date: date
+) -> Strategy:
+    """Maps `strategy_config.strategy_type` to its `Strategy` class, reading
+    that strategy's own tunables from `strategy_config.params` (missing keys
+    fall back to each strategy's own constructor defaults) — the only place
+    in the codebase that needs to know all four concrete strategy types.
+    """
+    params = strategy_config.params or {}
+    strategy_type = strategy_config.strategy_type
+
+    if strategy_type == "synthetic":
+        return SyntheticStrategy(instrument_id=instrument_id, expiry_date=expiry_date)
+    if strategy_type == "orb":
+        return ORBStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in ORB_PARAM_KEYS},
+        )
+    if strategy_type == "vwap_pullback":
+        return VWAPPullbackStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in VWAP_PULLBACK_PARAM_KEYS},
+        )
+    if strategy_type == "ema_micro_pullback":
+        return EMAMicroPullbackStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in EMA_MICRO_PULLBACK_PARAM_KEYS},
+        )
+    raise HTTPException(
+        status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{strategy_type}'"
+    )
+
+
+KNOWN_STRATEGY_TYPES = {"synthetic", "orb", "vwap_pullback", "ema_micro_pullback"}
+
+
 class StrategyConfigOut(BaseModel):
     id: uuid.UUID
     name: str
+    strategy_type: str
     params: dict
     status: str
 
@@ -68,6 +133,7 @@ class StrategyConfigOut(BaseModel):
 
 class CreateStrategyRequest(BaseModel):
     name: str
+    strategy_type: str = "synthetic"
     params: dict = {}
 
 
@@ -77,6 +143,11 @@ def create_strategy(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("strategy.edit")),
 ) -> StrategyConfig:
+    if body.strategy_type not in KNOWN_STRATEGY_TYPES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{body.strategy_type}'"
+        )
+
     existing = (
         db.query(StrategyConfig)
         .filter(StrategyConfig.workspace_id == user.workspace_id, StrategyConfig.name == body.name)
@@ -86,7 +157,11 @@ def create_strategy(
         raise HTTPException(status.HTTP_409_CONFLICT, "A strategy with this name already exists")
 
     config = StrategyConfig(
-        id=uuid.uuid4(), workspace_id=user.workspace_id, name=body.name, params=body.params
+        id=uuid.uuid4(),
+        workspace_id=user.workspace_id,
+        name=body.name,
+        strategy_type=body.strategy_type,
+        params=body.params,
     )
     db.add(config)
     db.commit()
@@ -139,6 +214,10 @@ def start_strategy(
     if trading_session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
 
+    instrument = db.get(Instrument, body.instrument_id)
+    if instrument is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Instrument not found")
+
     # "at most one active run per strategy" is a check-then-act, same class
     # of race the rest of this codebase always serializes explicitly (see
     # core/locking.py's docstring) — two concurrent start requests for the
@@ -190,8 +269,25 @@ def start_strategy(
         db.commit()
         db.refresh(run)
 
-    strategy = SyntheticStrategy(instrument_id=body.instrument_id, expiry_date=body.expiry_date)
-    runner = SyntheticStrategyRunner(strategy, run.id, interval_seconds=body.interval_seconds)
+    # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
+    # nothing ever actually started one outside tests — real strategies
+    # (unlike the synthetic stub) need genuinely live price_bars/
+    # indicator_snapshots for their underlying. One shared service for the
+    # whole process (see market_data.registry's own docstring for why: a
+    # broker connection is a single shared stream, not one per instrument),
+    # idempotent per symbol so several concurrent runs on the same or
+    # different underlyings all share it.
+    ensure_ingestion_running(instrument.symbol)
+
+    # One immediate option-chain snapshot so the first evaluate() cycle has
+    # something to rank against, rather than waiting on whatever polling
+    # cadence (Scheduler, on-demand) later refreshes it — record_option_
+    # chain_snapshot is designed to be called this way (build plan: "called
+    # on a schedule or on demand").
+    record_option_chain_snapshot(instrument.id, get_broker(), instrument.symbol, body.expiry_date)
+
+    strategy = _build_strategy(strategy_config, body.instrument_id, body.expiry_date)
+    runner = StrategyRunner(strategy, run.id, interval_seconds=body.interval_seconds)
     runner.start()
     _RUNNERS[run.id] = runner
 
@@ -249,6 +345,94 @@ def stop_strategy(
     )
     db.commit()
     return {"ok": True}
+
+
+class RunningPositionOut(BaseModel):
+    position_id: uuid.UUID
+    option_contract_id: uuid.UUID
+    side: str
+    qty: int
+    entry_price: float
+
+
+class RunningStrategyOut(BaseModel):
+    strategy_run_id: uuid.UUID
+    strategy_config_id: uuid.UUID
+    strategy_name: str
+    strategy_type: str
+    trading_session_id: uuid.UUID
+    execution_mode: str
+    status: str
+    started_at: datetime
+    open_position: RunningPositionOut | None
+    pending_approval_count: int
+
+
+@router.get("/strategies/running", response_model=list[RunningStrategyOut])
+def list_running_strategies(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.view")),
+) -> list[RunningStrategyOut]:
+    """Every non-STOPPED `StrategyRun` in the workspace, the first point in
+    Phase 4 where multiple concurrent real runs need a single place to see
+    them all — read-only, no new write path. `open_position`/
+    `pending_approval_count` are read fresh from the DB on every call rather
+    than cached, so this is always ground truth regardless of which runner
+    thread produced it.
+    """
+    runs = (
+        db.query(StrategyRun)
+        .join(StrategyConfig, StrategyRun.strategy_config_id == StrategyConfig.id)
+        .filter(
+            StrategyConfig.workspace_id == user.workspace_id,
+            StrategyRun.status != StrategyRunStatus.STOPPED,
+        )
+        .order_by(StrategyRun.started_at.desc())
+        .all()
+    )
+
+    result: list[RunningStrategyOut] = []
+    for run in runs:
+        strategy_config = db.get(StrategyConfig, run.strategy_config_id)
+        if strategy_config is None:
+            continue
+
+        position = get_open_position_for_run(db, run)
+        pending_count = (
+            db.query(PendingTradeApproval)
+            .filter(
+                PendingTradeApproval.strategy_run_id == run.id,
+                PendingTradeApproval.status == ApprovalStatus.PENDING,
+            )
+            .count()
+        )
+
+        result.append(
+            RunningStrategyOut(
+                strategy_run_id=run.id,
+                strategy_config_id=strategy_config.id,
+                strategy_name=strategy_config.name,
+                strategy_type=strategy_config.strategy_type,
+                trading_session_id=run.trading_session_id,
+                execution_mode=run.execution_mode.value,
+                status=run.status.value,
+                started_at=run.started_at,
+                open_position=(
+                    RunningPositionOut(
+                        position_id=position.id,
+                        option_contract_id=position.option_contract_id,
+                        side=position.side.value,
+                        qty=position.qty,
+                        entry_price=float(position.entry_price),
+                    )
+                    if position is not None
+                    else None
+                ),
+                pending_approval_count=pending_count,
+            )
+        )
+
+    return result
 
 
 def _get_pending_approval_or_404(

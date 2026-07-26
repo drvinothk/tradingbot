@@ -5,7 +5,7 @@ reasoning as test_execution_paper_service.py). Most tests drive
 `run_once()` directly against the test's own rolled-back `db` session
 (deterministic, no thread/timing involved) — a dedicated test at the bottom
 exercises the actual background-thread timer, same split
-test_synthetic_strategy.py uses for `SyntheticStrategyRunner`.
+test_synthetic_strategy.py uses for `StrategyRunner`.
 """
 
 from __future__ import annotations
@@ -74,6 +74,12 @@ def trading_session(db: Session, workspace, broker_account, user: User) -> Tradi
         daily_target_profit=1_000_000,
         daily_loss_cap=1_000_000,
         funding_mode=FundingMode.CASH,
+        # Explicit, not the column default (15:20 IST) — tests in this file
+        # that expect a position to stay OPEN must not depend on real
+        # wall-clock IST staying before cutoff_time; the default silently
+        # started forcing EOD square-off on every position once a real test
+        # run happened to execute after 15:20 IST.
+        cutoff_time=dt_time(23, 59),
     )
     db.add(ts)
     db.flush()
@@ -138,6 +144,7 @@ def _dispatch_position(
     *,
     stop_price: float,
     target_price: float,
+    structure_level: float | None = None,
 ) -> Position:
     now = datetime.now(UTC)
     signal = Signal(
@@ -152,6 +159,7 @@ def _dispatch_position(
         stop_price=stop_price,
         target_price=target_price,
         qty_lots=1,
+        structure_level=structure_level,
         generated_at=now,
     )
     db.add(signal)
@@ -170,6 +178,7 @@ def _dispatch_position(
         entry_price=80.0,
         stop_price=stop_price,
         target_price=target_price,
+        structure_level=structure_level,
         status=TradeIntentStatus.DISPATCHED,
         created_at=now,
         dispatched_at=now,
@@ -235,6 +244,29 @@ def test_run_once_leaves_position_open_when_price_is_fine(
 
     db.refresh(position)
     assert position.status == PositionStatus.OPEN
+
+
+def test_run_once_exits_on_underlying_structure_break(
+    db: Session, broker, trading_session, strategy_run, option_contract, instrument
+):
+    real_price = broker._price_for(option_contract.symbol)  # noqa: SLF001
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=real_price - 20.0, target_price=real_price + 20.0,
+        structure_level=22000.0,
+    )
+    # Option premium stays fine (well inside stop/target); only the
+    # underlying's own price has broken the opening-range/pullback/EMA9
+    # level the strategy anchored structure_level to.
+    broker._prices[instrument.symbol] = 21990.0  # noqa: SLF001
+
+    manager = PositionManager(
+        trading_session.id, broker=broker, session_factory=_session_factory_for(db)
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
 
 
 def test_run_once_force_closes_past_cutoff_time(
@@ -319,7 +351,7 @@ def real_commit_factory(engine):
 def test_manager_starts_and_stops_on_a_real_thread(real_commit_factory):
     """The actual timer/threading mechanism, not just run_once() called
     directly — mirrors test_synthetic_strategy.py's own dedicated test for
-    SyntheticStrategyRunner.
+    StrategyRunner.
     """
     ids: dict[str, uuid.UUID] = {}
     broker = MockBrokerAdapter()

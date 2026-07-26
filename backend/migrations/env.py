@@ -10,7 +10,20 @@ from app.core.db.base import Base
 
 # Import every domain package here so its models register on Base.metadata
 # before autogenerate runs. Add new domain packages as Phase 1+ introduces them.
-from app.domain import audit, identity, market, session  # noqa: F401
+# (Phase 2/3 added broker/execution/ops/risk/strategy without updating this
+# list — caught during Phase 4 planning when autogenerate tried to drop
+# every table those packages define; see the build plan's Phase 4 QC notes.)
+from app.domain import (  # noqa: F401
+    audit,
+    broker,
+    execution,
+    identity,
+    market,
+    ops,
+    risk,
+    session,
+    strategy,
+)
 
 config = context.config
 

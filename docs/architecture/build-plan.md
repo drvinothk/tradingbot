@@ -675,6 +675,125 @@ approval-required mode, across multiple simulated sessions, with distinct compar
 scorecards and a running-strategies view showing all three plus any pending
 approvals correctly.
 
+*Phase 4 amendments (implementation-time decisions):*
+- **Frontend stayed API-only**, confirmed with the user before implementation:
+  the "running-strategies dashboard" is `GET /strategies/running`, verified via
+  Swagger/manual QC. `frontend/src/` is still untouched; the React SPA is
+  deferred to a dedicated later phase.
+- **A new `price_bars` table**, not just the existing `indicator_snapshots`
+  scalars — `IndicatorEngine`/`BarAggregator` already built a completed `Bar`
+  (O/H/L/C/V) internally every cycle just to feed EMA, then discarded it.
+  `IndicatorEngine.on_tick` now returns `(indicator_values, completed_bar)`;
+  `market_data.ingestion` persists the bar alongside whatever indicators
+  changed. All three real strategies need genuine candle structure (opening
+  range, pullback extremes, confirmation closes), not just a scalar.
+- **Per-method trailing, structure-break, and spread-blowout exits** —
+  `TradeProposal` gained three new optional fields (`trail_activation_fraction`,
+  `trail_lock_fraction`, `structure_level`), threaded through `Signal`/
+  `TradeIntent` unchanged from Phase 3's shape otherwise. `structure_level`
+  lives on the *existing* `stop_plans` row (not a new table) — a second,
+  independent invalidation level on the *underlying's* own price, checked
+  after stop/target but before the trail step in `evaluate_open_position`.
+  Two new `ExitReason`s: `STRUCTURE_BREAK` (underlying crossed the strategy's
+  own structural level) and `SPREAD_BLOWOUT` (option's live bid/ask width
+  exceeded a fixed, generic `SPREAD_BLOWOUT_PCT` — deliberately not
+  per-strategy, unlike the trail). All three are `None`/inactive for
+  `SyntheticStrategy`, which is unchanged.
+- **`ConfirmationFilterStrategy`** (`strategy_engine/common_rules.py`) is the
+  "implemented generically once" template method the build plan calls for:
+  `evaluate()` enforces full-candle-completion (never re-fires on the same
+  bar) and no-signal-while-in-position, then delegates to each strategy's
+  `check_setup(db, strategy_run, latest_bar)`. `get_recent_completed_bars`
+  supports both a fixed window (`since`/`until` — ORB's opening range, anchored
+  to `strategy_run.started_at` so a runner restart mid-session can't shift it)
+  and a trailing window (`limit` — VWAP Pullback/EMA Micro-pullback's last-N-bars
+  need).
+- **The strategy runner was generalized, not duplicated a fourth time** —
+  Phase 2's `SyntheticStrategyRunner` (bespoke, hardcoded to one class) is
+  gone; `strategy_engine/runner.py`'s `StrategyRunner` + standalone `run_cycle`
+  function drive all four strategies identically. `run_cycle` also refreshes
+  `strategy_run.status` (`IN_POSITION` vs `SCANNING`) from whether the run
+  actually has an open Position right now — ground truth, correct regardless
+  of which path (auto-dispatch / approval-required / risk-rejected) a given
+  cycle took.
+- **`strategy_configs.strategy_type`** (plain `String`, not an `enum.StrEnum`
+  column like this file's other status fields — new strategy types arrive in
+  later phases without a migration touching an existing constraint) is what
+  `api.v1.strategies.start_strategy` maps to a concrete `Strategy` class;
+  `POST /strategies` validates it against a known-types set at creation time.
+- **Entry logic, concretely** (no per-strategy spec existed anywhere before
+  this phase): ORB fires on the first bar closing beyond the opening range
+  (`or_minutes`, anchored to `started_at`) in either direction, once per
+  direction per run; VWAP Pullback/EMA Micro-pullback both fire on a
+  pullback-bar-touches-then-confirmation-bar-closes-back-through pattern
+  against VWAP or EMA9 (with EMA9>EMA20/EMA9<EMA20 as the trend filter)
+  respectively. All three still call the unchanged strike-ranking engine
+  (`atm_range=3` default already matched "ATM±3") for the actual contract, and
+  stop/target stay percentage-based on the option premium — there's no
+  options-pricing model in this system to translate an underlying-index
+  structural level directly into a premium level, so direction/timing comes
+  from the underlying's technicals and stop/target stay the same
+  percentage-based shape `SyntheticStrategy` already used, tuned per strategy.
+
+*QC pass findings (post-implementation review, before Phase 5 starts):*
+- **Bug fix: `migrations/env.py` only imported 4 of the 9 domain packages**
+  (`audit, identity, market, session` — missing `broker, execution, ops, risk,
+  strategy`, all added by Phase 2/3 without this file being updated). The first
+  autogenerate run for this phase's own migration tried to *drop* every table
+  those five packages define (`orders`, `positions`, `trade_intents`,
+  `risk_decisions`, `system_alerts`, and a dozen more) — caught before it was
+  ever applied by reading the generated migration rather than blindly running
+  it. Fixed the import list; the resulting real (unrelated) schema drift this
+  uncovered — `sessions`/`users`' unique-index shape not matching what the
+  current model produces, a stale index on `trading_sessions.broker_account_id`
+  — was split into its own migration (0007) so Phase 4's migration (0008)
+  contains only Phase 4's own changes.
+- **Gap found (fixed): `MarketDataIngestionService`/`IndicatorEngine` were
+  built in Phase 1 but nothing ever actually started one outside tests.**
+  Phase 2/3's synthetic strategy only ever needed a point-in-time
+  `OptionChainSnapshot` + the latest underlying `QuoteTick`, so this went
+  unnoticed for three phases. Phase 4's real strategies need genuinely live
+  `price_bars`/`indicator_snapshots`, so `market_data/registry.py`'s
+  `ensure_ingestion_running` is now called from `start_strategy`, same
+  explicit-start-at-strategy-start shape `ensure_position_manager_running`
+  already established.
+- **Bug fix: a `MarketDataIngestionService` instance *per underlying
+  instrument* silently drops every underlying's ticks except whichever
+  instrument subscribed most recently.** `BrokerPort.subscribe_quotes`'s own
+  docstring says a broker connection is a *single shared connection*
+  ("Shoonya only supports one connection per session"), and
+  `MockBrokerAdapter` reflects that literally — one `on_tick`/`on_depth`
+  callback slot, `self._on_tick = on_tick` on every call. The registry's first
+  cut (one service per instrument) had each one's `subscribe_quotes` call
+  overwrite the previous one's callback; found live during this phase's own
+  manual QC (BankNifty ticks flowing, Nifty's completely silent — the
+  giveaway was the two instruments' `indicator_snapshots` counts differing by
+  two orders of magnitude over the same time window instead of being
+  comparable). Fixed by sharing one `MarketDataIngestionService` instance
+  across every underlying (`MarketDataIngestionService.start` already
+  accumulates `_symbol_map` across repeated calls, and re-subscribing the same
+  bound callback is a no-op change to the mock's single slot) — matches the
+  documented single-connection contract instead of fighting it. Regression
+  test: `test_market_data_registry.py`.
+- **Gap found and fixed (same-day follow-up, after the phase's own QC pass):**
+  `broker_adapter.composition.get_broker()`'s lazily-constructed
+  `MockBrokerAdapter()` singleton had no instrument universe (`instruments=None`
+  defaults to `[]`), so `get_option_chain()` against the live process singleton
+  always returned an empty chain — `record_option_chain_snapshot`/
+  `rank_from_latest_snapshot` silently found nothing to rank, even though
+  ticks/orders/positions all worked fine (hash-seeded by symbol string,
+  independent of `self._instruments`). Present since Phase 1 — Phase 2/3's
+  synthetic strategy had the identical exposure in live use, just never
+  noticed until a real strategy's manual QC needed a live option chain.
+  Fixed: `get_broker()` now seeds `MockBrokerAdapter(instruments=
+  build_mock_universe(_next_weekly_expiry()))` instead of a bare instance, and
+  `app.main`'s startup sequence gained a step (`_sync_mock_instrument_universe`,
+  a no-op once a non-mock broker is configured) that runs
+  `sync_instrument_master` against that same seeded instance so
+  `instruments`/`option_contracts` DB rows match what it actually quotes.
+  Verified live: `get_option_chain("NIFTY", expiry)` went from 0 entries to 42
+  (21 strikes × CE/PE) against the real dev DB and a running server.
+
 **Phase 5 — Shoonya Broker Adapter (real integration, still no live orders)**
 `broker_adapter/shoonya` per Phase 0's verified auth details — confirmed via
 shoonya.com/api-documentation and the Shoonya-API-OAuth-Python repo: a browser

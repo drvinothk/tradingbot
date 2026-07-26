@@ -75,6 +75,9 @@ def submit_signal(
         stop_price=proposal.stop_price,
         target_price=proposal.target_price,
         qty_lots=proposal.qty_lots,
+        trail_activation_fraction=proposal.trail_activation_fraction,
+        trail_lock_fraction=proposal.trail_lock_fraction,
+        structure_level=proposal.structure_level,
         payload=proposal.payload,
         generated_at=now,
     )
@@ -120,6 +123,9 @@ def submit_signal(
         entry_price=proposal.entry_price,
         stop_price=proposal.stop_price,
         target_price=proposal.target_price,
+        trail_activation_fraction=proposal.trail_activation_fraction,
+        trail_lock_fraction=proposal.trail_lock_fraction,
+        structure_level=proposal.structure_level,
         status=TradeIntentStatus.PENDING_RISK,
         created_at=now,
     )

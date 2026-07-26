@@ -100,6 +100,15 @@ class ExitReason(enum.StrEnum):
     TRAIL = "trail"
     EOD_SQUARE_OFF = "eod_square_off"
     MANUAL = "manual"
+    # Underlying-index structural invalidation — opening-range boundary
+    # broken back through, pullback swing broken, or price closed back
+    # through EMA9 — independent of whether the option premium's own
+    # stop/target has been hit yet.
+    STRUCTURE_BREAK = "structure_break"
+    # The option's own bid/ask spread blew out past a tradeable width —
+    # distinct from STRUCTURE_BREAK (a liquidity problem, not a setup
+    # invalidation) so reports/scorecards can tell the two apart.
+    SPREAD_BLOWOUT = "spread_blowout"
 
 
 class Order(Base, UUIDPkMixin):
@@ -193,6 +202,12 @@ class StopPlan(Base, UUIDPkMixin):
     position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"), unique=True)
     stop_price: Mapped[float] = mapped_column(Numeric(12, 4))
     qty: Mapped[int] = mapped_column(Integer)
+    # A second, independent invalidation level on the *underlying's* own
+    # price (opening-range boundary / pullback extreme / EMA9) — distinct
+    # from stop_price, which is always on the option premium. Null for any
+    # strategy that doesn't supply one (e.g. SyntheticStrategy); see
+    # execution_engine.paper.service.evaluate_open_position.
+    structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     status: Mapped[StopPlanStatus] = mapped_column(String(20), default=StopPlanStatus.CONFIRMED)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

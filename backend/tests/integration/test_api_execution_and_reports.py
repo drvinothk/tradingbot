@@ -6,7 +6,7 @@ stated scope — route wiring, permissions, and workspace scoping; the
 underlying math is already covered by test_reporting.py and
 test_reconciliation.py. `submit_signal` is called directly (not via the
 strategy-start HTTP route) so this file never needs to touch
-`SyntheticStrategyRunner`/`PositionManager` background threads at all.
+`StrategyRunner`/`PositionManager` background threads at all.
 """
 
 from __future__ import annotations
