@@ -281,6 +281,101 @@ def test_daily_plan_updates_session_and_is_audited(api_client: TestClient, seede
         assert len(events) == 1
 
 
+def test_list_broker_accounts_returns_workspace_scoped_accounts(
+    api_client: TestClient, seeded_admin
+):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    response = api_client.get("/api/v1/broker-accounts")
+    assert response.status_code == 200
+    accounts = response.json()
+    assert len(accounts) == 1
+    assert accounts[0]["id"] == str(seeded_admin["broker_account_id"])
+
+
+def test_list_broker_accounts_requires_login(api_client: TestClient):
+    response = api_client.get("/api/v1/broker-accounts")
+    assert response.status_code == 401
+
+
+def test_list_sessions_returns_workspace_sessions_most_recent_first(
+    api_client: TestClient, seeded_admin
+):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    first = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()
+    second = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()
+
+    response = api_client.get("/api/v1/sessions")
+    assert response.status_code == 200
+    ids = [row["id"] for row in response.json()]
+    assert ids[:2] == [second["id"], first["id"]]
+
+
+def test_list_instruments_returns_active_instruments_with_expiry_dates(
+    api_client: TestClient, seeded_admin, engine
+):
+    import uuid as uuid_module
+    from datetime import date
+
+    from app.domain.market.models import Instrument, OptionContract, OptionType
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    instrument_id = uuid_module.uuid4()
+    try:
+        with session_factory() as db:
+            db.add(
+                Instrument(
+                    id=instrument_id,
+                    symbol=f"TESTIDX-{instrument_id.hex[:6]}",
+                    exchange="NFO",
+                    lot_size=25,
+                    tick_size=0.05,
+                    is_active=True,
+                )
+            )
+            db.flush()
+            db.add(
+                OptionContract(
+                    id=uuid_module.uuid4(),
+                    instrument_id=instrument_id,
+                    expiry_date=date(2026, 8, 6),
+                    strike=20000,
+                    option_type=OptionType.CE,
+                    symbol=f"TESTIDX-{instrument_id.hex[:6]}-20000-CE",
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        api_client.post(
+            "/api/v1/auth/login",
+            json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+        )
+        response = api_client.get("/api/v1/instruments")
+        assert response.status_code == 200
+        rows = {row["id"]: row for row in response.json()}
+        assert str(instrument_id) in rows
+        assert rows[str(instrument_id)]["expiry_dates"] == ["2026-08-06"]
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(OptionContract).filter(
+                OptionContract.instrument_id == instrument_id
+            ).delete()
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
 def test_daily_plan_rejects_non_positive_budget(api_client: TestClient, seeded_admin):
     api_client.post(
         "/api/v1/auth/login",

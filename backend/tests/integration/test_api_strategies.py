@@ -133,7 +133,7 @@ def seeded_admin(engine):
         db.add(role)
         db.flush()
         permission_ids: list[uuid.UUID] = []
-        for code in ("session.start", "strategy.edit", "papertrade.execute"):
+        for code in ("session.start", "strategy.edit", "strategy.view", "papertrade.execute"):
             permission = Permission(id=uuid.uuid4(), code=code, description="")
             db.add(permission)
             db.flush()
@@ -309,6 +309,18 @@ def test_create_strategy_requires_login(api_client: TestClient):
     assert response.status_code == 401
 
 
+def test_list_strategies_returns_workspace_scoped_configs(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    api_client.post("/api/v1/strategies", json={"name": "orb-list-test", "strategy_type": "orb"})
+
+    response = api_client.get("/api/v1/strategies")
+    assert response.status_code == 200
+    names = [row["name"] for row in response.json()]
+    assert "orb-list-test" in names
+
+
 def test_create_strategy_then_duplicate_name_conflicts(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     first = api_client.post("/api/v1/strategies", json={"name": "orb"})
@@ -460,6 +472,7 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
             )
             db.add(strategy_run)
             db.flush()
+            strategy_run_id = strategy_run.id
 
             proposal = TradeProposal(
                 option_contract_id=option_contract.id,
@@ -481,9 +494,30 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
             )
             trade_intent_id = decision.trade_intent_id
 
+        # Regression check for the pending_approvals shape: the running-
+        # strategies list must carry each pending approval's own id (not
+        # just a count), since the frontend's inline Approve/Reject buttons
+        # act directly on it without a separate lookup.
+        running_resp = api_client.get("/api/v1/strategies/running")
+        assert running_resp.status_code == 200
+        run_row = next(
+            row for row in running_resp.json() if row["strategy_run_id"] == str(strategy_run_id)
+        )
+        assert [a["approval_id"] for a in run_row["pending_approvals"]] == [approval_id]
+
         approve_resp = api_client.post(f"/api/v1/trade-approvals/{approval_id}/approve")
         assert approve_resp.status_code == 200
         assert approve_resp.json()["trade_intent_status"] == TradeIntentStatus.DISPATCHED
+
+        # Regression check: a second approve on an already-approved approval
+        # must be a clean 409, not a 500 — found live via manual browser QC,
+        # two rapid Approve clicks on the same pending approval produced a
+        # real Postgres deadlock between the two requests' unlocked
+        # check-then-act updates. approve_trade_approval now wraps its body
+        # in LOCK_EXECUTION_SINGLETON (same reasoning start_strategy already
+        # uses it for), which serializes this instead.
+        second_approve_resp = api_client.post(f"/api/v1/trade-approvals/{approval_id}/approve")
+        assert second_approve_resp.status_code == 409
 
         with session_factory() as verify_db:
             position = (

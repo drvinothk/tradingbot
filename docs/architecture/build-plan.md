@@ -794,6 +794,70 @@ approvals correctly.
   Verified live: `get_option_chain("NIFTY", expiry)` went from 0 entries to 42
   (21 strikes × CE/PE) against the real dev DB and a running server.
 
+**Frontend SPA (React) — first real cut** — ✅ done
+Phase 4 deliberately stayed API-only (see its amendments above); this is the
+first real implementation of the "React SPA over REST" decision locked in
+this doc's "Locked architectural decisions" section. Goal: a genuinely usable
+SPA — login, create/manage sessions, create/start/stop strategies (all four
+types), watch them run live, approve/reject pending trades, view reports —
+not a read-only dashboard stub. WebSocket push stayed out of scope (REST +
+polling is enough for what exists today; this doc already frames WebSocket
+as needed "later" once a frontend exists to push to).
+
+Four small, read-only, workspace-scoped GET endpoints were added first
+(`GET /sessions`, `/broker-accounts`, `/strategies`, `/instruments`) —
+every write endpoint already existed, but nothing let the frontend list
+anything to populate dropdowns/history. `/instruments` also returns each
+instrument's distinct `OptionContract.expiry_date`s so the start-strategy
+form can offer a real expiry dropdown. `GET /strategies/running`'s
+`pending_approval_count: int` became `pending_approvals:
+list[PendingApprovalOut]` (full rows: `approval_id`, side, qty_lots,
+entry_price, expires_at) — a bare count can't drive an inline Approve/Reject
+button, which needs the approval's own id.
+
+Stack: Vite + React 19 + TypeScript, TanStack Query (`refetchInterval` for
+the running-strategies poll, cache invalidation on every mutation), React
+Router (four pages: Running Strategies / Sessions / Strategies / Reports,
+plus Login), hand-written CSS (no framework — internal tool, not a product),
+hand-written TS types mirroring the Pydantic `*Out` models (no OpenAPI
+codegen), cookie auth via `vite.config.ts`'s same-origin dev proxy to
+`127.0.0.1:5000` (no FastAPI CORS middleware needed for local dev). No
+frontend test tooling in this first cut — verified instead by driving the
+real dev server end-to-end with the Browser tool.
+
+*QC pass findings (this session's manual browser QC, before Phase 5 starts):*
+- **Bug fix: `GET /strategies/running` 500'd on every real request.**
+  `list_running_strategies` called `.value` on `run.execution_mode`,
+  `run.status`, `position.side`, and `trade_intent.side` — all four are
+  `String`-column-typed with a `StrEnum` type hint (`Mapped[ExecutionMode]`
+  etc.), not an actual `sqlalchemy.Enum` column. A row loaded fresh from the
+  DB (any session other than the one that just wrote it — i.e. every real
+  request, since `get_db` hands out a new session per request) comes back
+  as a plain `str`, which has no `.value`. This endpoint had never been
+  exercised by any test before this session added the first one that
+  round-trips it through a real second DB session — it had been silently
+  broken since Phase 4 shipped it. Fixed by switching to `str(...)`, which
+  is safe for both a live `StrEnum` member (its own `__str__` returns
+  `.value`) and a plain reloaded `str`. Regression test in
+  `test_api_strategies.py` now asserts on the running-strategies response
+  shape directly, closing the gap that let this ship unexercised.
+- **Bug fix: concurrent Approve/Reject clicks could deadlock Postgres.**
+  Found live: two rapid clicks on the same pending approval's Approve
+  button produced a genuine `DeadlockDetected` between the two requests'
+  unlocked `pending_trade_approvals` UPDATEs and a `PositionManager`
+  background poll — Postgres's own deadlock detector aborted one request
+  (a raw 500, not a clean 409), though no double-dispatch occurred. Root
+  cause: `approve_trade_approval`/`reject_trade_approval`'s
+  `approval.status != PENDING` check was an unlocked check-then-act, the
+  same class of race this doc's "Idempotency and single-writer discipline"
+  section calls out — `start_strategy`'s own "at most one active run"
+  check already wraps itself in `LOCK_EXECUTION_SINGLETON` for exactly this
+  reason. Both endpoints now do the same; safe to nest with
+  `dispatch_trade_intent`'s own use of the same lock since Postgres
+  session-level advisory locks are reentrant per session (documented
+  elsewhere in this file). Regression test: a second `approve` call on an
+  already-approved approval must return a clean 409, not 500.
+
 **Phase 5 — Shoonya Broker Adapter (real integration, still no live orders)**
 `broker_adapter/shoonya` per Phase 0's verified auth details — confirmed via
 shoonya.com/api-documentation and the Shoonya-API-OAuth-Python repo: a browser

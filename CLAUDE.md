@@ -67,6 +67,22 @@ wired in later via a credentials file.
   most recently, and `get_broker()`'s live singleton having no instrument
   universe (fixed same-day, as a follow-up once QC surfaced it) — all
   recorded there.
+- ✅ **Frontend SPA (React) — first real cut** — a genuinely usable Vite +
+  React + TypeScript SPA (`frontend/`), not just a read-only dashboard stub:
+  Login, Running Strategies (poll `GET /strategies/running` every ~4s, inline
+  Approve/Reject on pending trades, Stop), Sessions (create + kill-switch/
+  square-off/reconcile), Strategies (create/start/stop, all four strategy
+  types), Reports (daily report + scorecard). Four new read-only backend
+  endpoints (`GET /sessions`, `/broker-accounts`, `/strategies`,
+  `/instruments`) added first, since none existed before this — every prior
+  phase only ever needed single-item lookups. TanStack Query for all server
+  state/polling, React Router for the four pages, cookie auth via a
+  same-origin dev proxy (no CORS needed). No WebSocket push yet (REST +
+  polling is enough for what exists today); see the build plan's own
+  section for the full page-by-page breakdown and the two real bugs this
+  session's manual browser QC found and fixed in `list_running_strategies`/
+  `approve_trade_approval`/`reject_trade_approval` (recorded there, same
+  "QC pass findings" pattern as every other phase).
 - 👈 **Phase 5 is next** — Shoonya Broker Adapter (real integration, still no
   live orders). Full spec in the build plan under "Phase 5".
 
@@ -100,10 +116,21 @@ BOOTSTRAP_ADMIN_EMAIL=admin@example.com BOOTSTRAP_ADMIN_PASSWORD="a-real-passwor
 # Swagger UI: http://127.0.0.1:5000/docs
 ```
 
+```bash
+# 5. Frontend (from frontend/, with the backend already running on :5000)
+npm install
+npm run dev
+# http://localhost:5173 — vite.config.ts proxies /api to 127.0.0.1:5000,
+# so the backend's session cookie works same-origin with no CORS setup.
+```
+
 **Tests**: `./.venv/Scripts/python -m pytest` — auto-creates and drops an isolated
 `<DB_NAME>_test` database (see `tests/conftest.py`); never touches the dev DB. Run
 `ruff check .` and `mypy app tests` before considering anything done — both are
-enforced in CI and kept at zero errors throughout Phase 0-4.
+enforced in CI and kept at zero errors throughout Phase 0-4. There's no
+frontend test tooling yet (see the build plan's frontend section); verify
+frontend changes by driving the real dev server (`npm run build` for a type
+check, then exercise it live).
 
 ## Conventions that matter (don't relitigate without reading the "why")
 

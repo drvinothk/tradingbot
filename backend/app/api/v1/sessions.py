@@ -32,6 +32,7 @@ from app.modules.reconciliation.service import run_reconciliation
 from app.modules.scheduler.eod_square_off import run_eod_square_off
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+broker_accounts_router = APIRouter(prefix="/broker-accounts", tags=["broker-accounts"])
 
 
 class CreateSessionRequest(BaseModel):
@@ -51,6 +52,15 @@ class SessionOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BrokerAccountOut(BaseModel):
+    id: uuid.UUID
+    broker_type: str
+    label: str
+    status: str
+
+    model_config = {"from_attributes": True}
+
+
 class KillSwitchRequest(BaseModel):
     reason: str = "manual kill switch"
 
@@ -60,6 +70,32 @@ class DailyPlanRequest(BaseModel):
     daily_target_profit: float = Field(gt=0)
     daily_loss_cap: float = Field(gt=0)
     funding_mode: FundingMode = FundingMode.CASH
+
+
+@broker_accounts_router.get("", response_model=list[BrokerAccountOut])
+def list_broker_accounts(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> list[BrokerAccount]:
+    return (
+        db.query(BrokerAccount)
+        .filter(BrokerAccount.workspace_id == user.workspace_id)
+        .order_by(BrokerAccount.label)
+        .all()
+    )
+
+
+@router.get("", response_model=list[SessionOut])
+def list_sessions(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> list[TradingSession]:
+    return (
+        db.query(TradingSession)
+        .filter(TradingSession.workspace_id == user.workspace_id)
+        .order_by(TradingSession.started_at.desc())
+        .all()
+    )
 
 
 @router.post("", response_model=SessionOut)

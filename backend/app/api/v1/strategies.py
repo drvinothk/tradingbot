@@ -137,6 +137,19 @@ class CreateStrategyRequest(BaseModel):
     params: dict = {}
 
 
+@router.get("/strategies", response_model=list[StrategyConfigOut])
+def list_strategies(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.view")),
+) -> list[StrategyConfig]:
+    return (
+        db.query(StrategyConfig)
+        .filter(StrategyConfig.workspace_id == user.workspace_id)
+        .order_by(StrategyConfig.name)
+        .all()
+    )
+
+
 @router.post("/strategies", response_model=StrategyConfigOut)
 def create_strategy(
     body: CreateStrategyRequest,
@@ -355,6 +368,16 @@ class RunningPositionOut(BaseModel):
     entry_price: float
 
 
+class PendingApprovalOut(BaseModel):
+    approval_id: uuid.UUID
+    trade_intent_id: uuid.UUID
+    option_contract_id: uuid.UUID
+    side: str
+    qty_lots: int
+    entry_price: float
+    expires_at: datetime
+
+
 class RunningStrategyOut(BaseModel):
     strategy_run_id: uuid.UUID
     strategy_config_id: uuid.UUID
@@ -365,7 +388,7 @@ class RunningStrategyOut(BaseModel):
     status: str
     started_at: datetime
     open_position: RunningPositionOut | None
-    pending_approval_count: int
+    pending_approvals: list[PendingApprovalOut]
 
 
 @router.get("/strategies/running", response_model=list[RunningStrategyOut])
@@ -376,9 +399,11 @@ def list_running_strategies(
     """Every non-STOPPED `StrategyRun` in the workspace, the first point in
     Phase 4 where multiple concurrent real runs need a single place to see
     them all — read-only, no new write path. `open_position`/
-    `pending_approval_count` are read fresh from the DB on every call rather
+    `pending_approvals` are read fresh from the DB on every call rather
     than cached, so this is always ground truth regardless of which runner
-    thread produced it.
+    thread produced it. `pending_approvals` carries full rows (not just a
+    count) so the frontend's inline Approve/Reject buttons have an
+    `approval_id` to act on without a separate lookup.
     """
     runs = (
         db.query(StrategyRun)
@@ -398,13 +423,14 @@ def list_running_strategies(
             continue
 
         position = get_open_position_for_run(db, run)
-        pending_count = (
-            db.query(PendingTradeApproval)
+        pending_rows = (
+            db.query(PendingTradeApproval, TradeIntent)
+            .join(TradeIntent, PendingTradeApproval.trade_intent_id == TradeIntent.id)
             .filter(
                 PendingTradeApproval.strategy_run_id == run.id,
                 PendingTradeApproval.status == ApprovalStatus.PENDING,
             )
-            .count()
+            .all()
         )
 
         result.append(
@@ -414,21 +440,39 @@ def list_running_strategies(
                 strategy_name=strategy_config.name,
                 strategy_type=strategy_config.strategy_type,
                 trading_session_id=run.trading_session_id,
-                execution_mode=run.execution_mode.value,
-                status=run.status.value,
+                # str(), not .value: these are String columns typed with a
+                # StrEnum hint (Mapped[ExecutionMode] etc.), not an actual
+                # sqlalchemy.Enum column — a row loaded fresh from the DB
+                # (any session other than the one that just wrote it, i.e.
+                # every real request) comes back as a plain str with no
+                # .value attribute. str() is safe for both: StrEnum's own
+                # __str__ returns its .value, and a plain str returns itself.
+                execution_mode=str(run.execution_mode),
+                status=str(run.status),
                 started_at=run.started_at,
                 open_position=(
                     RunningPositionOut(
                         position_id=position.id,
                         option_contract_id=position.option_contract_id,
-                        side=position.side.value,
+                        side=str(position.side),
                         qty=position.qty,
                         entry_price=float(position.entry_price),
                     )
                     if position is not None
                     else None
                 ),
-                pending_approval_count=pending_count,
+                pending_approvals=[
+                    PendingApprovalOut(
+                        approval_id=approval.id,
+                        trade_intent_id=trade_intent.id,
+                        option_contract_id=trade_intent.option_contract_id,
+                        side=str(trade_intent.side),
+                        qty_lots=trade_intent.qty_lots,
+                        entry_price=float(trade_intent.entry_price),
+                        expires_at=approval.expires_at,
+                    )
+                    for approval, trade_intent in pending_rows
+                ],
             )
         )
 
@@ -463,95 +507,109 @@ def approve_trade_approval(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("papertrade.execute")),
 ) -> dict:
-    approval = _get_pending_approval_or_404(db, user, approval_id)
-    if approval.status != ApprovalStatus.PENDING:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"approval already {approval.status}")
+    """Wrapped in `LOCK_EXECUTION_SINGLETON` for the same reason
+    `start_strategy` is: the `approval.status != PENDING` check below is a
+    check-then-act, and two concurrent Approve calls for the same approval
+    (a double-click, or a retried request) could otherwise both pass it
+    before either commits. Found live, via manual browser QC: two rapid
+    clicks produced a genuine Postgres deadlock between the two requests'
+    `pending_trade_approvals` UPDATEs and a `PositionManager` background
+    poll — Postgres's own deadlock detector aborted one (a 500, not a clean
+    409), and no double-dispatch occurred, but the endpoint had no business
+    depending on that detector as its only safety net. Reentrant with the
+    same lock `dispatch_trade_intent` takes internally, per
+    `core/locking.py`'s own docstring.
+    """
+    with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        approval = _get_pending_approval_or_404(db, user, approval_id)
+        if approval.status != ApprovalStatus.PENDING:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"approval already {approval.status}")
 
-    trade_intent = db.get(TradeIntent, approval.trade_intent_id)
-    if trade_intent is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade intent not found")
+        trade_intent = db.get(TradeIntent, approval.trade_intent_id)
+        if trade_intent is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade intent not found")
 
-    now = _utcnow()
-    if approval.expires_at < now:
-        approval.status = ApprovalStatus.EXPIRED
-        trade_intent.status = TradeIntentStatus.EXPIRED
-        db.add(approval)
-        db.add(trade_intent)
-        db.flush()
-        record_event(
-            db,
-            workspace_id=user.workspace_id,
-            actor_type=ActorType.USER,
-            actor_id=user.id,
-            event_category=EventCategory.RISK_DECISION,
-            event_type="pending_trade_approval.expired",
-            entity_type="trade_intent",
-            entity_id=trade_intent.id,
-        )
-        db.commit()
-        raise HTTPException(status.HTTP_409_CONFLICT, "Approval window has expired")
-
-    # Lightweight freshness re-check — a click is a stale instruction if the
-    # market moved materially while the human was deciding. Surfaces as 409
-    # rather than silently dispatching the original, now-stale numbers; the
-    # approval stays PENDING so re-clicking Approve retries this check.
-    latest_tick = (
-        db.query(QuoteTick)
-        .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
-        .order_by(QuoteTick.ts.desc())
-        .first()
-    )
-    if latest_tick is not None and float(trade_intent.entry_price) > 0:
-        drift = abs(float(latest_tick.ltp) - float(trade_intent.entry_price)) / float(
-            trade_intent.entry_price
-        )
-        if drift > FRESHNESS_TOLERANCE_PCT:
+        now = _utcnow()
+        if approval.expires_at < now:
+            approval.status = ApprovalStatus.EXPIRED
+            trade_intent.status = TradeIntentStatus.EXPIRED
+            db.add(approval)
+            db.add(trade_intent)
+            db.flush()
             record_event(
                 db,
                 workspace_id=user.workspace_id,
                 actor_type=ActorType.USER,
                 actor_id=user.id,
                 event_category=EventCategory.RISK_DECISION,
-                event_type="pending_trade_approval.stale",
+                event_type="pending_trade_approval.expired",
                 entity_type="trade_intent",
                 entity_id=trade_intent.id,
-                payload={"drift_pct": drift},
             )
             db.commit()
-            raise HTTPException(
-                status.HTTP_409_CONFLICT, "Conditions changed — re-approve to confirm"
+            raise HTTPException(status.HTTP_409_CONFLICT, "Approval window has expired")
+
+        # Lightweight freshness re-check — a click is a stale instruction if the
+        # market moved materially while the human was deciding. Surfaces as 409
+        # rather than silently dispatching the original, now-stale numbers; the
+        # approval stays PENDING so re-clicking Approve retries this check.
+        latest_tick = (
+            db.query(QuoteTick)
+            .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
+            .order_by(QuoteTick.ts.desc())
+            .first()
+        )
+        if latest_tick is not None and float(trade_intent.entry_price) > 0:
+            drift = abs(float(latest_tick.ltp) - float(trade_intent.entry_price)) / float(
+                trade_intent.entry_price
             )
+            if drift > FRESHNESS_TOLERANCE_PCT:
+                record_event(
+                    db,
+                    workspace_id=user.workspace_id,
+                    actor_type=ActorType.USER,
+                    actor_id=user.id,
+                    event_category=EventCategory.RISK_DECISION,
+                    event_type="pending_trade_approval.stale",
+                    entity_type="trade_intent",
+                    entity_id=trade_intent.id,
+                    payload={"drift_pct": drift},
+                )
+                db.commit()
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "Conditions changed — re-approve to confirm"
+                )
 
-    approval.status = ApprovalStatus.APPROVED
-    approval.decided_by_user_id = user.id
-    approval.decided_at = now
-    trade_intent.status = TradeIntentStatus.DISPATCHED
-    trade_intent.dispatched_at = now
-    db.add(approval)
-    db.add(trade_intent)
-    db.flush()
+        approval.status = ApprovalStatus.APPROVED
+        approval.decided_by_user_id = user.id
+        approval.decided_at = now
+        trade_intent.status = TradeIntentStatus.DISPATCHED
+        trade_intent.dispatched_at = now
+        db.add(approval)
+        db.add(trade_intent)
+        db.flush()
 
-    record_event(
-        db,
-        workspace_id=user.workspace_id,
-        actor_type=ActorType.USER,
-        actor_id=user.id,
-        event_category=EventCategory.RISK_DECISION,
-        event_type="pending_trade_approval.approved",
-        entity_type="trade_intent",
-        entity_id=trade_intent.id,
-    )
+        record_event(
+            db,
+            workspace_id=user.workspace_id,
+            actor_type=ActorType.USER,
+            actor_id=user.id,
+            event_category=EventCategory.RISK_DECISION,
+            event_type="pending_trade_approval.approved",
+            entity_type="trade_intent",
+            entity_id=trade_intent.id,
+        )
 
-    # Hands off to the real Execution Service, same as the auto-execute path
-    # (strategy_engine.service.submit_signal) — without this, an approved
-    # intent would sit DISPATCHED forever, permanently holding a concurrency
-    # slot and a same-strike lock for the rest of the session.
-    trading_session = db.get(TradingSession, trade_intent.trading_session_id)
-    if trading_session is not None:
-        dispatch_trade_intent(db, trading_session, trade_intent)
+        # Hands off to the real Execution Service, same as the auto-execute path
+        # (strategy_engine.service.submit_signal) — without this, an approved
+        # intent would sit DISPATCHED forever, permanently holding a concurrency
+        # slot and a same-strike lock for the rest of the session.
+        trading_session = db.get(TradingSession, trade_intent.trading_session_id)
+        if trading_session is not None:
+            dispatch_trade_intent(db, trading_session, trade_intent)
 
-    db.commit()
-    return {"ok": True, "trade_intent_status": trade_intent.status}
+        db.commit()
+        return {"ok": True, "trade_intent_status": trade_intent.status}
 
 
 @router.post("/trade-approvals/{approval_id}/reject")
@@ -560,32 +618,37 @@ def reject_trade_approval(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("papertrade.execute")),
 ) -> dict:
-    approval = _get_pending_approval_or_404(db, user, approval_id)
-    if approval.status != ApprovalStatus.PENDING:
-        raise HTTPException(status.HTTP_409_CONFLICT, f"approval already {approval.status}")
+    """Same `LOCK_EXECUTION_SINGLETON` reasoning as `approve_trade_approval`
+    above — the `approval.status != PENDING` check is check-then-act and
+    must not race a concurrent approve/reject on the same approval.
+    """
+    with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        approval = _get_pending_approval_or_404(db, user, approval_id)
+        if approval.status != ApprovalStatus.PENDING:
+            raise HTTPException(status.HTTP_409_CONFLICT, f"approval already {approval.status}")
 
-    trade_intent = db.get(TradeIntent, approval.trade_intent_id)
-    if trade_intent is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade intent not found")
+        trade_intent = db.get(TradeIntent, approval.trade_intent_id)
+        if trade_intent is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Trade intent not found")
 
-    now = _utcnow()
-    approval.status = ApprovalStatus.REJECTED
-    approval.decided_by_user_id = user.id
-    approval.decided_at = now
-    trade_intent.status = TradeIntentStatus.HUMAN_REJECTED
-    db.add(approval)
-    db.add(trade_intent)
-    db.flush()
+        now = _utcnow()
+        approval.status = ApprovalStatus.REJECTED
+        approval.decided_by_user_id = user.id
+        approval.decided_at = now
+        trade_intent.status = TradeIntentStatus.HUMAN_REJECTED
+        db.add(approval)
+        db.add(trade_intent)
+        db.flush()
 
-    record_event(
-        db,
-        workspace_id=user.workspace_id,
-        actor_type=ActorType.USER,
-        actor_id=user.id,
-        event_category=EventCategory.RISK_DECISION,
-        event_type="pending_trade_approval.rejected",
-        entity_type="trade_intent",
-        entity_id=trade_intent.id,
-    )
-    db.commit()
-    return {"ok": True}
+        record_event(
+            db,
+            workspace_id=user.workspace_id,
+            actor_type=ActorType.USER,
+            actor_id=user.id,
+            event_category=EventCategory.RISK_DECISION,
+            event_type="pending_trade_approval.rejected",
+            entity_type="trade_intent",
+            entity_id=trade_intent.id,
+        )
+        db.commit()
+        return {"ok": True}
