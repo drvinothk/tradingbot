@@ -920,16 +920,38 @@ this live, so "done when" above is not yet met):*
   `NormalizationError` naming the missing field rather than a bare
   `KeyError`, so a real-account mismatch is a small, obvious diff there,
   not a redesign.
-- **Not done yet**: the error-scenario → mode-transition mapping this
-  phase's spec calls for (invalid credentials, IP mismatch, TOTP drift,
-  mid-session expiry, WS drops). The adapter raises a specific exception
-  per scenario (`ShoonyaAuthError`, `ShoonyaSessionExpiredError`,
-  `ShoonyaApiError`) so something *can* catch and map them, but nothing
-  does yet — needs wiring into the Scheduler's existing health-check loop
-  (same "pure check, caller decides" shape `core/clock.py` already
-  establishes), not investigated this session. The frontend also has no
-  "Connect Shoonya" button — `/shoonya/login-url` works today only via a
-  direct browser visit or Swagger.
+- **Error-scenario → mode-transition mapping, scoped down from the
+  original plan.** No periodic Scheduler health-check loop exists to wire
+  into — NTP/disk checks (`core/clock.py`) have only ever run once at
+  startup despite that module's own docstring describing a future
+  periodic loop; that gap predates Phase 5, applies to more than Shoonya,
+  and is still open. Instead: `base/errors.py` adds a broker-agnostic
+  `BrokerAuthError`/`BrokerConnectivityError` hierarchy (every Shoonya
+  exception now inherits from these), and `PositionManager.run_once` — the
+  one place that already polls the broker repeatedly per session — catches
+  `BrokerAuthError` and reacts. Building this surfaced a real design bug:
+  `paper_only → degraded_mode` isn't a legal edge in `core/modes/
+  transitions.py` — `degraded_mode` exists to protect *live* money
+  (`paper_plus_guarded_live`/`live_enabled` only), and Phase 5 is still
+  paper-only throughout. So the actually-correct behavior for the traffic
+  this phase produces is: log the failure, don't force an illegal
+  transition. Two new tests in `test_position_manager.py` cover both
+  paths — a guarded-live session does transition to `degraded_mode`, a
+  paper-only one (matching Phase 5's real usage) doesn't and just logs.
+  Also fixed the `ShoonyaSessionExpiredError`/session-expiry-marker
+  matching that `adapter.py` had defined but never actually wired up to
+  classify anything — moved into `rest_client.py`'s `_post`, right where
+  the raw `Not_Ok` response is parsed.
+- **Frontend "Connect Shoonya" button**, also done this session — a
+  connection-status card + button on the Sessions page
+  (`SessionsPage.tsx`) that opens `/shoonya/login-url`'s authorize URL in
+  a new tab and polls `/shoonya/status` on window focus. Manual browser
+  verification caught a real bug immediately: `vite.config.ts`'s dev
+  proxy only forwarded `/api`, not `/shoonya` (which lives outside
+  `/api/v1` on purpose, per `api/v1/shoonya.py`'s own comment about the
+  fixed `SHOONYA_REDIRECT_URL`) — the button silently 404'd against
+  Vite's own dev server, never reaching the backend at all. Fixed with a
+  matching proxy rule.
 - **QC finding along the way, unrelated to Shoonya itself**: writing a
   test that actually exercised `MarketDataIngestionService.stop()` (most
   existing tests monkeypatch it away) surfaced a real race —

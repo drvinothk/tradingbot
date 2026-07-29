@@ -23,7 +23,13 @@ from app.domain.broker.models import ReconciliationRun
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
-from app.domain.session.models import FundingMode, SafeMode, TradingSession
+from app.domain.session.models import (
+    FundingMode,
+    SafeMode,
+    SessionModeTransition,
+    TradingSession,
+    TransitionTriggerType,
+)
 from app.domain.strategy.models import (
     ExecutionMode,
     Signal,
@@ -34,6 +40,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
+from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.position_manager import PositionManager
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
@@ -221,6 +228,118 @@ def test_run_once_exits_on_stop_hit(
 
     db.refresh(position)
     assert position.status == PositionStatus.CLOSED
+
+
+class _AuthFailingBroker:
+    """Wraps a real `MockBrokerAdapter` but makes `get_quote` raise
+    `BrokerAuthError`, standing in for a real adapter (Shoonya) whose
+    session died mid-poll — proves `PositionManager` reacts to the generic
+    broker-agnostic error, not anything Shoonya-specific (this test file
+    never imports `broker_adapter.shoonya`).
+    """
+
+    def __init__(self, inner: MockBrokerAdapter):
+        self._inner = inner
+
+    def get_quote(self, contract_symbol: str):
+        raise BrokerAuthError("session expired")
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_run_once_moves_guarded_live_session_to_degraded_mode_on_broker_auth_error(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """`degraded_mode` exists to protect *live* money — only
+    `paper_plus_guarded_live`/`live_enabled` have a legal `SYSTEM`-triggered
+    edge there (see `core/modes/transitions.py`). This test uses a
+    guarded-live session specifically to exercise that edge; the next test
+    proves the (far more common, this phase) `paper_only` case correctly
+    does *not* transition.
+    """
+    _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.flush()
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.DEGRADED_MODE
+
+    transitions = (
+        db.query(SessionModeTransition)
+        .filter(SessionModeTransition.trading_session_id == trading_session.id)
+        .all()
+    )
+    assert len(transitions) == 1
+    assert transitions[0].trigger_type == TransitionTriggerType.SYSTEM
+
+
+def test_run_once_does_not_transition_a_paper_only_session_on_broker_auth_error(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """`paper_only` (all of Phase 5's real traffic today) has no
+    `degraded_mode` edge at all — a broker auth failure must be logged, not
+    force an illegal transition or otherwise crash the poll cycle.
+    """
+    _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()  # must not raise
+
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+    assert (
+        db.query(SessionModeTransition)
+        .filter(SessionModeTransition.trading_session_id == trading_session.id)
+        .count()
+        == 0
+    )
+
+
+def test_run_once_is_idempotent_when_already_degraded(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A second poll cycle after the session is already `degraded_mode`
+    must not raise — `degraded_mode` itself has no outbound `SYSTEM`-
+    triggered edge back to `degraded_mode` (nor would `transition_mode`
+    accept a same-mode transition), so `_handle_broker_auth_error`'s
+    "only live-adjacent modes get a transition attempt" guard correctly
+    no-ops here too, same as `paper_only`.
+    """
+    _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    trading_session.mode = SafeMode.DEGRADED_MODE
+    db.flush()
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()  # must not raise
+
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.DEGRADED_MODE
 
 
 def test_run_once_leaves_position_open_when_price_is_fine(

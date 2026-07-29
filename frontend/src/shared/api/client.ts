@@ -15,8 +15,8 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+async function request<T>(base: string, path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${base}${path}`, {
     ...init,
     credentials: 'include',
     headers: {
@@ -37,7 +37,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>(path),
+  get: <T>(path: string) => request<T>(BASE, path),
   post: <T>(path: string, body?: unknown) =>
-    request<T>(path, { method: 'POST', body: body !== undefined ? JSON.stringify(body) : undefined }),
+    request<T>(BASE, path, {
+      method: 'POST',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }),
+}
+
+// Shoonya's OAuth routes live outside /api/v1 on purpose (the backend's
+// SHOONYA_REDIRECT_URL is a fixed URL registered on Shoonya's own API key
+// form — prefixing it would break that registration), so they need their
+// own unprefixed client rather than going through `api` above.
+export const shoonyaApi = {
+  get: <T>(path: string) => request<T>('', path),
 }

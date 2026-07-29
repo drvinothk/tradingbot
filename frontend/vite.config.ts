@@ -13,6 +13,16 @@ export default defineConfig({
         target: 'http://127.0.0.1:5000',
         changeOrigin: true,
       },
+      // Shoonya's OAuth routes live outside /api/v1 on the backend (see
+      // api/v1/shoonya.py's own comment: SHOONYA_REDIRECT_URL is a fixed
+      // URL registered on Shoonya's own API key form, so it can't be
+      // prefixed) — needs its own proxy rule, found missing when
+      // "Connect Shoonya" silently 404'd against Vite's own dev server
+      // instead of reaching the backend at all.
+      '/shoonya': {
+        target: 'http://127.0.0.1:5000',
+        changeOrigin: true,
+      },
     },
   },
 })

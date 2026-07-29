@@ -23,14 +23,23 @@ import logging
 import httpx
 
 from app.core.rate_limiter import RateLimitExceeded, TokenBucket, make_broker_call_limiter
+from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerConnectivityError
 
 logger = logging.getLogger("app.broker_adapter.shoonya")
 
+# Substrings observed (via research, not a live session — same caveat as
+# the rest of this package) in Shoonya's `emsg` for a token that died
+# mid-session. Checked case-insensitively against every Not_Ok response so
+# a dead session surfaces as `ShoonyaSessionExpiredError` (a `BrokerAuthError`
+# broker-agnostic callers like `PositionManager` already know to react to),
+# not a generic `ShoonyaApiError` indistinguishable from any other failure.
+_SESSION_EXPIRED_MARKERS = ("session expired", "invalid session", "invalid token")
 
-class ShoonyaApiError(Exception):
+
+class ShoonyaApiError(BrokerConnectivityError):
     """A Shoonya call returned `stat: Not_Ok` (or an HTTP error status) —
     carries `emsg` (Shoonya's own error message) so callers can pattern-match
-    known scenarios (IP mismatch, session expiry) without re-parsing JSON.
+    known scenarios without re-parsing JSON.
     """
 
     def __init__(self, endpoint: str, message: str, raw: object = None) -> None:
@@ -38,6 +47,16 @@ class ShoonyaApiError(Exception):
         self.endpoint = endpoint
         self.message = message
         self.raw = raw
+
+
+class ShoonyaSessionExpiredError(ShoonyaApiError, BrokerAuthError):
+    """The access token this session was using is no longer valid — the
+    only recovery is a fresh OAuth browser login (no silent refresh in
+    this design; Phase 5's spec treats mid-session expiry as an explicit
+    scenario, not something to paper over). Inherits from both
+    `ShoonyaApiError` (existing Shoonya-specific catch sites keep working)
+    and `BrokerAuthError` (broker-agnostic callers react to it too).
+    """
 
 
 class ShoonyaRestClient:
@@ -100,7 +119,13 @@ class ShoonyaRestClient:
         # failure; a list response (OrderBook, PositionBook, SearchScrip's
         # `values`) has no top-level stat at all and is never itself an error.
         if isinstance(parsed, dict) and parsed.get("stat") == "Not_Ok":
-            raise ShoonyaApiError(endpoint, str(parsed.get("emsg", "unknown error")), raw=parsed)
+            emsg = str(parsed.get("emsg", "unknown error"))
+            error_cls = (
+                ShoonyaSessionExpiredError
+                if any(marker in emsg.lower() for marker in _SESSION_EXPIRED_MARKERS)
+                else ShoonyaApiError
+            )
+            raise error_cls(endpoint, emsg, raw=parsed)
 
         return parsed
 

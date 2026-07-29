@@ -22,11 +22,18 @@ from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist
 from app.core.db.session import session_scope
+from app.core.modes.state_machine import ModeTransitionError, transition_mode
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.market.models import Instrument, OptionContract
-from app.domain.session.models import TradingSession, TradingSessionStatus
+from app.domain.session.models import (
+    SafeMode,
+    TradingSession,
+    TradingSessionStatus,
+    TransitionTriggerType,
+)
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.execution_engine.paper.service import evaluate_open_position
 from app.modules.reconciliation.service import run_reconciliation
@@ -81,70 +88,117 @@ class PositionManager:
             if trading_session is None or trading_session.status != TradingSessionStatus.ACTIVE:
                 return
 
-            open_positions = (
-                db.query(Position)
-                .filter(
-                    Position.trading_session_id == trading_session.id,
-                    Position.status == PositionStatus.OPEN,
-                )
-                .all()
+            try:
+                self._run_cycle(db, trading_session)
+            except BrokerAuthError as exc:
+                self._handle_broker_auth_error(db, trading_session, exc)
+
+    def _handle_broker_auth_error(
+        self, db: Session, trading_session: TradingSession, exc: BrokerAuthError
+    ) -> None:
+        """Broker-agnostic reaction to Phase 5's "invalid credentials / IP
+        mismatch / mid-session expiry" scenarios — catches the generic
+        `BrokerAuthError` (see `broker_adapter/base/errors.py`'s own
+        docstring for why this module never imports anything
+        Shoonya-specific).
+
+        Only actually moves the session to `degraded_mode` when the
+        transitions table (`core/modes/transitions.py`) has a legal
+        `SYSTEM`-triggered edge there from the current mode — which is
+        `paper_plus_guarded_live`/`live_enabled` only. `degraded_mode`
+        exists to protect *live* money; a `paper_only` session (all of
+        Phase 5's real traffic, since it's still no-live-orders) has
+        nothing for it to protect, so the state machine deliberately has
+        no edge there at all. Logging is the entire response in that case
+        — same "market data hiccup, not a safety event" reasoning this
+        system already applies to a `MockBrokerAdapter`-only run.
+        """
+        logger.warning(
+            "broker auth failure for session %s: %s", self.trading_session_id, exc
+        )
+        from_mode = SafeMode(trading_session.mode)
+        if from_mode not in (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED):
+            return
+        try:
+            transition_mode(
+                db,
+                trading_session,
+                SafeMode.DEGRADED_MODE,
+                TransitionTriggerType.SYSTEM,
+                reason=f"broker auth failure: {exc}"[:500],
             )
-            # Cache underlying quotes within this cycle — multiple open
-            # positions (Phase 4: several concurrent strategy runs) commonly
-            # share the same underlying instrument, and this only ever needs
-            # its current price once per cycle regardless of how many
-            # positions reference it.
-            underlying_price_cache: dict[uuid.UUID, float] = {}
-            for position in open_positions:
-                option_contract = db.get(OptionContract, position.option_contract_id)
-                if option_contract is None:
-                    continue
-                tick = self._broker.get_quote(option_contract.symbol)
+            db.commit()
+        except ModeTransitionError:
+            logger.exception(
+                "could not move session %s to degraded_mode after broker auth failure",
+                self.trading_session_id,
+            )
 
-                underlying_price = underlying_price_cache.get(option_contract.instrument_id)
-                if underlying_price is None:
-                    instrument = db.get(Instrument, option_contract.instrument_id)
-                    if instrument is not None:
-                        underlying_price = self._broker.get_quote(instrument.symbol).ltp
-                        underlying_price_cache[option_contract.instrument_id] = underlying_price
+    def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
+        open_positions = (
+            db.query(Position)
+            .filter(
+                Position.trading_session_id == trading_session.id,
+                Position.status == PositionStatus.OPEN,
+            )
+            .all()
+        )
+        # Cache underlying quotes within this cycle — multiple open
+        # positions (Phase 4: several concurrent strategy runs) commonly
+        # share the same underlying instrument, and this only ever needs
+        # its current price once per cycle regardless of how many
+        # positions reference it.
+        underlying_price_cache: dict[uuid.UUID, float] = {}
+        for position in open_positions:
+            option_contract = db.get(OptionContract, position.option_contract_id)
+            if option_contract is None:
+                continue
+            tick = self._broker.get_quote(option_contract.symbol)
 
-                evaluate_open_position(
-                    db,
-                    trading_session,
-                    position,
-                    tick.ltp,
-                    broker=self._broker,
-                    bid=tick.bid,
-                    ask=tick.ask,
-                    underlying_price=underlying_price,
-                )
+            underlying_price = underlying_price_cache.get(option_contract.instrument_id)
+            if underlying_price is None:
+                instrument = db.get(Instrument, option_contract.instrument_id)
+                if instrument is not None:
+                    underlying_price = self._broker.get_quote(instrument.symbol).ltp
+                    underlying_price_cache[option_contract.instrument_id] = underlying_price
 
-            # Local import: same load-time-cycle reasoning as
-            # run_eod_square_off's import just below —
-            # strategy_engine.service imports execution_engine.paper.service,
-            # so importing it at module scope here would cycle back through
-            # this package's own __init__.py.
-            from app.modules.strategy_engine.service import expire_stale_pending_approvals
+            evaluate_open_position(
+                db,
+                trading_session,
+                position,
+                tick.ltp,
+                broker=self._broker,
+                bid=tick.bid,
+                ask=tick.ask,
+                underlying_price=underlying_price,
+            )
 
-            expire_stale_pending_approvals(db, trading_session)
+        # Local import: same load-time-cycle reasoning as
+        # run_eod_square_off's import just below —
+        # strategy_engine.service imports execution_engine.paper.service,
+        # so importing it at module scope here would cycle back through
+        # this package's own __init__.py.
+        from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
-            if now_ist().time() >= trading_session.cutoff_time:
-                # Local import: app.modules.scheduler's package __init__
-                # eagerly re-exports eod_square_off, which itself imports
-                # execution_engine.paper.service — importing it at module
-                # scope here would form a load-time cycle through this
-                # package's own __init__.py. Same one-directional-dependency
-                # reasoning as close_position's local import of
-                # risk_engine.service.
-                from app.modules.scheduler.eod_square_off import run_eod_square_off
+        expire_stale_pending_approvals(db, trading_session)
 
-                run_eod_square_off(db, self._broker, trading_session)
+        if now_ist().time() >= trading_session.cutoff_time:
+            # Local import: app.modules.scheduler's package __init__
+            # eagerly re-exports eod_square_off, which itself imports
+            # execution_engine.paper.service — importing it at module
+            # scope here would form a load-time cycle through this
+            # package's own __init__.py. Same one-directional-dependency
+            # reasoning as close_position's local import of
+            # risk_engine.service.
+            from app.modules.scheduler.eod_square_off import run_eod_square_off
 
-            self._cycle_count += 1
-            if self._cycle_count % self._reconcile_every_n_cycles == 0:
-                run_reconciliation(
-                    db, self._broker, trading_session, ReconciliationTrigger.POLL
-                )
+            run_eod_square_off(db, self._broker, trading_session)
+
+        self._cycle_count += 1
+        if self._cycle_count % self._reconcile_every_n_cycles == 0:
+            run_reconciliation(
+                db, self._broker, trading_session, ReconciliationTrigger.POLL
+            )
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

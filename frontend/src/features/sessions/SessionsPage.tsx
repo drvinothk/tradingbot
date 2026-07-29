@@ -1,7 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
-import { api, ApiError } from '../../shared/api/client'
-import type { BrokerAccountOut, FundingMode, SessionOut } from '../../shared/api/types'
+import { api, ApiError, shoonyaApi } from '../../shared/api/client'
+import type {
+  BrokerAccountOut,
+  FundingMode,
+  SessionOut,
+  ShoonyaLoginUrlOut,
+  ShoonyaStatusOut,
+} from '../../shared/api/types'
 
 export function SessionsPage() {
   const queryClient = useQueryClient()
@@ -81,6 +87,8 @@ export function SessionsPage() {
       <div className="page-header">
         <h2>Sessions</h2>
       </div>
+
+      <ShoonyaConnectionCard />
 
       <div className="card">
         <h3>Start a new session</h3>
@@ -182,6 +190,54 @@ export function SessionsPage() {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+function statusLabel(isLoading: boolean, connected: boolean): string {
+  if (isLoading) return 'checking...'
+  return connected ? 'connected' : 'not connected'
+}
+
+function ShoonyaConnectionCard() {
+  const [error, setError] = useState<string | null>(null)
+
+  const statusQuery = useQuery({
+    queryKey: ['shoonya', 'status'],
+    queryFn: () => shoonyaApi.get<ShoonyaStatusOut>('/shoonya/status'),
+    // The OAuth login happens in a separate tab (Shoonya's own login page,
+    // then their redirect back to /shoonya/callback) — refetching on focus
+    // is what notices "connected" flipping true once the user returns here,
+    // without needing a websocket for something this infrequent.
+    refetchOnWindowFocus: true,
+  })
+
+  const connectMutation = useMutation({
+    mutationFn: () => shoonyaApi.get<ShoonyaLoginUrlOut>('/shoonya/login-url'),
+    onSuccess: (data) => {
+      window.open(data.authorize_url, '_blank', 'noopener,noreferrer')
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not start login'),
+  })
+
+  const connected = statusQuery.data?.connected ?? false
+
+  return (
+    <div className="card">
+      <h3>Shoonya connection</h3>
+      <p>
+        Status: <span className="badge">{statusLabel(statusQuery.isLoading, connected)}</span>
+      </p>
+      {error && <p className="error">{error}</p>}
+      <div className="form-actions">
+        <button disabled={connectMutation.isPending} onClick={() => connectMutation.mutate()}>
+          {connected ? 'Reconnect Shoonya' : 'Connect Shoonya'}
+        </button>
+      </div>
+      <p style={{ fontSize: '0.85rem', opacity: 0.75 }}>
+        Opens Shoonya's own login page in a new tab. After you log in there, come back to this
+        tab — the status above updates automatically.
+      </p>
     </div>
   )
 }

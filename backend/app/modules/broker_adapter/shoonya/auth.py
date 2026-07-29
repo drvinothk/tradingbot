@@ -25,14 +25,15 @@ import httpx
 
 from app.config.settings import ShoonyaSettings
 from app.modules.broker_adapter.base.contracts import AuthResult
+from app.modules.broker_adapter.base.errors import BrokerAuthError
 
 
-class ShoonyaAuthError(Exception):
+class ShoonyaAuthError(BrokerAuthError):
     """Raised on anything from a malformed `GenAcsTok` response to a
-    non-2xx HTTP status — `ShoonyaBrokerAdapter.authenticate` maps this to
-    the "invalid credentials" mode-transition scenario Phase 5's spec
-    calls for, distinct from a network-level `httpx` exception (mapped to
-    the "broker unreachable" scenario instead).
+    non-2xx HTTP status — covers the "invalid credentials"/"IP mismatch"/
+    "TOTP drift" login-time scenarios Phase 5's spec calls for. A
+    `BrokerAuthError` subclass so broker-agnostic callers can catch it
+    without importing anything Shoonya-specific.
     """
 
 

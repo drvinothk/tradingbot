@@ -315,17 +315,39 @@ check, then exercise it live).
   body) and as an OAuth-style `Authorization: Bearer` header simultaneously,
   since research didn't settle which one Shoonya's OAuth variant actually
   needs. Harmless either way; simplify once a real account confirms it.
-- **Shoonya error-scenario → mode-transition wiring isn't done** — the
-  adapter raises a specific exception per scenario (`ShoonyaAuthError`,
-  `ShoonyaSessionExpiredError`, `ShoonyaApiError`) per the build plan's
-  Phase 5 spec, but nothing yet catches these and calls
-  `transition_mode`/`enter_kill_switch` — needs wiring into the Scheduler's
-  existing health-check loop (same shape as the NTP/disk checks), not yet
-  investigated this session.
-- **Frontend has no "Connect Shoonya" button yet** — `GET /shoonya/login-url`
-  and `/shoonya/status` exist and are tested, but nothing in `frontend/`
-  calls them yet; the OAuth flow is reachable today only via a direct
-  browser visit to `/shoonya/login-url` (or Swagger) once credentials exist.
+- ~~Shoonya error-scenario → mode-transition wiring~~ — done this session,
+  scoped down from the original plan: there's no periodic Scheduler
+  health-check loop to wire into (NTP/disk checks only ever ran once at
+  startup — that gap predates Phase 5 and applies to more than just
+  Shoonya, so it's still open, see below). Instead, `PositionManager.
+  run_once` — the one place that already polls the broker repeatedly per
+  session — catches the new generic `BrokerAuthError`
+  (`broker_adapter/base/errors.py`, broker-agnostic on purpose) and moves
+  the session to `degraded_mode`. Turned up a real design bug while wiring
+  this: `paper_only → degraded_mode` isn't a legal edge in
+  `core/modes/transitions.py` at all — `degraded_mode` only exists to
+  protect *live* money (`paper_plus_guarded_live`/`live_enabled`), and
+  Phase 5 is still paper-only. So for the traffic Phase 5 actually
+  produces, a broker auth failure is correctly just logged, not escalated
+  — confirmed by two new tests (`test_position_manager.py`) for both the
+  guarded-live case (does transition) and the paper-only case (doesn't).
+- **No periodic Scheduler health-check loop exists for anything** — NTP/
+  disk checks (`core/clock.py`) and now broker auth failures are each
+  checked only where something else already polls (once at startup; every
+  `PositionManager` cycle). A real "Scheduler runs checks on a timer and
+  reacts" loop, as `core/clock.py`'s own docstring has described since
+  Phase 0, still doesn't exist. Pre-existing gap, not Shoonya-specific;
+  surfaced clearly while scoping the item above.
+- ~~Frontend has no "Connect Shoonya" button~~ — done this session: the
+  Sessions page has a connection-status card + "Connect Shoonya" button
+  (`frontend/src/features/sessions/SessionsPage.tsx`) that opens
+  `/shoonya/login-url`'s authorize URL in a new tab and polls `/shoonya/
+  status` on window focus. Found and fixed a real bug while verifying it
+  live: `vite.config.ts`'s dev proxy only forwarded `/api`, not `/shoonya`
+  (which lives outside `/api/v1` on purpose — see `api/v1/shoonya.py`'s own
+  comment), so the button silently 404'd against Vite's own dev server
+  instead of ever reaching the backend. Added a matching `/shoonya` proxy
+  rule.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
   `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
   Phase 3's changes are uncommitted in the working tree as of this note — check

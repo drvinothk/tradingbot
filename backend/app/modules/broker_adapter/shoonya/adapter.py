@@ -52,7 +52,11 @@ from app.modules.broker_adapter.base.contracts import (
     Tick,
 )
 from app.modules.broker_adapter.shoonya import normalizer
-from app.modules.broker_adapter.shoonya.rest_client import ShoonyaApiError, ShoonyaRestClient
+from app.modules.broker_adapter.shoonya.rest_client import (
+    ShoonyaApiError,
+    ShoonyaRestClient,
+    ShoonyaSessionExpiredError,
+)
 from app.modules.broker_adapter.shoonya.ws_client import ShoonyaWSClient
 
 logger = logging.getLogger("app.broker_adapter.shoonya")
@@ -62,17 +66,10 @@ logger = logging.getLogger("app.broker_adapter.shoonya")
 # NFO contract, per this module's own docstring.
 KNOWN_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
 
-# Substrings observed (via research, not a live session) in Shoonya's `emsg`
-# for a token that died mid-session — checked case-insensitively.
-_SESSION_EXPIRED_MARKERS = ("session expired", "invalid session", "invalid token")
-
-
-class ShoonyaSessionExpiredError(ShoonyaApiError):
-    """The access token this adapter was constructed with is no longer
-    valid — the only recovery is a fresh OAuth browser login (there is no
-    silent refresh in this design; Phase 5's spec treats mid-session expiry
-    as an explicit scenario, not something to paper over).
-    """
+# Re-exported for callers that only import from adapter.py — the actual
+# class lives in rest_client.py now (session-expiry classification happens
+# right where the raw Not_Ok response is parsed, not one layer up).
+__all__ = ["ShoonyaBrokerAdapter", "ShoonyaSessionExpiredError"]
 
 
 class ShoonyaBrokerAdapter(BrokerPort):

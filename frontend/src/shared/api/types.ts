@@ -13,6 +13,14 @@ export interface UserOut {
   display_name: string
 }
 
+export interface ShoonyaStatusOut {
+  connected: boolean
+}
+
+export interface ShoonyaLoginUrlOut {
+  authorize_url: string
+}
+
 export interface BrokerAccountOut {
   id: string
   broker_type: string
