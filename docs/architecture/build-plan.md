@@ -878,6 +878,72 @@ Done when: the three strategies run in paper mode against real Shoonya data for
 several sessions with stable reconnects, and a reconciliation dry-run against real
 (empty) broker positions passes.
 
+*Phase 5 progress (this session — no Shoonya account existed to verify any of
+this live, so "done when" above is not yet met):*
+- **Built**: `broker_adapter/shoonya/{auth,rest_client,ws_client,normalizer,
+  adapter}.py`, exactly the module layout this doc's own "Repository
+  structure" section already specified. `ShoonyaBrokerAdapter` implements
+  every `BrokerPort` method and slots into `composition.get_broker()` with
+  zero upstream changes, proving the broker-agnostic boundary actually holds
+  four phases later. `api.v1.shoonya` adds `/shoonya/login-url` (returns the
+  OAuth authorize URL), `/shoonya/callback` (completes `GenAcsTok`, installs
+  the adapter via `set_broker`), `/shoonya/status` — mounted *without* the
+  usual `/api/v1` prefix since `SHOONYA_REDIRECT_URL` is a fixed URL the
+  user registers on Shoonya's own API key form
+  (`http://127.0.0.1:5000/shoonya/callback`); prefixing it would silently
+  break that registration. 41 new unit/integration tests, all against mocked
+  HTTP (`httpx.MockTransport`) or pure in-memory logic — none hit a real
+  Shoonya endpoint, since none exist to hit.
+- **Two-step construction, not `MockBrokerAdapter`'s one-liner**:
+  `ShoonyaBrokerAdapter` is never built until `/shoonya/callback` already
+  has a completed `OAuthSession` in hand — nothing server-side can run
+  Shoonya's browser+TOTP login itself. `authenticate()` on the finished
+  instance just returns the `AuthResult` it was constructed with.
+- **`get_instrument_master` deliberately narrows to NIFTY/BANKNIFTY**
+  (`KNOWN_UNDERLYINGS` in `adapter.py`) via `SearchScrip`, not a bulk
+  per-exchange scrip-master file download — this system never trades
+  anything else (`mock_universe.py` has the identical hardcoded scope), so
+  a literal "every tradable instrument on the exchange" reading would just
+  mean syncing thousands of stock F&O contracts nothing here will ever
+  touch. A deliberate interpretation, not an oversight — noted in
+  `adapter.py`'s own docstring.
+- **Every genuinely uncertain assumption is flagged, not guessed silently**
+  — recorded in `CLAUDE.md`'s "Known open items" (worth reading before
+  touching this code with real credentials): the REST host path
+  (`NorenWClientAPI` vs `NorenWClientTP` — official Shoonya-Dev GitHub
+  disagrees with this doc's own Phase 0 research and neither could be
+  confirmed live), and the auth transport hedge (`rest_client.py` sends the
+  access token both as classic Noren `jKey` in the POST body *and* as an
+  `Authorization: Bearer` header, since it's unclear which one Shoonya's
+  OAuth variant actually reads). `normalizer.py` is deliberately the only
+  place any of this can be wrong — every parse function raises a specific
+  `NormalizationError` naming the missing field rather than a bare
+  `KeyError`, so a real-account mismatch is a small, obvious diff there,
+  not a redesign.
+- **Not done yet**: the error-scenario → mode-transition mapping this
+  phase's spec calls for (invalid credentials, IP mismatch, TOTP drift,
+  mid-session expiry, WS drops). The adapter raises a specific exception
+  per scenario (`ShoonyaAuthError`, `ShoonyaSessionExpiredError`,
+  `ShoonyaApiError`) so something *can* catch and map them, but nothing
+  does yet — needs wiring into the Scheduler's existing health-check loop
+  (same "pure check, caller decides" shape `core/clock.py` already
+  establishes), not investigated this session. The frontend also has no
+  "Connect Shoonya" button — `/shoonya/login-url` works today only via a
+  direct browser visit or Swagger.
+- **QC finding along the way, unrelated to Shoonya itself**: writing a
+  test that actually exercised `MarketDataIngestionService.stop()` (most
+  existing tests monkeypatch it away) surfaced a real race —
+  `MockBrokerAdapter.unsubscribe_quotes` signaled its stream thread to stop
+  but never joined it, so an in-flight `on_tick` callback could still
+  insert a `QuoteTick` row after a test's own cleanup had already deleted
+  `QuoteTick`s, leaving one FK'd to an `Instrument` the same cleanup then
+  failed to delete — a `uq_instrument_symbol_exchange` collision that
+  cascaded into ~40 unrelated tests erroring whenever it won the race.
+  Present since Phase 1; only surfaced now because Phase 5's own tests
+  happened to add pressure in the right place. Fixed by joining the thread
+  (bounded, 5s timeout) before `unsubscribe_quotes` returns. Confirmed
+  clean across five full-suite runs after the fix.
+
 **Phase 6 — Guarded live execution, safeguards proven end-to-end**
 Execution Service's live path (submit/modify/cancel/exit) against Shoonya;
 `paper_plus_guarded_live` activated for real; Reconciliation upgraded to real

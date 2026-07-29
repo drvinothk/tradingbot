@@ -7,7 +7,7 @@ wired in later via a credentials file.
 
 **Full build plan (architecture, schema, phase-by-phase spec): [docs/architecture/build-plan.md](docs/architecture/build-plan.md) — read this first for any non-trivial change.**
 
-## Status: Phase 0-4 complete, Phase 5 next
+## Status: Phase 0-4 + frontend complete, Phase 5 in progress
 
 - ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
   operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
@@ -83,8 +83,19 @@ wired in later via a credentials file.
   session's manual browser QC found and fixed in `list_running_strategies`/
   `approve_trade_approval`/`reject_trade_approval` (recorded there, same
   "QC pass findings" pattern as every other phase).
-- 👈 **Phase 5 is next** — Shoonya Broker Adapter (real integration, still no
-  live orders). Full spec in the build plan under "Phase 5".
+- 👈 **Phase 5 in progress** — Shoonya Broker Adapter. The full adapter is
+  built behind `BrokerPort` (`app/modules/broker_adapter/shoonya/`: `auth.py`
+  OAuth login, `rest_client.py`, `ws_client.py`, `normalizer.py`, `adapter.py`),
+  wired into `composition.get_broker()`/`api.v1.shoonya`'s `/login-url` +
+  `/callback` routes, and covered by 41 new unit/integration tests against
+  mocked HTTP/WS responses — all still **researched, not live-verified**:
+  no Shoonya account existed to test any of it against a real session.
+  What's left is exactly that: real credentials, then a live OAuth login and
+  a paper-mode soak per the build plan's "done when." Full spec, the
+  specific unverified assumptions to check first, and two real bugs found
+  along the way (a `MockBrokerAdapter` background-thread race that could
+  leave a stray `QuoteTick` after test cleanup, confirmed rate-limiter
+  numbers) in the build plan under "Phase 5".
 
 QC passes were done after Phases 1, 2, 3, and 4 (see git log) that each found
 and fixed several real bugs — worth reading `git log -p` on those commits if
@@ -264,16 +275,57 @@ check, then exercise it live).
   will resurface in any other test file exercising this code path if worked
   on later in the day — set `cutoff_time` explicitly rather than trusting the
   default.
+- **`BrokerPort.unsubscribe_quotes` must join its stream thread before
+  returning, not just signal it to stop.** `MockBrokerAdapter`'s background
+  `_stream_loop` only checks the stop event *between* iterations
+  (`_stream_stop.wait(...)`), so a caller that tears down its DB/session
+  right after `unsubscribe_quotes()` returns can race an in-flight
+  `on_tick` callback still landing a `QuoteTick` insert afterward. Present
+  since Phase 1, only surfaced during Phase 5 when a new test finally
+  exercised `MarketDataIngestionService.stop()` for real — the resulting
+  stray `QuoteTick` FK'd to an `Instrument` that a later test's cleanup
+  then couldn't delete, cascading into ~40 unrelated tests erroring
+  whenever the race lost. Fixed with a bounded `.join(timeout=5.0)` in
+  `unsubscribe_quotes` once `_subscribed` empties. Any future real
+  `BrokerPort` adapter's `unsubscribe_quotes` (Shoonya's `ws_client.py`
+  included) needs the same guarantee — "stopped" must mean no more
+  callbacks fire, not just "asked to stop."
 
 ## Known open items
 
 - **Shoonya IP whitelist / static-IP situation** — user was checking with Airtel
   about CGNAT vs static IP; outcome not yet recorded here. Relevant when Phase 5
   configures `SHOONYA_PRIMARY_IP`/`SHOONYA_BACKUP_IP`.
-- **Shoonya Authentication doc deep-dive** — the OAuth flow (browser redirect,
-  `GenAcsTok` token exchange) is confirmed and documented in the build plan's Phase 5
-  section, but the exact rate limits weren't accessible programmatically from their
-  docs site; worth a manual look before Phase 5's rate-limiter tuning.
+- ~~Shoonya Authentication doc deep-dive~~ — done this session: GetQuotes is
+  10/sec & 200/min, order placement 20/sec & 200/min per service instance
+  (shoonya.com FAQ). `core/rate_limiter.py`'s existing conservative default
+  (5/sec, burst 10) already sits safely under both; docstring updated to
+  record the confirmed numbers, no behavior change needed.
+- **Shoonya REST host path is unconfirmed and has a real discrepancy** —
+  `ShoonyaSettings.api_host`/`ws_host` (`app/config/settings.py`) have said
+  `NorenWClientAPI`/`NorenWSAPI` since Phase 0's own research, but this
+  session's Phase 5 research found the official Shoonya-Dev GitHub org's own
+  wrapper hardcoding `NorenWClientTP`/`NorenWSTP` instead. Left unchanged
+  (a primary-source claim shouldn't be silently overwritten by secondary
+  research with no live account to arbitrate) but flagged in
+  `settings.py` itself — first thing to try if `GenAcsTok`/any REST call
+  404s once real credentials exist.
+- **Shoonya adapter auth transport is a hedge, not a confirmed fact** —
+  `rest_client.py` sends the access token both as classic Noren `jKey` (POST
+  body) and as an OAuth-style `Authorization: Bearer` header simultaneously,
+  since research didn't settle which one Shoonya's OAuth variant actually
+  needs. Harmless either way; simplify once a real account confirms it.
+- **Shoonya error-scenario → mode-transition wiring isn't done** — the
+  adapter raises a specific exception per scenario (`ShoonyaAuthError`,
+  `ShoonyaSessionExpiredError`, `ShoonyaApiError`) per the build plan's
+  Phase 5 spec, but nothing yet catches these and calls
+  `transition_mode`/`enter_kill_switch` — needs wiring into the Scheduler's
+  existing health-check loop (same shape as the NTP/disk checks), not yet
+  investigated this session.
+- **Frontend has no "Connect Shoonya" button yet** — `GET /shoonya/login-url`
+  and `/shoonya/status` exist and are tested, but nothing in `frontend/`
+  calls them yet; the OAuth flow is reachable today only via a direct
+  browser visit to `/shoonya/login-url` (or Swagger) once credentials exist.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
   `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
   Phase 3's changes are uncommitted in the working tree as of this note — check

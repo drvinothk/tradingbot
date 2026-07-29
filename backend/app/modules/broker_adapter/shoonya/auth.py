@@ -1,0 +1,121 @@
+"""OAuth-style browser-redirect login, per `ShoonyaSettings`' own docstring
+(`app/config/settings.py`) — Phase 0's verified flow, not the classic
+direct-TOTP `QuickAuth` login most generic Noren-OMS forks use. Two steps:
+
+1. `build_authorize_url` — the URL `api.v1.shoonya.login_redirect` sends the
+   user's own browser to. They log in on Shoonya's own site (User ID +
+   password + OTP/TOTP) and get redirected back to `redirect_url` with a
+   `code` query param.
+2. `exchange_code_for_token` — `api.v1.shoonya.oauth_callback` POSTs that
+   `code` (plus a checksum) to `GenAcsTok` for the actual access token.
+
+Neither step is exercised end-to-end without a real Shoonya account and a
+human completing the browser login — see this package's own `README`-shaped
+caveat in `normalizer.py` for the same "researched, not live-verified"
+caveat applied to the token-exchange response shape.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from urllib.parse import urlencode
+
+import httpx
+
+from app.config.settings import ShoonyaSettings
+from app.modules.broker_adapter.base.contracts import AuthResult
+
+
+class ShoonyaAuthError(Exception):
+    """Raised on anything from a malformed `GenAcsTok` response to a
+    non-2xx HTTP status — `ShoonyaBrokerAdapter.authenticate` maps this to
+    the "invalid credentials" mode-transition scenario Phase 5's spec
+    calls for, distinct from a network-level `httpx` exception (mapped to
+    the "broker unreachable" scenario instead).
+    """
+
+
+@dataclass(frozen=True)
+class OAuthSession:
+    """What `exchange_code_for_token` returns beyond the broker-agnostic
+    `AuthResult` — the refresh token isn't part of `AuthResult` (that DTO
+    is broker-agnostic and no other adapter has a refresh concept), so it's
+    threaded separately for `ShoonyaBrokerAdapter` to hold privately.
+    """
+
+    auth_result: AuthResult
+    refresh_token: str | None
+
+
+def build_authorize_url(settings: ShoonyaSettings) -> str:
+    """The user opens this URL in their own browser (never fetched
+    server-side — the whole point of the OAuth redirect is that Shoonya's
+    login page, including TOTP entry, only ever sees the user's own
+    browser, never this backend).
+    """
+    params = {"client_id": settings.client_id, "redirect_uri": settings.redirect_url}
+    return f"{settings.oauth_authorize_url}?{urlencode(params)}"
+
+
+def _token_exchange_checksum(client_id: str, secret_code: str, code: str) -> str:
+    """`SHA256(client_id + secret_code + code)`, per `ShoonyaSettings`'
+    docstring — string concatenation in that exact order, hex-digest
+    output (Noren's own checksum convention elsewhere in this codebase's
+    research, e.g. `appkey = SHA256(userid|api_secret)`, is consistently
+    "concatenate then hex-digest," not HMAC).
+    """
+    return hashlib.sha256(f"{client_id}{secret_code}{code}".encode()).hexdigest()
+
+
+def exchange_code_for_token(
+    settings: ShoonyaSettings, code: str, *, http_client: httpx.Client | None = None
+) -> OAuthSession:
+    """POSTs to `{api_host}/GenAcsTok`. Raises `ShoonyaAuthError` on any
+    non-2xx response or a response missing the expected token field —
+    never returns a partially-valid `OAuthSession`.
+    """
+    checksum = _token_exchange_checksum(
+        settings.client_id, settings.secret_code.get_secret_value(), code
+    )
+    payload = {"client_id": settings.client_id, "code": code, "checksum": checksum}
+
+    owns_client = http_client is None
+    client = http_client or httpx.Client(timeout=15.0)
+    try:
+        response = client.post(f"{settings.api_host}/GenAcsTok", json=payload)
+    except httpx.HTTPError as exc:
+        raise ShoonyaAuthError(f"GenAcsTok request failed: {exc}") from exc
+    finally:
+        if owns_client:
+            client.close()
+
+    if response.status_code >= 400:
+        raise ShoonyaAuthError(
+            f"GenAcsTok returned HTTP {response.status_code}: {response.text[:500]}"
+        )
+
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise ShoonyaAuthError(f"GenAcsTok returned non-JSON body: {response.text[:500]}") from exc
+
+    try:
+        access_token = str(
+            body.get("susertoken") or body.get("access_token") or body["token"]
+        )
+        account_id = str(body.get("actid") or body.get("account_id") or settings.user_id)
+    except (KeyError, TypeError) as exc:
+        raise ShoonyaAuthError(
+            f"GenAcsTok response missing expected token field: {body!r}"
+        ) from exc
+
+    refresh_token = body.get("refresh_token")
+    return OAuthSession(
+        auth_result=AuthResult(
+            session_token=access_token,
+            account_id=account_id,
+            expires_at=None,
+        ),
+        refresh_token=str(refresh_token) if refresh_token else None,
+    )

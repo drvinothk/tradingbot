@@ -183,9 +183,23 @@ class MockBrokerAdapter(BrokerPort):
             self._stream_thread.start()
 
     def unsubscribe_quotes(self, contract_symbols: list[str]) -> None:
+        """When this empties `_subscribed`, joins the stream thread before
+        returning rather than just signaling it to stop — a caller that
+        tears down its DB/session right after `unsubscribe_quotes()`
+        returns (every test using a real `session_factory` does exactly
+        this) must not race an in-flight `_stream_loop` iteration's
+        `on_tick` callback, which can still be mid-flight past the stop
+        event (it only checks `_stream_stop` between iterations, via
+        `.wait(...)`, not inside one). Found live: a `QuoteTick` insert
+        landing after the test's own cleanup had already deleted
+        `QuoteTick` rows, leaving one FK'd to an `Instrument` the same
+        cleanup then failed to delete.
+        """
         self._subscribed.difference_update(contract_symbols)
         if not self._subscribed:
             self._stream_stop.set()
+            if self._stream_thread is not None:
+                self._stream_thread.join(timeout=5.0)
 
     def _stream_loop(self) -> None:
         while not self._stream_stop.is_set():

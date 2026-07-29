@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1 import auth, execution, instruments, reports, sessions, strategies
+from app.api.v1 import auth, execution, instruments, reports, sessions, shoonya, strategies
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
 from app.domain.session.models import TradingSessionStatus
@@ -214,6 +214,12 @@ def create_app() -> FastAPI:
     app.include_router(execution.router, prefix="/api/v1")
     app.include_router(reports.router, prefix="/api/v1")
     app.include_router(instruments.router, prefix="/api/v1")
+    # No /api/v1 prefix, deliberately: SHOONYA_REDIRECT_URL (the fixed URL
+    # the user registers on Shoonya's own API key form) is
+    # http://127.0.0.1:5000/shoonya/callback — mounting under /api/v1 would
+    # break that redirect. /login-url and /status live at the same
+    # unprefixed path for consistency, not because they need to.
+    app.include_router(shoonya.router)
 
     @app.get("/health")
     def health() -> dict:

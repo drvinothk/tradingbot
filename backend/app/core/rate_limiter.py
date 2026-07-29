@@ -58,11 +58,12 @@ class RateLimitExceeded(Exception):
 
 
 def make_broker_call_limiter() -> TokenBucket:
-    """Conservative default until Phase 5's research spike confirms
-    Shoonya's actual documented rate limits — 5/second with a small burst
-    allowance is comfortably under what any broker API tends to allow for a
-    low-frequency retail system, and safety-net limiters should start
-    conservative and widen only once the real limits are confirmed, not the
-    other way around.
+    """Phase 5's research spike confirmed Shoonya's documented limits
+    (shoonya.com FAQ): GetQuotes 10/sec & 200/min, order placement 20/sec &
+    200/min per service instance. 5/second with a burst of 10 stays under
+    the tightest of those (GetQuotes) even though every call type shares
+    this one limiter, which is intentional — this system is explicitly not
+    high-frequency (see module docstring), so there's no reason to run
+    closer to the real ceiling than "comfortably safe."
     """
     return TokenBucket(capacity=10, refill_rate_per_second=5.0)
