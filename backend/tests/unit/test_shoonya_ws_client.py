@@ -105,3 +105,5 @@ def test_handle_message_swallows_normalization_error():
     message = json.dumps({"t": "tk", "e": "NFO", "tk": "12345"})
     client._handle_message(message)
     assert ticks == []
+
+

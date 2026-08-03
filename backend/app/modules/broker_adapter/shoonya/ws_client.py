@@ -12,10 +12,19 @@ this project's pinned minimum) rather than an asyncio event loop in a
 thread, which is simpler and matches `MockBrokerAdapter._stream_loop`'s own
 plain-`threading.Thread` shape exactly.
 
-**Researched, not live-verified** (same caveat as `normalizer.py` and
-`auth.py`) — the connect/subscribe/tick message shapes below come from the
-public Noren-OMS WebSocket convention shared across every broker forking
-that OMS, not a live Shoonya session.
+**Live-tested against a real account, still unresolved**: the auth
+handshake (`_authenticate`) consistently gets `{"t": "ck", "s": "NOT_OK"}`
+back, even though every other candidate cause was checked and ruled out —
+`susertoken` (not the OAuth `access_token`) is confirmed used, the message
+fields match the reference `NorenApi.py` implementation exactly (including
+`uid`/`actid` both being the same value, per that reference), REST and WS
+both connect from the same whitelisted IP, and both `NorenWSAPI` and
+`NorenWSTP` hosts were tried, as were three URL forms (bare, `?token=`,
+`?access_token=`) — every attempt gets the identical rejection at the
+identical point (the WebSocket connection itself always succeeds; only the
+post-connect auth frame is ever rejected). This rules out URL/host/field/
+token-type mistakes on this client's side. Next step is Shoonya's own API
+support, not further guessing at the wire format.
 """
 
 from __future__ import annotations
