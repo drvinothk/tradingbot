@@ -207,27 +207,42 @@ class ShoonyaBrokerAdapter(BrokerPort):
         )
 
     def _resolve_underlying_token(self, underlying: str) -> tuple[str, str]:
-        """**Live-corrected twice**: the underlying index itself (`NIFTY`/
-        `BANKNIFTY`) only exists as a tradable scrip on `NSE` (the cash/
-        index segment) — `NFO` exclusively lists derivative contracts *on*
-        it (option/future symbols like `NIFTY28AUG25FUT`), never a bare
+        """**Live-corrected three times**: the underlying index itself
+        (`NIFTY`/`BANKNIFTY`) only exists as a tradable scrip on `NSE` (the
+        cash/index segment) — `NFO` exclusively lists derivative contracts
+        *on* it (option/future symbols like `NIFTY28AUG25FUT`), never a bare
         `NIFTY` tsym; searching `NFO` for it (the original assumption)
         never finds a match. Round 2: even on `NSE`, the index's own tsym
         isn't the bare underlying name — it's Shoonya's own display-style
         string ("Nifty 50"/"Nifty Bank"), confirmed via a live diagnostic
         log (see `_UNDERLYING_INDEX_TSYM`'s own docstring for the full
-        candidate list that made a fuzzy match too risky to use instead).
+        candidate list). Round 3: searching NSE with `search_text=
+        "BANKNIFTY"` returns only an unrelated ETF ticker ("BANKNIFTY1-EQ")
+        — "Nifty Bank" never appears, confirmed via the same diagnostic
+        logging — Shoonya's fuzzy search apparently needs *some* textual
+        overlap with the actual tsym, and "BANKNIFTY" doesn't share enough
+        with "Nifty Bank". Both known display-style tsyms happen to share
+        the "Nifty" prefix, so searching with the fixed anchor text
+        `"NIFTY"` (never the underlying's own name) reliably surfaces both.
         """
         try:
             return self._resolve_token(underlying)
         except ShoonyaApiError:
             index_tsym = _UNDERLYING_INDEX_TSYM.get(underlying.upper(), underlying).upper()
-            rows = self._rest.search_scrip(self._uid, "NSE", underlying)
+            rows = self._rest.search_scrip(self._uid, "NSE", "NIFTY")
             for row in rows:
                 if str(row.get("tsym", "")).upper() == index_tsym:
                     token = str(row.get("token", ""))
                     self._remember_token(underlying, "NSE", token)
                     return "NSE", token
+            logger.warning(
+                "No exact NSE tsym match for underlying %r (expected %r) among "
+                "%d search_scrip results: %s",
+                underlying,
+                index_tsym,
+                len(rows),
+                [row.get("tsym") for row in rows][:20],
+            )
             raise
 
     def _resolve_futures_anchor_tsym(self, underlying: str) -> str:

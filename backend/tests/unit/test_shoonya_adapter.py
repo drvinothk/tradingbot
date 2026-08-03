@@ -257,6 +257,30 @@ def test_get_option_chain_resolves_underlying_token_on_nse_not_nfo():
     assert ("FA1", "NSE", "NIFTY") in search_calls
 
 
+def test_resolve_underlying_token_searches_nse_with_fixed_nifty_anchor_for_banknifty():
+    """Live-corrected a third time: searching NSE with search_text=
+    "BANKNIFTY" (the underlying's own name) returned only an unrelated ETF
+    ticker ("BANKNIFTY1-EQ") — "Nifty Bank" never appeared, confirmed via a
+    live diagnostic log. Both known display-style tsyms share the "Nifty"
+    prefix, so the search text is now always the fixed anchor "NIFTY",
+    never the underlying's own name — this is what actually finds
+    "Nifty Bank" for BANKNIFTY.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "BANKNIFTY1-EQ", "token": "1"},
+        {"tsym": "Nifty Bank", "token": "88888"},
+        {"tsym": "Nifty 50", "token": "26000"},
+    ]
+
+    exchange, token = adapter._resolve_underlying_token("BANKNIFTY")
+
+    assert (exchange, token) == ("NSE", "88888")
+    search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
+    assert search_calls == [("FA1", "NSE", "NIFTY")]
+
+
 def test_get_option_chain_uses_nearest_futures_contract_as_anchor():
     """Live-corrected three times against a real account: "NIFTY",
     "Nifty 50", and quote_plus-encoded "Nifty+50" were all rejected by
