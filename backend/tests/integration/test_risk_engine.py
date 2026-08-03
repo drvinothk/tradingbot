@@ -33,6 +33,7 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import verify_chain
+from app.modules.broker_adapter.base.contracts import MarginInfo
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.risk_engine.service import (
@@ -450,6 +451,32 @@ def test_evaluate_trade_intent_budget_exceeded(
 
     assert decision.decision == "rejected"
     assert "budget_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_margin_check_failed(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Proves `_check_margin` is a real broker-backed check now, not the old
+    `capital_required > 0` stub — a broker reporting insufficient available
+    margin rejects the trade even though every other check would pass.
+    """
+
+    class _LowMarginBroker(MockBrokerAdapter):
+        def get_margin(self):
+            return MarginInfo(
+                available_margin=1.0, used_margin=0.0, total_margin=1.0, ts=datetime.now(UTC)
+            )
+
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session: _LowMarginBroker(),
+    )
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "margin_check_failed" in decision.reasons
 
 
 def test_evaluate_trade_intent_rejection_raises_system_alert(

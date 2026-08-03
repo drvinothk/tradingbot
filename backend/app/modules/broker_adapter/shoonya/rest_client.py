@@ -197,3 +197,9 @@ class ShoonyaRestClient:
     def position_book(self, uid: str, actid: str) -> list[dict]:
         result = self._post("PositionBook", {"uid": uid, "actid": actid})
         return list(result) if isinstance(result, list) else []
+
+    def get_limits(self, uid: str, actid: str) -> dict:
+        result = self._post("Limits", {"uid": uid, "actid": actid})
+        if not isinstance(result, dict):
+            raise ShoonyaApiError("Limits", f"unexpected list response: {result!r}")
+        return result

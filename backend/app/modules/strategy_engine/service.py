@@ -32,6 +32,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
@@ -152,41 +153,51 @@ def expire_stale_pending_approvals(
     does. An un-acted-on approval must never silently fire later once
     conditions have moved on; this is what makes that actually true instead
     of true-only-if-someone-happens-to-click-it-afterward.
+
+    Wrapped in LOCK_EXECUTION_SINGLETON, same lock
+    api.v1.strategies.approve_trade_approval/reject_trade_approval already
+    take on this exact table (a Phase 4 QC fix, after a real deadlock from
+    two concurrent Approve clicks racing an unlocked check-then-act) - this
+    function is called every PositionManager poll cycle and was the one
+    remaining unlocked writer to pending_trade_approvals, able to
+    interleave with an in-flight Approve/Reject and desync
+    TradeIntentStatus from what actually executed.
     """
     now = _utcnow()
-    stale = (
-        db.query(PendingTradeApproval)
-        .join(StrategyRun, PendingTradeApproval.strategy_run_id == StrategyRun.id)
-        .filter(
-            StrategyRun.trading_session_id == trading_session.id,
-            PendingTradeApproval.status == ApprovalStatus.PENDING,
-            PendingTradeApproval.expires_at < now,
+    with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        stale = (
+            db.query(PendingTradeApproval)
+            .join(StrategyRun, PendingTradeApproval.strategy_run_id == StrategyRun.id)
+            .filter(
+                StrategyRun.trading_session_id == trading_session.id,
+                PendingTradeApproval.status == ApprovalStatus.PENDING,
+                PendingTradeApproval.expires_at < now,
+            )
+            .all()
         )
-        .all()
-    )
 
-    expired: list[PendingTradeApproval] = []
-    for approval in stale:
-        trade_intent = db.get(TradeIntent, approval.trade_intent_id)
-        if trade_intent is None:
-            continue
+        expired: list[PendingTradeApproval] = []
+        for approval in stale:
+            trade_intent = db.get(TradeIntent, approval.trade_intent_id)
+            if trade_intent is None:
+                continue
 
-        approval.status = ApprovalStatus.EXPIRED
-        trade_intent.status = TradeIntentStatus.EXPIRED
-        db.add(approval)
-        db.add(trade_intent)
-        db.flush()
+            approval.status = ApprovalStatus.EXPIRED
+            trade_intent.status = TradeIntentStatus.EXPIRED
+            db.add(approval)
+            db.add(trade_intent)
+            db.flush()
 
-        record_event(
-            db,
-            workspace_id=trading_session.workspace_id,
-            actor_type=ActorType.SYSTEM,
-            event_category=EventCategory.RISK_DECISION,
-            event_type="pending_trade_approval.expired",
-            entity_type="trade_intent",
-            entity_id=trade_intent.id,
-            trading_session_id=trading_session.id,
-        )
-        expired.append(approval)
+            record_event(
+                db,
+                workspace_id=trading_session.workspace_id,
+                actor_type=ActorType.SYSTEM,
+                event_category=EventCategory.RISK_DECISION,
+                event_type="pending_trade_approval.expired",
+                entity_type="trade_intent",
+                entity_id=trade_intent.id,
+                trading_session_id=trading_session.id,
+            )
+            expired.append(approval)
 
     return expired

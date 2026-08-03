@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
+from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, QuoteTick
@@ -45,6 +46,8 @@ from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.runner import StrategyRunner
 from app.modules.strategy_engine.strategies import (
     EMAMicroPullbackStrategy,
+    LiquiditySweepReversalStrategy,
+    OIVolumeConfirmedStrategy,
     ORBStrategy,
     SyntheticStrategy,
     VWAPPullbackStrategy,
@@ -80,6 +83,14 @@ VWAP_PULLBACK_PARAM_KEYS = {
     "trail_lock_fraction",
 }
 EMA_MICRO_PULLBACK_PARAM_KEYS = VWAP_PULLBACK_PARAM_KEYS
+OI_VOLUME_CONFIRMED_PARAM_KEYS = {
+    "lookback_bars",
+    "stop_pct",
+    "target_pct",
+    "trail_activation_fraction",
+    "trail_lock_fraction",
+}
+LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = OI_VOLUME_CONFIRMED_PARAM_KEYS
 
 
 def _build_strategy(
@@ -88,7 +99,7 @@ def _build_strategy(
     """Maps `strategy_config.strategy_type` to its `Strategy` class, reading
     that strategy's own tunables from `strategy_config.params` (missing keys
     fall back to each strategy's own constructor defaults) — the only place
-    in the codebase that needs to know all four concrete strategy types.
+    in the codebase that needs to know all six concrete strategy types.
     """
     params = strategy_config.params or {}
     strategy_type = strategy_config.strategy_type
@@ -113,12 +124,31 @@ def _build_strategy(
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in EMA_MICRO_PULLBACK_PARAM_KEYS},
         )
+    if strategy_type == "oi_volume_confirmed":
+        return OIVolumeConfirmedStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in OI_VOLUME_CONFIRMED_PARAM_KEYS},
+        )
+    if strategy_type == "liquidity_sweep_reversal":
+        return LiquiditySweepReversalStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS},
+        )
     raise HTTPException(
         status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{strategy_type}'"
     )
 
 
-KNOWN_STRATEGY_TYPES = {"synthetic", "orb", "vwap_pullback", "ema_micro_pullback"}
+KNOWN_STRATEGY_TYPES = {
+    "synthetic",
+    "orb",
+    "vwap_pullback",
+    "ema_micro_pullback",
+    "oi_volume_confirmed",
+    "liquidity_sweep_reversal",
+}
 
 
 class StrategyConfigOut(BaseModel):
@@ -282,6 +312,14 @@ def start_strategy(
         db.commit()
         db.refresh(run)
 
+    # Sleep inhibitor: "actively scanning" half of the two overlapping
+    # lifecycles core/sleep_inhibitor.py's own docstring describes (the
+    # other half is an open position, acquired/released around
+    # _open_position_from_fill/close_position). Reference-counted, so a
+    # session with several concurrent runs stays awake until every one of
+    # them has stopped.
+    get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
+
     # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
     # nothing ever actually started one outside tests — real strategies
     # (unlike the synthetic stub) need genuinely live price_bars/
@@ -338,6 +376,12 @@ def stop_strategy(
     runner = _RUNNERS.pop(run.id, None)
     if runner is not None:
         runner.stop()
+
+    # Releases this run's half of the sleep inhibitor's reference count —
+    # see the matching acquire in start_strategy. Safe even if this run
+    # never acquired it (e.g. a process restart between start and stop):
+    # SleepInhibitor.release on an absent reason is a no-op.
+    get_sleep_inhibitor().release(f"strategy_run:{run.id}")
 
     run.status = StrategyRunStatus.STOPPED
     run.stopped_at = _utcnow()

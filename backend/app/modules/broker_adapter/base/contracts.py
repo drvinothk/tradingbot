@@ -137,3 +137,11 @@ class AuthResult:
     session_token: str
     account_id: str
     expires_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class MarginInfo:
+    available_margin: float
+    used_margin: float
+    total_margin: float
+    ts: datetime

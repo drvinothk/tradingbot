@@ -102,6 +102,30 @@ def test_missing_depth_scores_neutral_not_zero():
     assert ranked[0].breakdown["depth"] == 0.5
 
 
+def test_min_oi_min_volume_default_to_zero_and_filter_nothing():
+    # Default StrikeRankingConfig() has min_oi=min_volume=0 — every existing
+    # strategy (ORB/VWAP/EMA/Synthetic) relies on this not filtering
+    # anything out, so this pins that default explicitly.
+    contract = _contract(22000, volume=1, oi=1)
+    config = StrikeRankingConfig(atm_range=0, max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, [contract], config)
+
+    assert [r.strike for r in ranked] == [22000]
+
+
+def test_below_participation_floor_is_hard_filtered_out():
+    thin = _contract(22000, volume=100, oi=1000)
+    liquid = _contract(22050, volume=5000, oi=50000)
+    config = StrikeRankingConfig(
+        atm_range=2, max_spread_pct=1.0, min_oi=5000, min_volume=500
+    )
+
+    ranked = rank_strikes(22000.0, [thin, liquid], config)
+
+    assert [r.strike for r in ranked] == [22050]
+
+
 def test_ranked_output_sorted_descending_by_score():
     contracts = [
         _contract(22000, volume=100, oi=1000, ltp=500, option_type=OptionType.CE),

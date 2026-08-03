@@ -301,8 +301,29 @@ def test_list_broker_accounts_requires_login(api_client: TestClient):
 
 
 def test_list_sessions_returns_workspace_sessions_most_recent_first(
-    api_client: TestClient, seeded_admin
+    api_client: TestClient, seeded_admin, engine
 ):
+    # A second BrokerAccount, not a second session on the same one: Batch C
+    # added a "one ACTIVE session per broker account per day" lock in
+    # create_session (a reconciliation false-alarm fix — two ACTIVE sessions
+    # on the same account would each see the other's positions as phantom
+    # mismatches), so two sessions in the same test now need two accounts.
+    # Cleaned up here explicitly since seeded_admin's own teardown only
+    # knows about its one seeded broker_account_id.
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        second_account = BrokerAccount(
+            id=uuid.uuid4(),
+            workspace_id=seeded_admin["workspace_id"],
+            broker_type=BrokerType.SHOONYA,
+            label="qc-test-account-2",
+            credentials_ref="config/credentials/shoonya.env",
+            status=BrokerAccountStatus.ACTIVE,
+        )
+        db.add(second_account)
+        db.commit()
+        second_account_id = second_account.id
+
     api_client.post(
         "/api/v1/auth/login",
         json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
@@ -313,13 +334,26 @@ def test_list_sessions_returns_workspace_sessions_most_recent_first(
     ).json()
     second = api_client.post(
         "/api/v1/sessions",
-        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+        json={"broker_account_id": str(second_account_id)},
     ).json()
 
     response = api_client.get("/api/v1/sessions")
     assert response.status_code == 200
     ids = [row["id"] for row in response.json()]
     assert ids[:2] == [second["id"], first["id"]]
+
+    with session_factory() as cleanup_db:
+        from app.domain.session.models import TradingSession
+
+        # TradingSession before BrokerAccount (FK) — seeded_admin's own
+        # teardown deletes every TradingSession in the workspace too, but
+        # that runs *after* this test function returns, so this account's
+        # own session must be cleared first or this delete 409s on the FK.
+        cleanup_db.query(TradingSession).filter(
+            TradingSession.broker_account_id == second_account_id
+        ).delete()
+        cleanup_db.query(BrokerAccount).filter(BrokerAccount.id == second_account_id).delete()
+        cleanup_db.commit()
 
 
 def test_list_instruments_returns_active_instruments_with_expiry_dates(

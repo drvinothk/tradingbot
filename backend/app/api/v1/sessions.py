@@ -13,7 +13,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
+from app.core.clock import now_ist
 from app.core.db.session import get_db
+from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes import ModeTransitionError, enter_kill_switch
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
@@ -27,7 +29,7 @@ from app.domain.session.models import (
     TransitionTriggerType,
 )
 from app.modules.audit_service.service import record_event
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.reconciliation.service import run_reconciliation
 from app.modules.scheduler.eod_square_off import run_eod_square_off
 
@@ -119,23 +121,59 @@ def create_session(
         # a clean 404.
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Broker account not found")
 
-    defaults = get_settings().risk_defaults
-    trading_session = TradingSession(
-        id=uuid.uuid4(),
-        workspace_id=user.workspace_id,
-        broker_account_id=broker_account.id,
-        started_by_user_id=user.id,
-        mode=SafeMode.PAPER_ONLY,
-        started_at=datetime.now(UTC),
-        budget_amount=body.budget_amount or defaults.default_budget,
-        daily_target_profit=body.daily_target_profit or defaults.daily_target_profit,
-        daily_loss_cap=body.daily_loss_cap or defaults.daily_loss_cap,
-        funding_mode=body.funding_mode,
-    )
-    db.add(trading_session)
-    db.commit()
-    db.refresh(trading_session)
-    return trading_session
+    # "At most one ACTIVE session per broker account, per day" is a
+    # check-then-act, same class of race this codebase always serializes
+    # explicitly (see core/locking.py's docstring) — reused
+    # LOCK_EXECUTION_SINGLETON rather than a new named lock, same reasoning
+    # start_strategy already uses it for "at most one active run per
+    # strategy". This is the actual invariant
+    # reconciliation.service.run_reconciliation's unscoped
+    # broker.get_positions() comparison silently assumes: without it, two
+    # concurrently ACTIVE sessions on the same account would each see the
+    # other's positions as phantom mismatches.
+    #
+    # Scoped to "today" (IST), not "ever": nothing in this codebase
+    # currently transitions TradingSession.status to ENDED (no
+    # end-session action exists yet — session status is set once at
+    # creation and never revisited), so an unscoped ACTIVE check would
+    # permanently block a broker account from ever starting a second
+    # session after its first one, which is a real regression this
+    # session-per-day scoping avoids while still catching the actual
+    # collision case (two sessions genuinely trading the same account on
+    # the same day).
+    today_ist = now_ist().date()
+    with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        existing_active_today = (
+            db.query(TradingSession)
+            .filter(
+                TradingSession.broker_account_id == broker_account.id,
+                TradingSession.status == TradingSessionStatus.ACTIVE,
+            )
+            .all()
+        )
+        if any(s.started_at.date() == today_ist for s in existing_active_today):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "Broker account already has an active trading session today",
+            )
+
+        defaults = get_settings().risk_defaults
+        trading_session = TradingSession(
+            id=uuid.uuid4(),
+            workspace_id=user.workspace_id,
+            broker_account_id=broker_account.id,
+            started_by_user_id=user.id,
+            mode=SafeMode.PAPER_ONLY,
+            started_at=datetime.now(UTC),
+            budget_amount=body.budget_amount or defaults.default_budget,
+            daily_target_profit=body.daily_target_profit or defaults.daily_target_profit,
+            daily_loss_cap=body.daily_loss_cap or defaults.daily_loss_cap,
+            funding_mode=body.funding_mode,
+        )
+        db.add(trading_session)
+        db.commit()
+        db.refresh(trading_session)
+        return trading_session
 
 
 @router.post("/{session_id}/daily-plan", response_model=SessionOut)
@@ -250,7 +288,7 @@ def manual_square_off(
     instead of waiting for real wall-clock IST to cross cutoff_time.
     """
     trading_session = _get_session_or_404(db, user, session_id)
-    outcomes = run_eod_square_off(db, get_broker(), trading_session)
+    outcomes = run_eod_square_off(db, get_execution_broker(trading_session), trading_session)
     db.commit()
     return {"closed_count": len(outcomes)}
 
@@ -267,6 +305,8 @@ def manual_reconcile(
     mismatch), same reasoning as `manual_square_off` above.
     """
     trading_session = _get_session_or_404(db, user, session_id)
-    run = run_reconciliation(db, get_broker(), trading_session, ReconciliationTrigger.EVENT)
+    run = run_reconciliation(
+        db, get_execution_broker(trading_session), trading_session, ReconciliationTrigger.EVENT
+    )
     db.commit()
     return {"mismatches_found": run.mismatches_found, "action_taken": run.action_taken}

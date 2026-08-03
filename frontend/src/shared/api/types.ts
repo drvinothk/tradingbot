@@ -5,7 +5,13 @@
 export type ExecutionMode = 'auto' | 'approval_required'
 export type FundingMode = 'cash' | 'mtf'
 export type StrategyRunStatus = 'scanning' | 'in_position' | 'paused' | 'stopped'
-export type StrategyType = 'synthetic' | 'orb' | 'vwap_pullback' | 'ema_micro_pullback'
+export type StrategyType =
+  | 'synthetic'
+  | 'orb'
+  | 'vwap_pullback'
+  | 'ema_micro_pullback'
+  | 'oi_volume_confirmed'
+  | 'liquidity_sweep_reversal'
 
 export interface UserOut {
   id: string

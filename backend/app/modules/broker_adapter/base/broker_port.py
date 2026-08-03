@@ -21,6 +21,7 @@ from app.modules.broker_adapter.base.contracts import (
     AuthResult,
     DepthSnapshot,
     InstrumentInfo,
+    MarginInfo,
     OptionChainSnapshot,
     OrderRequest,
     OrderResult,
@@ -90,3 +91,8 @@ class BrokerPort(ABC):
 
     @abstractmethod
     def get_positions(self) -> list[Position]: ...
+
+    @abstractmethod
+    def get_margin(self) -> MarginInfo:
+        """Available funds/margin for the account — Risk Service's pre-trade
+        capital check calls this instead of a fixed stub value."""

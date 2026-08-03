@@ -150,6 +150,28 @@ td {
   background: rgba(128, 128, 128, 0.2);
 }
 
+.badge-live {
+  background: rgba(179, 38, 30, 0.2);
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.mode-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.4rem 1.25rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--border);
+  background: rgba(128, 128, 128, 0.08);
+}
+
+.mode-banner-alarm {
+  background: rgba(179, 38, 30, 0.12);
+  color: var(--danger);
+  font-weight: 600;
+}
+
 .page-header {
   display: flex;
   justify-content: space-between;

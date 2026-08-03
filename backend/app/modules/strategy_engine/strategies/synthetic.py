@@ -20,6 +20,7 @@ from datetime import date
 from sqlalchemy.orm import Session
 
 from app.domain.strategy.models import SignalSide, StrategyRun
+from app.modules.strategy_engine.common_rules import compute_stop_target
 from app.modules.strategy_engine.interface import Strategy, TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
@@ -51,8 +52,7 @@ class SyntheticStrategy(Strategy):
 
         top = ranked[0]
         entry_price = top.ltp
-        stop_price = round(entry_price * (1 - STOP_PCT), 2)
-        target_price = round(entry_price * (1 + TARGET_PCT), 2)
+        stop_price, target_price = compute_stop_target(entry_price, STOP_PCT, TARGET_PCT)
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

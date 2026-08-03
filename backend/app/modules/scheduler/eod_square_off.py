@@ -1,9 +1,19 @@
-"""EOD forced square-off — the mandatory end-of-day flatten, regardless of
-where price currently sits relative to a position's stop/target. Called by
-`PositionManager` once IST wall-clock passes `trading_session.cutoff_time`
-(see `app.core.clock.now_ist`), and safe to call repeatedly: a session with
-no open positions is a no-op, and `close_position` itself no-ops on an
-already-closed position.
+"""Forced square-off — closes every open position for a session regardless
+of where price currently sits relative to its stop/target. Two callers share
+`_square_off_all_open_positions`, differing only in `ExitReason`:
+
+- `run_eod_square_off`: the mandatory end-of-day flatten, called by
+  `PositionManager` once IST wall-clock passes `trading_session.cutoff_time`
+  (see `app.core.clock.now_ist`).
+- `run_margin_breach_square_off`: the Addendum hardening batch's one narrow
+  automatic emergency-square-off trigger — a detected negative available
+  margin on a guarded-live/live session (see `PositionManager._run_cycle`).
+  Deliberately *not* triggered by connectivity loss, reconciliation lag, or
+  anything else — kill-switch stays freeze-and-alert by design; this is a
+  separate, additional control.
+
+Both are safe to call repeatedly: a session with no open positions is a
+no-op, and `close_position` itself no-ops on an already-closed position.
 """
 
 from __future__ import annotations
@@ -17,8 +27,8 @@ from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.execution_engine.paper.service import close_position
 
 
-def run_eod_square_off(
-    db: Session, broker: BrokerPort, trading_session: TradingSession
+def _square_off_all_open_positions(
+    db: Session, broker: BrokerPort, trading_session: TradingSession, exit_reason: ExitReason
 ) -> list[TradeOutcome]:
     open_positions = (
         db.query(Position)
@@ -36,8 +46,20 @@ def run_eod_square_off(
             continue
         tick = broker.get_quote(option_contract.symbol)
         outcome = close_position(
-            db, trading_session, position, ExitReason.EOD_SQUARE_OFF, tick.ltp, broker=broker
+            db, trading_session, position, exit_reason, tick.ltp, broker=broker
         )
         if outcome is not None:
             outcomes.append(outcome)
     return outcomes
+
+
+def run_eod_square_off(
+    db: Session, broker: BrokerPort, trading_session: TradingSession
+) -> list[TradeOutcome]:
+    return _square_off_all_open_positions(db, broker, trading_session, ExitReason.EOD_SQUARE_OFF)
+
+
+def run_margin_breach_square_off(
+    db: Session, broker: BrokerPort, trading_session: TradingSession
+) -> list[TradeOutcome]:
+    return _square_off_all_open_positions(db, broker, trading_session, ExitReason.MARGIN_BREACH)

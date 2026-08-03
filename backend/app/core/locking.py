@@ -6,6 +6,25 @@ concurrent writers, not just relying on transaction isolation).
 
 Named locks are mapped to a stable bigint via hashing the name — Postgres
 advisory locks are keyed by integers, not strings.
+
+**`advisory_lock()` uses transaction-scoped locks (`pg_advisory_xact_lock`),
+not session-scoped.** A real incident (found live during Phase 7's browser
+verification) is why: `SQLAlchemy Session.commit()` releases the connection
+back to the pool, and any `db.execute()` call after a `commit()` — including
+the `finally: pg_advisory_unlock(...)` a session-scoped lock needs — can get
+handed a *different* physical connection than the one that acquired the
+lock. `pg_advisory_unlock` on the wrong connection silently returns `false`
+(no error), while the original connection goes back into the pool still
+holding the lock, forever, invisible to any per-request diagnostic. Several
+call sites (`start_strategy`, `approve_trade_approval`,
+`reject_trade_approval`, `create_session`) call `db.commit()` while still
+inside a `with advisory_lock(...)` block — by design, since the check-then-
+act sequence they guard needs to be durable *before* the lock releases, not
+after. `pg_advisory_xact_lock` has no separate unlock call at all: release is
+automatic, tied to whatever connection the transaction commits or rolls back
+on, which makes this whole leak class structurally impossible rather than
+just less likely. See `docs/architecture/build-plan.md`'s Phase 7 section for
+the full root-cause writeup.
 """
 
 from __future__ import annotations
@@ -33,7 +52,22 @@ LOCK_AUDIT_CHAIN = "audit_chain"
 # backend process accidentally started alongside the first (e.g. the Windows
 # Service already running plus someone launching it manually) fails fast at
 # startup instead of both processes believing they're the sole engine.
+# Deliberately NOT converted to a transaction-scoped lock like the three
+# above — it must outlive any single transaction, so it keeps the
+# session-scoped, dedicated-connection pattern in app.main instead (a raw
+# engine.connect() held open for the process lifetime, never returned to the
+# pool, so the leak class above doesn't apply to it).
 LOCK_PROCESS_SINGLETON = "engine_process_singleton"
+
+# How long a caller will wait to acquire any of the transaction-scoped locks
+# below before failing loudly, rather than blocking forever — defense in
+# depth against any future stuck-lock scenario, confirmed or not: a fast,
+# diagnosable OperationalError beats a silent hang in a live trading system.
+# Callers aren't expected to catch this specifically; PositionManager's own
+# `_loop` already logs-and-retries-next-cycle on any uncaught exception, and
+# API endpoints surface it as a 500 — a clean typed exception/HTTP mapping is
+# a reasonable future refinement, not required for the leak fix itself.
+LOCK_ACQUIRE_TIMEOUT = "10s"
 
 
 def _lock_key(name: str) -> int:
@@ -43,17 +77,24 @@ def _lock_key(name: str) -> int:
 
 @contextmanager
 def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
-    """Session-level advisory lock, held for the lifetime of the `with` block
-    on the given SQLAlchemy Session's underlying connection. Blocks until
-    acquired — callers needing a non-blocking attempt should use
-    try_advisory_lock instead.
+    """Transaction-scoped advisory lock — released automatically at whatever
+    commit or rollback ends the current transaction on `db`'s connection, not
+    at the `with` block's own exit (see this module's docstring for why).
+    Reentrant within one transaction (a second acquisition of the same key by
+    the same session/transaction is a fast no-op), same as the session-scoped
+    primitive it replaced. Blocks until acquired, bounded by
+    `LOCK_ACQUIRE_TIMEOUT` — callers needing a non-blocking attempt should use
+    try_advisory_lock instead (session-scoped; only `LOCK_PROCESS_SINGLETON`
+    uses it, see that constant's own docstring for why it's different).
     """
     key = _lock_key(name)
-    db.execute(text("SELECT pg_advisory_lock(:key)"), {"key": key})
-    try:
-        yield
-    finally:
-        db.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": key})
+    # SET LOCAL doesn't accept bind parameters in Postgres (it's a utility
+    # statement, not DML) — safe to inline here since LOCK_ACQUIRE_TIMEOUT is
+    # a fixed internal constant, never user input. Transaction-scoped, same
+    # as the lock itself, so it reverts automatically at commit/rollback.
+    db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_ACQUIRE_TIMEOUT}'"))
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+    yield
 
 
 def try_advisory_lock(db: Session, name: str) -> bool:

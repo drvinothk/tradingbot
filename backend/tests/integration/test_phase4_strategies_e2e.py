@@ -1,10 +1,11 @@
-"""End-to-end proof of Phase 4's "done when": ORB, VWAP Pullback, and EMA
-Micro-pullback each run on the real `StrategyRunner` (not just `check_setup`
-in isolation, which test_orb_strategy.py/test_vwap_pullback_strategy.py/
-test_ema_micro_pullback_strategy.py already cover) through the unchanged
-Signal -> TradeIntent -> RiskDecision -> dispatch pipeline, concurrently,
-across more than one trading_session, in a mix of auto and
-approval-required execution mode.
+"""End-to-end proof of Phase 4's "done when" (ORB, VWAP Pullback, EMA
+Micro-pullback), extended in Phase 7 to also cover OI/Volume Confirmed and
+Liquidity Sweep/Reversal per *that* phase's own "done when": all five run
+on the real `StrategyRunner` (not just `check_setup` in isolation, which
+each strategy's own dedicated test file already covers) through the
+unchanged Signal -> TradeIntent -> RiskDecision -> dispatch pipeline,
+concurrently, across more than one trading_session, in a mix of auto and
+approval-required execution mode, with no regression to the original three.
 
 Uses its own fully real-committed fixture data via `real_commit_factory`
 (background threads need real commits visible across connections — the
@@ -66,6 +67,10 @@ from app.domain.strategy.models import (
 from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME
 from app.modules.strategy_engine.runner import StrategyRunner
 from app.modules.strategy_engine.strategies.ema_micro_pullback import EMAMicroPullbackStrategy
+from app.modules.strategy_engine.strategies.liquidity_sweep_reversal import (
+    LiquiditySweepReversalStrategy,
+)
+from app.modules.strategy_engine.strategies.oi_volume_confirmed import OIVolumeConfirmedStrategy
 from app.modules.strategy_engine.strategies.orb import ORBStrategy
 from app.modules.strategy_engine.strategies.vwap_pullback import VWAPPullbackStrategy
 
@@ -175,7 +180,33 @@ def _seed_ema_pullback(db, instrument: Instrument) -> None:
     _seed_bar(db, instrument, base + timedelta(minutes=1), o=22010, h=22030, l=22008, c=22025)
 
 
-def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
+def _seed_oivol_breakout(db, instrument: Instrument) -> None:
+    """5-bar rolling window flat at [21950, 22050] (OIVolumeConfirmedStrategy's
+    default lookback_bars=5), then a bar closing above it."""
+    base = datetime(2026, 7, 24, 11, 0, tzinfo=UTC)
+    mid = 22000.0
+    _seed_bar(db, instrument, base, o=mid, h=22050.0, l=mid - 5, c=mid)
+    _seed_bar(db, instrument, base + timedelta(minutes=1), o=mid, h=mid + 5, l=21950.0, c=mid)
+    for i in range(2, 5):
+        _seed_bar(db, instrument, base + timedelta(minutes=i), o=mid, h=mid + 5, l=mid - 5, c=mid)
+    _seed_bar(db, instrument, base + timedelta(minutes=5), o=22050, h=22080, l=22045, c=22070)
+
+
+def _seed_liquidity_sweep(db, instrument: Instrument) -> None:
+    """10-bar rolling window flat at [21950, 22050]
+    (LiquiditySweepReversalStrategy's default lookback_bars=10), then a bar
+    that sweeps the window high but closes back inside it -> bearish
+    reversal (PE)."""
+    base = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
+    mid = 22000.0
+    _seed_bar(db, instrument, base, o=mid, h=22050.0, l=mid - 5, c=mid)
+    _seed_bar(db, instrument, base + timedelta(minutes=1), o=mid, h=mid + 5, l=21950.0, c=mid)
+    for i in range(2, 10):
+        _seed_bar(db, instrument, base + timedelta(minutes=i), o=mid, h=mid + 5, l=mid - 5, c=mid)
+    _seed_bar(db, instrument, base + timedelta(minutes=10), o=22030, h=22070, l=22020, c=22040)
+
+
+def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     real_commit_factory,
 ):
     ids: dict[str, list[uuid.UUID] | uuid.UUID] = {}
@@ -230,7 +261,7 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
             # breaking) another's pattern-matching in this test.
             instruments = {}
             option_contracts = {}
-            for tag in ("orb", "vwap", "ema"):
+            for tag in ("orb", "vwap", "ema", "oivol", "sweep"):
                 inst = Instrument(
                     id=uuid.uuid4(), symbol=f"NIFTY-{tag.upper()}-E2E", exchange="NFO",
                     lot_size=25, tick_size=0.05,
@@ -264,14 +295,24 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
                     id=uuid.uuid4(), workspace_id=workspace.id, name="ema-e2e",
                     strategy_type="ema_micro_pullback",
                 ),
+                "oivol": StrategyConfig(
+                    id=uuid.uuid4(), workspace_id=workspace.id, name="oivol-e2e",
+                    strategy_type="oi_volume_confirmed",
+                ),
+                "sweep": StrategyConfig(
+                    id=uuid.uuid4(), workspace_id=workspace.id, name="sweep-e2e",
+                    strategy_type="liquidity_sweep_reversal",
+                ),
             }
             db.add_all(strategy_configs.values())
             db.flush()
             ids["strategy_config_ids"] = [c.id for c in strategy_configs.values()]
 
             # orb: auto mode, session_a. vwap: approval-required, session_a.
-            # ema: auto mode, session_b — two strategies in one session, one
-            # in another, satisfying "across multiple sessions".
+            # ema: auto mode, session_b. sweep: auto mode, session_a. oivol:
+            # approval-required, session_b — three strategies in one
+            # session, two in another, mixed auto/approval-required
+            # throughout, satisfying "across multiple sessions".
             strategy_runs = {
                 "orb": StrategyRun(
                     id=uuid.uuid4(), strategy_config_id=strategy_configs["orb"].id,
@@ -291,6 +332,18 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
                     status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
                     started_by_user_id=user.id,
                 ),
+                "sweep": StrategyRun(
+                    id=uuid.uuid4(), strategy_config_id=strategy_configs["sweep"].id,
+                    trading_session_id=session_a.id, execution_mode=ExecutionMode.AUTO,
+                    status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
+                    started_by_user_id=user.id,
+                ),
+                "oivol": StrategyRun(
+                    id=uuid.uuid4(), strategy_config_id=strategy_configs["oivol"].id,
+                    trading_session_id=session_b.id, execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+                    status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
+                    started_by_user_id=user.id,
+                ),
             }
             db.add_all(strategy_runs.values())
             db.flush()
@@ -299,6 +352,8 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
             _seed_orb_breakout(db, instruments["orb"], strategy_runs["orb"].started_at)
             _seed_vwap_pullback(db, instruments["vwap"])
             _seed_ema_pullback(db, instruments["ema"])
+            _seed_oivol_breakout(db, instruments["oivol"])
+            _seed_liquidity_sweep(db, instruments["sweep"])
 
             # Captured as plain UUIDs before this session commits/closes —
             # reading ORM attributes off these objects afterward would raise
@@ -310,6 +365,8 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
             "orb": ORBStrategy(instrument_ids_by_tag["orb"], EXPIRY),
             "vwap": VWAPPullbackStrategy(instrument_ids_by_tag["vwap"], EXPIRY),
             "ema": EMAMicroPullbackStrategy(instrument_ids_by_tag["ema"], EXPIRY),
+            "oivol": OIVolumeConfirmedStrategy(instrument_ids_by_tag["oivol"], EXPIRY),
+            "sweep": LiquiditySweepReversalStrategy(instrument_ids_by_tag["sweep"], EXPIRY),
         }
         for tag, strategy in strategies.items():
             runner = StrategyRunner(
@@ -357,13 +414,37 @@ def test_three_strategies_run_concurrently_across_two_sessions_mixed_modes(
             )
             assert ema_intent.status == TradeIntentStatus.DISPATCHED
 
+            sweep_intent = (
+                verify_db.query(TradeIntent)
+                .filter(TradeIntent.strategy_run_id == strategy_run_ids_by_tag["sweep"])
+                .one()
+            )
+            assert sweep_intent.status == TradeIntentStatus.DISPATCHED
+
+            oivol_intent = (
+                verify_db.query(TradeIntent)
+                .filter(TradeIntent.strategy_run_id == strategy_run_ids_by_tag["oivol"])
+                .one()
+            )
+            assert oivol_intent.status == TradeIntentStatus.PENDING_APPROVAL
+            oivol_approval = (
+                verify_db.query(PendingTradeApproval)
+                .filter(PendingTradeApproval.trade_intent_id == oivol_intent.id)
+                .one()
+            )
+            assert oivol_approval.status == ApprovalStatus.PENDING
+
             orb_run = verify_db.get(StrategyRun, strategy_run_ids_by_tag["orb"])
             vwap_run = verify_db.get(StrategyRun, strategy_run_ids_by_tag["vwap"])
             ema_run = verify_db.get(StrategyRun, strategy_run_ids_by_tag["ema"])
+            sweep_run = verify_db.get(StrategyRun, strategy_run_ids_by_tag["sweep"])
+            oivol_run = verify_db.get(StrategyRun, strategy_run_ids_by_tag["oivol"])
             assert orb_run.status == StrategyRunStatus.IN_POSITION
-            # vwap never dispatched (still pending approval) -> no Position yet.
+            # vwap/oivol never dispatched (still pending approval) -> no Position yet.
             assert vwap_run.status == StrategyRunStatus.SCANNING
             assert ema_run.status == StrategyRunStatus.IN_POSITION
+            assert sweep_run.status == StrategyRunStatus.IN_POSITION
+            assert oivol_run.status == StrategyRunStatus.SCANNING
     finally:
         for runner in runners:
             runner.stop()

@@ -109,6 +109,11 @@ class ExitReason(enum.StrEnum):
     # distinct from STRUCTURE_BREAK (a liquidity problem, not a setup
     # invalidation) so reports/scorecards can tell the two apart.
     SPREAD_BLOWOUT = "spread_blowout"
+    # Emergency square-off's one narrow automatic trigger (Addendum
+    # hardening batch) — a detected negative available margin on a
+    # guarded-live/live session, distinct from EOD_SQUARE_OFF so
+    # reports can tell a scheduled flatten from a forced one apart.
+    MARGIN_BREACH = "margin_breach"
 
 
 class Order(Base, UUIDPkMixin):

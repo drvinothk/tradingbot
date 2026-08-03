@@ -7,7 +7,7 @@ wired in later via a credentials file.
 
 **Full build plan (architecture, schema, phase-by-phase spec): [docs/architecture/build-plan.md](docs/architecture/build-plan.md) — read this first for any non-trivial change.**
 
-## Status: Phase 0-4 + frontend complete, Phase 5 in progress
+## Status: Phase 0-4 + frontend + Phase 7 complete; Phase 5 in progress (Phase 6 blocked on it)
 
 - ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
   operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
@@ -91,11 +91,32 @@ wired in later via a credentials file.
   mocked HTTP/WS responses — all still **researched, not live-verified**:
   no Shoonya account existed to test any of it against a real session.
   What's left is exactly that: real credentials, then a live OAuth login and
-  a paper-mode soak per the build plan's "done when." Full spec, the
-  specific unverified assumptions to check first, and two real bugs found
-  along the way (a `MockBrokerAdapter` background-thread race that could
-  leave a stray `QuoteTick` after test cleanup, confirmed rate-limiter
-  numbers) in the build plan under "Phase 5".
+  a paper-mode soak per the build plan's "done when" — **which now also
+  includes the paper-vs-live signal-comparison check added in the build
+  plan's "Addendum" section**, not just stable reconnects + an empty-position
+  reconciliation dry-run. Full spec, the specific unverified assumptions to
+  check first, and two real bugs found along the way (a `MockBrokerAdapter`
+  background-thread race that could leave a stray `QuoteTick` after test
+  cleanup, confirmed rate-limiter numbers) in the build plan under "Phase 5".
+- ✅ **Phase 7** — Strategies 4 & 5 (OI/Volume Confirmed, Liquidity
+  Sweep/Reversal), built out of order ahead of Phase 6 since neither needs
+  Shoonya — both paper-only, against the mock broker, five of six
+  strategies now live. OI/Volume Confirmed's "confirmed" half lives in a
+  new chain-participation-weighted `StrikeRankingConfig` mode
+  (`min_oi`/`min_volume` hard floor + doubled OI/volume score weights), not
+  a temporal OI-buildup signal — deliberately, since
+  `record_option_chain_snapshot` is only ever called once per run
+  (`start_strategy` time) and a delta-based design would never fire in
+  real operation. That single-snapshot-per-run gap is real and affects
+  every strategy's ranking freshness, not just this one — flagged, not
+  fixed, see the build plan's Phase 7 amendments. Liquidity Sweep/Reversal
+  is a genuine break-and-reverse pattern (wicks beyond a rolling level,
+  closes back inside it), sharing ORB's new `compute_range_high_low`
+  helper but not Batch E's `touch_and_confirm` (different shape, same
+  "don't force a shared helper across a real behavioral difference"
+  reasoning that also kept `structure_level` strategy-owned there). Full
+  design reasoning and the extended 5-strategy concurrency e2e proof in
+  the build plan under "Phase 7 amendments".
 
 QC passes were done after Phases 1, 2, 3, and 4 (see git log) that each found
 and fixed several real bugs — worth reading `git log -p` on those commits if
@@ -226,16 +247,37 @@ check, then exercise it live).
   a test-owned `broker=`) from unit/integration tests, and auto-starting a real
   background thread there would spawn one per test run polling the *production*
   DB via `PositionManager`'s default `session_scope`.
-- **Postgres session-level advisory locks are reentrant per session**: a second
-  `pg_advisory_lock(key)` call for a key the same session already holds returns
-  immediately and just increments an internal count (must be unlocked the same
-  number of times). This is what makes it safe for `dispatch_trade_intent`/
-  `close_position` (holding `LOCK_EXECUTION_SINGLETON`) to run an event-triggered
-  reconciliation pass that can itself call `transition_mode` (which acquires the
-  *same* lock) without deadlocking — but this only holds because nothing in this
+- **`LOCK_EXECUTION_SINGLETON`/`LOCK_RISK_EVALUATION_QUEUE`/`LOCK_AUDIT_CHAIN`
+  are transaction-scoped advisory locks (`pg_advisory_xact_lock`), not
+  session-scoped** — changed after a real incident: session-scoped locks
+  (`pg_advisory_lock`/`pg_advisory_unlock`) leak permanently the moment any
+  caller commits while still holding one, because `SQLAlchemy Session.commit()`
+  releases the connection back to the pool, and the `finally: pg_advisory_unlock`
+  a session-scoped lock needs can then run on a *different* pooled connection
+  than the one that acquired it — it silently no-ops, and the original
+  connection goes back into the pool still holding the lock forever. Found
+  live during Phase 7's browser verification (every `POST /strategies/{id}/start`
+  started hanging after a few minutes of real multi-strategy traffic); full
+  root-cause writeup in `docs/architecture/build-plan.md`'s Phase 7 section
+  and `core/locking.py`'s own module docstring. Transaction-scoped locks have
+  no separate unlock call — release is automatic at whatever commit/rollback
+  ends the transaction — making the leak structurally impossible. Reentrancy
+  is preserved: a second acquisition of the same key by the same
+  session/transaction is still a fast no-op, same as before, which is what
+  keeps `dispatch_trade_intent`/`close_position` (holding
+  `LOCK_EXECUTION_SINGLETON`) safe to run an event-triggered reconciliation
+  pass that can itself call `transition_mode` (which acquires the *same*
+  lock) without deadlocking — but this only holds because nothing in this
   codebase ever acquires `LOCK_RISK_EVALUATION_QUEUE` before
   `LOCK_EXECUTION_SINGLETON`; keep that ordering invariant if you add a new
-  call path that touches both.
+  call path that touches both. One real behavior change from this fix: a
+  lock acquired now stays held until whatever *outer* transaction eventually
+  commits, not just the `with advisory_lock(...)` block's own scope — a
+  reduction in concurrency, not a correctness issue, consistent with this
+  system's own low trade-volume governance. `LOCK_PROCESS_SINGLETON` is
+  unaffected — it deliberately keeps the session-scoped, dedicated-connection
+  pattern (a raw connection held open for the process lifetime, never
+  returned to the pool), since it must outlive any single transaction.
 - **A broker connection is a single shared stream, not one per instrument.**
   `BrokerPort.subscribe_quotes`'s own docstring says so ("Shoonya only
   supports one connection per session"), and `MockBrokerAdapter` reflects that
@@ -331,13 +373,56 @@ check, then exercise it live).
   produces, a broker auth failure is correctly just logged, not escalated
   — confirmed by two new tests (`test_position_manager.py`) for both the
   guarded-live case (does transition) and the paper-only case (doesn't).
-- **No periodic Scheduler health-check loop exists for anything** — NTP/
-  disk checks (`core/clock.py`) and now broker auth failures are each
-  checked only where something else already polls (once at startup; every
-  `PositionManager` cycle). A real "Scheduler runs checks on a timer and
-  reacts" loop, as `core/clock.py`'s own docstring has described since
-  Phase 0, still doesn't exist. Pre-existing gap, not Shoonya-specific;
-  surfaced clearly while scoping the item above.
+- ~~No periodic Scheduler health-check loop exists for anything~~ — **done
+  this session** for NTP/disk: `scheduler/health_check.py`'s
+  `HealthCheckScheduler`, a 5-minute background timer (same thread shape as
+  `PositionManager`, started/stopped from `app.main`'s lifespan) that now
+  reacts to a failing `core/clock.py` check by moving any
+  `paper_plus_guarded_live`/`live_enabled` session to `degraded_mode` and
+  writing a `SystemAlert`, not just logging. Broker auth failures are still
+  only checked per-`PositionManager`-cycle, not by this new timer loop —
+  that specific wiring (named in `ShoonyaBrokerAdapter`'s own docstring as
+  "the next concrete step") remains open, distinct from the health-check
+  loop's existence which is now done. Full design in
+  `docs/architecture/build-plan.md`'s Addendum section.
+- ~~🔴 `LOCK_EXECUTION_SINGLETON` can get stuck held forever on a pooled
+  connection~~ — **fixed.** Found during Phase 7's own browser verification
+  (three strategies running against one session; every subsequent
+  `POST /strategies/{id}/start` hung indefinitely after a few minutes).
+  Root cause fully confirmed afterward (live `pg_locks`/`pg_stat_activity`
+  diagnostics + a systematic audit of all 9 call sites of
+  `LOCK_EXECUTION_SINGLETON`/`LOCK_RISK_EVALUATION_QUEUE`/`LOCK_AUDIT_CHAIN`
+  + external research into the identical documented bug in other projects):
+  `SQLAlchemy Session.commit()` releases the connection back to the pool,
+  so any `db.execute()` after a `commit()` — including the old
+  `finally: pg_advisory_unlock(...)` a session-scoped lock needs — could
+  land on a *different* pooled connection than the one that acquired the
+  lock. The unlock silently no-ops on the wrong connection; the original
+  connection returns to the pool still holding the lock, forever, invisible
+  to any per-request diagnostic. Latent since Phase 4
+  (`approve_trade_approval`/`reject_trade_approval` both commit while still
+  holding the lock, by design), never triggered before because nothing had
+  exercised real concurrent connection-pool churn this hard until Phase 7's
+  live multi-strategy test. **Fixed by converting `LOCK_EXECUTION_SINGLETON`,
+  `LOCK_RISK_EVALUATION_QUEUE`, and `LOCK_AUDIT_CHAIN` from session-scoped
+  (`pg_advisory_lock`/`pg_advisory_unlock`) to transaction-scoped
+  (`pg_advisory_xact_lock`)** in `core/locking.py` — release is now
+  automatic, tied to whatever connection the transaction commits or rolls
+  back on, making this leak class structurally impossible. Added a
+  `lock_timeout` alongside it as defense in depth (any future stuck
+  acquisition fails loud within 10s instead of hanging silently).
+  `LOCK_PROCESS_SINGLETON` was deliberately left unchanged (a different,
+  already-correct dedicated-connection pattern). Regression tests in
+  `tests/integration/test_locking.py` prove the exact leak mechanism
+  deterministically (two raw connections, lock on one, unlock-attempt on
+  the other — confirmed still held), confirm reentrancy and cross-session
+  mutual exclusion are preserved, and exercise concurrent `start_strategy`
+  calls end-to-end. Live-reproduced the original failure against the fix
+  (four strategies started concurrently against one session, `PositionManager`s
+  cycling every 1-3s for 2+ minutes, zero locks ever caught held in
+  `pg_locks`, a fourth strategy start completed in 0.1s where it used to
+  hang forever) — see `docs/architecture/build-plan.md`'s Phase 7 section
+  for the full root-cause writeup.
 - ~~Frontend has no "Connect Shoonya" button~~ — done this session: the
   Sessions page has a connection-status card + "Connect Shoonya" button
   (`frontend/src/features/sessions/SessionsPage.tsx`) that opens
@@ -348,6 +433,39 @@ check, then exercise it live).
   comment), so the button silently 404'd against Vite's own dev server
   instead of ever reaching the backend. Added a matching `/shoonya` proxy
   rule.
+- ~~Addendum hardening batch (get_margin, metric_series + health-check
+  loop, emergency square-off, DB backup/restore)~~ — **done this session.**
+  Four Shoonya-independent gaps from the build plan's Addendum section, all
+  implemented, tested (279/279 backend tests pass, `ruff`/`mypy` clean),
+  and live-verified: `BrokerPort.get_margin` (+ `MockBrokerAdapter`/Shoonya
+  implementations + real Risk Service wiring, replacing the old
+  `capital_required > 0` stub), `metric_series` + `GET /metrics` + the
+  periodic health-check loop (verified by hitting the live endpoint after
+  a real scheduler cycle), the margin-breach emergency-square-off
+  auto-trigger (`PositionManager._check_margin_breach`, `ExitReason
+  .MARGIN_BREACH`), and `ops/scripts/backup_db.ps1`/`restore_db.ps1` (the
+  restore drill was actually run against a throwaway DB, row counts
+  verified against the source, not just scripted). Two scope corrections
+  found during planning, both recorded in the build plan's Addendum: the
+  manual "exit all" square-off button and EOD auto-square-off already
+  existed from Phase 3 (only the margin-breach trigger was new), and
+  `ShoonyaBrokerAdapter`'s own docstring had already anticipated the
+  health-check loop as the natural next step for wiring in its error
+  taxonomy. Full design reasoning in `docs/architecture/build-plan.md`'s
+  Addendum section (each item now struck through there).
+- ~~`GET /audit/verify` reports `intact: false` on this dev database~~ —
+  **root-caused and fixed this session.** A live integration QC pass run
+  after the Addendum batch above found two historical chain-*link* forks
+  (seq 470, seq 489 — every row's own hash is independently valid, only
+  two `prev_hash` pointers are stale), both from before the transaction-
+  scoped `LOCK_AUDIT_CHAIN` fix and the same root cause as the documented
+  `LOCK_EXECUTION_SINGLETON` incident above. A full scan confirmed zero new
+  forks since, across real concurrent load. Since a hash chain can't be
+  repaired without defeating its own purpose, `verify_chain`/
+  `GET /audit/verify` gained an optional `since_seq` checkpoint parameter
+  instead — `GET /audit/verify?since_seq=489` reports `intact: true` on
+  this database today, verified live. Full write-up in
+  `docs/architecture/build-plan.md`'s Addendum section.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
   `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
   Phase 3's changes are uncommitted in the working tree as of this note — check

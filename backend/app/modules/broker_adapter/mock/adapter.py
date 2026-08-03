@@ -22,6 +22,7 @@ from app.modules.broker_adapter.base.contracts import (
     DepthLevel,
     DepthSnapshot,
     InstrumentInfo,
+    MarginInfo,
     OptionChainEntry,
     OptionChainSnapshot,
     OptionType,
@@ -31,6 +32,12 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     Tick,
 )
+
+# Generous synthetic funds — paper mode should never be capital-constrained by
+# a fake margin figure; this exists purely so the DTO is populated, not to
+# model real margin math (see MTF_STUB_LEVERAGE_FACTOR's own docstring in
+# risk_engine/service.py for the equivalent reasoning on the leverage side).
+_SYNTHETIC_TOTAL_MARGIN = 10_000_000.0
 
 
 def _utcnow() -> datetime:
@@ -265,3 +272,12 @@ class MockBrokerAdapter(BrokerPort):
 
     def get_positions(self) -> list[Position]:
         return [p for p in self._positions.values() if p.qty != 0]
+
+    def get_margin(self) -> MarginInfo:
+        used = sum(abs(p.qty) * p.avg_price for p in self._positions.values() if p.qty != 0)
+        return MarginInfo(
+            available_margin=_SYNTHETIC_TOTAL_MARGIN - used,
+            used_margin=used,
+            total_margin=_SYNTHETIC_TOTAL_MARGIN,
+            ts=_utcnow(),
+        )

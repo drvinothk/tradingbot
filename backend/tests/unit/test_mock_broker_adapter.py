@@ -153,3 +153,25 @@ def test_unknown_order_id_raises():
     api = MockBrokerAdapter(instruments=_instruments(), seed=17)
     with pytest.raises(KeyError):
         api.get_order_status("does-not-exist")
+
+
+def test_get_margin_reflects_open_positions():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=19)
+    baseline = api.get_margin()
+    assert baseline.used_margin == 0.0
+    assert baseline.available_margin == baseline.total_margin
+
+    api.place_order(
+        OrderRequest(
+            idempotency_key="margin-buy-1",
+            contract_symbol="NIFTY30JUL26C24000",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            qty=25,
+            limit_price=100.0,
+        )
+    )
+    after_buy = api.get_margin()
+    assert after_buy.used_margin == pytest.approx(25 * 100.0)
+    expected_available = after_buy.total_margin - after_buy.used_margin
+    assert after_buy.available_margin == pytest.approx(expected_available)

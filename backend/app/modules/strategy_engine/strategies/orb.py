@@ -26,11 +26,14 @@ from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    compute_range_high_low,
+    compute_stop_target,
     get_recent_completed_bars,
 )
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
+    pick_top_by_type,
     rank_from_latest_snapshot,
 )
 
@@ -74,8 +77,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         if not or_bars:
             return None
 
-        or_high = max(float(b.high) for b in or_bars)
-        or_low = min(float(b.low) for b in or_bars)
+        or_high, or_low = compute_range_high_low(or_bars)
         close = float(latest_bar.close)
 
         if close > or_high and OptionType.CE not in self._fired_directions:
@@ -88,15 +90,14 @@ class ORBStrategy(ConfirmationFilterStrategy):
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
         )
-        top = next((r for r in ranked if r.option_type == option_type), None)
+        top = pick_top_by_type(ranked, option_type)
         if top is None:
             return None
 
         self._fired_directions.add(option_type)
 
         entry_price = top.ltp
-        stop_price = round(entry_price * (1 - self.stop_pct), 2)
-        target_price = round(entry_price * (1 + self.target_pct), 2)
+        stop_price, target_price = compute_stop_target(entry_price, self.stop_pct, self.target_pct)
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

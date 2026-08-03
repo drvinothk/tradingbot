@@ -18,12 +18,15 @@ from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    compute_stop_target,
     get_latest_indicator_value,
     get_recent_completed_bars,
+    touch_and_confirm,
 )
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
+    pick_top_by_type,
     rank_from_latest_snapshot,
 )
 
@@ -64,21 +67,10 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         if vwap is None:
             return None
 
-        band = vwap * self.pullback_tolerance_frac
-        close = float(latest_bar.close)
-
-        # "Touched" means the pullback bar's extreme landed within `band` of
-        # VWAP — either just above or just below it (testing it as
-        # support/resistance) — not merely "somewhere below/above VWAP",
-        # which would also match a bar that blew straight through it.
-        touched_from_above = abs(float(prev_bar.low) - vwap) <= band
-        bullish_confirmation = close > float(prev_bar.high) and close > vwap
-        touched_from_below = abs(float(prev_bar.high) - vwap) <= band
-        bearish_confirmation = close < float(prev_bar.low) and close < vwap
-
-        if touched_from_above and bullish_confirmation:
+        direction = touch_and_confirm(prev_bar, latest_bar, vwap, self.pullback_tolerance_frac)
+        if direction == "bullish":
             option_type, structure_level = OptionType.CE, float(prev_bar.low)
-        elif touched_from_below and bearish_confirmation:
+        elif direction == "bearish":
             option_type, structure_level = OptionType.PE, float(prev_bar.high)
         else:
             return None
@@ -86,13 +78,12 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
         )
-        top = next((r for r in ranked if r.option_type == option_type), None)
+        top = pick_top_by_type(ranked, option_type)
         if top is None:
             return None
 
         entry_price = top.ltp
-        stop_price = round(entry_price * (1 - self.stop_pct), 2)
-        target_price = round(entry_price * (1 + self.target_pct), 2)
+        stop_price, target_price = compute_stop_target(entry_price, self.stop_pct, self.target_pct)
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

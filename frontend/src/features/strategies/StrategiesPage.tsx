@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
 import { api, ApiError } from '../../shared/api/client'
+import { useSessions } from '../../shared/hooks/useSessions'
+import { useStrategies } from '../../shared/hooks/useStrategies'
 import type {
   ExecutionMode,
   InstrumentOut,
@@ -10,7 +12,14 @@ import type {
   StrategyType,
 } from '../../shared/api/types'
 
-const STRATEGY_TYPES: StrategyType[] = ['synthetic', 'orb', 'vwap_pullback', 'ema_micro_pullback']
+const STRATEGY_TYPES: StrategyType[] = [
+  'synthetic',
+  'orb',
+  'vwap_pullback',
+  'ema_micro_pullback',
+  'oi_volume_confirmed',
+  'liquidity_sweep_reversal',
+]
 
 export function StrategiesPage() {
   const queryClient = useQueryClient()
@@ -18,14 +27,8 @@ export function StrategiesPage() {
   const [startError, setStartError] = useState<string | null>(null)
   const [startedRuns, setStartedRuns] = useState<Record<string, StrategyRunOut>>({})
 
-  const strategiesQuery = useQuery({
-    queryKey: ['strategies'],
-    queryFn: () => api.get<StrategyConfigOut[]>('/strategies'),
-  })
-  const sessionsQuery = useQuery({
-    queryKey: ['sessions'],
-    queryFn: () => api.get<SessionOut[]>('/sessions'),
-  })
+  const strategiesQuery = useStrategies()
+  const sessionsQuery = useSessions()
   const instrumentsQuery = useQuery({
     queryKey: ['instruments'],
     queryFn: () => api.get<InstrumentOut[]>('/instruments'),

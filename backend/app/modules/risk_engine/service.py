@@ -28,6 +28,7 @@ actual fill instead of a random P&L.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -62,6 +63,10 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.base.errors import BrokerError
+from app.modules.broker_adapter.composition import get_execution_broker
+
+logger = logging.getLogger("app.risk_engine")
 
 # Stub only — no real broker margin API exists until Phase 5. MTF's actual
 # leverage terms are account-specific and broker-supplied; this constant
@@ -81,6 +86,8 @@ _ALERT_WORTHY_REASON_PREFIXES = (
     "max_trades_per_day_reached",
     "consecutive_loss_pause_active",
     "budget_exceeded",
+    "per_trade_lot_cap_exceeded",
+    "margin_check_failed",
 )
 
 
@@ -317,13 +324,31 @@ def _is_alert_worthy(reasons: list[str]) -> bool:
     )
 
 
-def _check_margin_stub(capital_required: Decimal) -> bool:
-    """Placeholder for a real broker margin/funds check (Phase 5+) — for now
-    only confirms the computed capital figure is sane. Always records `True`
-    into risk_decisions.checked_margin's *check ran* meaning, not a broker-
-    confirmed funds guarantee.
+def _check_margin(capital_required: Decimal, trading_session: TradingSession) -> bool:
+    """Real broker-backed margin check (Phase 5+) via `BrokerPort.get_margin`
+    — replaces the old fixed-placeholder stub. Uses `get_execution_broker`,
+    same as every other execution-facing call site, so this always checks
+    against the persistent paper mock today (`MockBrokerAdapter.get_margin`
+    returns a generous synthetic figure, so paper mode stays capital-
+    unconstrained same as before) and against the real Shoonya adapter once
+    Phase 6 makes it the execution broker.
+
+    Fails closed (rejects) on a `BrokerError` rather than treating it as
+    `margin_ok=True` — `MockBrokerAdapter` never raises `BrokerError`
+    (see `broker_adapter/base/errors.py`'s own docstring), so this only
+    matters once a real broker adapter is the execution broker, at which
+    point "couldn't confirm funds" should block the trade, not silently
+    wave it through.
     """
-    return capital_required > 0
+    if capital_required <= 0:
+        return False
+    broker = get_execution_broker(trading_session)
+    try:
+        margin = broker.get_margin()
+    except BrokerError:
+        logger.exception("get_margin failed during pre-trade check; failing closed")
+        return False
+    return capital_required <= _dec(margin.available_margin)
 
 
 def evaluate_trade_intent(
@@ -389,7 +414,7 @@ def evaluate_trade_intent(
         if trade_intent.qty_lots > risk_config.per_trade_lot_cap:
             reasons.append("per_trade_lot_cap_exceeded")
 
-        margin_ok = _check_margin_stub(_dec(analytics.capital_required))
+        margin_ok = _check_margin(_dec(analytics.capital_required), trading_session)
         if not margin_ok:
             reasons.append("margin_check_failed")
 

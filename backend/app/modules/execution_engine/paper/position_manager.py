@@ -7,7 +7,9 @@ clean shutdown). One instance per `trading_session`, started by
 startup-recovery check after a restart — its job for the life of the
 session is: check every open Position's stop/target/trail against the
 current price, force a square-off once IST wall-clock passes
-`cutoff_time`, and periodically run a polling reconciliation pass.
+`cutoff_time`, watch for a margin breach on guarded-live/live sessions
+(Addendum hardening batch's narrow emergency-square-off trigger), and
+periodically run a polling reconciliation pass.
 """
 
 from __future__ import annotations
@@ -17,28 +19,34 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist
 from app.core.db.session import session_scope
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
+from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.market.models import Instrument, OptionContract
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import (
     SafeMode,
     TradingSession,
     TradingSessionStatus,
     TransitionTriggerType,
 )
+from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.broker_adapter.base.errors import BrokerAuthError
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerError
+from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.execution_engine.paper.service import evaluate_open_position
 from app.modules.reconciliation.service import run_reconciliation
 
 logger = logging.getLogger("app.execution_engine.paper.position_manager")
+
+_MARGIN_BREACH_MODES = (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED)
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
@@ -56,7 +64,13 @@ class PositionManager:
         session_factory: SessionFactory = session_scope,
     ) -> None:
         self.trading_session_id = trading_session_id
-        self._broker = broker or get_broker()
+        # Not resolved eagerly: __init__ only has a trading_session_id, not
+        # the TradingSession row get_execution_broker needs, and this class
+        # is often constructed before a DB session is open (registry.py).
+        # None means "resolve get_execution_broker(trading_session) fresh
+        # every cycle in _run_cycle"; an explicit broker (tests, always)
+        # is used as-is, unchanged from before.
+        self._broker_override = broker
         self._poll_interval_seconds = poll_interval_seconds
         self._reconcile_every_n_cycles = reconcile_every_n_cycles
         self._session_factory = session_factory
@@ -134,7 +148,70 @@ class PositionManager:
                 self.trading_session_id,
             )
 
+    def _check_margin_breach(
+        self, db: Session, trading_session: TradingSession, broker: BrokerPort
+    ) -> None:
+        """Addendum hardening batch's one narrow automatic emergency-square-
+        off trigger (build-plan.md: "a detected margin breach on a live
+        position — not on connectivity loss, reconciliation lag, or any
+        other transient condition"). Only called for
+        `paper_plus_guarded_live`/`live_enabled` sessions with open
+        positions (see `_run_cycle`'s guard) — kill-switch is deliberately
+        untouched by this path; a manual "exit all" endpoint and the
+        existing EOD square-off cover the other two legs of that same
+        Addendum decision.
+        """
+        try:
+            margin = broker.get_margin()
+        except BrokerError:
+            logger.exception(
+                "get_margin failed during margin-breach check for session %s",
+                self.trading_session_id,
+            )
+            return
+
+        if margin.available_margin >= 0:
+            return
+
+        logger.warning(
+            "margin breach detected for session %s: available_margin=%.2f",
+            self.trading_session_id,
+            margin.available_margin,
+        )
+
+        # Local import: same load-time-cycle reasoning as
+        # run_eod_square_off's import in _run_cycle below.
+        from app.modules.scheduler.eod_square_off import run_margin_breach_square_off
+
+        run_margin_breach_square_off(db, broker, trading_session)
+
+        reason = f"margin breach: available_margin={margin.available_margin:.2f}"[:500]
+        db.add(
+            SystemAlert(
+                id=uuid.uuid4(),
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="margin_breach_square_off",
+                message=reason,
+                created_at=datetime.now(UTC),
+            )
+        )
+        record_event(
+            db,
+            workspace_id=trading_session.workspace_id,
+            actor_type=ActorType.SYSTEM,
+            event_category=EventCategory.SYSTEM_HEALTH,
+            event_type="margin_breach_square_off",
+            entity_type="trading_session",
+            entity_id=trading_session.id,
+            trading_session_id=trading_session.id,
+            payload={"available_margin": margin.available_margin},
+        )
+        db.commit()
+
     def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
+        broker = self._broker_override or get_execution_broker(trading_session)
         open_positions = (
             db.query(Position)
             .filter(
@@ -153,13 +230,13 @@ class PositionManager:
             option_contract = db.get(OptionContract, position.option_contract_id)
             if option_contract is None:
                 continue
-            tick = self._broker.get_quote(option_contract.symbol)
+            tick = broker.get_quote(option_contract.symbol)
 
             underlying_price = underlying_price_cache.get(option_contract.instrument_id)
             if underlying_price is None:
                 instrument = db.get(Instrument, option_contract.instrument_id)
                 if instrument is not None:
-                    underlying_price = self._broker.get_quote(instrument.symbol).ltp
+                    underlying_price = broker.get_quote(instrument.symbol).ltp
                     underlying_price_cache[option_contract.instrument_id] = underlying_price
 
             evaluate_open_position(
@@ -167,11 +244,14 @@ class PositionManager:
                 trading_session,
                 position,
                 tick.ltp,
-                broker=self._broker,
+                broker=broker,
                 bid=tick.bid,
                 ask=tick.ask,
                 underlying_price=underlying_price,
             )
+
+        if open_positions and SafeMode(trading_session.mode) in _MARGIN_BREACH_MODES:
+            self._check_margin_breach(db, trading_session, broker)
 
         # Local import: same load-time-cycle reasoning as
         # run_eod_square_off's import just below —
@@ -192,12 +272,12 @@ class PositionManager:
             # risk_engine.service.
             from app.modules.scheduler.eod_square_off import run_eod_square_off
 
-            run_eod_square_off(db, self._broker, trading_session)
+            run_eod_square_off(db, broker, trading_session)
 
         self._cycle_count += 1
         if self._cycle_count % self._reconcile_every_n_cycles == 0:
             run_reconciliation(
-                db, self._broker, trading_session, ReconciliationTrigger.POLL
+                db, broker, trading_session, ReconciliationTrigger.POLL
             )
 
     def _loop(self) -> None:

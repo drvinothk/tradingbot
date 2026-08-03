@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 from abc import abstractmethod
 from datetime import datetime
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -99,6 +100,64 @@ def get_latest_indicator_value(
         .first()
     )
     return float(row.value) if row is not None else None
+
+
+def compute_range_high_low(bars: list[PriceBar]) -> tuple[float, float]:
+    """(high, low) across a window of completed bars — the range-boundary
+    computation ORB does over its fixed, session-anchored opening-range
+    window, and the OI/Volume Confirmed and Liquidity Sweep/Reversal
+    strategies (Phase 7) both do over a rolling last-N-bars window instead.
+    Assumes `bars` is non-empty; callers already guard on window length
+    before calling this.
+    """
+    return max(float(b.high) for b in bars), min(float(b.low) for b in bars)
+
+
+def compute_stop_target(
+    entry_price: float, stop_pct: float, target_pct: float
+) -> tuple[float, float]:
+    """The identical stop/target formula every strategy (synthetic, ORB,
+    VWAP Pullback, EMA Micro-pullback) computed inline — same percentage-off
+    -entry shape, same rounding, only the pct values differ per strategy.
+    """
+    stop_price = round(entry_price * (1 - stop_pct), 2)
+    target_price = round(entry_price * (1 + target_pct), 2)
+    return stop_price, target_price
+
+
+def touch_and_confirm(
+    prev_bar: PriceBar,
+    latest_bar: PriceBar,
+    reference_level: float,
+    tolerance_frac: float,
+) -> Literal["bullish", "bearish"] | None:
+    """"Pullback bar touches `reference_level`, confirmation bar closes back
+    through it" — the touch/confirm mechanics VWAP Pullback (touching VWAP)
+    and EMA Micro-pullback (touching EMA9) both need, byte-for-byte
+    identical once the reference scalar is factored out. Deliberately
+    returns *only* the touch/confirm direction, nothing else: each
+    strategy's own trend filter (EMA's ema9-vs-ema20 gate, which VWAP has no
+    equivalent of) and `structure_level` assignment (VWAP uses the touched
+    bar's own extreme; EMA uses the reference level itself) stay
+    strategy-owned — those differ in ways that would silently change
+    behavior if folded in here too.
+    """
+    band = reference_level * tolerance_frac
+    close = float(latest_bar.close)
+
+    # "Touched" means the pullback bar's extreme landed within `band` of
+    # reference_level — not merely "somewhere below/above it", which would
+    # also match a bar that blew straight through the level.
+    touched_from_above = abs(float(prev_bar.low) - reference_level) <= band
+    bullish_confirmation = close > float(prev_bar.high) and close > reference_level
+    touched_from_below = abs(float(prev_bar.high) - reference_level) <= band
+    bearish_confirmation = close < float(prev_bar.low) and close < reference_level
+
+    if touched_from_above and bullish_confirmation:
+        return "bullish"
+    if touched_from_below and bearish_confirmation:
+        return "bearish"
+    return None
 
 
 class ConfirmationFilterStrategy(Strategy):

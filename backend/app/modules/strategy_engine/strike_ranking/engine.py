@@ -37,6 +37,13 @@ class StrikeRankingConfig:
     weight_oi: float = 0.20
     weight_premium_fit: float = 0.20
     weight_depth: float = 0.10
+    # Hard participation floor, alongside max_spread_pct — a candidate below
+    # either gets excluded before scoring, not merely penalized. Both
+    # default to 0 (no filtering), preserving every existing caller's
+    # behavior unchanged; the OI/Volume Confirmed strategy (Phase 7) is the
+    # first to set these to non-zero values.
+    min_oi: int = 0
+    min_volume: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,6 +114,8 @@ def rank_strikes(
     survivors: list[tuple[RankableContract, float]] = []
     for c in contracts:
         if c.strike not in allowed_strikes:
+            continue
+        if c.oi < config.min_oi or c.volume < config.min_volume:
             continue
         mid = (c.bid + c.ask) / 2
         spread_pct = (c.ask - c.bid) / mid if mid > 0 else 1.0
@@ -245,3 +254,15 @@ def rank_from_latest_snapshot(
         )
 
     return rank_strikes(float(latest_spot_tick.ltp), candidates, config)
+
+
+def pick_top_by_type(
+    ranked: list[RankedContract], option_type: OptionType
+) -> RankedContract | None:
+    """The highest-scored contract of a given `option_type` from an already
+    `rank_strikes`-sorted list — the identical lookup ORB/VWAP Pullback/EMA
+    Micro-pullback each did inline (`ranked` is already sorted best-first,
+    so the first match is the top one). Not used by the synthetic strategy,
+    which takes `ranked[0]` unconditionally regardless of type.
+    """
+    return next((r for r in ranked if r.option_type == option_type), None)

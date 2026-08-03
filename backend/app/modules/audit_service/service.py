@@ -87,14 +87,36 @@ def record_event(
         return event
 
 
-def verify_chain(db: Session) -> tuple[bool, uuid.UUID | None]:
-    """Walks the full chain in insertion order and recomputes each hash.
-    Returns (True, None) if intact, or (False, id-of-first-broken-row) —
-    for the reconciliation-lock / kill-switch resume checklist to call, not
-    for hot-path use.
+def verify_chain(db: Session, since_seq: int | None = None) -> tuple[bool, uuid.UUID | None]:
+    """Walks the chain in insertion order and recomputes each hash, starting
+    from row 1 by default or from a documented checkpoint when `since_seq`
+    is given. Returns (True, None) if intact, or (False,
+    id-of-first-broken-row) — for the reconciliation-lock / kill-switch
+    resume checklist to call, not for hot-path use.
+
+    `since_seq` exists because a hash-chain break is permanent once
+    written — an append-only tamper-evident log can never be "repaired" by
+    recomputing a historical link without defeating the entire point of it.
+    Two such historical incidents exist in this project's own dev database
+    (both root-caused to the pre-fix session-scoped `LOCK_AUDIT_CHAIN`
+    documented in `core/locking.py`'s module docstring, confirmed via a
+    full-chain scan to be isolated — every row's own hash is internally
+    valid, only the two `prev_hash` links are stale, and zero new forks
+    have appeared across everything written since the fix landed); see
+    `docs/architecture/build-plan.md`'s Addendum section for the write-up.
+    No default `since_seq` is baked in here on purpose — the right anchor
+    is a fact about one specific database's own history, not about this
+    schema or code, so every caller must pass it explicitly.
     """
+    query = db.query(AuditEvent).order_by(AuditEvent.seq.asc())
     prev_hash: str | None = None
-    for event in db.query(AuditEvent).order_by(AuditEvent.seq.asc()).yield_per(500):
+    if since_seq is not None:
+        anchor = db.query(AuditEvent).filter(AuditEvent.seq == since_seq).one_or_none()
+        if anchor is not None:
+            prev_hash = anchor.hash
+        query = query.filter(AuditEvent.seq > since_seq)
+
+    for event in query.yield_per(500):
         fields_for_hash = {
             "workspace_id": str(event.workspace_id),
             "ts": event.ts.isoformat(),

@@ -25,6 +25,7 @@ from app.modules.broker_adapter.base.contracts import (
     DepthLevel,
     DepthSnapshot,
     InstrumentInfo,
+    MarginInfo,
     OptionChainEntry,
     OptionType,
     OrderRequest,
@@ -315,6 +316,23 @@ def parse_position(raw: dict) -> Position:
         contract_symbol=str(_require(raw, "tsym")),
         qty=_int(raw, "netqty"),
         avg_price=_float(raw, "netavgprc", default=0.0),
+    )
+
+
+def parse_margin(raw: dict) -> MarginInfo:
+    """`Limits` response. `cash`/`marginused` are the Noren-OMS field names
+    observed across community forks researched for this — not live-verified
+    against a real Shoonya account, same caveat as the rest of this module.
+    Defaults to 0.0 rather than raising on a missing field (unlike
+    `parse_tick`'s required `lp`): a margin figure that's merely
+    conservative-wrong (reads as less available than reality) is a safer
+    failure mode here than a hard crash on every pre-trade check once this
+    is wired into Risk Service.
+    """
+    total = _float(raw, "cash", default=0.0)
+    used = _float(raw, "marginused", default=0.0)
+    return MarginInfo(
+        available_margin=total - used, used_margin=used, total_margin=total, ts=_utcnow()
     )
 
 

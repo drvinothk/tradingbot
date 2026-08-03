@@ -130,13 +130,23 @@ trading-bot/
       core/                          # cross-cutting infra, no trading logic
         security/                    # Argon2 hashing, session tokens, RBAC dependency
         db/                          # SQLAlchemy engine/session, declarative Base
-        redis_client.py
         clock.py                     # NTP drift check (startup + periodic) -> SystemAlert / mode signal
         rate_limiter.py              # token-bucket wrapping outbound broker calls
         locking.py                   # Postgres advisory lock -> Execution Service singleton
         idempotency.py               # idempotency key generation + atomic pre-dispatch persistence
-        eventbus.py                  # in-process pub/sub: order-state-change -> reconciliation trigger
-        sleep_inhibitor.py           # Windows SetThreadExecutionState, acquired/released by session+position state
+        sleep_inhibitor.py           # Windows SetThreadExecutionState, singleton via get_sleep_inhibitor();
+                                      # acquired/released around strategy-run scanning + open positions
+        # redis_client.py / eventbus.py, both originally planned here, were
+        # deliberately never built. Redis runs in Docker but nothing uses
+        # it; event-triggered reconciliation (the one thing eventbus.py was
+        # for) is a direct synchronous call from dispatch_trade_intent/
+        # close_position instead, inside the same LOCK_EXECUTION_SINGLETON
+        # scope — better than pub/sub here, since it gets transactional
+        # consistency for free instead of having to re-solve ordering/
+        # delivery guarantees for a single in-process consumer. Revisit
+        # only if a second independent async consumer appears (e.g.
+        # WebSocket push on order events) or the process splits into
+        # multiple deployables (Stage 3).
         modes/
           state_machine.py           # the 6-mode state machine
           transitions.py             # guards/preconditions per transition
@@ -149,10 +159,15 @@ trading-bot/
           base/contracts.py          # broker-agnostic DTOs
           mock/                      # replay/mock adapter — used Phases 1-4 and in all tests, forever
           shoonya/                   # ALL Shoonya-specific code lives ONLY here
-            auth.py                  # TOTP + direct REST login -> susertoken
+            auth.py                  # OAuth browser-redirect (User ID+password+OTP on Shoonya's site) -> code -> GenAcsTok
             rest_client.py  ws_client.py  normalizer.py
         market_data/
-          ingestion.py  indicators/ (VWAP, EMA9, EMA20)  option_chain.py
+          # option_chain.py, originally planned as its own file, was never
+          # split out — record_option_chain_snapshot lives in ingestion.py
+          # instead (one ~40-line function reusing ingestion.py's own
+          # SessionFactory/model imports; nothing substantial enough to
+          # warrant a separate file).
+          ingestion.py  indicators/ (VWAP, EMA9, EMA20)  registry.py
         strategy_engine/
           interface.py               # shared Strategy ABC — emits Signal/TradeIntent ONLY, no Order/Position access
           strike_ranking/            # shared engine: spread/volume/OI/premium-fit/depth
@@ -167,16 +182,28 @@ trading-bot/
         reporting/
         scheduler/                   # session open/close, health checks, EOD square-off, daily instrument/strike sync
         ai_extension/                # advisory-only; read-only ports; never imports execution/risk write paths
-      api/v1/ (auth, strategies, sessions, orders, positions, risk, reports, audit, admin)
-      api/websocket/ (quotes_ws, positions_ws, alerts_ws)
+      # Actual layout: auth.py, strategies.py, sessions.py (also mounts
+      # broker_accounts_router), execution.py (orders+positions, folded
+      # into one file rather than split), reports.py, instruments.py,
+      # audit.py (list + verify-chain, added in the post-Phase-5 hardening
+      # pass), shoonya.py (mounted without the /api/v1 prefix — see its own
+      # module comment). No dedicated risk.py/admin.py — nothing yet needs
+      # a write surface those files were reserved for.
+      api/v1/ (auth, strategies, sessions, execution, reports, instruments, audit, shoonya)
+      api/websocket/ (quotes_ws, positions_ws, alerts_ws)  # still an empty stub — see Phase 3's own note
       workers/ (market_data_worker.py, reconciliation_worker.py, scheduler_worker.py, strategy_worker.py)
     migrations/                      # Alembic
     tests/unit/ integration/ fixtures/ (recorded tick/depth/chain sessions for deterministic replay)
     alembic.ini  pyproject.toml
   frontend/
-    src/features/ (auth, sessions, strategies, orders, positions, risk, reports, audit, admin)
-    src/shared/
-    src/app/ (routing, layout, websocket provider, always-visible mode banner)
+    # Actual layout: src/features/{auth,sessions,strategies,reports}/ —
+    # no dedicated orders/positions/risk/audit/admin pages yet (the
+    # backend endpoints exist for orders/positions/audit; frontend
+    # pages for them are a real gap, not yet built).
+    src/features/ (auth, sessions, strategies, reports)
+    src/shared/ (api client + types, hooks/ — useActiveSessionMode)
+    src/app/ (routing, Layout.tsx + ModeBanner.tsx — the always-visible
+              mode/broker banner, added in the post-Phase-5 hardening pass)
   ops/
     docker/docker-compose.local.yml  # Postgres + Redis only; app runs natively
     docker/Dockerfile.backend, Dockerfile.frontend  # used starting Stage 2
@@ -876,7 +903,9 @@ paper-only — this phase proves real data + auth, deliberately separated from r
 order placement.
 Done when: the three strategies run in paper mode against real Shoonya data for
 several sessions with stable reconnects, and a reconciliation dry-run against real
-(empty) broker positions passes.
+(empty) broker positions passes. **Plus the paper-vs-live signal comparison in the
+"Addendum" section below** — added after this phase's initial build, so treat it as
+part of this phase's actual done-when bar, not optional.
 
 *Phase 5 progress (this session — no Shoonya account existed to verify any of
 this live, so "done when" above is not yet met):*
@@ -976,30 +1005,259 @@ Admin-flipped `strategy_configs.status` can receive a live TradeIntent). Documen
 manual sign-off checklist before the first real-money trade.
 Done when: one graduated strategy (likely ORB) executes a single real 1-lot trade
 end-to-end with correct stop placement, correct reconciliation, full audit trail, no
-manual broker-terminal intervention.
+manual broker-terminal intervention. **Plus every "Phase 5/6" item in the "Addendum"
+section below** (periodic health-check loop, real margin/limit retrieval, order-ack-
+timeout fallback, emergency square-off) and the "Before Phase 6" operational-floor
+items (DB backup/restore, `metric_series` wiring) — added after this phase's
+original text, all required before the manual sign-off checklist, not optional
+extras.
 
-**Phase 7 — Strategies 4 & 5** (OI/Volume confirmed, Liquidity sweep/reversal)
+**Phase 7 — Strategies 4 & 5** (OI/Volume confirmed, Liquidity sweep/reversal) — ✅ done
 Same paper-first graduation path as Phase 4. Strategy 4 exercises a
 chain-participation-weighted mode of the strike-ranking engine; Strategy 5 needs a
 small shared level/structure helper (reusable with ORB's opening-range logic).
+Done when: both strategies run concurrently in paper mode (mixed auto/
+approval-required) alongside the three Phase 4 strategies for several sessions,
+each with its own distinct scorecard, with no regression to the existing three.
+
+*Phase 7 amendments (implementation-time decisions — no per-strategy spec
+existed anywhere before this phase, same situation Phase 4's own entry-logic
+amendments describe):*
+- **A new shared helper, `common_rules.compute_range_high_low`**, factored
+  out of ORB's own inline high/low-over-a-window computation so ORB and the
+  new Strategy 5 share it (pure refactor, zero behavior change — confirmed
+  against `test_orb_strategy.py`'s existing assertions before building
+  anything new on top of it).
+- **Strategy 4 (OI/Volume Confirmed)'s "confirmed" half lives in the
+  strike-ranking engine, not a new temporal signal.** `StrikeRankingConfig`
+  gained `min_oi`/`min_volume` (both default `0`, so every existing
+  strategy's ranked output is provably unchanged — pinned by a new test).
+  `rank_strikes` hard-filters below that floor, same treatment as the
+  existing `max_spread_pct` filter. Strategy 4's own preset
+  (`OI_VOLUME_RANKING_CONFIG`) doubles the OI/volume score weights and sets
+  a real participation floor. The entry trigger itself is a rolling-window
+  breakout — deliberately similar in shape to ORB (same
+  `compute_range_high_low` helper, over a rolling last-N-bars window
+  instead of a fixed session-anchored one) — since this strategy's point of
+  difference is the strike selection, not a novel price pattern.
+  **Why not a delta between consecutive chain snapshots** (the more
+  literal reading of "OI/Volume *confirmed*" as a build-up signal): checked
+  the actual call graph first — `record_option_chain_snapshot` is called
+  exactly once, at `start_strategy` time (`api/v1/strategies.py`), and
+  nothing since Phase 4 has ever refreshed it again for the life of a run.
+  A delta-based design would silently never fire in real operation. Flagged
+  as a separate, real, previously-undiscovered gap (affecting *every*
+  strategy's strike-ranking freshness, not just this one) — not fixed here,
+  since it's out of this phase's scope and doesn't block it.
+- **Strategy 5 (Liquidity Sweep/Reversal)** is a real, distinct pattern
+  from Strategy 4 despite sharing the range-helper: a bar that *wicks*
+  beyond a recent rolling-window high/low but *closes* back inside it is a
+  false breakout, traded in the reversal direction — the opposite shape
+  from a continuation breakout. Deliberately does not reuse Batch E's
+  `touch_and_confirm` helper (that's for a pullback-*to*-and-continue
+  pattern, VWAP/EMA's territory; folding break-and-reverse into it would
+  silently change one or the other, the same reasoning that already kept
+  `structure_level` strategy-owned there). No per-direction fired-once
+  guard, unlike ORB/Strategy 4 — the rolling window continuously shifts, so
+  a later genuine setup must still be allowed to fire, same as VWAP/EMA.
+- **Stop/target values** (Strategy 4: 0.11/0.18; Strategy 5: 0.10/0.16)
+  picked to sit sensibly within the existing three strategies' range
+  (ORB 0.12/0.20, VWAP 0.10/0.15, EMA 0.08/0.12), not derived from anywhere
+  external — same "the strategy author picks a defensible number" pattern
+  every prior phase's stop/target values already followed.
+- Extended `test_phase4_strategies_e2e.py`'s concurrency proof from three
+  strategies to all five (renamed
+  `test_five_strategies_run_concurrently_across_two_sessions_mixed_modes`)
+  rather than writing a separate Phase 7 e2e file — reuses the same
+  fixture/cleanup machinery, and is the most direct proof of this phase's
+  own "no regression to the existing three" criterion.
+
+*QC pass findings (live browser verification, before Phase 7 was called
+done):*
+- **Bug fix: `LOCK_EXECUTION_SINGLETON` could leak permanently, freezing all
+  future order dispatch/strategy starts.** Not caught by the automated
+  suite (most tests use a rolled-back transaction that never reaches a real
+  commit); found live, after running three strategies concurrently for a
+  few minutes and watching every subsequent `POST /strategies/{id}/start`
+  hang forever. Root cause, confirmed via `pg_locks`/`pg_stat_activity`
+  (the stuck connection was `idle` with `COMMIT` as its last statement, not
+  stuck mid-query) plus external research into the identical documented bug
+  in other projects: `SQLAlchemy Session.commit()` releases the connection
+  back to the pool, so any `db.execute()` after a `commit()` — including
+  the `finally: pg_advisory_unlock(...)` a session-scoped advisory lock
+  needs — can land on a *different* pooled connection than the one that
+  acquired the lock. The unlock silently no-ops on the wrong connection;
+  the original connection returns to the pool still holding the lock,
+  forever, invisible to any per-request diagnostic. Latent since Phase 4
+  (`approve_trade_approval`/`reject_trade_approval` both commit while still
+  holding the lock, by design — the check-then-act sequence they guard
+  needs to be durable before the lock releases), never triggered before
+  because nothing had exercised real concurrent connection-pool churn this
+  hard until Phase 7's live multi-strategy test. Audited all 9 call sites
+  of `LOCK_EXECUTION_SINGLETON`/`LOCK_RISK_EVALUATION_QUEUE`/
+  `LOCK_AUDIT_CHAIN`; 4 (`start_strategy`, `approve_trade_approval`,
+  `reject_trade_approval`, and the Batch-C `create_session` fix) commit
+  inside their lock scope and were genuinely vulnerable, 5 were not.
+  **Fixed by converting all three lock names from session-scoped
+  (`pg_advisory_lock`/`pg_advisory_unlock`) to transaction-scoped
+  (`pg_advisory_xact_lock`)** in `core/locking.py` — release becomes
+  automatic, tied to whatever connection the transaction commits or rolls
+  back on, with no separate unlock statement, making this leak class
+  structurally impossible rather than just less likely. Confirmed via
+  research that this is the standard fix for this exact bug class, that
+  session- and transaction-scoped locks on the same key share one lock
+  space (so all callers of one lock name have to move together, not just
+  the vulnerable ones), and that reentrancy — which
+  `dispatch_trade_intent`'s nested `transition_mode` call depends on — is
+  preserved under the transaction-scoped variant. `LOCK_PROCESS_SINGLETON`
+  was deliberately left unchanged (a different, already-correct pattern: a
+  dedicated raw connection held for the process lifetime, never returned to
+  the pool). Added a `SET LOCAL lock_timeout` alongside the fix as defense
+  in depth, converting any future stuck acquisition into a fast, loud
+  failure instead of a silent hang. Regression tests in
+  `tests/integration/test_locking.py` reproduce the exact leak pattern
+  against a real Postgres, confirm reentrancy and cross-session mutual
+  exclusion, and exercise concurrent `start_strategy` calls end-to-end.
 
 **Phase 8 — Strategy 6** (Market Depth Imbalance Scalp — last, hardest)
 Rolling-window persistent depth-imbalance detection (not single-snapshot), wider
 ATM±5 (±7 analysis-only) scan, liquidity-reject-then-rank pipeline, tightest stops +
 time-stop exit. Extended paper-only soak period; slippage is the primary graduation
 gate given this is the most data-sensitive strategy.
+Done when: Strategy 6 produces genuine signals (not silenced entirely by the
+liquidity-reject filter) over an extended paper-only soak, with its scorecard's
+slippage figure explicitly reviewed against the other five strategies' before any
+live-graduation discussion starts.
 
 **Phase 9 — AI Extension Service** (optional, once credentials supplied)
 Read-only ports into Signals/market-data/audit, suggestion-event emission only,
 enforced no-write at the type level (no TradeIntent/RiskDecision/Order constructors
 reachable) plus a CI import-linter rule that fails the build if `ai_extension`
 imports any execution/risk write path.
+Done when: the CI import-linter rule fails the build against a deliberately-broken
+test branch that has `ai_extension` import an execution/risk write path, proving
+the enforcement is real rather than aspirational — mirroring how every other
+phase's "done when" includes a check that fails against the old/broken code, not
+just passes against the new.
 
 **Phase 10/11 — Stage 2 (cloud packaging) / Stage 3 (split deployables)**: deferred
 until Stage 1 is stable; no further design needed now beyond the module boundaries
 already captured above.
 
-## Verification approach
+## Addendum — hardening gaps found in plan review (nothing above renumbered)
+
+Two external plan drafts were reviewed against this document (one pre-Shoonya,
+one post-Shoonya) to sanity-check completeness before continuing Phase 5. Both
+turned out to already be covered, phase-for-phase and more precisely, by
+what's above — with the exceptions below, which are genuine gaps. These are
+additive: they slot into the existing phases named, not new phases of their
+own.
+
+**Before Phase 6 (guarded live) — operational floor:**
+- ~~Database backup/restore.~~ — **done this session** (Addendum hardening
+  batch). `ops/scripts/backup_db.ps1` (`docker compose exec postgres
+  pg_dump` to a timestamped file under the new, gitignored `ops/backups/`)
+  and `ops/scripts/restore_db.ps1` (defaults to a throwaway
+  `trading_bot_restore_drill` DB, *not* the real dev DB — restoring into
+  `trading_bot` itself is a separate, explicit `-TargetDb` opt-in). The
+  restore drill was actually run, not just scripted: backed up the real
+  local dev DB, restored into the throwaway DB, spot-checked
+  `trading_sessions`/`audit_events`/`users` row counts matched the source
+  exactly, then dropped the throwaway DB.
+- ~~`metric_series` wiring.~~ — **done this session.** `MetricSeries` model
+  (`domain/ops/models.py`, migration `0009_metric_series.py`),
+  `modules/ops/metrics_service.record_metric` (the write helper), and
+  `GET /api/v1/metrics` (`api/v1/metrics.py`, reuses the `audit.view`
+  permission rather than seeding a new RBAC code). First real writer is the
+  new periodic health-check loop below — verified live end-to-end (started
+  the real backend, hit the endpoint, got back real `ntp_drift_seconds`/
+  `disk_free_gb` rows the scheduler had written on its own startup cycle).
+- Structured/JSON logging is a nice-to-have, not a gate — current stdlib
+  `logging` is fine for a single-process Windows Service. Revisit only if
+  incident review off plain-text logs becomes painful.
+
+**Phase 5/6 — live-data and live-order hardening:**
+- ~~Periodic health-check loop, promoted from "known open item" to a Phase 6
+  prerequisite.~~ — **done this session.** `scheduler/health_check.py`'s
+  `HealthCheckScheduler` — same background-thread shape as `PositionManager`
+  but one process-wide instance, 5-minute default interval, started/stopped
+  in `app.main`'s lifespan alongside the position managers. A failing
+  NTP/disk check now writes `metric_series` rows, moves any
+  `paper_plus_guarded_live`/`live_enabled` session to `degraded_mode` (same
+  legal-edge reasoning `PositionManager._handle_broker_auth_error` already
+  established — `paper_only` has no edge there, so it's logged-and-alerted
+  only), and writes a `SystemAlert` per affected workspace regardless of
+  mode. `ShoonyaBrokerAdapter`'s own docstring had already named this loop
+  as the next concrete step for wiring its error taxonomy into — that
+  wiring itself is still open (see broker error taxonomy below), only the
+  loop's existence is done.
+- **Paper-vs-live signal comparison during the Phase 5 soak.** Still open —
+  needs a real Shoonya session to compare against, unchanged by this
+  session's work.
+- ~~Real margin/limit retrieval — bigger than "replace the stub" implies.~~
+  — **done this session**, all four parts named: (1) `MarginInfo` DTO
+  (`contracts.py`) + `BrokerPort.get_margin` abstract method, (2)
+  `MockBrokerAdapter.get_margin` — a generous synthetic figure net of
+  open-position exposure, so paper mode stays capital-unconstrained same as
+  before, (3) `ShoonyaRestClient.get_limits` + `normalizer.parse_margin` +
+  `ShoonyaBrokerAdapter.get_margin` — same "researched, not live-verified"
+  caveat as the rest of the Shoonya adapter (field names `cash`/`marginused`
+  are the common Noren-OMS convention, unconfirmed against a real account),
+  (4) Risk Service's `_check_margin_stub` replaced with a real
+  `get_execution_broker(...).get_margin()` call, failing closed (rejects)
+  on a `BrokerError` rather than treating it as approved.
+- **Order-ack-timeout fallback to order-history lookup.** Still open,
+  unchanged by this session's work.
+- **Broker error taxonomy, completion.** Still open, unchanged by this
+  session's work.
+- ~~Emergency square-off — decided, scoped narrowly, does not change the
+  kill-switch default.~~ — **done this session**, though two of the three
+  legs turned out to already exist from Phase 3: (1) the manual "exit all"
+  button — `POST /sessions/{id}/square-off` + the frontend's existing
+  `squareOffMutation` — was already built and needed no change; (2) EOD
+  forced square-off — unchanged, `PositionManager` already did this; (3)
+  the one new narrow automatic trigger — `PositionManager._check_margin_breach`
+  calls the new `get_margin` once per cycle for
+  `paper_plus_guarded_live`/`live_enabled` sessions with open positions,
+  and on a negative `available_margin` calls the new
+  `run_margin_breach_square_off` (`scheduler/eod_square_off.py`, sharing a
+  `_square_off_all_open_positions` helper with the EOD path, differing only
+  in `ExitReason.MARGIN_BREACH` vs `ExitReason.EOD_SQUARE_OFF`), writes a
+  `CRITICAL` `SystemAlert`, and leaves kill-switch and every other mode
+  untouched — exactly the narrow scope decided here, not a connectivity- or
+  reconciliation-lag trigger.
+- **Known historical audit-chain gap in this dev database, root-caused and
+  fixed — found and fixed this session, via a live integration QC pass run
+  after the four items above.** `GET /audit/verify` reported `intact:
+  false`. Forensic trace (recomputing every one of 1,168 events' own SHA-256
+  and separately checking every `prev_hash` link, not just the first break
+  `verify_chain` stops at): every row's own hash is internally valid — zero
+  content corruption anywhere — but exactly two chain-*link* forks exist, at
+  seq 470 (2026-07-26 06:28) and seq 489 (2026-07-29 05:25). At each, two
+  `record_event` calls read the same "last row" and both computed
+  `prev_hash` against it — i.e. two writers raced past what should have
+  been mutual exclusion. Both predate the last commit (2026-07-29 12:46)
+  and, per `core/locking.py`'s own docstring, predate the transaction-scoped
+  `LOCK_AUDIT_CHAIN` fix — same root cause already found and fixed for
+  `LOCK_EXECUTION_SINGLETON` (session-scoped `pg_advisory_lock` + connection
+  pooling), just manifesting here as "two writers slipped through" rather
+  than "one writer stuck forever." **Zero new forks from seq 490 through
+  1168** — a range spanning Phase 7's own concurrent multi-strategy stress
+  test and this session's own live QC run, both exactly the load that would
+  reproduce this again if the fix were incomplete. It isn't recurring.
+  A hash chain can't be "repaired" by recomputing a historical link without
+  defeating the entire point of an append-only tamper-evident log — so the
+  fix isn't touching the two rows, it's making `GET /audit/verify`/
+  `verify_chain` capable of reporting a meaningful answer despite them:
+  both gained an optional `since_seq` parameter (`audit_service/service.py`,
+  `api/v1/audit.py`) that walks the chain from a documented checkpoint
+  forward instead of from row 1 every time, using the anchor row's own
+  (internally valid) hash as the starting `prev_hash`. No default `since_seq`
+  is baked into the code — the right anchor is a fact about *this* database's
+  own history, not about the schema, so callers pass it explicitly. For this
+  dev database specifically: `GET /audit/verify?since_seq=489` reports
+  `intact: true` today; verified live against the real dev DB, not just in
+  tests.
 
 Each phase has its own "done when" criteria above, checkable end-to-end without
 needing later phases:

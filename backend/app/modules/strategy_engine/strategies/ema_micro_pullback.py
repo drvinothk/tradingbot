@@ -20,12 +20,15 @@ from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    compute_stop_target,
     get_latest_indicator_value,
     get_recent_completed_bars,
+    touch_and_confirm,
 )
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
+    pick_top_by_type,
     rank_from_latest_snapshot,
 )
 
@@ -67,22 +70,13 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         if ema9 is None or ema20 is None or ema9 == ema20:
             return None
 
-        band = ema9 * self.pullback_tolerance_frac
-        close = float(latest_bar.close)
         bullish_trend = ema9 > ema20
         bearish_trend = ema9 < ema20
 
-        # "Touched" means the pullback bar's extreme landed within `band` of
-        # EMA9 — not merely "somewhere below/above it", which would also
-        # match a bar that blew straight through the average.
-        touched_from_above = abs(float(prev_bar.low) - ema9) <= band
-        bullish_confirmation = close > float(prev_bar.high) and close > ema9
-        touched_from_below = abs(float(prev_bar.high) - ema9) <= band
-        bearish_confirmation = close < float(prev_bar.low) and close < ema9
-
-        if bullish_trend and touched_from_above and bullish_confirmation:
+        direction = touch_and_confirm(prev_bar, latest_bar, ema9, self.pullback_tolerance_frac)
+        if bullish_trend and direction == "bullish":
             option_type = OptionType.CE
-        elif bearish_trend and touched_from_below and bearish_confirmation:
+        elif bearish_trend and direction == "bearish":
             option_type = OptionType.PE
         else:
             return None
@@ -90,13 +84,12 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
         )
-        top = next((r for r in ranked if r.option_type == option_type), None)
+        top = pick_top_by_type(ranked, option_type)
         if top is None:
             return None
 
         entry_price = top.ltp
-        stop_price = round(entry_price * (1 - self.stop_pct), 2)
-        target_price = round(entry_price * (1 + self.target_pct), 2)
+        stop_price, target_price = compute_stop_target(entry_price, self.stop_pct, self.target_pct)
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

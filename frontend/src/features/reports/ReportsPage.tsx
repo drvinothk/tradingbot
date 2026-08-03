@@ -1,23 +1,13 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { api, ApiError } from '../../shared/api/client'
-import type {
-  DailyReportOut,
-  PerformanceStatsOut,
-  ScorecardOut,
-  SessionOut,
-  StrategyConfigOut,
-} from '../../shared/api/types'
+import { useSessions } from '../../shared/hooks/useSessions'
+import { useStrategies } from '../../shared/hooks/useStrategies'
+import type { DailyReportOut, PerformanceStatsOut, ScorecardOut } from '../../shared/api/types'
 
 export function ReportsPage() {
-  const sessionsQuery = useQuery({
-    queryKey: ['sessions'],
-    queryFn: () => api.get<SessionOut[]>('/sessions'),
-  })
-  const strategiesQuery = useQuery({
-    queryKey: ['strategies'],
-    queryFn: () => api.get<StrategyConfigOut[]>('/strategies'),
-  })
+  const sessionsQuery = useSessions()
+  const strategiesQuery = useStrategies()
 
   const [sessionId, setSessionId] = useState('')
   const [strategyId, setStrategyId] = useState('')

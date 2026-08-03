@@ -45,6 +45,7 @@ from app.modules.broker_adapter.base.contracts import (
     AuthResult,
     DepthSnapshot,
     InstrumentInfo,
+    MarginInfo,
     OptionChainSnapshot,
     OrderRequest,
     OrderResult,
@@ -281,6 +282,10 @@ class ShoonyaBrokerAdapter(BrokerPort):
     def get_positions(self) -> list[Position]:
         rows = self._rest.position_book(self._uid, self._actid)
         return [normalizer.parse_position(row) for row in rows]
+
+    def get_margin(self) -> MarginInfo:
+        raw = self._rest.get_limits(self._uid, self._actid)
+        return normalizer.parse_margin(raw)
 
 
 def _utcnow() -> datetime:

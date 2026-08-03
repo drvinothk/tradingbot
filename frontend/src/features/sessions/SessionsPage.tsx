@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
 import { api, ApiError, shoonyaApi } from '../../shared/api/client'
+import { useSessions } from '../../shared/hooks/useSessions'
 import type {
   BrokerAccountOut,
   FundingMode,
@@ -14,10 +15,7 @@ export function SessionsPage() {
   const [formError, setFormError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
 
-  const sessionsQuery = useQuery({
-    queryKey: ['sessions'],
-    queryFn: () => api.get<SessionOut[]>('/sessions'),
-  })
+  const sessionsQuery = useSessions()
 
   const brokerAccountsQuery = useQuery({
     queryKey: ['broker-accounts'],

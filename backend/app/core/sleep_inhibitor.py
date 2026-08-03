@@ -62,3 +62,23 @@ class SleepInhibitor:
     @property
     def is_inhibited(self) -> bool:
         return bool(self._active_reasons)
+
+
+_inhibitor: SleepInhibitor | None = None
+
+
+def get_sleep_inhibitor() -> SleepInhibitor:
+    """Process-wide singleton, same shape as `broker_adapter.composition.
+    get_broker()` — one `SleepInhibitor` for the whole process, since the
+    reference-counting only means anything if every acquire/release call
+    site shares the same instance. Callers: `api.v1.strategies.start_strategy`
+    /`stop_strategy` acquire/release around "actively scanning"
+    (`f"strategy_run:{run.id}"`), `execution_engine.paper.service`
+    `_open_position_from_fill`/`close_position` acquire/release around "has
+    an open position" (`f"position:{position.id}"`) — the two overlapping
+    lifecycles this module's own docstring describes.
+    """
+    global _inhibitor
+    if _inhibitor is None:
+        _inhibitor = SleepInhibitor()
+    return _inhibitor

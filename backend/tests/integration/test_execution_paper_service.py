@@ -38,6 +38,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
+from app.modules.broker_adapter import composition
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
     close_position,
@@ -203,6 +204,44 @@ def _make_trade_intent(
 
 
 # -- dispatch_trade_intent ----------------------------------------------------
+
+
+class _RealBrokerNeverCalled:
+    """Stands in for a connected real broker (e.g. Shoonya, installed via
+    `composition.set_broker` exactly as `api.v1.shoonya.oauth_callback`
+    does). Any call proves paper execution routed to whichever broker
+    `get_broker()` currently resolves to, instead of the persistent
+    execution mock `get_execution_broker` must always use today.
+    """
+
+    def place_order(self, request):  # noqa: ANN001, ARG002 - deliberately never valid to call
+        raise AssertionError(
+            "a 'connected' broker's place_order was called for a paper trade — "
+            "get_execution_broker isn't isolating execution from whichever broker "
+            "composition.get_broker() currently resolves to"
+        )
+
+    def get_positions(self):
+        raise AssertionError("a 'connected' broker's get_positions was called for a paper trade")
+
+
+def test_dispatch_ignores_connected_real_broker_for_paper_session(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """Regression test for the bug where connecting a real broker (Shoonya)
+    silently caused paper execution's default broker resolution to route
+    through it instead of the persistent execution mock — deliberately does
+    NOT pass `broker=` to `dispatch_trade_intent`, since that's the exact
+    default-resolution path that was broken.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    composition.set_broker(_RealBrokerNeverCalled())  # type: ignore[arg-type]
+    try:
+        order = dispatch_trade_intent(db, trading_session, trade_intent)
+    finally:
+        composition.set_broker(None)
+
+    assert order.status == OrderStatus.FILLED
 
 
 def test_dispatch_creates_order_position_stop_and_trail(

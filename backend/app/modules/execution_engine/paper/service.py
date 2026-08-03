@@ -4,13 +4,19 @@ replace Phase 2's `close_dispatched_trade_intent_synthetically`/
 `record_synthetic_outcome` stand-in.
 
 Calls `BrokerPort.place_order`/`get_positions` against whichever adapter
-`app.modules.broker_adapter.composition.get_broker` resolves to
-(`MockBrokerAdapter` for the whole of Phase 3) rather than simulating fills
-purely from tick data — this reuses Phase 1's already-built order/position
+`app.modules.broker_adapter.composition.get_execution_broker` resolves to
+(the persistent mock, today, regardless of what `get_broker()` — the
+market-data accessor — currently holds) rather than simulating fills purely
+from tick data — this reuses Phase 1's already-built order/position
 simulation and gives Reconciliation Service a genuine broker-side state to
 diff local `positions` against. See the Phase 3 plan's "Key design
-decision" note for the full reasoning; Phase 5/6 become pure DI swaps of
-`get_broker`'s resolution, not an Execution Service rewrite.
+decision" note for the full reasoning; Phase 6's real live-order path will
+extend `get_execution_broker` with graduation gating, not rewrite this
+module. `get_execution_broker` is deliberately separate from `get_broker`
+so that connecting Shoonya for real market data (Phase 5) can never, by
+itself, cause a paper trade to place a real order — see
+`broker_adapter/composition.py`'s own docstring for the incident that
+motivated the split.
 
 Callers (not this module): `strategy_engine.service.submit_signal` calls
 `dispatch_trade_intent` right after `risk_engine.service.evaluate_trade_intent`
@@ -26,11 +32,11 @@ still inside their own `LOCK_EXECUTION_SINGLETON` scope — per the build
 plan, Reconciliation Service is "event-triggered + polling", and
 `PositionManager` only covers the polling half. Nesting is safe here: a
 mismatch can escalate to `reconciliation_lock` via `transition_mode`, which
-acquires the *same* `LOCK_EXECUTION_SINGLETON` again — Postgres session-level
-advisory locks are reentrant/stacked per session (a second
-`pg_advisory_lock(key)` call on a key this same session already holds
-returns immediately and just increments a count), so this cannot self-
-deadlock; it only would if some other call path acquired
+acquires the *same* `LOCK_EXECUTION_SINGLETON` again — `core/locking.py`'s
+transaction-scoped advisory locks are reentrant/stacked per transaction (a
+second `pg_advisory_xact_lock(key)` call on a key this same
+session/transaction already holds returns immediately, no-op), so this
+cannot self-deadlock; it only would if some other call path acquired
 `LOCK_RISK_EVALUATION_QUEUE` before `LOCK_EXECUTION_SINGLETON` and the two
 crossed with this one, which nothing in this codebase does.
 """
@@ -44,6 +50,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
+from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import (
@@ -70,7 +77,7 @@ from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest
 from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSide
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.reconciliation.service import run_reconciliation
 
 # Generic Phase-3 trailing rule, used when a TradeIntent doesn't specify its
@@ -128,7 +135,7 @@ def dispatch_trade_intent(
     same `LOCK_EXECUTION_SINGLETON` scope as the insert, so two concurrent
     callers can't both pass it.
     """
-    broker = broker or get_broker()
+    broker = broker or get_execution_broker(trading_session)
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         existing = (
@@ -311,6 +318,14 @@ def _open_position_from_fill(
         trading_session_id=trading_session.id,
         payload={"qty": position.qty, "entry_price": float(entry_price)},
     )
+
+    # Sleep inhibitor: "has an open position" half of the two overlapping
+    # lifecycles core/sleep_inhibitor.py's own docstring describes — the
+    # other half (actively scanning) is acquired/released in
+    # api.v1.strategies.start_strategy/stop_strategy. Released in
+    # close_position below.
+    get_sleep_inhibitor().acquire(f"position:{position.id}")
+
     return position
 
 
@@ -330,7 +345,7 @@ def close_position(
     or the current market price for EOD/manual) — it's what `slippage` is
     measured against, not a duplicate of the actual fill price.
     """
-    broker = broker or get_broker()
+    broker = broker or get_execution_broker(trading_session)
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         if position.status != PositionStatus.OPEN:
@@ -407,6 +422,10 @@ def close_position(
         position.closed_at = now
         position.closing_order_id = exit_order.id
         db.add(position)
+
+        # Releases this position's half of the sleep inhibitor's reference
+        # count — see the matching acquire in _open_position_from_fill.
+        get_sleep_inhibitor().release(f"position:{position.id}")
 
         stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
         if stop_plan is not None and stop_plan.status not in (
@@ -605,6 +624,7 @@ def evaluate_open_position(
             if tightened:
                 trail_plan.current_stop_price = float(new_trail_stop)
                 trail_plan.status = TrailPlanStatus.ACTIVE
+                trail_plan.updated_at = _utcnow()
                 db.add(trail_plan)
                 db.flush()
             else:

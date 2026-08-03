@@ -35,5 +35,8 @@ desktop.ini
 # Logs
 *.log
 
+# DB backups — may contain real trading data
+ops/backups/
+
 # Claude
 .claude/settings.local.json

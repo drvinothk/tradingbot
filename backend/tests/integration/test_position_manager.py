@@ -20,9 +20,10 @@ import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.domain.broker.models import ReconciliationRun
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.ops.models import SystemAlert
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
@@ -340,6 +341,93 @@ def test_run_once_is_idempotent_when_already_degraded(
 
     db.refresh(trading_session)
     assert trading_session.mode == SafeMode.DEGRADED_MODE
+
+
+class _LowMarginBroker:
+    """Wraps a real `MockBrokerAdapter` but makes `get_margin` report a
+    negative available margin, standing in for a real broker mid-margin-
+    breach — proves `PositionManager` reacts via the narrow emergency-
+    square-off trigger (Addendum hardening batch), not via kill-switch.
+    """
+
+    def __init__(self, inner: MockBrokerAdapter):
+        self._inner = inner
+
+    def get_margin(self):
+        from app.modules.broker_adapter.base.contracts import MarginInfo
+
+        return MarginInfo(
+            available_margin=-500.0,
+            used_margin=10_500.0,
+            total_margin=10_000.0,
+            ts=datetime.now(UTC),
+        )
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_session(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - keep it between stop/target
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.flush()
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.MARGIN_BREACH
+
+    # Kill-switch is deliberately untouched by this path.
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "margin_breach_square_off",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_run_once_does_not_check_margin_for_paper_only_session(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """`paper_only` (this phase's real traffic) is excluded from the margin
+    check entirely, not just from escalation — no real money is at stake,
+    so there's nothing for this trigger to protect.
+    """
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - keep it between stop/target
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
 
 
 def test_run_once_leaves_position_open_when_price_is_fine(

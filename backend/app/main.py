@@ -20,6 +20,13 @@
    `PositionManager` (so stop/trail management picks back up instead of the
    process coming back up idle) and runs an immediate reconciliation pass
    against the broker's own book, per Phase 3.
+5. Health-check scheduler — starts `HealthCheckScheduler`
+   (`scheduler/health_check.py`), the repeating version of step 1's one-shot
+   boot check: on a 5-minute timer, a failing NTP/disk check now writes
+   `metric_series` rows and moves any `paper_plus_guarded_live`/
+   `live_enabled` session to `degraded_mode`, not just a log line. Addendum
+   hardening batch, promoted from "known open item" to a Phase 6
+   prerequisite — see the build plan.
 """
 
 from __future__ import annotations
@@ -29,7 +36,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1 import auth, execution, instruments, reports, sessions, shoonya, strategies
+from app.api.v1 import (
+    audit,
+    auth,
+    execution,
+    instruments,
+    metrics,
+    reports,
+    sessions,
+    shoonya,
+    strategies,
+)
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
 from app.domain.session.models import TradingSessionStatus
@@ -120,7 +137,7 @@ def _run_startup_recovery_check() -> None:
     from app.domain.broker.models import ReconciliationTrigger
     from app.domain.execution.models import Position, PositionStatus
     from app.domain.session.models import TradingSession
-    from app.modules.broker_adapter.composition import get_broker
+    from app.modules.broker_adapter.composition import get_execution_broker
     from app.modules.execution_engine.paper.registry import ensure_position_manager_running
     from app.modules.reconciliation.service import run_reconciliation
 
@@ -149,7 +166,12 @@ def _run_startup_recovery_check() -> None:
                 continue
 
             ensure_position_manager_running(trading_session.id)
-            run_reconciliation(db, get_broker(), trading_session, ReconciliationTrigger.EVENT)
+            run_reconciliation(
+                db,
+                get_execution_broker(trading_session),
+                trading_session,
+                ReconciliationTrigger.EVENT,
+            )
             resumed.append(trading_session.id)
 
         if resumed:
@@ -185,6 +207,10 @@ async def lifespan(app: FastAPI):
     try:
         _sync_mock_instrument_universe()
         _run_startup_recovery_check()
+
+        from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
+
+        ensure_health_check_scheduler_running()
     except Exception:
         from app.core.locking import release_advisory_lock
 
@@ -197,8 +223,10 @@ async def lifespan(app: FastAPI):
 
     from app.core.locking import release_advisory_lock
     from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
+    from app.modules.scheduler.health_check import stop_health_check_scheduler
 
     stop_all_position_managers()
+    stop_health_check_scheduler()
     release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
     singleton_connection.close()
     logger.info("Process singleton lock released; shutdown complete.")
@@ -214,6 +242,8 @@ def create_app() -> FastAPI:
     app.include_router(execution.router, prefix="/api/v1")
     app.include_router(reports.router, prefix="/api/v1")
     app.include_router(instruments.router, prefix="/api/v1")
+    app.include_router(audit.router, prefix="/api/v1")
+    app.include_router(metrics.router, prefix="/api/v1")
     # No /api/v1 prefix, deliberately: SHOONYA_REDIRECT_URL (the fixed URL
     # the user registers on Shoonya's own API key form) is
     # http://127.0.0.1:5000/shoonya/callback — mounting under /api/v1 would

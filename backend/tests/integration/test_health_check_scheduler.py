@@ -1,0 +1,167 @@
+"""HealthCheckScheduler — the periodic NTP/disk timer loop that replaces
+`app.main`'s one-shot boot check with a real Scheduler, per the build plan's
+Addendum. Requires real Postgres (mode transitions use the same advisory-
+lock-backed `transition_mode` every other mode-transition test needs).
+"""
+
+from __future__ import annotations
+
+import uuid
+from contextlib import contextmanager
+from datetime import UTC, datetime
+from datetime import time as dt_time
+
+import pytest
+from sqlalchemy.orm import Session
+
+from app.core.clock import ClockCheckResult, DiskCheckResult
+from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
+from app.domain.ops.models import MetricSeries, SystemAlert
+from app.domain.session.models import (
+    FundingMode,
+    SafeMode,
+    SessionModeTransition,
+    TradingSession,
+)
+from app.modules.scheduler.health_check import HealthCheckScheduler
+
+_OK_NTP = ClockCheckResult(ok=True, drift_seconds=0.1)
+_OK_DISK = DiskCheckResult(ok=True, free_gb=50.0, total_gb=200.0)
+_BAD_NTP = ClockCheckResult(ok=False, drift_seconds=None, error="unreachable")
+_BAD_DISK = DiskCheckResult(ok=False, free_gb=0.5, total_gb=200.0)
+
+
+@pytest.fixture
+def broker_account(db: Session, workspace) -> BrokerAccount:
+    account = BrokerAccount(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_type=BrokerType.SHOONYA,
+        label="health-check-test-account",
+        credentials_ref="config/credentials/shoonya.env",
+        status=BrokerAccountStatus.ACTIVE,
+    )
+    db.add(account)
+    db.flush()
+    return account
+
+
+@pytest.fixture
+def trading_session(db: Session, workspace, broker_account, user: User) -> TradingSession:
+    ts = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        started_at=datetime.now(UTC),
+        budget_amount=1_000_000,
+        daily_target_profit=1_000_000,
+        daily_loss_cap=1_000_000,
+        funding_mode=FundingMode.CASH,
+        cutoff_time=dt_time(23, 59),
+    )
+    db.add(ts)
+    db.flush()
+    return ts
+
+
+def _session_factory_for(db: Session):
+    @contextmanager
+    def _factory():
+        yield db
+
+    return _factory
+
+
+def _scheduler_for(db: Session) -> HealthCheckScheduler:
+    return HealthCheckScheduler(session_factory=_session_factory_for(db))
+
+
+def test_run_once_records_metrics_for_active_sessions_workspace(
+    db: Session, trading_session, monkeypatch
+):
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_ntp_drift", lambda: _OK_NTP
+    )
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
+    )
+
+    _scheduler_for(db).run_once()
+
+    metrics = (
+        db.query(MetricSeries)
+        .filter(MetricSeries.workspace_id == trading_session.workspace_id)
+        .all()
+    )
+    names = {m.metric_name for m in metrics}
+    assert names == {"ntp_drift_seconds", "disk_free_gb"}
+
+
+def test_run_once_moves_guarded_live_session_to_degraded_mode_on_failed_check(
+    db: Session, trading_session, monkeypatch
+):
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.flush()
+
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_ntp_drift", lambda: _BAD_NTP
+    )
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
+    )
+
+    _scheduler_for(db).run_once()
+
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.DEGRADED_MODE
+    assert (
+        db.query(SessionModeTransition)
+        .filter(SessionModeTransition.trading_session_id == trading_session.id)
+        .count()
+        == 1
+    )
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "health_check_failed",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_run_once_does_not_transition_paper_only_session_on_failed_check(
+    db: Session, trading_session, monkeypatch
+):
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_ntp_drift", lambda: _OK_NTP
+    )
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _BAD_DISK
+    )
+
+    _scheduler_for(db).run_once()  # must not raise
+
+    db.refresh(trading_session)
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+    assert (
+        db.query(SessionModeTransition)
+        .filter(SessionModeTransition.trading_session_id == trading_session.id)
+        .count()
+        == 0
+    )
+    # Paper-only still gets alert visibility, just no mode escalation.
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "health_check_failed",
+        )
+        .count()
+        == 1
+    )

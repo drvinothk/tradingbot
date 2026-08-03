@@ -1,5 +1,6 @@
 import { NavLink, Outlet } from 'react-router-dom'
 import { useAuth } from '../shared/auth/AuthContext'
+import { ModeBanner } from './ModeBanner'
 
 export function Layout() {
   const { user, logout } = useAuth()
@@ -18,6 +19,7 @@ export function Layout() {
           <button onClick={() => void logout()}>Log out</button>
         </div>
       </nav>
+      <ModeBanner />
       <main className="content">
         <Outlet />
       </main>
