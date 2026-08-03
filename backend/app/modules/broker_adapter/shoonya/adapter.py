@@ -40,6 +40,7 @@ import threading
 from datetime import UTC, date, datetime
 
 from app.config.settings import ShoonyaSettings
+from app.core.clock import now_ist
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -110,6 +111,18 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # not just the tradable symbol string.
         self._token_by_symbol: dict[str, tuple[str, str]] = {}
         self._token_lock = threading.Lock()
+
+        # underlying -> (futures anchor tsym, that contract's own expiry) —
+        # unlike _token_by_symbol above, this is NOT safe to cache forever:
+        # the nearest-expiry futures contract _resolve_futures_anchor_tsym
+        # picks today eventually expires and stops being a valid
+        # GetOptionChain anchor. Cached only while `now_ist().date() <
+        # cached_expiry` (contract expiry is an IST-calendar concept — the
+        # server's own system clock may not be IST); once that's no longer
+        # true, the cache entry is treated as stale and re-resolved
+        # (naturally rolling to the next contract), never reused past the
+        # contract's own expiry date.
+        self._futures_anchor_cache: dict[str, tuple[str, date]] = {}
 
         self._ws: ShoonyaWSClient | None = None
         self._ws_on_tick: TickCallback | None = None
@@ -256,7 +269,22 @@ class ShoonyaBrokerAdapter(BrokerPort):
         reference, more reliable than pattern-matching `tsym` strings.
         Picks the nearest expiry so this stays valid as far into the
         future as any currently-listed contract does.
+
+        Cached in `_futures_anchor_cache` — `get_option_chain` runs on
+        every periodic snapshot refresh (freshness gate) as well as at
+        strategy start, and this contract's own tsym almost never changes
+        within a day, so a fresh `SearchScrip` call every time was pure
+        waste. The cache is expiry-aware (see that attribute's own
+        docstring for why a naive forever-cache would be a real, delayed
+        bug) — never trusted past the cached contract's own expiry date.
         """
+        with self._token_lock:
+            cached = self._futures_anchor_cache.get(underlying)
+        if cached is not None:
+            cached_tsym, cached_expiry = cached
+            if now_ist().date() < cached_expiry:
+                return cached_tsym
+
         rows = self._rest.search_scrip(self._uid, "NFO", underlying)
         futures = [
             row
@@ -277,7 +305,12 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 return date.max
 
         futures.sort(key=_expiry_key)
-        return str(futures[0]["tsym"])
+        nearest = futures[0]
+        tsym = str(nearest["tsym"])
+        expiry = _expiry_key(nearest)
+        with self._token_lock:
+            self._futures_anchor_cache[underlying] = (tsym, expiry)
+        return tsym
 
     # -- BrokerPort: quotes / depth -------------------------------------------
 

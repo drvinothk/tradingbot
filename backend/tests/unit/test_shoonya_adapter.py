@@ -331,6 +331,69 @@ def test_get_option_chain_uses_nearest_futures_contract_as_anchor():
     assert chain_calls[0][1] == "NFO"
 
 
+def test_resolve_futures_anchor_tsym_caches_within_expiry():
+    """The futures anchor almost never changes within a day (`get_option_chain`
+    runs on every periodic freshness-gate refresh, not just at strategy
+    start) — a fresh NFO SearchScrip call every time was pure waste. A
+    second call for the same underlying, still before the cached contract's
+    own expiry, must reuse the cached tsym rather than searching again.
+
+    Uses a real relative-future expiry (`today + 30 days`), not a hardcoded
+    date string — a hardcoded past-looking date is exactly the class of
+    wall-clock-dependent test trap this codebase has hit before (see
+    CLAUDE.md's `TradingSession.cutoff_time` note), and this fixture data
+    would otherwise silently start failing once real time caught up to it.
+    """
+    from datetime import timedelta
+
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    future_expiry = date.today() + timedelta(days=30)
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        {
+            "tsym": "NIFTY28AUG25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": future_expiry.strftime("%d-%b-%Y").upper(),
+            "token": "3",
+        },
+    ]
+
+    first = adapter._resolve_futures_anchor_tsym("NIFTY")
+    second = adapter._resolve_futures_anchor_tsym("NIFTY")
+
+    assert first == second == "NIFTY28AUG25F"
+    search_calls = [call for call in rest.calls if call[0] == "search_scrip"]
+    assert len(search_calls) == 1
+
+
+def test_resolve_futures_anchor_tsym_refetches_once_cached_contract_expires():
+    """A naive forever-cache would be a real, delayed bug: the cached
+    contract eventually expires and stops being a valid GetOptionChain
+    anchor. Simulates rollover by injecting an already-expired cache entry
+    directly, then confirms a stale cache is never trusted — it re-resolves
+    against live data instead of silently returning the expired symbol.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        {
+            "tsym": "NIFTY25SEP25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": "25-SEP-2025",
+            "token": "2",
+        },
+    ]
+    adapter._futures_anchor_cache["NIFTY"] = ("NIFTY28AUG25F", date(2020, 1, 1))
+
+    tsym = adapter._resolve_futures_anchor_tsym("NIFTY")
+
+    assert tsym == "NIFTY25SEP25F"
+    search_calls = [call for call in rest.calls if call[0] == "search_scrip"]
+    assert len(search_calls) == 1
+
+
 def test_get_option_chain_uses_underlying_ltp_as_strike_price():
     """Live-corrected: `strprc=0.0` (the original hardcoded placeholder)
     was rejected outright ("Invalid strprc") — Shoonya's docs call it the
