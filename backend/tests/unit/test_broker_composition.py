@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from datetime import UTC, date, datetime
+
+import pytest
+
+from app.modules.broker_adapter import composition
+from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.base.contracts import (
+    AuthResult,
+    DepthSnapshot,
+    InstrumentInfo,
+    MarginInfo,
+    OptionChainSnapshot,
+    OrderRequest,
+    OrderResult,
+    Position,
+    Tick,
+)
+from app.modules.broker_adapter.base.errors import BrokerAuthError
+
+
+class _FakeRealBroker(BrokerPort):
+    """Stands in for `ShoonyaBrokerAdapter` — tracks whether `close()` was
+    called and lets a test make any given method raise `BrokerAuthError` on
+    demand, without needing a real Shoonya account.
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.margin_raises: BrokerAuthError | None = None
+
+    def authenticate(self) -> AuthResult:
+        return AuthResult(session_token="tok", account_id="acc")
+
+    def get_instrument_master(self, exchange: str) -> list[InstrumentInfo]:
+        return []
+
+    def get_option_chain(self, underlying: str, expiry: date) -> OptionChainSnapshot:
+        return OptionChainSnapshot(underlying=underlying, expiry=expiry, ts=datetime.now(UTC))
+
+    def get_quote(self, contract_symbol: str) -> Tick:
+        return Tick(contract_symbol, 0.0, 0.0, 0.0, 0, None, datetime.now(UTC))
+
+    def get_depth(self, contract_symbol: str) -> DepthSnapshot:
+        return DepthSnapshot(contract_symbol, (), (), datetime.now(UTC))
+
+    def subscribe_quotes(self, contract_symbols, on_tick, on_depth=None) -> None:
+        return None
+
+    def unsubscribe_quotes(self, contract_symbols) -> None:
+        return None
+
+    def place_order(self, request: OrderRequest) -> OrderResult:
+        raise NotImplementedError
+
+    def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
+        raise NotImplementedError
+
+    def cancel_order(self, broker_order_id: str) -> OrderResult:
+        raise NotImplementedError
+
+    def get_order_status(self, broker_order_id: str) -> OrderResult:
+        raise NotImplementedError
+
+    def get_positions(self) -> list[Position]:
+        return []
+
+    def get_margin(self) -> MarginInfo:
+        if self.margin_raises is not None:
+            raise self.margin_raises
+        return MarginInfo(0.0, 0.0, 0.0, datetime.now(UTC))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def _reset():
+    composition.reset_for_tests()
+    yield
+    composition.reset_for_tests()
+
+
+def test_set_broker_marks_connected_and_status_reflects_it():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+    assert composition.is_shoonya_configured() is True
+
+
+def test_set_broker_none_disconnects():
+    composition.set_broker(_FakeRealBroker())
+    composition.set_broker(None)
+    assert composition.is_shoonya_configured() is False
+
+
+def test_set_broker_closes_previous_real_adapter_on_swap():
+    first = _FakeRealBroker()
+    composition.set_broker(first)
+    composition.set_broker(_FakeRealBroker())
+    assert first.closed is True
+
+
+def test_set_broker_none_closes_the_installed_adapter():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+    composition.set_broker(None)
+    assert fake.closed is True
+
+
+def test_set_broker_over_execution_mock_default_does_not_crash():
+    """`get_broker()`'s lazy default (the persistent execution `MockBrokerAdapter`)
+    has no `close()` at all — swapping it out for a real broker must not
+    blow up on the duck-typed close check.
+    """
+    composition.get_broker()  # populates _broker with the execution mock default
+    composition.set_broker(_FakeRealBroker())
+    assert composition.is_shoonya_configured() is True
+
+
+def test_broker_auth_error_from_any_call_site_marks_disconnected():
+    fake = _FakeRealBroker()
+    fake.margin_raises = BrokerAuthError("session expired")
+    composition.set_broker(fake)
+    assert composition.is_shoonya_configured() is True
+
+    broker = composition.get_broker()
+    with pytest.raises(BrokerAuthError):
+        broker.get_margin()
+
+    assert composition.is_shoonya_configured() is False
+
+
+def test_broker_auth_error_still_propagates_to_the_caller():
+    fake = _FakeRealBroker()
+    fake.margin_raises = BrokerAuthError("session expired")
+    composition.set_broker(fake)
+    broker = composition.get_broker()
+
+    with pytest.raises(BrokerAuthError, match="session expired"):
+        broker.get_margin()
+
+
+def test_non_auth_calls_are_unaffected_when_connected():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+    broker = composition.get_broker()
+    assert broker.get_positions() == []
+    assert composition.is_shoonya_configured() is True

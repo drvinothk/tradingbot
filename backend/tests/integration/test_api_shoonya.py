@@ -153,10 +153,14 @@ def test_login_url_returns_authorize_url_when_configured(
     api_client: TestClient, seeded_admin, monkeypatch
 ):
     _login(api_client, seeded_admin)
+    from pydantic import SecretStr
+
     from app.config.settings import ShoonyaSettings
 
     settings = ShoonyaSettings(
         client_id="TESTCID",
+        secret_code=SecretStr("TESTSECRET"),
+        user_id="FA12345",
         redirect_url="http://127.0.0.1:5000/shoonya/callback",
         oauth_authorize_url="https://api.shoonya.test/OAuthlogin/authorize/oauth",
     )

@@ -94,6 +94,28 @@ class ShoonyaSettings(BaseSettings):
     ws_host: str = "wss://api.shoonya.com/NorenWSAPI/"
     oauth_authorize_url: str = "https://api.shoonya.com/OAuthlogin/authorize/oauth"
 
+    def missing_required_fields(self) -> list[str]:
+        """Fields the OAuth login (`build_authorize_url`) + token exchange
+        (`exchange_code_for_token`) + adapter construction actually consume —
+        checked here instead of at `Settings()` construction time, since
+        every test and every paper-only local run constructs `ShoonyaSettings()`
+        regardless of whether Shoonya is ever used, and must not start failing
+        just because no `shoonya.env` exists yet. `vendor_code`/`primary_ip`/
+        `backup_ip`/`totp_secret` are deliberately not checked — none of them
+        are read by any code path yet (TOTP entry happens on Shoonya's own
+        login page in the user's browser, not in this backend).
+        """
+        missing = []
+        if not self.client_id:
+            missing.append("SHOONYA_CLIENT_ID")
+        if not self.secret_code.get_secret_value():
+            missing.append("SHOONYA_SECRET_CODE")
+        if not self.user_id:
+            missing.append("SHOONYA_USER_ID")
+        if not self.redirect_url:
+            missing.append("SHOONYA_REDIRECT_URL")
+        return missing
+
 
 class RiskDefaults(BaseSettings):
     """System-default risk governance values — these seed `risk_limit_configs`

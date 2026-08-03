@@ -39,11 +39,12 @@ def get_status(user: User = Depends(require_permission("session.start"))) -> dic
 @router.get("/login-url")
 def get_login_url(user: User = Depends(require_permission("session.start"))) -> dict:
     settings = get_settings().shoonya
-    if not settings.client_id:
+    missing = settings.missing_required_fields()
+    if missing:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            "Shoonya credentials are not configured — fill in "
-            "backend/app/config/credentials/shoonya.env first",
+            "Shoonya credentials are not configured — missing "
+            f"{', '.join(missing)} in backend/app/config/credentials/shoonya.env",
         )
     return {"authorize_url": build_authorize_url(settings)}
 
