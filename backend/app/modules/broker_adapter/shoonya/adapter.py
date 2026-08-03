@@ -67,6 +67,20 @@ logger = logging.getLogger("app.broker_adapter.shoonya")
 # NFO contract, per this module's own docstring.
 KNOWN_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
 
+# Live-confirmed via a diagnostic log of real search_scrip("NSE", "NIFTY")
+# results: Shoonya's NSE tsym for the index isn't the bare "NIFTY"/
+# "BANKNIFTY" name used everywhere else in this codebase — it's a distinct
+# display-style string. The same search for "NIFTY" also returned "Nifty
+# Bank", "Nifty Next 50", "Nifty Fin Service", and a dozen unrelated
+# NIFTYxxx-EQ ETF tickers, so a substring/startswith match would have been
+# genuinely ambiguous — an explicit mapping, scoped to the same two known
+# underlyings this whole adapter already limits itself to, is the only safe
+# fix.
+_UNDERLYING_INDEX_TSYM: dict[str, str] = {
+    "NIFTY": "Nifty 50",
+    "BANKNIFTY": "Nifty Bank",
+}
+
 # Re-exported for callers that only import from adapter.py — the actual
 # class lives in rest_client.py now (session-expiry classification happens
 # right where the raw Not_Ok response is parsed, not one layer up).
@@ -149,9 +163,30 @@ class ShoonyaBrokerAdapter(BrokerPort):
 
     def get_option_chain(self, underlying: str, expiry: date) -> OptionChainSnapshot:
         exchange = "NFO"
-        underlying_exchange, underlying_token = self._resolve_underlying_token(underlying, exchange)
+        # Resolves the underlying's own (NSE) token — both as a side effect
+        # (caches it for a later subscribe_quotes/get_quote("NIFTY") call)
+        # and, live-corrected below, to fetch its current price for strprc.
+        underlying_exchange, underlying_token = self._resolve_underlying_token(underlying)
+        # Live-corrected (three wrong guesses first — "NIFTY", "Nifty 50",
+        # and quote_plus-encoded "Nifty+50" were all rejected as "Invalid
+        # Trading Symbol"): GetOptionChain's `tsym` isn't an index name in
+        # any form — Shoonya's own docs define it as "Trading symbol of any
+        # of the option or future. Option chain for that underlying will be
+        # returned," e.g. a real contract like `NIFTY28AUG25F`. Any live,
+        # currently-listed futures contract on this underlying works as the
+        # anchor — the returned chain is filtered by `expiry` below
+        # regardless of which contract's own expiry we anchored on.
+        anchor_tsym = self._resolve_futures_anchor_tsym(underlying)
+        # Live-corrected: `strprc=0.0` was rejected outright ("Invalid
+        # strprc") — Shoonya's docs call it the "mid price" to center the
+        # chain on (near ATM), not an optional/zero-default field. Uses the
+        # underlying's own current LTP, the same "lp" field normalizer.
+        # parse_tick already reads from an identical GetQuotes response
+        # shape.
+        underlying_quote = self._rest.get_quotes(self._uid, underlying_exchange, underlying_token)
+        strike_price = float(underlying_quote.get("lp", 0.0))
         rows = self._rest.get_option_chain(
-            self._uid, underlying_exchange, underlying, strike_price=0.0
+            self._uid, exchange, anchor_tsym, strike_price=strike_price
         )
 
         entries = []
@@ -171,17 +206,63 @@ class ShoonyaBrokerAdapter(BrokerPort):
             entries=tuple(entries),
         )
 
-    def _resolve_underlying_token(self, underlying: str, exchange: str) -> tuple[str, str]:
+    def _resolve_underlying_token(self, underlying: str) -> tuple[str, str]:
+        """**Live-corrected twice**: the underlying index itself (`NIFTY`/
+        `BANKNIFTY`) only exists as a tradable scrip on `NSE` (the cash/
+        index segment) — `NFO` exclusively lists derivative contracts *on*
+        it (option/future symbols like `NIFTY28AUG25FUT`), never a bare
+        `NIFTY` tsym; searching `NFO` for it (the original assumption)
+        never finds a match. Round 2: even on `NSE`, the index's own tsym
+        isn't the bare underlying name — it's Shoonya's own display-style
+        string ("Nifty 50"/"Nifty Bank"), confirmed via a live diagnostic
+        log (see `_UNDERLYING_INDEX_TSYM`'s own docstring for the full
+        candidate list that made a fuzzy match too risky to use instead).
+        """
         try:
             return self._resolve_token(underlying)
         except ShoonyaApiError:
-            rows = self._rest.search_scrip(self._uid, exchange, underlying)
+            index_tsym = _UNDERLYING_INDEX_TSYM.get(underlying.upper(), underlying).upper()
+            rows = self._rest.search_scrip(self._uid, "NSE", underlying)
             for row in rows:
-                if str(row.get("tsym", "")).upper() == underlying.upper():
+                if str(row.get("tsym", "")).upper() == index_tsym:
                     token = str(row.get("token", ""))
-                    self._remember_token(underlying, exchange, token)
-                    return exchange, token
+                    self._remember_token(underlying, "NSE", token)
+                    return "NSE", token
             raise
+
+    def _resolve_futures_anchor_tsym(self, underlying: str) -> str:
+        """Finds any live, currently-listed NFO futures contract on this
+        underlying to use as `GetOptionChain`'s `tsym` anchor — see
+        `get_option_chain`'s own docstring for why a real contract symbol
+        is required at all. `instname` starting with `FUT` (`FUTIDX`/
+        `FUTSTK`) is the same Noren convention `normalizer.
+        parse_instrument_master_row` already uses to identify option rows
+        (`OPTIDX`/`OPTSTK`); `symname` is the row's own underlying
+        reference, more reliable than pattern-matching `tsym` strings.
+        Picks the nearest expiry so this stays valid as far into the
+        future as any currently-listed contract does.
+        """
+        rows = self._rest.search_scrip(self._uid, "NFO", underlying)
+        futures = [
+            row
+            for row in rows
+            if str(row.get("instname", "")).upper().startswith("FUT")
+            and str(row.get("symname", "")).upper() == underlying.upper()
+        ]
+        if not futures:
+            raise ShoonyaApiError(
+                "resolve_futures_anchor",
+                f"no NFO futures contract found for underlying {underlying!r}",
+            )
+
+        def _expiry_key(row: dict) -> date:
+            try:
+                return normalizer.parse_shoonya_date(str(row.get("exd", "")))
+            except normalizer.NormalizationError:
+                return date.max
+
+        futures.sort(key=_expiry_key)
+        return str(futures[0]["tsym"])
 
     # -- BrokerPort: quotes / depth -------------------------------------------
 

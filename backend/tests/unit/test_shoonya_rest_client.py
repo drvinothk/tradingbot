@@ -56,6 +56,29 @@ def test_post_sends_jdata_as_unencoded_raw_json():
     assert captured["jdata"] == {"uid": "FA1", "exch": "NFO"}
 
 
+def test_get_option_chain_url_encodes_tsym():
+    """Live-corrected: a real "Nifty 50" query (the index underlying's own
+    tsym, which contains a space) got rejected as "Invalid Trading Symbol"
+    when sent literally — the reference NorenApi.py implementation
+    `urllib.parse.quote_plus`-encodes `tsym` specifically for this endpoint
+    before embedding it in the jData JSON string, which this now matches.
+    """
+    import json
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw = request.content.decode()
+        jdata_part = raw.split("&jKey=")[0][len("jData=") :]
+        captured["jdata"] = json.loads(jdata_part)
+        return httpx.Response(200, json={"stat": "Ok", "values": []})
+
+    client = _client(handler)
+    client.get_option_chain("FA1", "NFO", "Nifty 50", 0.0)
+
+    assert captured["jdata"]["tsym"] == "Nifty+50"
+
+
 def test_post_raises_on_not_ok_status():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "Invalid Input"})

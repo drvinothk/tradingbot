@@ -37,17 +37,32 @@ class _FakeRestClient:
         self.place_order_response: dict = {"norenordno": "ORD1", "status": "COMPLETE"}
         self.order_status_response: list[dict] = [{"norenordno": "ORD1", "status": "COMPLETE"}]
         self.search_scrip_response: list[dict] = []
+        # Keyed by exchange — get_option_chain now searches both NSE (the
+        # underlying's own token, for later quote/subscribe use) and NFO
+        # (a real futures contract to anchor the GetOptionChain call
+        # itself), so a single flat canned response isn't enough once both
+        # are exercised in the same test.
+        self.search_scrip_response_by_exchange: dict[str, list[dict]] = {}
+        self.get_quotes_response: dict = {
+            "lp": "100.0",
+            "bp1": "99.5",
+            "sp1": "100.5",
+            "v": "10",
+            "oi": "5",
+        }
 
     def _record(self, name, *args, **kwargs):
         self.calls.append((name, args, kwargs))
 
     def search_scrip(self, uid, exchange, search_text):
         self._record("search_scrip", uid, exchange, search_text)
+        if exchange in self.search_scrip_response_by_exchange:
+            return self.search_scrip_response_by_exchange[exchange]
         return self.search_scrip_response
 
     def get_quotes(self, uid, exchange, token):
         self._record("get_quotes", uid, exchange, token)
-        return {"lp": "100.0", "bp1": "99.5", "sp1": "100.5", "v": "10", "oi": "5"}
+        return self.get_quotes_response
 
     def get_option_chain(self, uid, exchange, tradingsymbol, strike_price, count=10):
         self._record("get_option_chain", uid, exchange, tradingsymbol, strike_price)
@@ -183,12 +198,131 @@ def test_get_positions_maps_all_rows():
     assert positions[0].qty == 25
 
 
+def _configure_search_scrip_for_option_chain(rest: _FakeRestClient) -> None:
+    """Both underlying-token resolution (NSE) and futures-anchor resolution
+    (NFO) run during get_option_chain now — see the three "live-corrected"
+    rounds documented on `_resolve_underlying_token`/`_resolve_futures_anchor_tsym`.
+    """
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        {
+            "tsym": "NIFTY28AUG25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": "28-AUG-2025",
+            "token": "12345",
+        }
+    ]
+
+
 def test_get_option_chain_filters_by_expiry():
     rest = _FakeRestClient()
     adapter, _ = _adapter(rest)
-    # No cached token for NIFTY yet -> falls back to search_scrip internally.
-    rest.search_scrip_response = [{"tsym": "NIFTY", "token": "26000"}]
+    _configure_search_scrip_for_option_chain(rest)
 
     snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
     assert snapshot.underlying == "NIFTY"
     assert snapshot.entries == ()
+
+
+def test_get_option_chain_resolves_underlying_token_on_nse_not_nfo():
+    """Live-corrected against a real account: NFO only lists derivative
+    contracts on NIFTY/BANKNIFTY (e.g. NIFTY28AUG25F), never a bare "NIFTY"
+    tsym — only NSE (the cash/index segment) has the underlying itself.
+    Even on NSE, the index's own tsym isn't the bare underlying name —
+    it's "Nifty 50", confirmed via a live diagnostic log of real
+    search_scrip results that also included "Nifty Bank", "Nifty Next 50",
+    and a dozen unrelated NIFTYxxx-EQ ETF tickers (see
+    `_UNDERLYING_INDEX_TSYM`'s own docstring).
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "Nifty Bank", "token": "99999"},
+        {"tsym": "Nifty 50", "token": "26000"},
+    ]
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        {
+            "tsym": "NIFTY28AUG25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": "28-AUG-2025",
+            "token": "12345",
+        }
+    ]
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
+    assert ("FA1", "NSE", "NIFTY") in search_calls
+
+
+def test_get_option_chain_uses_nearest_futures_contract_as_anchor():
+    """Live-corrected three times against a real account: "NIFTY",
+    "Nifty 50", and quote_plus-encoded "Nifty+50" were all rejected by
+    GetOptionChain as "Invalid Trading Symbol" — Shoonya's own docs define
+    `tsym` there as "Trading symbol of any of the option or future," so it
+    needs a real contract, not any form of the index name. Picks the
+    nearest-expiry NFO futures contract on the underlying (matched via
+    `instname` startswith `FUT` + `symname`, not fragile tsym pattern
+    matching) as the anchor.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        # A stock future that merely contains "NIFTY" in its name (decoy —
+        # wrong symname) plus two real NIFTY index futures at different
+        # expiries, to prove both the symname filter and nearest-expiry
+        # selection are doing real work, not just picking whatever's first.
+        {
+            "tsym": "NIFTYBEES28AUG25F",
+            "instname": "FUTSTK",
+            "symname": "NIFTYBEES",
+            "exd": "28-AUG-2025",
+            "token": "1",
+        },
+        {
+            "tsym": "NIFTY25SEP25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": "25-SEP-2025",
+            "token": "2",
+        },
+        {
+            "tsym": "NIFTY28AUG25F",
+            "instname": "FUTIDX",
+            "symname": "NIFTY",
+            "exd": "28-AUG-2025",
+            "token": "3",
+        },
+    ]
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
+    assert ("FA1", "NFO", "NIFTY") in search_calls
+    chain_calls = [call[1] for call in rest.calls if call[0] == "get_option_chain"]
+    assert chain_calls[0][2] == "NIFTY28AUG25F"
+    assert chain_calls[0][1] == "NFO"
+
+
+def test_get_option_chain_uses_underlying_ltp_as_strike_price():
+    """Live-corrected: `strprc=0.0` (the original hardcoded placeholder)
+    was rejected outright ("Invalid strprc") — Shoonya's docs call it the
+    "mid price" to center the chain on (near ATM), not an optional/zero
+    default. Fetches the underlying's own current quote (same "lp" field
+    `normalizer.parse_tick` already reads) and uses that as the strike
+    price GetOptionChain is anchored on.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_quotes_response = {"lp": "24567.85"}
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    quote_calls = [call[1] for call in rest.calls if call[0] == "get_quotes"]
+    assert ("FA1", "NSE", "26000") in quote_calls
+    chain_calls = [call[1] for call in rest.calls if call[0] == "get_option_chain"]
+    assert chain_calls[0][3] == 24567.85
