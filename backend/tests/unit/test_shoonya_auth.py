@@ -69,13 +69,21 @@ def test_exchange_code_for_token_non_json_body_raises():
         auth.exchange_code_for_token(SETTINGS, "auth-code", http_client=client)
 
 
-def test_exchange_code_for_token_sends_expected_payload():
+def test_exchange_code_for_token_sends_jdata_form_field():
+    """Live-corrected shape — `GenAcsTok` (like every other Noren endpoint)
+    wants a `jData=<json-string>` form field, not a plain JSON body. A real
+    account's first live attempt against the old `json=payload` shape got
+    back `Invalid Input : jData or jKey is Missing.` — see `auth.py`'s own
+    docstring for the full story.
+    """
+    import json
+    from urllib.parse import parse_qs
+
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        import json
-
-        captured["body"] = json.loads(request.content)
+        form = parse_qs(request.content.decode())
+        captured["body"] = json.loads(form["jData"][0])
         return httpx.Response(200, json={"susertoken": "tok", "actid": "FA12345"})
 
     client = httpx.Client(transport=httpx.MockTransport(handler))

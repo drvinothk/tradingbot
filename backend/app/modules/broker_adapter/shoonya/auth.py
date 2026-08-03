@@ -18,6 +18,7 @@ caveat applied to the token-exchange response shape.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -75,6 +76,23 @@ def exchange_code_for_token(
     """POSTs to `{api_host}/GenAcsTok`. Raises `ShoonyaAuthError` on any
     non-2xx response or a response missing the expected token field —
     never returns a partially-valid `OAuthSession`.
+
+    **Live-corrected twice (first real account, prior assumptions were
+    wrong):** every Noren-OMS endpoint — including, it turns out,
+    `GenAcsTok` — wants its payload as a single `jData=<json-string>` form
+    field, never a plain JSON body (round 1: `json=payload` got back
+    `"jData or jKey is Missing"`). Round 2: httpx's dict-based `data={...}`
+    percent-encodes the JSON string's `{`/`"`/`:` characters, but Shoonya's
+    server does its own naive `jData=`-prefix string split rather than
+    proper form-decoding — it got back `"jData is not valid json object"`
+    for the percent-encoded body. The reference `NorenApi.py` implementations
+    confirm this: they build the body via raw string concatenation
+    (`'jData=' + json.dumps(values)`) and POST that string directly, never
+    a dict — so the fix is `content=`, not `data=`, sending the exact bytes
+    unencoded. No `jKey` here, matching the reference `login`/
+    `forgot_password` calls (also pre-session, before any token exists).
+    Inner field names (`client_id`/`code`/`checksum`) are unchanged since
+    nothing live has contradicted them yet.
     """
     checksum = _token_exchange_checksum(
         settings.client_id, settings.secret_code.get_secret_value(), code
@@ -84,7 +102,9 @@ def exchange_code_for_token(
     owns_client = http_client is None
     client = http_client or httpx.Client(timeout=15.0)
     try:
-        response = client.post(f"{settings.api_host}/GenAcsTok", json=payload)
+        response = client.post(
+            f"{settings.api_host}/GenAcsTok", content=f"jData={json.dumps(payload)}"
+        )
     except httpx.HTTPError as exc:
         raise ShoonyaAuthError(f"GenAcsTok request failed: {exc}") from exc
     finally:

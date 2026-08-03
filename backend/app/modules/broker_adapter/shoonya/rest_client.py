@@ -87,18 +87,24 @@ class ShoonyaRestClient:
         self.close()
 
     def _post(self, endpoint: str, jdata: dict) -> dict | list:
+        """**Live-corrected**: httpx's dict-based `data={...}` percent-encodes
+        the `jData` JSON string, but Shoonya's server does a naive
+        `jData=`-prefix string split rather than proper form-decoding (see
+        `auth.exchange_code_for_token`'s docstring for the live error that
+        confirmed this for `GenAcsTok` — the same convention applies to
+        every Noren endpoint, this one included). Sends the raw
+        `jData=...&jKey=...` string via `content=`, unencoded, matching every
+        reference `NorenApi.py` implementation.
+        """
         if not self._rate_limiter.acquire_blocking(timeout=self._rate_limit_timeout):
             raise RateLimitExceeded(f"broker call limiter timed out waiting to call {endpoint}")
 
-        body = {
-            "jData": json.dumps(jdata),
-            "jKey": self._access_token,
-        }
+        body = f"jData={json.dumps(jdata)}&jKey={self._access_token}"
         headers = {"Authorization": f"Bearer {self._access_token}"}
 
         try:
             response = self._client.post(
-                f"{self._api_host}/{endpoint}", data=body, headers=headers
+                f"{self._api_host}/{endpoint}", content=body, headers=headers
             )
         except httpx.HTTPError as exc:
             raise ShoonyaApiError(endpoint, f"request failed: {exc}") from exc

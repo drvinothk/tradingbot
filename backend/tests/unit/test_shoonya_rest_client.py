@@ -29,6 +29,33 @@ def test_post_sends_jkey_and_authorization_header():
     assert captured["body"]["jKey"] == "tok-123"
 
 
+def test_post_sends_jdata_as_unencoded_raw_json():
+    """Live-corrected regression test: a real account's first live call
+    against the old dict-based `data={...}` shape got back
+    `Invalid Input : jData is not valid json object` — httpx percent-encodes
+    a dict's values, but Shoonya's server does a naive `jData=`-prefix
+    string split, not proper form-decoding. This asserts the body is the
+    literal, unencoded JSON text (no `%7B`/`%22` escaping), not just that a
+    `jKey` field happens to be parseable.
+    """
+    import json
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw = request.content.decode()
+        assert "%7B" not in raw and "%22" not in raw, "jData must not be percent-encoded"
+        jdata_part = raw.split("&jKey=")[0]
+        assert jdata_part.startswith("jData=")
+        captured["jdata"] = json.loads(jdata_part[len("jData=") :])
+        return httpx.Response(200, json={"stat": "Ok"})
+
+    client = _client(handler)
+    client._post("SomeEndpoint", {"uid": "FA1", "exch": "NFO"})
+
+    assert captured["jdata"] == {"uid": "FA1", "exch": "NFO"}
+
+
 def test_post_raises_on_not_ok_status():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "Invalid Input"})

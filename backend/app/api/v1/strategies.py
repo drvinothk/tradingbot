@@ -322,6 +322,22 @@ def start_strategy(
     # them has stopped.
     get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
 
+    # One immediate option-chain snapshot so the first evaluate() cycle has
+    # something to rank against, rather than waiting on whatever polling
+    # cadence (Scheduler, on-demand) later refreshes it — record_option_
+    # chain_snapshot is designed to be called this way (build plan: "called
+    # on a schedule or on demand").
+    #
+    # **Must run before ensure_ingestion_running below.** Live-corrected:
+    # against a real broker adapter, subscribe_quotes needs the underlying's
+    # broker token already cached (ShoonyaBrokerAdapter._resolve_token), and
+    # that cache is only populated as a side effect of get_option_chain's own
+    # underlying-token resolution — this call is what does that. Never
+    # surfaced against MockBrokerAdapter (no real token lookup needed there),
+    # only found once a real account's first live start_strategy call raised
+    # "no cached broker token for 'NIFTY'" from ensure_ingestion_running.
+    record_option_chain_snapshot(instrument.id, get_broker(), instrument.symbol, body.expiry_date)
+
     # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
     # nothing ever actually started one outside tests — real strategies
     # (unlike the synthetic stub) need genuinely live price_bars/
@@ -331,13 +347,6 @@ def start_strategy(
     # idempotent per symbol so several concurrent runs on the same or
     # different underlyings all share it.
     ensure_ingestion_running(instrument.symbol)
-
-    # One immediate option-chain snapshot so the first evaluate() cycle has
-    # something to rank against, rather than waiting on whatever polling
-    # cadence (Scheduler, on-demand) later refreshes it — record_option_
-    # chain_snapshot is designed to be called this way (build plan: "called
-    # on a schedule or on demand").
-    record_option_chain_snapshot(instrument.id, get_broker(), instrument.symbol, body.expiry_date)
 
     strategy = _build_strategy(strategy_config, body.instrument_id, body.expiry_date)
     runner = StrategyRunner(strategy, run.id, interval_seconds=body.interval_seconds)
