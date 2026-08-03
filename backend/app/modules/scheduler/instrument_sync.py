@@ -60,13 +60,16 @@ def sync_instrument_master(
                         exchange=exchange,
                         lot_size=info.lot_size,
                         tick_size=info.tick_size,
+                        freeze_qty=info.freeze_qty,
                         is_active=True,
                     )
                     db.add(instrument)
                     db.flush()
                     instruments_updated += 1
-                elif instrument.lot_size != info.lot_size or instrument.tick_size != Decimal(
-                    str(info.tick_size)
+                elif (
+                    instrument.lot_size != info.lot_size
+                    or instrument.tick_size != Decimal(str(info.tick_size))
+                    or (info.freeze_qty is not None and instrument.freeze_qty != info.freeze_qty)
                 ):
                     # Comparing the DB's Decimal to a raw float directly is unreliable
                     # (binary float imprecision makes 0.05 != Decimal('0.0500') even
@@ -74,6 +77,11 @@ def sync_instrument_master(
                     # its string repr to get a matching Decimal first.
                     instrument.lot_size = info.lot_size
                     instrument.tick_size = info.tick_size
+                    # Only overwrite when the broker actually supplies a value —
+                    # never blank out an operator-set freeze_qty just because
+                    # this sync source (e.g. Shoonya, today) doesn't carry one.
+                    if info.freeze_qty is not None:
+                        instrument.freeze_qty = info.freeze_qty
                     instruments_updated += 1
                 symbol_to_instrument_id[info.symbol] = instrument.id
 

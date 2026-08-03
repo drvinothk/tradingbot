@@ -40,6 +40,13 @@ from app.modules.broker_adapter.composition import get_broker
 from app.modules.execution_engine.paper.registry import ensure_position_manager_running
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.market_data import record_option_chain_snapshot
+from app.modules.market_data.freshness import (
+    PRICE_DRIFT_TOLERANCE_PCT,
+    check_price_drift,
+    classify_latest_tick,
+    classify_option_chain,
+    worse_of,
+)
 from app.modules.market_data.registry import ensure_ingestion_running
 from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
@@ -57,11 +64,6 @@ router = APIRouter(tags=["strategies"])
 
 # strategy_run_id -> live runner thread. See module docstring.
 _RUNNERS: dict[uuid.UUID, StrategyRunner] = {}
-
-# How much the underlying's premium may have moved since the intent was
-# generated before an Approve click is treated as stale — see the build
-# plan's "Auto-execute vs Approval-required" section.
-FRESHNESS_TOLERANCE_PCT = 0.03
 
 
 def _utcnow() -> datetime:
@@ -433,6 +435,7 @@ class RunningStrategyOut(BaseModel):
     started_at: datetime
     open_position: RunningPositionOut | None
     pending_approvals: list[PendingApprovalOut]
+    data_freshness: str | None
 
 
 @router.get("/strategies/running", response_model=list[RunningStrategyOut])
@@ -477,6 +480,22 @@ def list_running_strategies(
             .all()
         )
 
+        # Read-only classification (no refresh here — that only happens
+        # inside the runner's own cycle, see market_data.freshness) against
+        # whichever instrument/expiry the live runner thread is tracking.
+        # `None` (not "dead") when no live runner is registered for this run
+        # (e.g. right after a restart, before startup-recovery resumes it) —
+        # there's nothing to classify freshness *of* in that case.
+        runner = _RUNNERS.get(run.id)
+        data_freshness = (
+            worse_of(
+                classify_latest_tick(db, runner.instrument_id),
+                classify_option_chain(db, runner.instrument_id, runner.expiry_date),
+            ).value
+            if runner is not None
+            else None
+        )
+
         result.append(
             RunningStrategyOut(
                 strategy_run_id=run.id,
@@ -517,6 +536,7 @@ def list_running_strategies(
                     )
                     for approval, trade_intent in pending_rows
                 ],
+                data_freshness=data_freshness,
             )
         )
 
@@ -597,32 +617,37 @@ def approve_trade_approval(
         # market moved materially while the human was deciding. Surfaces as 409
         # rather than silently dispatching the original, now-stale numbers; the
         # approval stays PENDING so re-clicking Approve retries this check.
+        # Shared with evaluate_trade_intent's AUTO-mode equivalent via
+        # market_data.freshness.check_price_drift.
         latest_tick = (
             db.query(QuoteTick)
             .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
             .order_by(QuoteTick.ts.desc())
             .first()
         )
-        if latest_tick is not None and float(trade_intent.entry_price) > 0:
+        if latest_tick is not None and check_price_drift(
+            float(latest_tick.ltp),
+            float(trade_intent.entry_price),
+            tolerance_pct=PRICE_DRIFT_TOLERANCE_PCT,
+        ):
             drift = abs(float(latest_tick.ltp) - float(trade_intent.entry_price)) / float(
                 trade_intent.entry_price
             )
-            if drift > FRESHNESS_TOLERANCE_PCT:
-                record_event(
-                    db,
-                    workspace_id=user.workspace_id,
-                    actor_type=ActorType.USER,
-                    actor_id=user.id,
-                    event_category=EventCategory.RISK_DECISION,
-                    event_type="pending_trade_approval.stale",
-                    entity_type="trade_intent",
-                    entity_id=trade_intent.id,
-                    payload={"drift_pct": drift},
-                )
-                db.commit()
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT, "Conditions changed — re-approve to confirm"
-                )
+            record_event(
+                db,
+                workspace_id=user.workspace_id,
+                actor_type=ActorType.USER,
+                actor_id=user.id,
+                event_category=EventCategory.RISK_DECISION,
+                event_type="pending_trade_approval.stale",
+                entity_type="trade_intent",
+                entity_id=trade_intent.id,
+                payload={"drift_pct": drift},
+            )
+            db.commit()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "Conditions changed — re-approve to confirm"
+            )
 
         approval.status = ApprovalStatus.APPROVED
         approval.decided_by_user_id = user.id

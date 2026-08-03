@@ -17,7 +17,7 @@ from app.api.v1.strategies import _get_pending_approval_or_404
 from app.domain.audit.models import AuditEvent
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.identity.models import Workspace as WorkspaceRow
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
 from app.domain.ops.models import SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
@@ -477,6 +477,112 @@ def test_evaluate_trade_intent_margin_check_failed(
 
     assert decision.decision == "rejected"
     assert "margin_check_failed" in decision.reasons
+
+
+def test_evaluate_trade_intent_tick_size_violation(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    # instrument fixture's tick_size is 0.05 — 80.03 isn't a multiple of it.
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.03
+    )
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "tick_size_violation:entry" in decision.reasons
+
+
+def test_evaluate_trade_intent_tick_aligned_price_is_not_rejected(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.05
+    )
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert not any(r.startswith("tick_size_violation") for r in decision.reasons)
+
+
+def test_evaluate_trade_intent_freeze_qty_exceeded(
+    db: Session, trading_session, strategy_run, option_contract, instrument
+):
+    instrument.freeze_qty = 20  # lot_size=25 * qty_lots=1 = 25 > 20
+    db.add(instrument)
+    db.flush()
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "freeze_qty_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_freeze_qty_none_is_a_noop(
+    db: Session, trading_session, strategy_run, option_contract, instrument
+):
+    assert instrument.freeze_qty is None  # default — no operator value set
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "freeze_qty_exceeded" not in decision.reasons
+
+
+def test_evaluate_trade_intent_price_drift_exceeded(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """AUTO-mode equivalent of approve_trade_approval's manual price-drift
+    re-check — closes the asymmetry a human's Approve click was protected by
+    but an AUTO-dispatched intent never was.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(),
+            option_contract_id=option_contract.id,
+            ltp=95.0,  # ~19% away from entry_price=80.0, past the 3% tolerance
+            bid=94.9,
+            ask=95.1,
+            volume=100,
+            oi=1000,
+            ts=datetime.now(UTC),
+        )
+    )
+    db.flush()
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "price_drift_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_no_drift_rejection_when_tick_within_tolerance(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(),
+            option_contract_id=option_contract.id,
+            ltp=81.0,  # ~1.25% away, within the 3% tolerance
+            bid=80.9,
+            ask=81.1,
+            volume=100,
+            oi=1000,
+            ts=datetime.now(UTC),
+        )
+    )
+    db.flush()
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "price_drift_exceeded" not in decision.reasons
 
 
 def test_evaluate_trade_intent_rejection_raises_system_alert(

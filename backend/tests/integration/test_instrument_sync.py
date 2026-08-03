@@ -71,6 +71,45 @@ def test_sync_detects_a_real_lot_size_change(db: Session):
     assert nifty.lot_size == 30
 
 
+def test_sync_populates_freeze_qty_from_broker(db: Session):
+    broker = MockBrokerAdapter(instruments=build_mock_universe(EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    assert nifty.freeze_qty == 1800  # mock_universe's illustrative placeholder
+
+
+def test_sync_never_blanks_an_operator_set_freeze_qty_with_a_missing_value(db: Session):
+    """freeze_qty is operator-supplied (see Instrument.freeze_qty's own
+    docstring) — a sync source that doesn't carry the field (real Shoonya
+    data today) must never overwrite a value an operator already set.
+    """
+    broker = MockBrokerAdapter(instruments=build_mock_universe(EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    nifty.freeze_qty = 2500  # operator override
+    db.add(nifty)
+    db.flush()
+
+    # A "broker" universe that changes lot_size (forcing an update) but
+    # carries no freeze_qty at all — same shape real Shoonya data has today.
+    no_freeze_qty_universe = [
+        InstrumentInfo(symbol="NIFTY", exchange="NFO", lot_size=30, tick_size=0.05)
+        if i.symbol == "NIFTY" and not i.is_option
+        else i
+        for i in build_mock_universe(EXPIRY)
+    ]
+    broker2 = MockBrokerAdapter(instruments=no_freeze_qty_universe, seed=1)
+    log = sync_instrument_master(db, broker2, exchanges=["NFO"])
+
+    assert log.instruments_updated == 1
+    db.refresh(nifty)
+    assert nifty.lot_size == 30
+    assert nifty.freeze_qty == 2500  # untouched, not blanked to None
+
+
 def test_expired_contracts_are_deactivated_not_deleted(db: Session):
     # The expiry sweep runs unconditionally at the end of every call, so a
     # contract inserted with an already-past expiry is self-deactivated in

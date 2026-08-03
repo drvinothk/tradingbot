@@ -56,6 +56,13 @@ class Instrument(Base, UUIDPkMixin, TimestampMixin):
     exchange: Mapped[str] = mapped_column(String(20))
     lot_size: Mapped[int] = mapped_column(Integer)
     tick_size: Mapped[float] = mapped_column(Numeric(10, 4))
+    # Exchange-imposed max order size (NSE F&O "freeze quantity") in raw
+    # quantity, not lots. Nullable and operator-supplied on purpose — real
+    # values are periodically revised by exchange circular, so hardcoding a
+    # number here would be presenting a guess as a fact. None (the default
+    # for every existing/real instrument until populated) means the
+    # freeze-quantity check in risk_engine.evaluate_trade_intent is a no-op.
+    freeze_qty: Mapped[int | None] = mapped_column(Integer, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     __table_args__ = (UniqueConstraint("symbol", "exchange", name="uq_instrument_symbol_exchange"),)

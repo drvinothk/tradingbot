@@ -17,6 +17,7 @@ from __future__ import annotations
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import date
 
 from sqlalchemy.orm import Session
 
@@ -46,6 +47,14 @@ class TradeProposal:
 
 
 class Strategy(ABC):
+    # Every concrete strategy already stores these as plain instance
+    # attributes (set in __init__, either directly or via
+    # ConfirmationFilterStrategy's base __init__) — declared here formally
+    # so `strategy_engine.runner.run_cycle` can read them generically for the
+    # freshness gate without each strategy needing to expose anything new.
+    instrument_id: uuid.UUID
+    expiry_date: date
+
     @abstractmethod
     def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
         """Called once per scan cycle. Returns a proposal to submit, or

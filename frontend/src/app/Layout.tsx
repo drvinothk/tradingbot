@@ -13,6 +13,7 @@ export function Layout() {
           <NavLink to="/sessions">Sessions</NavLink>
           <NavLink to="/strategies">Strategies</NavLink>
           <NavLink to="/reports">Reports</NavLink>
+          <NavLink to="/recovery">Recovery</NavLink>
         </div>
         <div className="topnav-user">
           <span>{user?.email}</span>

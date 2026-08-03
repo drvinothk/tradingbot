@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import random
 import threading
+import time
 import uuid
 import zlib
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
@@ -32,6 +34,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     Tick,
 )
+from app.modules.broker_adapter.base.errors import BrokerConnectivityError
 
 # Generous synthetic funds — paper mode should never be capital-constrained by
 # a fake margin figure; this exists purely so the DTO is populated, not to
@@ -42,6 +45,24 @@ _SYNTHETIC_TOTAL_MARGIN = 10_000_000.0
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+@dataclass(frozen=True)
+class FillScenario:
+    """One queued `place_order` outcome, consumed FIFO per `contract_symbol`
+    by `queue_fill_scenario`/`place_order` below — opt-in fault injection
+    for partial fills, rejects, and delays. `filled_qty=None` defaults to
+    the full requested quantity; `avg_fill_price=None` defaults to the
+    normal computed price when `status` is FILLED, or to no price at all
+    otherwise (a REJECTED/PENDING order realistically has none) — this is
+    what lets a test exercise `close_position`'s handling of a non-terminal
+    exit order without contriving a fill price for it.
+    """
+
+    status: BrokerOrderStatus
+    filled_qty: int | None = None
+    avg_fill_price: float | None = None
+    delay_seconds: float = 0.0
 
 
 class MockBrokerAdapter(BrokerPort):
@@ -67,6 +88,27 @@ class MockBrokerAdapter(BrokerPort):
         # idempotency_key -> OrderResult, and a running position book
         self._orders: dict[str, OrderResult] = {}
         self._positions: dict[str, Position] = {}
+
+        # Opt-in fault injection — both empty/False by default, meaning
+        # every existing caller's behavior is unchanged unless a test
+        # explicitly queues a scenario or simulates a disconnect.
+        self._fill_scenarios: dict[str, list[FillScenario]] = {}
+        self._disconnected = False
+
+    def queue_fill_scenario(self, contract_symbol: str, scenario: FillScenario) -> None:
+        """The next `place_order` call for this symbol consumes one queued
+        scenario instead of the adapter's normal always-fills-immediately
+        behavior. Queue is per-symbol and FIFO; an unqueued symbol behaves
+        exactly as before this existed.
+        """
+        self._fill_scenarios.setdefault(contract_symbol, []).append(scenario)
+
+    def simulate_disconnect(self, disconnected: bool = True) -> None:
+        """While `True`, `get_quote`/`place_order` raise
+        `BrokerConnectivityError` instead of their normal behavior —
+        standing in for a dropped broker connection. Off by default.
+        """
+        self._disconnected = disconnected
 
     # -- price simulation -------------------------------------------------
 
@@ -169,6 +211,8 @@ class MockBrokerAdapter(BrokerPort):
     # -- BrokerPort: quotes / depth ------------------------------------------
 
     def get_quote(self, contract_symbol: str) -> Tick:
+        if self._disconnected:
+            raise BrokerConnectivityError("mock broker: simulated disconnect")
         return self._make_tick(contract_symbol, step=False)
 
     def get_depth(self, contract_symbol: str) -> DepthSnapshot:
@@ -220,20 +264,7 @@ class MockBrokerAdapter(BrokerPort):
 
     # -- BrokerPort: orders -------------------------------------------------
 
-    def place_order(self, request: OrderRequest) -> OrderResult:
-        if request.idempotency_key in self._orders:
-            return self._orders[request.idempotency_key]
-
-        fill_price = request.limit_price or self._price_for(request.contract_symbol)
-        result = OrderResult(
-            idempotency_key=request.idempotency_key,
-            broker_order_id=f"MOCK-{uuid.uuid4().hex[:10]}",
-            status=BrokerOrderStatus.FILLED,
-            filled_qty=request.qty,
-            avg_fill_price=round(fill_price, 2),
-        )
-        self._orders[request.idempotency_key] = result
-
+    def _apply_position_fill(self, request: OrderRequest, fill_price: float) -> None:
         signed_qty = request.qty if request.side == OrderSide.BUY else -request.qty
         existing = self._positions.get(request.contract_symbol)
         if existing is None:
@@ -245,6 +276,50 @@ class MockBrokerAdapter(BrokerPort):
             self._positions[request.contract_symbol] = Position(
                 contract_symbol=request.contract_symbol, qty=new_qty, avg_price=fill_price
             )
+
+    def place_order(self, request: OrderRequest) -> OrderResult:
+        if request.idempotency_key in self._orders:
+            return self._orders[request.idempotency_key]
+
+        if self._disconnected:
+            raise BrokerConnectivityError("mock broker: simulated disconnect")
+
+        queued = self._fill_scenarios.get(request.contract_symbol)
+        scenario = queued.pop(0) if queued else None
+
+        if scenario is not None:
+            if scenario.delay_seconds:
+                time.sleep(scenario.delay_seconds)
+            if scenario.avg_fill_price is not None:
+                fill_price: float | None = scenario.avg_fill_price
+            elif scenario.status == BrokerOrderStatus.FILLED:
+                fill_price = request.limit_price or self._price_for(request.contract_symbol)
+            else:
+                fill_price = None
+            filled_qty = scenario.filled_qty if scenario.filled_qty is not None else request.qty
+
+            result = OrderResult(
+                idempotency_key=request.idempotency_key,
+                broker_order_id=f"MOCK-{uuid.uuid4().hex[:10]}",
+                status=scenario.status,
+                filled_qty=filled_qty,
+                avg_fill_price=round(fill_price, 2) if fill_price is not None else None,
+            )
+            self._orders[request.idempotency_key] = result
+            if scenario.status == BrokerOrderStatus.FILLED and fill_price is not None:
+                self._apply_position_fill(request, fill_price)
+            return result
+
+        fill_price = request.limit_price or self._price_for(request.contract_symbol)
+        result = OrderResult(
+            idempotency_key=request.idempotency_key,
+            broker_order_id=f"MOCK-{uuid.uuid4().hex[:10]}",
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=request.qty,
+            avg_fill_price=round(fill_price, 2),
+        )
+        self._orders[request.idempotency_key] = result
+        self._apply_position_fill(request, fill_price)
         return result
 
     def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:

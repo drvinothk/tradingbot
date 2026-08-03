@@ -46,6 +46,7 @@ from app.api.v1 import (
     sessions,
     shoonya,
     strategies,
+    system_alerts,
 )
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
@@ -244,6 +245,7 @@ def create_app() -> FastAPI:
     app.include_router(instruments.router, prefix="/api/v1")
     app.include_router(audit.router, prefix="/api/v1")
     app.include_router(metrics.router, prefix="/api/v1")
+    app.include_router(system_alerts.router, prefix="/api/v1")
     # No /api/v1 prefix, deliberately: SHOONYA_REDIRECT_URL (the fixed URL
     # the user registers on Shoonya's own API key form) is
     # http://127.0.0.1:5000/shoonya/callback — mounting under /api/v1 would

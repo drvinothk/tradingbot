@@ -51,6 +51,11 @@ class InstrumentInfo:
     strike: float | None = None
     option_type: OptionType | None = None
     broker_token: str = ""
+    # Exchange-imposed max order size (NSE F&O "freeze quantity"), raw qty.
+    # None (the default, and what every real-broker adapter produces today —
+    # Shoonya's normalizer doesn't parse this field, see its own docstring)
+    # means risk_engine's freeze-quantity check stays a no-op.
+    freeze_qty: int | None = None
 
 
 @dataclass(frozen=True)

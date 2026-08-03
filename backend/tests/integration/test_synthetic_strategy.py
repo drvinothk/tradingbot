@@ -169,6 +169,56 @@ def test_run_cycle_with_no_market_data_yields_nothing(
     assert decision is None
 
 
+def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(
+    db: Session,
+    instrument: Instrument,
+    option_contract: OptionContract,
+    strategy_run,
+    trading_session,
+    strategy_config,
+    caplog,
+):
+    """The freshness gate's actual point: a broker failure during refresh
+    must mean "skip this cycle," never "trade off data we can't vouch for."
+    Seeds real market data first so a pass-through (bug) would otherwise
+    produce a real signal, making a false negative here loud, not silent.
+    """
+    from datetime import timedelta
+
+    from app.modules.broker_adapter import composition
+    from app.modules.broker_adapter.base.errors import BrokerConnectivityError
+
+    _seed_market_data(db, instrument, option_contract)
+    # Backdate past OPTION_CHAIN_THRESHOLDS.stale_after_seconds so
+    # ensure_fresh_option_chain actually attempts a refresh (and hits the
+    # failing broker below) instead of finding this fresh data and skipping
+    # the refresh path entirely.
+    snapshot = db.query(OptionChainSnapshot).filter(
+        OptionChainSnapshot.instrument_id == instrument.id
+    ).one()
+    snapshot.ts = datetime.now(UTC) - timedelta(minutes=20)
+    db.add(snapshot)
+    db.flush()
+
+    class _FailingBroker:
+        def get_option_chain(self, *args, **kwargs):
+            raise BrokerConnectivityError("feed down")
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    composition.set_broker(_FailingBroker())  # type: ignore[arg-type]
+    try:
+        strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+        with caplog.at_level("WARNING", logger="app.strategy_engine.runner"):
+            decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    finally:
+        composition.set_broker(None)
+
+    assert decision is None
+    assert "skipping cycle" in caplog.text
+
+
 def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     db: Session, instrument, option_contract, strategy_run, trading_session, strategy_config
 ):

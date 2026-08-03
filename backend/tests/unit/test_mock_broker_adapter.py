@@ -13,7 +13,9 @@ from app.modules.broker_adapter.base import (
     OrderSide,
     OrderType,
 )
+from app.modules.broker_adapter.base.errors import BrokerConnectivityError
 from app.modules.broker_adapter.mock import MockBrokerAdapter
+from app.modules.broker_adapter.mock.adapter import FillScenario
 
 EXPIRY = date(2026, 7, 30)
 
@@ -175,3 +177,79 @@ def test_get_margin_reflects_open_positions():
     assert after_buy.used_margin == pytest.approx(25 * 100.0)
     expected_available = after_buy.total_margin - after_buy.used_margin
     assert after_buy.available_margin == pytest.approx(expected_available)
+
+
+def _order(idempotency_key: str, qty: int = 25) -> OrderRequest:
+    return OrderRequest(
+        idempotency_key=idempotency_key,
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=qty,
+    )
+
+
+def test_place_order_without_a_queued_scenario_is_unchanged():
+    """Default-path regression check — the whole point of Batch 3's fault
+    injection being opt-in: nothing queued means byte-identical behavior to
+    before FillScenario existed.
+    """
+    api = MockBrokerAdapter(instruments=_instruments(), seed=21)
+    result = api.place_order(_order("default-1"))
+    assert result.status == BrokerOrderStatus.FILLED
+    assert result.filled_qty == 25
+    assert result.avg_fill_price is not None
+
+
+def test_queued_partial_fill_scenario_is_consumed_once():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=23)
+    api.queue_fill_scenario(
+        "NIFTY30JUL26C24000",
+        FillScenario(status=BrokerOrderStatus.PARTIALLY_FILLED, filled_qty=10),
+    )
+
+    partial = api.place_order(_order("partial-1"))
+    assert partial.status == BrokerOrderStatus.PARTIALLY_FILLED
+    assert partial.filled_qty == 10
+
+    # Queue is drained — the next call for the same symbol falls back to
+    # normal (unqueued) behavior.
+    normal = api.place_order(_order("partial-2"))
+    assert normal.status == BrokerOrderStatus.FILLED
+    assert normal.filled_qty == 25
+
+
+def test_queued_reject_scenario_has_no_fill_price_and_no_position():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=29)
+    api.queue_fill_scenario("NIFTY30JUL26C24000", FillScenario(status=BrokerOrderStatus.REJECTED))
+
+    result = api.place_order(_order("reject-1"))
+
+    assert result.status == BrokerOrderStatus.REJECTED
+    assert result.avg_fill_price is None
+    assert api.get_positions() == []
+
+
+def test_queued_scenario_can_override_fill_price_explicitly():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=31)
+    api.queue_fill_scenario(
+        "NIFTY30JUL26C24000",
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=123.45),
+    )
+
+    result = api.place_order(_order("explicit-price-1"))
+
+    assert result.avg_fill_price == 123.45
+
+
+def test_simulate_disconnect_raises_on_get_quote_and_place_order():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=37)
+    api.simulate_disconnect(True)
+
+    with pytest.raises(BrokerConnectivityError):
+        api.get_quote("NIFTY30JUL26C24000")
+    with pytest.raises(BrokerConnectivityError):
+        api.place_order(_order("disconnected-1"))
+
+    api.simulate_disconnect(False)
+    assert api.place_order(_order("disconnected-2")).status == BrokerOrderStatus.FILLED

@@ -27,6 +27,7 @@ from app.domain.execution.models import (
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.ops.models import SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -39,7 +40,8 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.broker_adapter import composition
-from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus
+from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
     close_position,
     dispatch_trade_intent,
@@ -358,6 +360,48 @@ def test_close_position_is_idempotent_when_already_closed(
     )
     assert second is None
     assert db.query(Order).filter(Order.position_id == position.id).count() == 1
+
+
+def test_close_position_leaves_position_open_when_exit_order_is_rejected(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The narrowly-scoped fix: a non-FILLED exit order must not crash
+    computing exit_price, and must not lie about the position being closed
+    — it stays OPEN so the next PositionManager cycle or a manual reconcile
+    can still see and retry it. Normal exits (every other test in this file)
+    are unaffected since they never queue a fault scenario.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    broker.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+    )
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    assert position.closing_order_id is None
+
+    exit_order = (
+        db.query(Order)
+        .filter(Order.position_id == position.id, Order.status == OrderStatus.REJECTED)
+        .one()
+    )
+    assert exit_order.avg_fill_price is None
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.trading_session_id == trading_session.id)
+        .filter(SystemAlert.category == "exit_order_unfilled")
+        .one()
+    )
+    assert str(position.id) in alert.message
 
 
 def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(

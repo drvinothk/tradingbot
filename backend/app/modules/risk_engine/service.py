@@ -43,7 +43,7 @@ from app.core.modes.state_machine import enter_kill_switch
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import User
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.risk.models import RiskDecision, RiskDecisionOutcome, RiskLimitConfig
 from app.domain.session.models import (
@@ -65,6 +65,7 @@ from app.domain.strategy.models import (
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_execution_broker
+from app.modules.market_data.freshness import PRICE_DRIFT_TOLERANCE_PCT, check_price_drift
 
 logger = logging.getLogger("app.risk_engine")
 
@@ -97,6 +98,12 @@ def _utcnow() -> datetime:
 
 def _dec(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _is_tick_aligned(price: Decimal, tick_size: Decimal) -> bool:
+    if tick_size <= 0:
+        return True
+    return price % tick_size == 0
 
 
 @dataclass(frozen=True)
@@ -413,6 +420,50 @@ def evaluate_trade_intent(
 
         if trade_intent.qty_lots > risk_config.per_trade_lot_cap:
             reasons.append("per_trade_lot_cap_exceeded")
+
+        # Safe against every current test/live-paper path, not just
+        # untested: MockBrokerAdapter's option premiums are seeded as whole
+        # numbers (base = 50.0 + crc32(symbol) % 200) and never "stepped"
+        # for options specifically (get_quote/get_option_chain always pass
+        # step=False; only a subscribed *underlying* symbol steps, via the
+        # streaming loop) — and compute_stop_target's clean 0.9/1.15-style
+        # multipliers preserve exact 0.05-tick alignment for any whole-
+        # number entry price. This only starts doing real rejecting work
+        # once Shoonya's genuinely fractional premiums flow through
+        # execution (Phase 6) — worth re-verifying then.
+        instrument = db.get(Instrument, option_contract.instrument_id)
+        if instrument is not None:
+            for label, price in (
+                ("entry", trade_intent.entry_price),
+                ("stop", trade_intent.stop_price),
+                ("target", trade_intent.target_price),
+            ):
+                if not _is_tick_aligned(_dec(price), _dec(instrument.tick_size)):
+                    reasons.append(f"tick_size_violation:{label}")
+
+            if instrument.freeze_qty is not None:
+                raw_qty = trade_intent.qty_lots * instrument.lot_size
+                if raw_qty > instrument.freeze_qty:
+                    reasons.append("freeze_qty_exceeded")
+
+        # AUTO-mode equivalent of the manual-approval price-drift re-check
+        # (api.v1.strategies.approve_trade_approval) — same shared helper,
+        # same tolerance. Closes the asymmetry where a human's Approve click
+        # was re-validated against the latest tick but an AUTO-dispatched
+        # intent, generated from a proposal that may itself be a cycle or
+        # more old by the time this evaluation runs, never was.
+        latest_tick = (
+            db.query(QuoteTick)
+            .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
+            .order_by(QuoteTick.ts.desc())
+            .first()
+        )
+        if latest_tick is not None and check_price_drift(
+            float(latest_tick.ltp),
+            float(trade_intent.entry_price),
+            tolerance_pct=PRICE_DRIFT_TOLERANCE_PCT,
+        ):
+            reasons.append("price_drift_exceeded")
 
         margin_ok = _check_margin(_dec(analytics.capital_required), trading_session)
         if not margin_ok:

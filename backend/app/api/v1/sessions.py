@@ -19,7 +19,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes import ModeTransitionError, enter_kill_switch
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.broker.models import ReconciliationTrigger
+from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
 from app.domain.identity.models import BrokerAccount, User
 from app.domain.session.models import (
     FundingMode,
@@ -310,3 +310,65 @@ def manual_reconcile(
     )
     db.commit()
     return {"mismatches_found": run.mismatches_found, "action_taken": run.action_taken}
+
+
+class ReconciliationRunOut(BaseModel):
+    id: uuid.UUID
+    trigger_type: str
+    mismatches_found: int
+    action_taken: str
+    started_at: datetime
+    finished_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BrokerSyncStateOut(BaseModel):
+    option_contract_id: uuid.UUID
+    local_qty: int
+    broker_qty: int
+    is_mismatched: bool
+    checked_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ReconciliationHistoryOut(BaseModel):
+    runs: list[ReconciliationRunOut]
+    current_mismatches: list[BrokerSyncStateOut]
+
+
+@router.get("/{session_id}/reconciliation-runs", response_model=ReconciliationHistoryOut)
+def list_reconciliation_runs(
+    session_id: uuid.UUID,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.view")),
+) -> ReconciliationHistoryOut:
+    """Recovery-panel read path — `ReconciliationRun` (the append-only pass
+    log) and `BrokerSyncState` (the latest per-contract snapshot, overwritten
+    each pass, not history) both had no read API before this; the manual
+    `/reconcile` endpoint above only ever returns the single run it just
+    performed, not this session's history.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    runs = (
+        db.query(ReconciliationRun)
+        .filter(ReconciliationRun.trading_session_id == trading_session.id)
+        .order_by(ReconciliationRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    mismatches = (
+        db.query(BrokerSyncState)
+        .filter(
+            BrokerSyncState.trading_session_id == trading_session.id,
+            BrokerSyncState.is_mismatched.is_(True),
+        )
+        .order_by(BrokerSyncState.checked_at.desc())
+        .all()
+    )
+    return ReconciliationHistoryOut(
+        runs=[ReconciliationRunOut.model_validate(r) for r in runs],
+        current_mismatches=[BrokerSyncStateOut.model_validate(m) for m in mismatches],
+    )

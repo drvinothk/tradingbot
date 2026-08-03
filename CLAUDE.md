@@ -466,6 +466,30 @@ check, then exercise it live).
   instead — `GET /audit/verify?since_seq=489` reports `intact: true` on
   this database today, verified live. Full write-up in
   `docs/architecture/build-plan.md`'s Addendum section.
+- **Guardrail-layer proposal evaluated; four genuine gaps closed** — an
+  externally-drafted "broker-agnostic guardrail layer" proposal (order state
+  machine, stale-quote protection, pre-trade validation, risk rails, a
+  recovery UI, as a new parallel `core/`/`adapters/`/`ui/` module tree) was
+  found ~90% already built more maturely under different names; the parallel
+  module tree was rejected outright as a competing system against the
+  locked modular-monolith decision. Four real, verified gaps were built as
+  small additions to the existing structure instead: a quote/option-chain
+  freshness gate (`market_data/freshness.py`, closing the Phase 7-flagged
+  single-snapshot-per-run staleness gap for real via an actual refresh, not
+  just a block, plus generalizing the manual-approval price-drift check to
+  AUTO-mode dispatch), tick-size/freeze-quantity pre-trade checks in
+  `evaluate_trade_intent` (`Instrument.freeze_qty` nullable and
+  operator-supplied — real NSE freeze quantities are never a fact to
+  hardcode), opt-in `MockBrokerAdapter` fault injection
+  (`queue_fill_scenario`/`simulate_disconnect`, default behavior
+  byte-identical, confirmed via the full suite before/after) alongside a
+  fix for a real latent `close_position` crash risk the fault injection
+  would have exposed, and a recovery panel (`GET /system-alerts`,
+  `GET /sessions/{id}/reconciliation-runs`, a new frontend page) surfacing
+  data that was already written but never readable. 312/312 backend tests
+  pass (up from 281), every batch live-verified against the real dev server.
+  Full design reasoning and the specific safety/blast-radius checks run
+  before each change in `docs/architecture/build-plan.md`'s own section.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
   `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
   Phase 3's changes are uncommitted in the working tree as of this note — check

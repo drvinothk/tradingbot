@@ -11,10 +11,16 @@ from datetime import date
 
 from app.modules.broker_adapter.base.contracts import InstrumentInfo, OptionType
 
-# (underlying symbol, exchange, lot_size, tick_size, synthetic spot price, strike step)
-_UNDERLYINGS: tuple[tuple[str, str, int, float, float, float], ...] = (
-    ("NIFTY", "NFO", 25, 0.05, 24500.0, 50.0),
-    ("BANKNIFTY", "NFO", 15, 0.05, 52000.0, 100.0),
+# (underlying symbol, exchange, lot_size, tick_size, synthetic spot price,
+# strike step, freeze_qty). freeze_qty values are illustrative placeholders
+# for exercising risk_engine's freeze-quantity check in paper mode — real
+# NSE F&O freeze quantities are exchange-published and periodically revised,
+# never a fact to hardcode (see Instrument.freeze_qty's own docstring); this
+# is what a *test* value should look like, not what an operator should trust
+# as current for live trading.
+_UNDERLYINGS: tuple[tuple[str, str, int, float, float, float, int], ...] = (
+    ("NIFTY", "NFO", 25, 0.05, 24500.0, 50.0, 1800),
+    ("BANKNIFTY", "NFO", 15, 0.05, 52000.0, 100.0, 900),
 )
 
 
@@ -30,7 +36,7 @@ def build_mock_universe(expiry: date, strike_range: int = 10) -> list[Instrument
     """
     universe: list[InstrumentInfo] = []
 
-    for symbol, exchange, lot_size, tick_size, spot, strike_step in _UNDERLYINGS:
+    for symbol, exchange, lot_size, tick_size, spot, strike_step, freeze_qty in _UNDERLYINGS:
         universe.append(
             InstrumentInfo(
                 symbol=symbol,
@@ -38,6 +44,7 @@ def build_mock_universe(expiry: date, strike_range: int = 10) -> list[Instrument
                 lot_size=lot_size,
                 tick_size=tick_size,
                 is_option=False,
+                freeze_qty=freeze_qty,
             )
         )
 

@@ -1259,6 +1259,99 @@ own.
   `intact: true` today; verified live against the real dev DB, not just in
   tests.
 
+## Guardrail-layer batch — external proposal evaluated, four genuine gaps closed
+
+An external "broker-agnostic guardrail layer" proposal (order state machine,
+stale-quote protection, pre-trade validation, risk rails, a recovery UI,
+built as a new `core/`/`adapters/`/`ui/` module tree ahead of Shoonya
+integration) was reviewed against this codebase. Verdict: ~90% of it is
+already built, more maturely, under different names — `OrderStatus`/
+`OrderEvent`, `RiskLimitConfig`/`evaluate_trade_intent`'s 9 gating checks,
+`ReconciliationRun`/`BrokerSyncState`. Building the proposed parallel module
+tree was rejected outright — it would create a second, competing
+risk/execution/reconciliation system in the same codebase, against the
+locked modular-monolith decision. Four pieces were confirmed as genuine,
+verified gaps and built as small additions to the *existing* structure:
+
+- **Quote/option-chain freshness gate.** Traced the actual signal-generation
+  path first: strategies never call the broker live — every cycle reads the
+  *latest DB row* via `strike_ranking.rank_from_latest_snapshot`, and
+  `OptionChainSnapshot` was written exactly once, at `start_strategy` time
+  (the Phase 7-flagged, previously-unfixed staleness gap). New
+  `market_data/freshness.py` (`FreshnessState`: `LIVE`/`DEGRADED`/`STALE`/
+  `DEAD` — trimmed from the proposal's 6-state list; `FALLBACK`/
+  `RECOVERING` describe a live-WebSocket-reconnect state machine this
+  DB-timestamp-age model doesn't have) — `ensure_fresh_option_chain` doesn't
+  just gate, it refreshes via the existing `record_option_chain_snapshot`,
+  which is the actual fix. Wired into `strategy_engine.runner.run_cycle`
+  before `evaluate()`; every one of the 6 strategies already exposed
+  `instrument_id`/`expiry_date` as plain attributes (confirmed by grep), so
+  this needed zero changes to any strategy file. Also generalized the
+  existing manual-approval price-drift check
+  (`api.v1.strategies.approve_trade_approval`'s `FRESHNESS_TOLERANCE_PCT`,
+  extracted not rewritten) into `evaluate_trade_intent`'s AUTO-mode path too
+  (`price_drift_exceeded`) — this is what actually delivers the proposal's
+  "price-band" ask, since no real NSE circuit-limit data exists anywhere in
+  this codebase or Shoonya's parsed fields to check against instead. A real
+  cross-session-visibility bug surfaced fixing the first failing test:
+  `ensure_fresh_option_chain` now threads `run_cycle`'s own session through
+  to the refresh (`session_factory` param) instead of opening a second,
+  independently-committing connection — more correct (atomic with the rest
+  of the cycle), not just a test workaround. `GET /strategies/running`
+  gained a `data_freshness` field, live-verified against a real running
+  strategy.
+- **Pre-trade mechanical checks.** `tick_size_violation` and
+  `freeze_qty_exceeded` added to `evaluate_trade_intent`. Empirically and
+  structurally verified safe against every existing test/live-paper path
+  before shipping as a hard reject (not just untested): `MockBrokerAdapter`
+  seeds option premiums as whole numbers and never steps them (`get_quote`/
+  `get_option_chain` always pass `step=False`; only a subscribed
+  *underlying* symbol steps), and `compute_stop_target`'s clean multipliers
+  preserve exact tick alignment — this only starts doing real rejecting work
+  once Shoonya's fractional premiums flow through execution (Phase 6).
+  `Instrument.freeze_qty` (migration `0010`) is nullable and
+  operator-supplied on purpose — real NSE freeze quantities are exchange-
+  published and periodically revised, never a fact to hardcode. Found and
+  fixed a real regression risk while wiring `instrument_sync.py`: naively
+  syncing `freeze_qty` from broker data would silently blank out an
+  operator-set value back to `NULL` on every sync, since Shoonya's
+  normalizer doesn't parse this field — fixed to only ever overwrite when
+  the broker source actually supplies a value, proven by a dedicated
+  regression test.
+- **`MockBrokerAdapter` fault injection.** Opt-in only, by design — the
+  blast radius of changing the *default* fill behavior was checked first
+  (34 `MockBrokerAdapter(` instantiations / ~28 `place_order` references
+  across 6-9 test files) and judged too risky. New `FillScenario` +
+  `queue_fill_scenario`/`simulate_disconnect`; nothing queued is
+  byte-identical to before this existed, confirmed by the full suite passing
+  unmodified both before and after. Found a real, previously-latent bug
+  while scoping this: `close_position` never branched on the exit order's
+  status — a non-terminal/`None` `avg_fill_price` would crash `_dec(None)`.
+  Never reachable in production (Mock always fills), but exercising
+  reject/delay scenarios on exit orders would hit it immediately. Fixed
+  narrowly: only a non-FILLED or price-less exit order is affected; it logs,
+  writes one `SystemAlert` (`exit_order_unfilled`), and leaves the position
+  `OPEN` for the next `PositionManager` cycle or a manual reconcile — normal
+  exits are untouched.
+- **Recovery panel.** `system_alerts` and `ReconciliationRun`/
+  `BrokerSyncState` were both written but had no read path at all — new
+  `GET /system-alerts` and `GET /sessions/{id}/reconciliation-runs`
+  (workspace/session-scoped, same pattern as `audit.py`/`metrics.py`).
+  Frontend: new types, a `useRecovery.ts` hook (4s poll, matching
+  `RunningStrategiesPage`'s precedent), and a new Recovery page + nav link.
+  `SessionsPage.tsx`'s existing Square-off/Reconcile/Kill-switch mutations
+  were deliberately left untouched — the Recovery page reads its own data
+  independently rather than threading typed responses through existing,
+  already-working mutations. Live-verified: created a real session, clicked
+  the existing Reconcile button, confirmed the new page showed the resulting
+  run without a page refresh.
+
+312/312 backend tests pass (up from 281), `ruff`/`mypy` clean throughout,
+`npm run build` clean, every batch live-verified via the real dev server
+(backend + frontend together for the recovery panel).
+
+## Verification approach
+
 Each phase has its own "done when" criteria above, checkable end-to-end without
 needing later phases:
 - Phases 0-4 are fully verifiable locally with the mock broker adapter and recorded

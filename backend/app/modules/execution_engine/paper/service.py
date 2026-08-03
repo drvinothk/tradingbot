@@ -43,6 +43,7 @@ crossed with this one, which nothing in this codebase does.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -70,6 +71,7 @@ from app.domain.execution.models import (
     TrailPlanStatus,
 )
 from app.domain.market.models import Instrument, OptionContract
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import SignalSide, TradeIntent
 from app.modules.audit_service.service import record_event
@@ -79,6 +81,8 @@ from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSi
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
 from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.reconciliation.service import run_reconciliation
+
+logger = logging.getLogger("app.execution_engine.paper.service")
 
 # Generic Phase-3 trailing rule, used when a TradeIntent doesn't specify its
 # own (Phase 4's per-strategy override — see _open_position_from_fill).
@@ -407,6 +411,39 @@ def close_position(
                     ts=now,
                 )
             )
+
+        # Narrowly scoped: only a non-FILLED (or price-less) exit order hits
+        # this — normal exits, the only path reachable in production today
+        # (MockBrokerAdapter always fills; Shoonya's real place_order falls
+        # back to get_order_status on an ack timeout), are unaffected. Left
+        # OPEN rather than marked CLOSED off no/partial fill data, so the
+        # next PositionManager cycle or a manual reconcile can still see and
+        # retry it — no new state machine, reuses the existing SystemAlert
+        # pattern every other hard-stop condition in this codebase already
+        # uses.
+        if exit_order.status != OrderStatus.FILLED or exit_order.avg_fill_price is None:
+            logger.error(
+                "exit order for position %s did not fill (status=%s) — "
+                "leaving position OPEN for reconciliation/retry",
+                position.id,
+                exit_order.status,
+            )
+            db.add(
+                SystemAlert(
+                    id=uuid.uuid4(),
+                    workspace_id=trading_session.workspace_id,
+                    trading_session_id=trading_session.id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="exit_order_unfilled",
+                    message=(
+                        f"Exit order for position {position.id} did not fill "
+                        f"(status={exit_order.status}); position left OPEN."
+                    ),
+                    created_at=now,
+                )
+            )
+            db.flush()
+            return None
 
         exit_price = _dec(exit_order.avg_fill_price)
         entry_price = _dec(position.entry_price)

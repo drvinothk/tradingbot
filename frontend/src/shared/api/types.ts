@@ -117,3 +117,37 @@ export interface DailyReportOut extends PerformanceStatsOut {
 export interface ScorecardOut extends PerformanceStatsOut {
   strategy_config_id: string
 }
+
+export interface SystemAlertOut {
+  id: string
+  trading_session_id: string | null
+  severity: string
+  category: string
+  message: string
+  payload: Record<string, unknown>
+  created_at: string
+  resolved_at: string | null
+  is_resolved: boolean
+}
+
+export interface ReconciliationRunOut {
+  id: string
+  trigger_type: string
+  mismatches_found: number
+  action_taken: string
+  started_at: string
+  finished_at: string
+}
+
+export interface BrokerSyncStateOut {
+  option_contract_id: string
+  local_qty: number
+  broker_qty: number
+  is_mismatched: boolean
+  checked_at: string
+}
+
+export interface ReconciliationHistoryOut {
+  runs: ReconciliationRunOut[]
+  current_mismatches: BrokerSyncStateOut[]
+}

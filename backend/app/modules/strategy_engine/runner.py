@@ -19,7 +19,8 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
+from datetime import date
 
 from sqlalchemy.orm import Session
 
@@ -27,6 +28,8 @@ from app.core.db.session import session_scope
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
+from app.modules.broker_adapter.composition import get_broker
+from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
 from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.service import submit_signal
@@ -49,9 +52,44 @@ def run_cycle(
     which path a trade took this cycle (auto-dispatch, approval-required,
     risk-rejected, or no signal at all), unlike trying to track the
     transition manually. Never touches a `STOPPED` run's status.
+
+    Before `evaluate()`, ensures the option-chain snapshot this strategy
+    ranks against isn't stale (`market_data.freshness.ensure_fresh_option_
+    chain` refreshes it once if needed — the actual fix for the "only ever
+    snapshotted once, at start_strategy time" gap). `evaluate()` is skipped
+    entirely (same as a normal "no signal" cycle) if data is still STALE/DEAD
+    after that refresh attempt — a broker hiccup should mean "wait for next
+    cycle," never "trade off data we can't vouch for."
     """
     decision: RiskDecision | None = None
-    proposal = strategy.evaluate(db, strategy_run)
+
+    @contextmanager
+    def _same_session():
+        # Reuses run_cycle's own already-open db/transaction for any
+        # option-chain refresh, rather than record_option_chain_snapshot's
+        # own default of opening a second, independently-committing
+        # connection — keeps the refresh atomic with the rest of this cycle.
+        yield db
+
+    freshness = ensure_fresh_option_chain(
+        db,
+        get_broker(),
+        strategy.instrument_id,
+        strategy.expiry_date,
+        session_factory=_same_session,
+    )
+    if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
+        logger.warning(
+            "run %s: option-chain data %s for instrument %s expiry %s — skipping cycle",
+            strategy_run.id,
+            freshness.value,
+            strategy.instrument_id,
+            strategy.expiry_date,
+        )
+        proposal = None
+    else:
+        proposal = strategy.evaluate(db, strategy_run)
+
     if proposal is not None:
         decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
 
@@ -80,6 +118,14 @@ class StrategyRunner:
         self._session_factory = session_factory
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+
+    @property
+    def instrument_id(self) -> uuid.UUID:
+        return self._strategy.instrument_id
+
+    @property
+    def expiry_date(self) -> date:
+        return self._strategy.expiry_date
 
     def start(self) -> None:
         self._stop_event.clear()

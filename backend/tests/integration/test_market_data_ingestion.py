@@ -27,6 +27,7 @@ from app.domain.market.models import (
 from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.broker_adapter.mock import MockBrokerAdapter
 from app.modules.market_data import MarketDataIngestionService, record_option_chain_snapshot
+from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
 from app.modules.market_data.indicators import IndicatorEngine
 
 EXPIRY = date(2026, 7, 31)
@@ -285,3 +286,61 @@ def test_option_chain_snapshot_is_persisted_and_usable_after_session_close(
     # explicit db.expunge() in record_option_chain_snapshot fixes.
     assert row.instrument_id == nifty.id
     assert len(row.chain_data) == 42  # 21 strikes * 2 (CE/PE) for NIFTY
+
+
+def test_ensure_fresh_option_chain_refreshes_when_none_exists(
+    seeded_universe, test_session_factory, db: Session
+):
+    """The gap this function exists to close: a strategy run that never
+    refreshes its chain snapshot after start_strategy's one-shot call.
+    """
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    assert db.query(OptionChainSnapshot).count() == 0
+
+    state = ensure_fresh_option_chain(
+        db, broker, nifty.id, EXPIRY, session_factory=test_session_factory
+    )
+
+    assert state == FreshnessState.LIVE
+    assert db.query(OptionChainSnapshot).count() == 1
+
+
+def test_ensure_fresh_option_chain_does_not_refetch_when_already_live(
+    seeded_universe, test_session_factory, db: Session
+):
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    record_option_chain_snapshot(
+        nifty.id, broker, "NIFTY", EXPIRY, session_factory=test_session_factory
+    )
+    assert db.query(OptionChainSnapshot).count() == 1
+
+    state = ensure_fresh_option_chain(
+        db, broker, nifty.id, EXPIRY, session_factory=test_session_factory
+    )
+
+    assert state == FreshnessState.LIVE
+    assert db.query(OptionChainSnapshot).count() == 1  # no second snapshot written
+
+
+def test_ensure_fresh_option_chain_reports_dead_on_broker_failure(
+    seeded_universe, test_session_factory, db: Session
+):
+    from app.modules.broker_adapter.base.errors import BrokerConnectivityError
+
+    class _FailingBroker:
+        def get_option_chain(self, *args, **kwargs):
+            raise BrokerConnectivityError("feed down")
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    state = ensure_fresh_option_chain(
+        db, _FailingBroker(), nifty.id, EXPIRY, session_factory=test_session_factory  # type: ignore[arg-type]
+    )
+
+    assert state == FreshnessState.DEAD
+    assert db.query(OptionChainSnapshot).count() == 0
