@@ -57,11 +57,13 @@ def test_post_sends_jdata_as_unencoded_raw_json():
 
 
 def test_get_option_chain_url_encodes_tsym():
-    """Live-corrected: a real "Nifty 50" query (the index underlying's own
-    tsym, which contains a space) got rejected as "Invalid Trading Symbol"
-    when sent literally — the reference NorenApi.py implementation
-    `urllib.parse.quote_plus`-encodes `tsym` specifically for this endpoint
-    before embedding it in the jData JSON string, which this now matches.
+    """Confirms this method still applies the reference NorenApi.py's
+    `quote_plus` encoding to `tsym` — harmless defensive behavior, but not
+    what actually fixed the live "Invalid Trading Symbol" rejection: a real
+    "Nifty 50" query got rejected even quote_plus-encoded ("Nifty+50" was
+    rejected too). The real fix was in ShoonyaBrokerAdapter.get_option_chain
+    (a real futures contract symbol, never any form of the index name) —
+    see its own docstring.
     """
     import json
 

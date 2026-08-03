@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -28,8 +27,6 @@ import httpx
 from app.config.settings import ShoonyaSettings
 from app.modules.broker_adapter.base.contracts import AuthResult
 from app.modules.broker_adapter.base.errors import BrokerAuthError
-
-logger = logging.getLogger("app.broker_adapter.shoonya")
 
 
 class ShoonyaAuthError(BrokerAuthError):
@@ -133,25 +130,6 @@ def exchange_code_for_token(
         raise ShoonyaAuthError(
             f"GenAcsTok response missing expected token field: {body!r}"
         ) from exc
-
-    # Temporary live diagnostic — never logs the token value itself, only
-    # which of the three candidate field names the real response actually
-    # used and the full set of top-level keys present. Investigating a
-    # live WebSocket auth rejection that succeeds with this exact same
-    # session_token for every REST call: a real, reported Shoonya quirk is
-    # that the WS handshake specifically needs the classic "susertoken"
-    # value, not an OAuth-style "access_token", even though both work fine
-    # for REST — this confirms which one GenAcsTok actually returned.
-    token_field_used = (
-        "susertoken" if body.get("susertoken")
-        else "access_token" if body.get("access_token")
-        else "token"
-    )
-    logger.warning(
-        "GenAcsTok token field used: %r; all top-level response keys: %s",
-        token_field_used,
-        sorted(body.keys()),
-    )
 
     refresh_token = body.get("refresh_token")
     return OAuthSession(

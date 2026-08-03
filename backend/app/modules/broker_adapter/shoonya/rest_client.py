@@ -159,13 +159,17 @@ class ShoonyaRestClient:
         `mock_universe.py`'s own `strike_range` convention (default 10
         comfortably covers every strategy's widest ATM±7 analysis window).
 
-        **Live-corrected**: `tsym` must be `quote_plus`-encoded before being
-        embedded in the `jData` JSON string — confirmed by the reference
-        `NorenApi.py` implementation doing exactly this, and by a live
-        `"Nifty 50" is Invalid Trading Symbol` rejection for the literal,
-        unencoded value (the index underlying's own tsym contains a space;
-        plain NFO contract symbols never do, which is presumably why this
-        was never needed anywhere else in this client).
+        `tsym` is `quote_plus`-encoded before being embedded in the `jData`
+        JSON string, matching the reference `NorenApi.py` implementation —
+        harmless defensive encoding for any future caller whose symbol
+        contains special characters. **Not the actual live fix**: a real
+        `"Nifty 50" is Invalid Trading Symbol"` rejection (the index
+        underlying's own display-style tsym, which contains a space) still
+        happened with this encoding applied (`"Nifty+50"` was rejected too)
+        — `GetOptionChain` needed a real NFO futures/option contract symbol
+        as `tsym` all along, never any form of the index name. See
+        `ShoonyaBrokerAdapter.get_option_chain`'s own docstring for the fix
+        that actually resolved it (`_resolve_futures_anchor_tsym`).
         """
         result = self._post(
             "GetOptionChain",
