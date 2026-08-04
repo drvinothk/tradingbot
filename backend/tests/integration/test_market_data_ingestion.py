@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
@@ -24,7 +24,7 @@ from app.domain.market.models import (
     PriceBar,
     QuoteTick,
 )
-from app.modules.broker_adapter.base.contracts import Tick
+from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.broker_adapter.mock import MockBrokerAdapter
 from app.modules.market_data import MarketDataIngestionService, record_option_chain_snapshot
 from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
@@ -176,7 +176,7 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
 
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=6)
     service = MarketDataIngestionService(
-        broker,
+        broker,  # type: ignore[arg-type]
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(timeframe_seconds=60),
     )
@@ -217,7 +217,7 @@ def test_completed_bars_are_persisted_for_underlying_instrument(
 
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
     service = MarketDataIngestionService(
-        broker,
+        broker,  # type: ignore[arg-type]
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(timeframe_seconds=60),
     )
@@ -246,6 +246,174 @@ def test_completed_bars_are_persisted_for_underlying_instrument(
     assert float(bars[0].open) == 100.0
     assert float(bars[0].close) == 100.0
     assert bars[0].timeframe == "60s"
+
+
+class _NeverTicksBroker:
+    """Models the real, live case this feature was built for: Shoonya's WS
+    auth consistently returns `NOT_OK`, so `subscribe_quotes` "succeeds"
+    (registers the callback) but never actually calls it. Tracks
+    subscribe/unsubscribe calls and serves canned candles per symbol so
+    REST-fallback behavior can be tested deterministically, without relying
+    on `MockBrokerAdapter`'s own timing-based streaming.
+    """
+
+    def __init__(self, candles_by_symbol: dict[str, list[PriceCandle]] | None = None) -> None:
+        self.subscribed: list[str] = []
+        self.unsubscribed: list[str] = []
+        self.price_history_calls: list[tuple] = []
+        self._candles_by_symbol = candles_by_symbol or {}
+
+    def subscribe_quotes(self, contract_symbols, on_tick, on_depth=None) -> None:
+        self.subscribed.extend(contract_symbols)
+
+    def unsubscribe_quotes(self, contract_symbols) -> None:
+        self.unsubscribed.extend(contract_symbols)
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        self.price_history_calls.append((underlying, start, end, timeframe_seconds))
+        return self._candles_by_symbol.get(underlying, [])
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
+def test_ws_health_watchdog_falls_back_to_rest_polling_when_no_tick_arrives(
+    seeded_universe, test_session_factory
+):
+    """The real, live case: WS "subscribes" successfully but never delivers
+    a single tick. Falling back is what actually keeps `price_bars` from
+    staying empty forever in that case.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        broker,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.05,
+        rest_poll_interval_seconds=1000.0,  # won't fire again during this test
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.2)
+
+    assert underlying_symbol in service._fallback_symbols  # noqa: SLF001
+    assert underlying_symbol in broker.unsubscribed  # dual-write race avoided
+    service.stop([underlying_symbol])
+
+
+def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
+    seeded_universe, test_session_factory
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=1, tick_interval_seconds=0.02)
+    service = MarketDataIngestionService(
+        broker, session_factory=test_session_factory, ws_health_grace_seconds=0.2
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.3)
+
+    assert underlying_symbol not in service._fallback_symbols  # noqa: SLF001
+    service.stop([underlying_symbol])
+
+
+def test_rest_fallback_persists_a_completed_candle_and_skips_the_still_forming_one(
+    seeded_universe, test_session_factory, db: Session
+):
+    """A broker's own "latest" candle can be the one still forming — only a
+    bucket whose window has fully closed is safe to treat as a real bar.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    now = datetime.now(UTC)
+    current_bucket = now - timedelta(seconds=now.timestamp() % 60)
+    completed_bucket = current_bucket - timedelta(seconds=60)
+    candles = [
+        PriceCandle(
+            bucket_start=completed_bucket, open=100.0, high=101.0, low=99.0, close=100.5, volume=0
+        ),
+        PriceCandle(  # still forming — must not be persisted
+            bucket_start=current_bucket, open=100.5, high=100.6, low=100.4, close=100.5, volume=0
+        ),
+    ]
+    broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
+    service = MarketDataIngestionService(
+        broker,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+        ws_health_grace_seconds=0.02,
+        rest_poll_interval_seconds=0.05,
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.3)
+    service.stop([underlying_symbol])
+
+    bars = db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).all()
+    assert len(bars) == 1
+    assert bars[0].bucket_start == completed_bucket
+    assert float(bars[0].close) == 100.5
+    ticks = db.query(QuoteTick).filter(QuoteTick.instrument_id == nifty.id).all()
+    assert len(ticks) == 1
+    snapshot_names = {
+        row.indicator_name
+        for row in db.query(IndicatorSnapshot).filter(IndicatorSnapshot.instrument_id == nifty.id)
+    }
+    assert "VWAP" not in snapshot_names  # never fed on this path — see on_completed_bar
+
+
+def test_rest_fallback_does_not_repersist_a_bucket_already_seen(
+    seeded_universe, test_session_factory, db: Session
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    now = datetime.now(UTC)
+    completed_bucket = now - timedelta(seconds=now.timestamp() % 60 + 60)
+    candles = [
+        PriceCandle(
+            bucket_start=completed_bucket, open=100.0, high=101.0, low=99.0, close=100.5, volume=0
+        )
+    ]
+    broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
+    service = MarketDataIngestionService(
+        broker,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.02,
+        rest_poll_interval_seconds=0.05,
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.3)  # several poll cycles, identical candle list every time
+    service.stop([underlying_symbol])
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    assert db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).count() == 1
+
+
+def test_stop_actually_joins_the_rest_poll_thread(seeded_universe, test_session_factory):
+    """Same "stopped must mean no more callbacks fire, not just asked to
+    stop" discipline `ShoonyaWSClient.unsubscribe_quotes` already promises
+    elsewhere in this codebase — a caller tearing down its session right
+    after `stop()` returns must not race an in-flight poll.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        broker,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.02,
+        rest_poll_interval_seconds=0.05,
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.15)
+    service.stop([underlying_symbol])
+    calls_at_stop = len(broker.price_history_calls)
+    time.sleep(0.3)
+
+    assert len(broker.price_history_calls) == calls_at_stop
 
 
 def test_depth_only_persisted_for_option_contracts_not_underlying(

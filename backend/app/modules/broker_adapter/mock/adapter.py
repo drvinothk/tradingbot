@@ -15,7 +15,7 @@ import time
 import uuid
 import zlib
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
@@ -32,6 +32,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderResult,
     OrderSide,
     Position,
+    PriceCandle,
     Tick,
 )
 from app.modules.broker_adapter.base.errors import BrokerConnectivityError
@@ -207,6 +208,45 @@ class MockBrokerAdapter(BrokerPort):
         return OptionChainSnapshot(
             underlying=underlying, expiry=expiry, ts=_utcnow(), entries=entries
         )
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        """Deterministic synthetic candles for tests exercising the REST-
+        polling fallback path (`market_data.ingestion`) — never touches
+        `_step_price`'s live, stateful random walk (streaming subscribers
+        may be consuming it concurrently; reusing it here would both
+        disturb the live stream and make two calls for the same historical
+        window return different answers, unlike a real broker's history
+        endpoint). Each bucket gets its own RNG seeded from
+        `underlying + bucket_start`, same crc32-based determinism as
+        `_price_for` uses for the seed price, so repeated calls for the
+        same window are stable.
+        """
+        candles: list[PriceCandle] = []
+        bucket_start = start - timedelta(seconds=start.timestamp() % timeframe_seconds)
+        price = self._price_for(underlying)
+        current = bucket_start
+        while current < end:
+            seed = zlib.crc32(f"{underlying}|{current.isoformat()}".encode())
+            rng = random.Random(seed)
+            open_price = price
+            close_price = max(0.5, open_price * (1 + rng.gauss(0, 0.004)))
+            high = max(open_price, close_price) * (1 + abs(rng.gauss(0, 0.001)))
+            low = min(open_price, close_price) * (1 - abs(rng.gauss(0, 0.001)))
+            candles.append(
+                PriceCandle(
+                    bucket_start=current,
+                    open=round(open_price, 2),
+                    high=round(high, 2),
+                    low=round(low, 2),
+                    close=round(close_price, 2),
+                    volume=rng.randint(100, 5000),
+                )
+            )
+            price = close_price
+            current += timedelta(seconds=timeframe_seconds)
+        return candles
 
     # -- BrokerPort: quotes / depth ------------------------------------------
 

@@ -15,6 +15,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderRequest,
     OrderResult,
     Position,
+    PriceCandle,
     Tick,
 )
 from app.modules.broker_adapter.base.errors import BrokerAuthError
@@ -38,6 +39,11 @@ class _FakeRealBroker(BrokerPort):
 
     def get_option_chain(self, underlying: str, expiry: date) -> OptionChainSnapshot:
         return OptionChainSnapshot(underlying=underlying, expiry=expiry, ts=datetime.now(UTC))
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        return []
 
     def get_quote(self, contract_symbol: str) -> Tick:
         return Tick(contract_symbol, 0.0, 0.0, 0.0, 0, None, datetime.now(UTC))

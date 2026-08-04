@@ -85,6 +85,27 @@ class DepthSnapshot:
 
 
 @dataclass(frozen=True)
+class PriceCandle:
+    """One completed OHLCV bar from a broker's own historical-candle
+    endpoint (Shoonya: `TPSeries`), as opposed to a bar this system
+    aggregates itself from a raw tick stream (see `BarAggregator`) —
+    distinct enough to warrant its own DTO rather than reusing that
+    module's `Bar`, since a broker-supplied candle is real, already-final
+    OHLC, not something built up tick-by-tick here. `volume` is `0` for a
+    symbol whose feed carries none (live-confirmed: Shoonya's NSE *index*
+    tokens report zero volume on every candle, unlike a derivative
+    contract's own token) — never inferred or defaulted to something else.
+    """
+
+    bucket_start: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+
+@dataclass(frozen=True)
 class OptionChainEntry:
     contract_symbol: str
     strike: float

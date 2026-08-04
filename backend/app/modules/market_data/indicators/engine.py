@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 
-from app.modules.broker_adapter.base.contracts import Tick
+from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.market_data.indicators.bar_aggregator import Bar, BarAggregator
 from app.modules.market_data.indicators.ema import EMACalculator
 from app.modules.market_data.indicators.vwap import VWAPCalculator
@@ -58,6 +58,34 @@ class IndicatorEngine:
                 results["EMA20"] = ema20_value
 
         return results, completed_bar
+
+    def on_completed_bar(self, instrument_id: uuid.UUID, candle: PriceCandle) -> dict[str, float]:
+        """For a REST-polled `PriceCandle` (already a complete, broker-
+        supplied bar) rather than a raw tick — the WS-fallback path in
+        `market_data.ingestion` uses this instead of `on_tick`. Updates
+        EMA9/EMA20 from the candle's own close, same as `on_tick` does the
+        moment `BarAggregator` completes a bar — but skips `BarAggregator`
+        entirely (there's nothing left to aggregate; the candle already is
+        the finished bar, with real broker-side high/low `BarAggregator`
+        has no way to reconstruct from a single point) and skips VWAP
+        (a tick/volume-cumulative concept a discrete completed candle can't
+        correctly feed one sample at a time — see `PriceCandle`'s own
+        docstring on why this path's `volume` can legitimately be `0` for
+        the NSE index tokens it's built for; VWAP-dependent strategies
+        simply see no VWAP value on this path, same as they already do
+        before volume-based VWAP ever warms up).
+        """
+        ema9_calc = self._ema9.setdefault(instrument_id, EMACalculator(EMA_SHORT_PERIOD))
+        ema20_calc = self._ema20.setdefault(instrument_id, EMACalculator(EMA_LONG_PERIOD))
+        ema9_value = ema9_calc.update(candle.close)
+        ema20_value = ema20_calc.update(candle.close)
+
+        results: dict[str, float] = {}
+        if ema9_value is not None:
+            results["EMA9"] = ema9_value
+        if ema20_value is not None:
+            results["EMA20"] = ema20_value
+        return results
 
     def reset_session(self, instrument_id: uuid.UUID | None = None) -> None:
         """VWAP resets at the start of each trading day; EMA deliberately

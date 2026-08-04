@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -76,6 +76,53 @@ def test_option_chain_returns_only_matching_underlying_and_expiry():
     chain = api.get_option_chain("NIFTY", EXPIRY)
     assert len(chain.entries) == 2
     assert {e.option_type for e in chain.entries} == {OptionType.CE, OptionType.PE}
+
+
+def test_get_price_history_returns_one_candle_per_bucket():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=1)
+    start = datetime(2026, 8, 4, 9, 15, tzinfo=UTC)
+    end = datetime(2026, 8, 4, 9, 20, tzinfo=UTC)
+
+    candles = api.get_price_history("NIFTY", start, end, timeframe_seconds=60)
+
+    assert len(candles) == 5
+    buckets = [c.bucket_start for c in candles]
+    assert buckets == sorted(buckets)
+    assert buckets[1] - buckets[0] == timedelta(seconds=60)
+
+
+def test_get_price_history_is_deterministic_across_calls():
+    """A real broker's history endpoint gives the same answer for the same
+    window every time it's asked — this must too, unlike `_step_price`'s
+    live stateful walk that streaming subscribers consume.
+    """
+    api = MockBrokerAdapter(instruments=_instruments(), seed=1)
+    start = datetime(2026, 8, 4, 9, 15, tzinfo=UTC)
+    end = datetime(2026, 8, 4, 9, 20, tzinfo=UTC)
+
+    first = api.get_price_history("NIFTY", start, end, timeframe_seconds=60)
+    second = api.get_price_history("NIFTY", start, end, timeframe_seconds=60)
+
+    assert first == second
+
+
+def test_get_price_history_does_not_disturb_live_streaming_price():
+    """Calling the history endpoint must not consume `_step_price`'s live
+    random walk — otherwise a strategy polling history while another part
+    of the system streams live ticks for the same symbol would see the live
+    stream jump/skip whenever history happened to be queried.
+    """
+    api = MockBrokerAdapter(instruments=_instruments(), seed=1)
+    live_before = api._price_for("NIFTY")  # noqa: SLF001
+
+    api.get_price_history(
+        "NIFTY",
+        datetime(2026, 8, 4, 9, 15, tzinfo=UTC),
+        datetime(2026, 8, 4, 10, 15, tzinfo=UTC),
+        timeframe_seconds=60,
+    )
+
+    assert api._price_for("NIFTY") == live_before  # noqa: SLF001
 
 
 def test_prices_never_go_negative_or_zero():

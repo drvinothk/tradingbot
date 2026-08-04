@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from app.modules.broker_adapter.base.contracts import Tick
+from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.market_data.indicators import (
     BarAggregator,
     EMACalculator,
@@ -152,3 +152,64 @@ class TestIndicatorEngine:
         assert bar.high == 105.0
         assert bar.close == 105.0  # last tick of the completed bucket
         assert bar.volume == 15
+
+    def test_on_completed_bar_warms_up_ema_from_candle_closes(self):
+        """The REST-polling fallback path feeds already-complete
+        `PriceCandle`s (real broker OHLC), not raw ticks — EMA9/EMA20
+        must warm up from those closes exactly like they do from
+        `on_tick`'s own bar-completion branch.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        results: dict[str, float] = {}
+        for i in range(1, 10):
+            candle = PriceCandle(
+                bucket_start=_ts(i * 60),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=0,
+            )
+            results = engine.on_completed_bar(instrument_id, candle)
+
+        assert results["EMA9"] == pytest.approx(100.0)
+        assert "EMA20" not in results  # not warmed up yet at 9 candles
+
+    def test_on_completed_bar_never_produces_or_touches_vwap(self):
+        """A completed candle has no per-trade volume to weight — VWAP is a
+        tick-level concept `on_completed_bar` deliberately never feeds (see
+        its own docstring). This is what correctly leaves VWAP Pullback
+        unable to fire on this path, matching the real, live-confirmed gap
+        that Shoonya's index feed carries no volume at all.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        candle = PriceCandle(
+            bucket_start=_ts(0), open=100.0, high=101.0, low=99.0, close=100.0, volume=5000
+        )
+
+        results = engine.on_completed_bar(instrument_id, candle)
+
+        assert "VWAP" not in results
+        assert instrument_id not in engine._vwap
+
+    def test_on_completed_bar_never_touches_bar_aggregator_state(self):
+        """This path bypasses `BarAggregator` entirely — the candle is
+        already a finished bar with real broker-side high/low,
+        `BarAggregator` has no way to reconstruct that from a single point,
+        and feeding it one synthetic tick per candle would silently corrupt
+        the aggregated bar (open=high=low=close=candle.close). Confirms no
+        aggregator state is created for an instrument that only ever goes
+        through `on_completed_bar`.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        candle = PriceCandle(
+            bucket_start=_ts(0), open=100.0, high=105.0, low=95.0, close=102.0, volume=0
+        )
+
+        engine.on_completed_bar(instrument_id, candle)
+
+        assert instrument_id not in engine._bar_aggregators

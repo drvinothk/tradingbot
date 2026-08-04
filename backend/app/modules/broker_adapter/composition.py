@@ -51,7 +51,7 @@ instance execution always uses today, entirely independent of whatever
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from app.domain.market.mock_universe import build_mock_universe
@@ -65,6 +65,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderRequest,
     OrderResult,
     Position,
+    PriceCandle,
     Tick,
 )
 from app.modules.broker_adapter.base.errors import BrokerAuthError
@@ -119,6 +120,15 @@ class _AuthAwareBroker(BrokerPort):
     def get_option_chain(self, underlying: str, expiry: date) -> OptionChainSnapshot:
         try:
             return self._inner.get_option_chain(underlying, expiry)
+        except BrokerAuthError as exc:
+            self._mark_disconnected(exc)
+            raise
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        try:
+            return self._inner.get_price_history(underlying, start, end, timeframe_seconds)
         except BrokerAuthError as exc:
             self._mark_disconnected(exc)
             raise

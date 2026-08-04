@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -26,6 +26,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderRequest,
     OrderResult,
     Position,
+    PriceCandle,
     Tick,
 )
 
@@ -51,6 +52,23 @@ class BrokerPort(ABC):
 
     @abstractmethod
     def get_option_chain(self, underlying: str, expiry: date) -> OptionChainSnapshot: ...
+
+    @abstractmethod
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        """Real, already-completed OHLCV bars for `underlying` between
+        `start`/`end` — the REST-polling fallback `market_data.ingestion`
+        uses when `subscribe_quotes`'s live stream isn't delivering ticks
+        (see that module's own docstring for why: a broker-side WS failure
+        shouldn't leave `price_bars` empty forever). Callers must not assume
+        every returned row's bucket has actually closed — a broker's own
+        "latest" candle can be the one still forming, not yet final; only a
+        row whose `bucket_start + timeframe_seconds <= now` is safe to
+        persist as a completed bar. `volume` may legitimately be `0` for a
+        symbol whose feed carries none (e.g. an NSE index token) — that's
+        real data, not a broker failure to raise over.
+        """
 
     @abstractmethod
     def get_quote(self, contract_symbol: str) -> Tick:

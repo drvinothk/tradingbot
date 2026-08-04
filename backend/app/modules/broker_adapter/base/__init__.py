@@ -14,6 +14,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderSide,
     OrderType,
     Position,
+    PriceCandle,
     Tick,
 )
 
@@ -33,5 +34,6 @@ __all__ = [
     "OrderSide",
     "OrderType",
     "Position",
+    "PriceCandle",
     "Tick",
 ]
