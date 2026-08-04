@@ -83,21 +83,45 @@ wired in later via a credentials file.
   session's manual browser QC found and fixed in `list_running_strategies`/
   `approve_trade_approval`/`reject_trade_approval` (recorded there, same
   "QC pass findings" pattern as every other phase).
-- 👈 **Phase 5 in progress** — Shoonya Broker Adapter. The full adapter is
-  built behind `BrokerPort` (`app/modules/broker_adapter/shoonya/`: `auth.py`
-  OAuth login, `rest_client.py`, `ws_client.py`, `normalizer.py`, `adapter.py`),
-  wired into `composition.get_broker()`/`api.v1.shoonya`'s `/login-url` +
-  `/callback` routes, and covered by 41 new unit/integration tests against
-  mocked HTTP/WS responses — all still **researched, not live-verified**:
-  no Shoonya account existed to test any of it against a real session.
-  What's left is exactly that: real credentials, then a live OAuth login and
-  a paper-mode soak per the build plan's "done when" — **which now also
-  includes the paper-vs-live signal-comparison check added in the build
-  plan's "Addendum" section**, not just stable reconnects + an empty-position
-  reconciliation dry-run. Full spec, the specific unverified assumptions to
-  check first, and two real bugs found along the way (a `MockBrokerAdapter`
-  background-thread race that could leave a stray `QuoteTick` after test
-  cleanup, confirmed rate-limiter numbers) in the build plan under "Phase 5".
+- 👈 **Phase 5 in progress** — Shoonya Broker Adapter. As of the
+  2026-08-04 live-verification sessions (an OCI cloud deployment against a
+  real account — see `docs/architecture/build-plan.md`'s Phase 5 section
+  and the Addendum for full detail), the REST/option-chain pipeline is
+  genuinely live-proven end-to-end for both NIFTY and BANKNIFTY: real
+  OAuth login, real `GetOptionChain`/`GetQuotes`/`SearchScrip`/`TPSeries`
+  calls, real strategies reaching `scanning` against real market data. Ten
+  real, live-only bugs were found and fixed along the way (wrong
+  content-type on every POST body, futures-anchored `GetOptionChain`
+  always returning the monthly chain regardless of requested expiry,
+  missing live quote fields, a missing `strprc` field on every real
+  *weekly* option row, a zombie `StrategyRun` left behind on a broker
+  failure, `instruments`/`option_contracts` never re-syncing after a real
+  login, spurious futures/decoy rows polluting the instrument picker, and
+  more — see the build plan for the complete list). **WebSocket auth is
+  still broken** — retested fresh during live market hours specifically to
+  rule out a "market was closed" theory from the first session, and it
+  still returns `NOT_OK` on every attempt; now a confirmed broker-side
+  issue, not a timing artifact. Since strategies need `price_bars` that
+  only ever came from WS ticks, a broker-agnostic **REST-polling fallback**
+  was built into `MarketDataIngestionService` (a health-watchdog falls an
+  underlying back to polling `BrokerPort.get_price_history` if WS delivers
+  no tick within a grace window) — live-proven: real OHLC `price_bars` and
+  `EMA9` populating every minute for both underlyings with zero WS. An
+  **order-ack-timeout fallback** (`ShoonyaBrokerAdapter.place_order` checks
+  `OrderBook` by idempotency key before concluding a genuinely-ambiguous
+  `PlaceOrder` failure means the order never went through — avoiding a real
+  duplicate-order risk) is unit-tested but not yet live-verified. All of
+  this sits on branch `fix/shoonya-option-chain-expiry-anchor`, not yet
+  committed or merged to `main` — deliberately, since it's Shoonya-specific
+  work kept isolated per the build plan's own branch note.
+  **Still open, per the build plan's actual "done when" bar**: a real
+  multi-session paper soak (today produced no live signal — market closed
+  minutes after the REST-fallback work finished), a reconciliation
+  dry-run against real (empty) broker positions, and the paper-vs-live
+  signal comparison from the Addendum — none of these are done yet. Two
+  smaller Addendum items also remain open: broker error taxonomy for IP
+  mismatch/TOTP drift specifically (needs live `emsg` evidence that
+  doesn't exist), and Shoonya support hasn't yet been emailed about WS.
 - ✅ **Phase 7** — Strategies 4 & 5 (OI/Volume Confirmed, Liquidity
   Sweep/Reversal), built out of order ahead of Phase 6 since neither needs
   Shoonya — both paper-only, against the mock broker, five of six

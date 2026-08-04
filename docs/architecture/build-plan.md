@@ -1206,10 +1206,31 @@ own.
   (4) Risk Service's `_check_margin_stub` replaced with a real
   `get_execution_broker(...).get_margin()` call, failing closed (rejects)
   on a `BrokerError` rather than treating it as approved.
-- **Order-ack-timeout fallback to order-history lookup.** Still open,
-  unchanged by this session's work.
-- **Broker error taxonomy, completion.** Still open, unchanged by this
-  session's work.
+- ~~Order-ack-timeout fallback to order-history lookup.~~ — **done in the
+  2026-08-04 live-verification session.** `ShoonyaBrokerAdapter.place_order`
+  now distinguishes a genuinely ambiguous failure (the `PlaceOrder`
+  request-response round trip never completed — timeout, dropped
+  connection) from a clean `stat: Not_Ok` rejection, by inspecting
+  `ShoonyaApiError.__cause__` (Python's own exception chaining, already
+  preserved by `rest_client._post`'s `raise ... from exc` — no new
+  exception type needed). On the ambiguous case, checks `OrderBook` for a
+  row whose `remarks` matches the request's own `idempotency_key` (echoed
+  back verbatim by Shoonya) before ever concluding the placement failed —
+  a caller blindly retrying after this specific ambiguity would risk
+  placing a real duplicate order, the #1 failure mode this system exists
+  to avoid. A clean rejection never triggers the lookup (no httpx cause) —
+  confirmed by a dedicated test. Unit-tested (found order via fallback,
+  genuinely-not-found re-raises, clean-rejection control case) but not yet
+  live-verified against a real ambiguous network failure (hard to trigger
+  on demand against a real broker) — same "researched, not live-verified"
+  caveat as the rest of this adapter until a real occurrence confirms the
+  `remarks` round-trip behavior.
+- **Broker error taxonomy, completion.** Partially addressed alongside the
+  item above (the ambiguous-vs-definitive distinction *is* a real taxonomy
+  gap closed this session) but not complete — mapping specific scenarios
+  this doc's own Phase 5 section names (IP mismatch, TOTP drift) to
+  distinct exception types still needs live evidence of their actual
+  `emsg` text, which doesn't exist yet. Still open for those specifically.
 - ~~Emergency square-off — decided, scoped narrowly, does not change the
   kill-switch default.~~ — **done this session**, though two of the three
   legs turned out to already exist from Phase 3: (1) the manual "exit all"
