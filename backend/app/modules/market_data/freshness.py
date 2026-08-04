@@ -107,6 +107,16 @@ def _latest_chain_snapshot(
     )
 
 
+def _snapshot_has_live_prices(snapshot: OptionChainSnapshotRow) -> bool:
+    """A snapshot can be time-fresh (just written) while still being useless
+    for trading — e.g. a broker entitlement/connectivity problem that leaves
+    every strike's `ltp` at 0. Age alone can't catch that; this checks the
+    data actually has *something* real in it.
+    """
+    entries: list[dict] = snapshot.chain_data or []  # type: ignore[assignment]
+    return any(float(entry.get("ltp", 0) or 0) > 0 for entry in entries)
+
+
 def classify_option_chain(
     db: Session,
     instrument_id: uuid.UUID,
@@ -116,11 +126,31 @@ def classify_option_chain(
 ) -> FreshnessState:
     """Read-only classification, no refresh — used for display (e.g.
     `GET /strategies/running`) where a broker call would be inappropriate.
+
+    A time-fresh snapshot whose every strike still shows zero live price
+    data is forced to DEAD regardless of age — the point of this whole
+    module is "don't trade on data we can't vouch for," and an all-zero
+    chain can't be vouched for no matter how recently it was written. This
+    is what actually makes `ensure_fresh_option_chain`'s post-refresh
+    classification (and `StrategyRunner.run_cycle`'s existing "skip this
+    cycle on STALE/DEAD" handling) halt trading rather than proceed on
+    prices that were never real.
     """
     latest = _latest_chain_snapshot(db, instrument_id, expiry_date)
     if latest is None:
         return FreshnessState.DEAD
-    return classify_age(latest.ts, datetime.now(UTC), thresholds)
+    state = classify_age(latest.ts, datetime.now(UTC), thresholds)
+    if state != FreshnessState.DEAD and not _snapshot_has_live_prices(latest):
+        logger.warning(
+            "option-chain snapshot for instrument %s expiry %s is time-fresh "
+            "(age classification %s) but every strike shows zero live price "
+            "data — treating as dead rather than trading blind",
+            instrument_id,
+            expiry_date,
+            state.value,
+        )
+        return FreshnessState.DEAD
+    return state
 
 
 def ensure_fresh_option_chain(

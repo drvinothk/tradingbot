@@ -53,6 +53,23 @@ def list_instruments(
                 .distinct()
             }
         )
+        # An instrument with no active option contracts can never be used to
+        # start a strategy — the start form requires an expiry, and every
+        # strategy ranks option strikes from a chain this instrument has
+        # none of. Live-found: a real Shoonya `SearchScrip` for
+        # "NIFTY"/"BANKNIFTY" also matches futures contracts
+        # (`NIFTY25AUG26F`) and unrelated substring decoys
+        # (`NIFTYNXT5025AUG26F`), which got synced in as underlying
+        # `Instrument` rows. `ShoonyaBrokerAdapter.get_instrument_master`
+        # now skips `FUT*` rows at the source, but rows synced *before* that
+        # fix still sit in the DB, showing up in the frontend's instrument
+        # picker with an empty expiry dropdown — selectable, then failing
+        # validation with a confusing "expiry is required". Filtering here
+        # (rather than only at sync time) means the picker is correct
+        # regardless of what historical rows exist, and stays correct for
+        # any future broker whose search is similarly fuzzy.
+        if not expiry_dates:
+            continue
         result.append(
             InstrumentOut(
                 id=instrument.id,

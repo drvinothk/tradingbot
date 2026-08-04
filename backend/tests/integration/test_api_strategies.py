@@ -398,6 +398,71 @@ def test_start_strategy_creates_run_and_stop_ends_it(
     assert stop_again.status_code == 404
 
 
+def test_start_strategy_leaves_no_zombie_run_when_option_chain_fetch_fails(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    """Live-found bug: `record_option_chain_snapshot` used to run *after*
+    the `StrategyRun` row was already committed with status SCANNING — a
+    broker failure there (e.g. a requested expiry that doesn't exist for
+    this underlying) left a "zombie" run visible in `GET /strategies/running`
+    with a working Stop button, even though nothing was actually scanning.
+    The fix validates before creating anything; this proves both halves:
+    a clean 502 (not an unhandled 500), and zero StrategyRun rows left
+    behind for a caller to mistake as live.
+    """
+    from app.modules.broker_adapter.base.errors import BrokerError
+
+    def _raise(instrument_id, broker, symbol, expiry, session_factory=None):
+        raise BrokerError("no NFO option contract found for underlying 'BANKNIFTY' expiry ...")
+
+    monkeypatch.setattr(strategies_module, "record_option_chain_snapshot", _raise)
+
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-zombie"}).json()["id"]
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+    try:
+        with session_factory() as db:
+            db.add(
+                Instrument(
+                    id=instrument_id,
+                    symbol="BANKNIFTY-ZOMBIE",
+                    exchange="NFO",
+                    lot_size=15,
+                    tick_size=0.05,
+                )
+            )
+            db.commit()
+
+        start_resp = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/start",
+            json={
+                "trading_session_id": session_id,
+                "instrument_id": str(instrument_id),
+                "expiry_date": date(2026, 8, 6).isoformat(),
+                "execution_mode": "auto",
+            },
+        )
+
+        assert start_resp.status_code == 502
+        assert len(_FakeRunner.instances) == 0
+        with session_factory() as db:
+            runs = (
+                db.query(StrategyRun)
+                .filter(StrategyRun.strategy_config_id == uuid.UUID(strategy_id))
+                .all()
+            )
+            assert runs == []
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
 def test_approve_unknown_trade_approval_is_404(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     response = api_client.post(f"/api/v1/trade-approvals/{uuid.uuid4()}/approve")

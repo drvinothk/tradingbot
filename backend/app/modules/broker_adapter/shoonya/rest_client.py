@@ -152,6 +152,42 @@ class ShoonyaRestClient:
             raise ShoonyaApiError("GetQuotes", f"unexpected list response: {result!r}")
         return result
 
+    def get_time_price_series(
+        self,
+        uid: str,
+        exchange: str,
+        token: str,
+        start_time: int,
+        end_time: int,
+        interval_minutes: int = 1,
+    ) -> list[dict]:
+        """`TPSeries` — real broker-side OHLCV candles for a token, rather
+        than aggregating our own bars from a tick stream. Each returned row
+        carries `into`/`inth`/`intl`/`intc` (OHLC), `intv` (volume),
+        `intvwap` (broker-computed VWAP) and `oi`, per the official
+        ShoonyaApi-py reference. `st`/`et` are epoch seconds; `intrv` is a
+        minute count as a string ("1", "3", "5", "15", ...).
+
+        Whether this endpoint supports NSE *index* tokens (NIFTY/BANKNIFTY
+        spot) is unconfirmed — there's a documented, unresolved report of
+        Shoonya returning no data for index historical queries while stock/
+        derivative tokens work fine, so callers must handle an empty list.
+        """
+        result = self._post(
+            "TPSeries",
+            {
+                "uid": uid,
+                "exch": exchange,
+                "token": token,
+                "st": str(start_time),
+                "et": str(end_time),
+                "intrv": str(interval_minutes),
+            },
+        )
+        if isinstance(result, dict):
+            return list(result.get("values", []))
+        return list(result)
+
     def get_option_chain(
         self, uid: str, exchange: str, tradingsymbol: str, strike_price: float, count: int = 10
     ) -> list[dict]:
@@ -166,10 +202,15 @@ class ShoonyaRestClient:
         `"Nifty 50" is Invalid Trading Symbol"` rejection (the index
         underlying's own display-style tsym, which contains a space) still
         happened with this encoding applied (`"Nifty+50"` was rejected too)
-        — `GetOptionChain` needed a real NFO futures/option contract symbol
-        as `tsym` all along, never any form of the index name. See
+        — `GetOptionChain` needed a real NFO option contract symbol as
+        `tsym` all along, never any form of the index name. See
         `ShoonyaBrokerAdapter.get_option_chain`'s own docstring for the fix
-        that actually resolved it (`_resolve_futures_anchor_tsym`).
+        that actually resolved it (`_resolve_option_anchor_tsym`) — live
+        diagnostic logging also confirmed each returned row carries only
+        structural contract data (`token`/`tsym`/`strprc`/`optt`/...),
+        never quote fields, and no `exd` at all — see that method's
+        docstring for why the anchor itself must already be the exact
+        requested expiry rather than filtering rows after the fact.
         """
         result = self._post(
             "GetOptionChain",

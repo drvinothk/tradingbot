@@ -18,6 +18,7 @@ an obscure traceback three frames away from the actual bad assumption.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, date, datetime
 
 from app.modules.broker_adapter.base.contracts import (
@@ -33,6 +34,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderSide,
     OrderType,
     Position,
+    PriceCandle,
     Tick,
 )
 
@@ -129,6 +131,25 @@ def parse_option_type(raw: str) -> OptionType:
     raise NormalizationError(f"unknown option type '{raw}'", raw)
 
 
+_TSYM_STRIKE_SUFFIX = re.compile(r"\d{2}[A-Z]{3}\d{2}[CP](\d+(?:\.\d+)?)$")
+
+
+def _strike_from_tsym(tsym: str) -> float | None:
+    """Fallback for a real, live-observed Shoonya data gap: every weekly
+    (`weekly` field present) NIFTY option row from a real `SearchScrip` NFO
+    search came back with no `strprc` field at all, while every monthly row
+    carried one normally — not a single bad row, 41/41 of that day's weekly
+    chain. The strike is still recoverable without guessing: Noren tsyms end
+    in a fixed `DDMMMYY` + `C`/`P` + strike suffix (e.g.
+    `NIFTY04AUG26C18500` -> strike `18500`), true regardless of what the
+    leading underlying symbol is.
+    """
+    match = _TSYM_STRIKE_SUFFIX.search(tsym)
+    if match is None:
+        return None
+    return float(match.group(1))
+
+
 def parse_instrument_master_row(row: dict, exchange: str) -> InstrumentInfo:
     """One row of `SearchScrip`'s JSON `values` list — chosen over parsing
     Shoonya's separately-downloadable scrip-master CSV files (a bulk
@@ -158,7 +179,15 @@ def parse_instrument_master_row(row: dict, exchange: str) -> InstrumentInfo:
 
     underlying = str(row.get("symname", symbol))
     expiry_raw = str(_require(row, "exd"))
-    strike = _float(row, "strprc")
+    strike_raw = row.get("strprc")
+    if strike_raw in (None, ""):
+        strike = _strike_from_tsym(symbol)
+        if strike is None:
+            raise NormalizationError(
+                f"missing 'strprc' and could not derive strike from tsym {symbol!r}", row
+            )
+    else:
+        strike = _float(row, "strprc")
     option_type_raw = str(row.get("optt", ""))
 
     return InstrumentInfo(
@@ -227,16 +256,63 @@ def parse_depth(raw: dict, contract_symbol: str) -> DepthSnapshot:
     )
 
 
-def parse_option_chain_entry(raw: dict, contract_symbol: str) -> OptionChainEntry:
+def parse_option_chain_entry(
+    raw: dict, contract_symbol: str, quote: dict | None = None
+) -> OptionChainEntry:
+    """`raw` is one `GetOptionChain` row — live-confirmed to carry only
+    structural contract data (`strprc`/`optt`/`token`/`tsym`/...), never
+    quote fields (`lp`/`bp1`/`sp1`/`v`/`oi`) despite `normalizer.parse_tick`
+    reading those exact field names elsewhere — `GetOptionChain` and
+    `GetQuotes` are genuinely different response shapes, not the same shape
+    with sometimes-missing fields. `quote` is a separate, per-contract
+    `GetQuotes` response the caller fetches and passes in; defaults to `{}`
+    (all-zero entry) when the caller couldn't get one, rather than pretending
+    `raw` ever had that data. `strike` prefers `strprc` but falls back to
+    `_strike_from_tsym` when absent — pre-emptive hardening against the same
+    real, live-observed gap `parse_instrument_master_row` hit for every
+    weekly NIFTY *SearchScrip* row (missing `strprc` entirely); a defaulted
+    `0.0` strike would silently corrupt ranking for a whole expiry's worth
+    of strikes rather than report one honestly.
+    """
+    quote = quote or {}
+    strike_raw = raw.get("strprc")
+    strike = (
+        _float(raw, "strprc")
+        if strike_raw not in (None, "")
+        else (_strike_from_tsym(contract_symbol) or 0.0)
+    )
     return OptionChainEntry(
         contract_symbol=contract_symbol,
-        strike=_float(raw, "strprc", default=0.0),
+        strike=strike,
         option_type=parse_option_type(str(raw.get("optt", "CE"))),
-        ltp=_float(raw, "lp", default=0.0),
-        bid=_float(raw, "bp1", default=0.0),
-        ask=_float(raw, "sp1", default=0.0),
-        volume=_int(raw, "v", default=0),
-        oi=_int(raw, "oi", default=0),
+        ltp=_float(quote, "lp", default=0.0),
+        bid=_float(quote, "bp1", default=0.0),
+        ask=_float(quote, "sp1", default=0.0),
+        volume=_int(quote, "v", default=0),
+        oi=_int(quote, "oi", default=0),
+    )
+
+
+# -- historical candles ------------------------------------------------------
+
+
+def parse_tpseries_row(raw: dict) -> PriceCandle:
+    """One row of `TPSeries` — `ssboe` (epoch seconds) is used for
+    `bucket_start` rather than the also-present `time` string, since it
+    needs no locale/format guessing (unlike `exd`'s `DD-MON-YYYY`
+    elsewhere in this module, `ssboe` is already an unambiguous number).
+    `intv` (volume) is read with a `0` default, not required — live-
+    confirmed real for Shoonya's NSE index tokens (NIFTY/BANKNIFTY spot),
+    which report zero volume on every candle while a derivative contract's
+    own token reports real volume on the same call.
+    """
+    return PriceCandle(
+        bucket_start=datetime.fromtimestamp(_int(raw, "ssboe"), tz=UTC),
+        open=_float(raw, "into"),
+        high=_float(raw, "inth"),
+        low=_float(raw, "intl"),
+        close=_float(raw, "intc"),
+        volume=_int(raw, "intv", default=0),
     )
 
 

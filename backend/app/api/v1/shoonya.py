@@ -27,6 +27,7 @@ from app.domain.identity.models import User
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import is_shoonya_configured, set_broker
 from app.modules.broker_adapter.shoonya.auth import build_authorize_url, exchange_code_for_token
+from app.modules.scheduler.instrument_sync import sync_instrument_master
 
 router = APIRouter(prefix="/shoonya", tags=["shoonya"])
 
@@ -86,6 +87,23 @@ def oauth_callback(
 
     adapter = ShoonyaBrokerAdapter(settings, session.auth_result)
     set_broker(adapter)
+
+    # Live-found bug: `composition.py`'s own docstring claims "once Phase 5's
+    # real Shoonya adapter is configured, that adapter syncs its own
+    # instrument master from the exchange" — it never actually did.
+    # `_sync_mock_instrument_universe` (app.main's startup hook) only runs
+    # once, at process startup, and only against the mock adapter (Shoonya
+    # isn't connected yet at that point — login is a live, later, in-browser
+    # action). With nothing re-syncing after a real login, `instruments`/
+    # `option_contracts` stayed permanently stuck on the mock adapter's
+    # synthetic seed data (a fixed "nearest Thursday" expiry, identical for
+    # every underlying) — which is exactly what the frontend's expiry picker
+    # was showing, and exactly why every real start_strategy call was
+    # requesting an expiry that doesn't actually exist. Syncing here, right
+    # after a real login, is what actually makes real expiries reach the
+    # picker. `sync_instrument_master` never raises (failures are recorded
+    # in its own log row, not thrown) — safe to call unconditionally.
+    sync_instrument_master(db, adapter, ["NFO"])
 
     record_event(
         db,

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
 from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
+    _snapshot_has_live_prices,
     check_price_drift,
     classify_age,
     worse_of,
@@ -54,3 +56,28 @@ def test_check_price_drift_beyond_tolerance_is_true():
 
 def test_check_price_drift_zero_reference_price_never_drifts():
     assert check_price_drift(50.0, 0.0, tolerance_pct=0.03) is False
+
+
+def _snapshot(chain_data: list[dict]) -> OptionChainSnapshotRow:
+    return OptionChainSnapshotRow(chain_data=chain_data)
+
+
+def test_snapshot_has_live_prices_true_when_any_entry_has_nonzero_ltp():
+    snapshot = _snapshot(
+        [{"ltp": 0.0, "strike": 100.0}, {"ltp": 142.35, "strike": 105.0}]
+    )
+    assert _snapshot_has_live_prices(snapshot) is True
+
+
+def test_snapshot_has_live_prices_false_when_every_entry_is_zero():
+    """The real, live-observed symptom this guards against: a
+    structurally-valid GetOptionChain response (real strikes/symbols) where
+    every strike's live quote came back zero — e.g. a broker entitlement or
+    connectivity gap, not a genuinely quiet market.
+    """
+    snapshot = _snapshot([{"ltp": 0.0, "strike": 100.0}, {"ltp": 0.0, "strike": 105.0}])
+    assert _snapshot_has_live_prices(snapshot) is False
+
+
+def test_snapshot_has_live_prices_false_when_chain_is_empty():
+    assert _snapshot_has_live_prices(_snapshot([])) is False

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -46,6 +46,61 @@ def test_parse_instrument_master_row_option():
 def test_parse_instrument_master_row_missing_field_raises():
     with pytest.raises(normalizer.NormalizationError):
         normalizer.parse_instrument_master_row({"ls": "25", "ti": "0.05"}, "NFO")
+
+
+def test_parse_instrument_master_row_falls_back_to_tsym_when_strprc_missing():
+    """Live-found: a real NFO SearchScrip response had `strprc` missing from
+    every weekly-tagged NIFTY option row (41/41 for that day's chain), while
+    monthly rows carried it normally. Strike is still recoverable from the
+    trading symbol's own fixed suffix.
+    """
+    row = {
+        "tsym": "NIFTY04AUG26C18500",
+        "ls": "65",
+        "ti": "0.05",
+        "token": "48399",
+        "instname": "OPTIDX",
+        "symname": "NIFTY",
+        "exd": "04-AUG-2026",
+        "weekly": "W1",
+        "optt": "CE",
+        # no strprc — the real, live-observed shape
+    }
+    info = normalizer.parse_instrument_master_row(row, "NFO")
+    assert info.strike == 18500.0
+
+
+def test_parse_instrument_master_row_raises_when_strprc_missing_and_tsym_unparseable():
+    row = {
+        "tsym": "SOMETHING-WEIRD",
+        "ls": "65",
+        "ti": "0.05",
+        "token": "1",
+        "instname": "OPTIDX",
+        "symname": "NIFTY",
+        "exd": "04-AUG-2026",
+        "optt": "CE",
+    }
+    with pytest.raises(normalizer.NormalizationError):
+        normalizer.parse_instrument_master_row(row, "NFO")
+
+
+def test_parse_option_chain_entry_falls_back_to_tsym_when_strprc_missing():
+    """Pre-emptive hardening: `GetOptionChain` is a different endpoint from
+    `SearchScrip`, but if it turns out to share the same real, live-observed
+    gap for weekly contracts, a defaulted `0.0` strike would silently
+    corrupt ranking for a whole expiry's worth of strikes rather than
+    report one honestly.
+    """
+    row = {"token": "48399", "optt": "CE", "instname": "OPTIDX"}  # no strprc
+    entry = normalizer.parse_option_chain_entry(row, "NIFTY04AUG26C18500")
+    assert entry.strike == 18500.0
+
+
+def test_parse_option_chain_entry_zero_strike_when_tsym_also_unparseable():
+    row = {"token": "1", "optt": "CE", "instname": "OPTIDX"}  # no strprc
+    entry = normalizer.parse_option_chain_entry(row, "SOMETHING-WEIRD")
+    assert entry.strike == 0.0
 
 
 @pytest.mark.parametrize("raw,expected", [("CE", OptionType.CE), ("PE", OptionType.PE)])
@@ -140,3 +195,53 @@ def test_parse_position_signed_qty():
     )
     assert position.qty == -25
     assert position.avg_price == 119.5
+
+
+def test_parse_tpseries_row():
+    """Live-confirmed shape against a real account: `TPSeries` returns real
+    OHLC for NSE index tokens (contrary to a documented, unresolved
+    community report that index historical queries return nothing on
+    Shoonya) — `ssboe` (epoch seconds) is used for `bucket_start`, not the
+    also-present `time` string, since it needs no locale/format guessing.
+    """
+    row = {
+        "stat": "Ok",
+        "time": "04-08-2026 13:55:00",
+        "ssboe": "1785831900",
+        "into": "24446.40",
+        "inth": "24448.40",
+        "intl": "24444.90",
+        "intc": "24446.80",
+        "intvwap": "24446.80",
+        "intv": "0",
+        "intoi": "0",
+    }
+    candle = normalizer.parse_tpseries_row(row)
+    assert candle.bucket_start == datetime.fromtimestamp(1785831900, tz=UTC)
+    assert candle.open == 24446.40
+    assert candle.high == 24448.40
+    assert candle.low == 24444.90
+    assert candle.close == 24446.80
+    assert candle.volume == 0
+
+
+def test_parse_tpseries_row_real_volume_on_a_derivative_token():
+    """Same endpoint, a futures token instead of an index token — live-
+    confirmed real, non-zero volume, unlike the index case above. Not a
+    parsing difference, a genuine broker-side data difference between the
+    two token types.
+    """
+    row = {
+        "stat": "Ok",
+        "time": "04-08-2026 13:55:00",
+        "ssboe": "1785831900",
+        "into": "24510.00",
+        "inth": "24519.00",
+        "intl": "24505.10",
+        "intc": "24510.10",
+        "intvwap": "24511.19",
+        "intv": "8970",
+        "intoi": "1365",
+    }
+    candle = normalizer.parse_tpseries_row(row)
+    assert candle.volume == 8970

@@ -410,6 +410,52 @@ def test_list_instruments_returns_active_instruments_with_expiry_dates(
             cleanup_db.commit()
 
 
+def test_list_instruments_excludes_instruments_with_no_option_contracts(
+    api_client: TestClient, seeded_admin, engine
+):
+    """Live-found: a real Shoonya `SearchScrip` for "NIFTY"/"BANKNIFTY" also
+    matches futures contracts (`NIFTY25AUG26F`) and unrelated substring
+    decoys (`NIFTYNXT5025AUG26F`), which got synced in as underlying
+    `Instrument` rows with no option contracts ever attached. They showed up
+    in the frontend's instrument picker with an empty expiry dropdown —
+    selectable, then failing validation with a confusing "expiry is
+    required". An instrument with no active option contracts can never start
+    a strategy, so it has no business being offered.
+    """
+    import uuid as uuid_module
+
+    from app.domain.market.models import Instrument
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    instrument_id = uuid_module.uuid4()
+    try:
+        with session_factory() as db:
+            db.add(
+                Instrument(
+                    id=instrument_id,
+                    symbol=f"FUTONLY-{instrument_id.hex[:6]}",
+                    exchange="NFO",
+                    lot_size=25,
+                    tick_size=0.05,
+                    is_active=True,
+                )
+            )
+            db.commit()
+
+        api_client.post(
+            "/api/v1/auth/login",
+            json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+        )
+        response = api_client.get("/api/v1/instruments")
+        assert response.status_code == 200
+        returned_ids = {row["id"] for row in response.json()}
+        assert str(instrument_id) not in returned_ids
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
 def test_daily_plan_rejects_non_positive_budget(api_client: TestClient, seeded_admin):
     api_client.post(
         "/api/v1/auth/login",

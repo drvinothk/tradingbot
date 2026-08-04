@@ -36,6 +36,7 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.execution_engine.paper.registry import ensure_position_manager_running
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
@@ -263,6 +264,37 @@ def start_strategy(
     if instrument is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Instrument not found")
 
+    # One immediate option-chain snapshot so the first evaluate() cycle has
+    # something to rank against, rather than waiting on whatever polling
+    # cadence (Scheduler, on-demand) later refreshes it — record_option_
+    # chain_snapshot is designed to be called this way (build plan: "called
+    # on a schedule or on demand"). Also the side effect ensure_ingestion_
+    # running below depends on: against a real broker adapter, subscribe_
+    # quotes needs the underlying's broker token already cached
+    # (ShoonyaBrokerAdapter._resolve_token), and that cache is only
+    # populated as a side effect of get_option_chain's own underlying-token
+    # resolution.
+    #
+    # **Deliberately runs before the StrategyRun row is created/committed
+    # below, not after.** Live-found bug: this used to run after commit, so
+    # a broker failure here (e.g. `ShoonyaApiError` for a requested expiry
+    # that doesn't exist for this underlying) left a `StrategyRun` row
+    # already committed with status SCANNING — a "zombie" run visible in
+    # `GET /strategies/running` with a working Stop button, even though
+    # nothing was actually scanning. Validating first means a failure here
+    # creates nothing: no run row, no audit event, no sleep-inhibitor
+    # acquisition. Translated to a clean 502 rather than an unhandled 500 —
+    # broker-agnostic (`BrokerError`), not Shoonya-specific, since any real
+    # adapter can fail here.
+    try:
+        record_option_chain_snapshot(
+            instrument.id, get_broker(), instrument.symbol, body.expiry_date
+        )
+    except BrokerError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"Could not fetch option chain: {exc}"
+        ) from exc
+
     # "at most one active run per strategy" is a check-then-act, same class
     # of race the rest of this codebase always serializes explicitly (see
     # core/locking.py's docstring) — two concurrent start requests for the
@@ -321,22 +353,6 @@ def start_strategy(
     # session with several concurrent runs stays awake until every one of
     # them has stopped.
     get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
-
-    # One immediate option-chain snapshot so the first evaluate() cycle has
-    # something to rank against, rather than waiting on whatever polling
-    # cadence (Scheduler, on-demand) later refreshes it — record_option_
-    # chain_snapshot is designed to be called this way (build plan: "called
-    # on a schedule or on demand").
-    #
-    # **Must run before ensure_ingestion_running below.** Live-corrected:
-    # against a real broker adapter, subscribe_quotes needs the underlying's
-    # broker token already cached (ShoonyaBrokerAdapter._resolve_token), and
-    # that cache is only populated as a side effect of get_option_chain's own
-    # underlying-token resolution — this call is what does that. Never
-    # surfaced against MockBrokerAdapter (no real token lookup needed there),
-    # only found once a real account's first live start_strategy call raised
-    # "no cached broker token for 'NIFTY'" from ensure_ingestion_running.
-    record_option_chain_snapshot(instrument.id, get_broker(), instrument.symbol, body.expiry_date)
 
     # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
     # nothing ever actually started one outside tests — real strategies

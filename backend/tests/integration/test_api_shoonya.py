@@ -182,11 +182,30 @@ def test_callback_success_installs_broker_and_audits(
     monkeypatch.setattr(
         shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
     )
+    # oauth_callback also runs a real instrument-master sync against the
+    # freshly-installed adapter (see that function's own docstring on why —
+    # closes the gap where the frontend's expiry picker stayed permanently
+    # stuck on the mock adapter's seed data after a real login). Left
+    # unmocked, this test's `tok-123` doesn't authenticate against anything
+    # real, so it was quietly leaving a FAILED InstrumentMasterSyncLog row
+    # behind (sync_instrument_master never raises, it records) — harmless
+    # to this test's own assertions, but a real, order-dependent leak into
+    # test_instrument_sync.py's count-based assertions when the full suite
+    # runs. Mocked here for the same reason exchange_code_for_token already
+    # is: no real network calls from a test.
+    sync_calls: list[tuple] = []
+    monkeypatch.setattr(
+        shoonya_module,
+        "sync_instrument_master",
+        lambda db, broker, exchanges: sync_calls.append((broker, exchanges)),
+    )
 
     response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
     assert response.status_code == 200
     assert "connected" in response.text.lower()
     assert composition.is_shoonya_configured() is True
+    assert len(sync_calls) == 1
+    assert sync_calls[0][1] == ["NFO"]
 
     session_factory = sessionmaker(bind=engine, future=True)
     with session_factory() as verify_db:

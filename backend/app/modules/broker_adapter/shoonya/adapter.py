@@ -39,8 +39,9 @@ import logging
 import threading
 from datetime import UTC, date, datetime
 
+import httpx
+
 from app.config.settings import ShoonyaSettings
-from app.core.clock import now_ist
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -51,6 +52,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderRequest,
     OrderResult,
     Position,
+    PriceCandle,
     Tick,
 )
 from app.modules.broker_adapter.shoonya import normalizer
@@ -112,17 +114,13 @@ class ShoonyaBrokerAdapter(BrokerPort):
         self._token_by_symbol: dict[str, tuple[str, str]] = {}
         self._token_lock = threading.Lock()
 
-        # underlying -> (futures anchor tsym, that contract's own expiry) —
-        # unlike _token_by_symbol above, this is NOT safe to cache forever:
-        # the nearest-expiry futures contract _resolve_futures_anchor_tsym
-        # picks today eventually expires and stops being a valid
-        # GetOptionChain anchor. Cached only while `now_ist().date() <
-        # cached_expiry` (contract expiry is an IST-calendar concept — the
-        # server's own system clock may not be IST); once that's no longer
-        # true, the cache entry is treated as stale and re-resolved
-        # (naturally rolling to the next contract), never reused past the
-        # contract's own expiry date.
-        self._futures_anchor_cache: dict[str, tuple[str, date]] = {}
+        # (underlying, requested expiry) -> option anchor tsym. Unlike the
+        # old futures-anchor cache this replaced, no time-based staleness
+        # check is needed: the key already pins an exact calendar date, so
+        # a resolved tsym for that exact key never needs re-resolving
+        # (contrast a "nearest expiry" cache, which has to reroll as time
+        # passes). A different requested expiry is simply a different key.
+        self._option_anchor_cache: dict[tuple[str, date], str] = {}
 
         self._ws: ShoonyaWSClient | None = None
         self._ws_on_tick: TickCallback | None = None
@@ -169,7 +167,44 @@ class ShoonyaBrokerAdapter(BrokerPort):
         for underlying in KNOWN_UNDERLYINGS:
             rows = self._rest.search_scrip(self._uid, exchange, underlying)
             for row in rows:
-                info = normalizer.parse_instrument_master_row(row, exchange)
+                # This system only ever trades index options, never futures
+                # (the old futures-anchor-based GetOptionChain approach was
+                # already replaced by an options-only anchor earlier today —
+                # nothing reads a futures InstrumentInfo anymore). Searching
+                # NFO for "NIFTY"/"BANKNIFTY" text live-confirmed to also
+                # match futures contracts (`NIFTY25AUG26F`) and unrelated
+                # decoys sharing the same substring (`NIFTYNXT5025AUG26F`,
+                # an ETF) — treating every non-option row as a tradable
+                # underlying (the pre-existing behavior below) synced those
+                # in as spurious, permanently-orphaned `Instrument` rows
+                # that pollute the frontend's instrument picker and can
+                # never be selected usefully. Skipping FUT* rows here keeps
+                # this method's real job (populating option data for the
+                # two known underlyings) unaffected — real option rows
+                # already attach to the pre-existing NIFTY/BANKNIFTY
+                # `Instrument` rows via `sync_instrument_master`'s own
+                # DB-lookup fallback, never via a row from this loop.
+                if str(row.get("instname", "")).upper().startswith("FUT"):
+                    continue
+                # Live-found: a real NFO SearchScrip response for NIFTY
+                # included at least one option row with no `strprc` field at
+                # all (`NIFTY04AUG26C18500`, `weekly: "W1"`) — never
+                # surfaced before because this method had only ever run
+                # against the mock adapter's clean synthetic data in
+                # production. One malformed row used to abort parsing every
+                # row after it in the whole underlying's list (a `for` loop
+                # building one flat `infos` list, no per-row isolation) —
+                # skipping just the bad row is what actually lets a real
+                # sync complete instead of silently syncing nothing.
+                try:
+                    info = normalizer.parse_instrument_master_row(row, exchange)
+                except normalizer.NormalizationError:
+                    logger.warning(
+                        "Skipping unparseable instrument master row for %r: %r",
+                        underlying,
+                        row,
+                    )
+                    continue
                 self._remember_token(info.symbol, exchange, info.broker_token)
                 infos.append(info)
         return infos
@@ -185,11 +220,24 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # Trading Symbol"): GetOptionChain's `tsym` isn't an index name in
         # any form — Shoonya's own docs define it as "Trading symbol of any
         # of the option or future. Option chain for that underlying will be
-        # returned," e.g. a real contract like `NIFTY28AUG25F`. Any live,
-        # currently-listed futures contract on this underlying works as the
-        # anchor — the returned chain is filtered by `expiry` below
-        # regardless of which contract's own expiry we anchored on.
-        anchor_tsym = self._resolve_futures_anchor_tsym(underlying)
+        # returned," e.g. a real contract like `NIFTY28AUG25F`. **Live-corrected
+        # again**: anchoring via the nearest-expiry *futures* contract (the
+        # original fix) always returns the *monthly* chain regardless of what
+        # `expiry` was requested — NFO futures are monthly-only, and
+        # `GetOptionChain`'s response follows the anchor's own series, not
+        # some separately-specified expiry (there is no separate expiry
+        # parameter to send). Live-confirmed via diagnostic logging: both
+        # NIFTY and BANKNIFTY chains anchored on their nearest futures
+        # contract came back on the identical monthly date, even though NIFTY
+        # still lists weekly options. The actual fix is anchoring on a real
+        # *option* contract that already matches the requested expiry exactly
+        # (see `_resolve_option_anchor_tsym`) — including refusing outright
+        # (never silently substituting the monthly series) when no such
+        # contract exists, e.g. a BANKNIFTY weekly, which NSE discontinued.
+        anchor_tsym = self._resolve_option_anchor_tsym(underlying, expiry)
+        logger.info(
+            "GetOptionChain anchor for %s expiry %s: tsym=%s", underlying, expiry, anchor_tsym
+        )
         # Live-corrected: `strprc=0.0` was rejected outright ("Invalid
         # strprc") — Shoonya's docs call it the "mid price" to center the
         # chain on (near ATM), not an optional/zero-default field. Uses the
@@ -202,16 +250,40 @@ class ShoonyaBrokerAdapter(BrokerPort):
             self._uid, exchange, anchor_tsym, strike_price=strike_price
         )
 
+        # Live-confirmed via diagnostic logging: a GetOptionChain row is
+        # purely structural (token/tsym/strprc/optt/...) — it never carries
+        # `exd`, and never carries live quote fields (lp/bp1/sp1/v/oi)
+        # either, unlike GetQuotes/WS touchline pushes that share those exact
+        # field names. Since the anchor above is now already pinned to the
+        # exact requested expiry, there's nothing left to filter rows by —
+        # every row this call returns is already that expiry's chain. Real
+        # pricing needs one GetQuotes call per contract token; a failure on
+        # any single contract degrades that one entry to zero rather than
+        # discarding the whole snapshot over one bad call.
         entries = []
         for row in rows:
-            row_expiry = row.get("exd")
-            if row_expiry and normalizer.parse_shoonya_date(str(row_expiry)) != expiry:
-                continue
             symbol = str(row.get("tsym", ""))
             token = str(row.get("token", ""))
             self._remember_token(symbol, exchange, token)
-            entries.append(normalizer.parse_option_chain_entry(row, symbol))
+            quote: dict = {}
+            if token:
+                try:
+                    quote = self._rest.get_quotes(self._uid, exchange, token)
+                except ShoonyaApiError:
+                    logger.warning(
+                        "Failed to fetch live quote for %s (token=%s); using zeros",
+                        symbol,
+                        token,
+                    )
+            entries.append(normalizer.parse_option_chain_entry(row, symbol, quote))
 
+        logger.info(
+            "GetOptionChain %s expiry %s: %d entries, sample=%r",
+            underlying,
+            expiry,
+            len(entries),
+            entries[:3],
+        )
         return OptionChainSnapshot(
             underlying=underlying,
             expiry=expiry,
@@ -258,59 +330,98 @@ class ShoonyaBrokerAdapter(BrokerPort):
             )
             raise
 
-    def _resolve_futures_anchor_tsym(self, underlying: str) -> str:
-        """Finds any live, currently-listed NFO futures contract on this
-        underlying to use as `GetOptionChain`'s `tsym` anchor — see
-        `get_option_chain`'s own docstring for why a real contract symbol
-        is required at all. `instname` starting with `FUT` (`FUTIDX`/
-        `FUTSTK`) is the same Noren convention `normalizer.
-        parse_instrument_master_row` already uses to identify option rows
-        (`OPTIDX`/`OPTSTK`); `symname` is the row's own underlying
-        reference, more reliable than pattern-matching `tsym` strings.
-        Picks the nearest expiry so this stays valid as far into the
-        future as any currently-listed contract does.
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        """`TPSeries` — live-confirmed against a real account (diagnostic
+        logging, since removed) to return real OHLC for NSE *index* tokens
+        (NIFTY/BANKNIFTY spot), contrary to a documented, unresolved
+        community report that index historical queries return no data on
+        Shoonya. `intv` (volume) is genuinely `0` on every index candle
+        though — confirmed by comparing against the same call against the
+        underlying's own front-month futures token, which reports real
+        volume in the same window. That's a real broker-side data gap for
+        the index feed, not a parsing bug — `parse_tpseries_row` reports it
+        as `0`, not a fabricated or estimated value.
 
-        Cached in `_futures_anchor_cache` — `get_option_chain` runs on
-        every periodic snapshot refresh (freshness gate) as well as at
-        strategy start, and this contract's own tsym almost never changes
-        within a day, so a fresh `SearchScrip` call every time was pure
-        waste. The cache is expiry-aware (see that attribute's own
-        docstring for why a naive forever-cache would be a real, delayed
-        bug) — never trusted past the cached contract's own expiry date.
+        `interval_minutes` only supports whole-minute granularity per
+        Shoonya's own docs ("1","3","5","10","15","30","60",...) — divides
+        `timeframe_seconds` by 60 rather than exposing seconds to the wire
+        call, since this system's only bar timeframe today is 60s anyway
+        (`IndicatorEngine`'s default).
         """
+        underlying_exchange, underlying_token = self._resolve_underlying_token(underlying)
+        interval_minutes = max(1, timeframe_seconds // 60)
+        rows = self._rest.get_time_price_series(
+            self._uid,
+            underlying_exchange,
+            underlying_token,
+            int(start.timestamp()),
+            int(end.timestamp()),
+            interval_minutes=interval_minutes,
+        )
+        return [normalizer.parse_tpseries_row(row) for row in rows]
+
+    def _resolve_option_anchor_tsym(self, underlying: str, expiry: date) -> str:
+        """`GetOptionChain` needs a real, currently-listed contract symbol
+        as its `tsym` anchor (see that method's own docstring for the "any
+        form of the index name" rejections that established this). The
+        anchor's own expiry is what the returned chain follows — there is
+        no separate expiry parameter — so it must already be an *option*
+        contract on the exact requested `expiry`, never a futures contract
+        (NFO futures are monthly-only, so that anchor always returns the
+        monthly chain no matter what was asked for — live-confirmed: NIFTY
+        and BANKNIFTY chains anchored on their nearest futures contract came
+        back on the identical monthly date, even though NIFTY still lists
+        weekly options).
+
+        Raises rather than falling back to a different expiry when nothing
+        matches (e.g. a BANKNIFTY weekly, discontinued by NSE) — a strategy
+        silently trading a different expiry than the one it asked for is a
+        worse failure mode than an explicit error here.
+
+        Cached by `(underlying, expiry)` — unlike a "nearest expiry" cache,
+        an exact calendar date never goes stale, so once resolved it's
+        reused for the life of the process (`get_option_chain` runs on
+        every periodic freshness-gate refresh as well as at strategy start;
+        a fresh `SearchScrip` call every time would be pure waste for data
+        that can't change).
+        """
+        cache_key = (underlying, expiry)
         with self._token_lock:
-            cached = self._futures_anchor_cache.get(underlying)
+            cached = self._option_anchor_cache.get(cache_key)
         if cached is not None:
-            cached_tsym, cached_expiry = cached
-            if now_ist().date() < cached_expiry:
-                return cached_tsym
+            return cached
 
         rows = self._rest.search_scrip(self._uid, "NFO", underlying)
-        futures = [
-            row
-            for row in rows
-            if str(row.get("instname", "")).upper().startswith("FUT")
-            and str(row.get("symname", "")).upper() == underlying.upper()
-        ]
-        if not futures:
-            raise ShoonyaApiError(
-                "resolve_futures_anchor",
-                f"no NFO futures contract found for underlying {underlying!r}",
-            )
-
-        def _expiry_key(row: dict) -> date:
+        available_expiries: set[date] = set()
+        for row in rows:
+            if not str(row.get("instname", "")).upper().startswith("OPT"):
+                continue
+            if str(row.get("symname", "")).upper() != underlying.upper():
+                continue
             try:
-                return normalizer.parse_shoonya_date(str(row.get("exd", "")))
+                row_expiry = normalizer.parse_shoonya_date(str(row.get("exd", "")))
             except normalizer.NormalizationError:
-                return date.max
+                continue
+            if row_expiry == expiry:
+                tsym = str(row["tsym"])
+                with self._token_lock:
+                    self._option_anchor_cache[cache_key] = tsym
+                return tsym
+            available_expiries.add(row_expiry)
 
-        futures.sort(key=_expiry_key)
-        nearest = futures[0]
-        tsym = str(nearest["tsym"])
-        expiry = _expiry_key(nearest)
-        with self._token_lock:
-            self._futures_anchor_cache[underlying] = (tsym, expiry)
-        return tsym
+        # The mismatch is the whole point of this method's safety guarantee,
+        # so the error should be self-diagnosing rather than sending an
+        # operator back to guess-and-check against SearchScrip by hand —
+        # list what expiries this underlying's chain actually has.
+        raise ShoonyaApiError(
+            "resolve_option_anchor",
+            f"no NFO option contract found for underlying {underlying!r} expiry "
+            f"{expiry} — refusing to anchor GetOptionChain on a different "
+            "(e.g. monthly) series than what was requested. Available expiries "
+            f"for {underlying!r}: {sorted(available_expiries)}",
+        )
 
     # -- BrokerPort: quotes / depth -------------------------------------------
 
@@ -366,7 +477,29 @@ class ShoonyaBrokerAdapter(BrokerPort):
             return self._orders_by_idempotency_key[request.idempotency_key]
 
         payload = normalizer.to_place_order_payload(request, uid=self._uid, actid=self._actid)
-        raw = self._rest.place_order(payload)
+        try:
+            raw = self._rest.place_order(payload)
+        except ShoonyaApiError as exc:
+            # `rest_client._post` wraps every failure into `ShoonyaApiError`
+            # uniformly, but `raise ... from exc` (its own code) preserves
+            # *which* failure via `__cause__` — an `httpx.HTTPError` cause
+            # means the request-response round trip itself never completed
+            # (timeout, dropped connection), genuinely ambiguous whether the
+            # broker ever received/processed it, unlike a clean `stat:
+            # Not_Ok` rejection (no httpx cause — the broker definitely
+            # answered). A caller that blindly retries after *this specific*
+            # ambiguity risks placing a real duplicate order — the #1
+            # failure mode this whole system exists to avoid — so check
+            # order history by our own idempotency_key (echoed back
+            # verbatim in `remarks`, see `to_place_order_payload`) before
+            # ever concluding the placement failed.
+            if isinstance(exc.__cause__, httpx.HTTPError):
+                found = self._find_order_by_remarks(request.idempotency_key)
+                if found is not None:
+                    self._orders_by_idempotency_key[request.idempotency_key] = found
+                    return found
+            raise
+
         result = normalizer.parse_order_result(raw, idempotency_key=request.idempotency_key)
 
         # PlaceOrder's own immediate response only ever carries an Ok/Not_Ok
@@ -384,6 +517,27 @@ class ShoonyaBrokerAdapter(BrokerPort):
 
         self._orders_by_idempotency_key[request.idempotency_key] = result
         return result
+
+    def _find_order_by_remarks(self, idempotency_key: str) -> OrderResult | None:
+        """Order-ack-timeout fallback: `OrderBook` rows echo back whatever
+        `remarks` was submitted with, so a genuinely-placed order can be
+        found this way even when `PlaceOrder`'s own response never arrived.
+        Returns `None` (not raises) on either "truly not found" or a failed
+        lookup itself — either way, the caller's only sane fallback is to
+        treat this as "couldn't confirm, re-raise the original ambiguity"
+        rather than invent a result.
+        """
+        try:
+            rows = self._rest.order_book(self._uid)
+        except ShoonyaApiError:
+            logger.exception(
+                "Order-history fallback lookup failed for idempotency_key=%r", idempotency_key
+            )
+            return None
+        for row in rows:
+            if str(row.get("remarks", "")) == idempotency_key:
+                return normalizer.parse_order_result(row, idempotency_key=idempotency_key)
+        return None
 
     def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
         payload = {
