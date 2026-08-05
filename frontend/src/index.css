@@ -5,6 +5,17 @@
   --muted: #666;
   --danger: #b3261e;
   --accent: #1a5fb4;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --border: #444;
+    --muted: #aaa;
+    --bg: #1e1e1e;
+    --fg: #f0f0f0;
+  }
 }
 
 * {
@@ -13,6 +24,8 @@
 
 body {
   margin: 0;
+  background: var(--bg);
+  color: var(--fg);
 }
 
 button {
@@ -41,8 +54,19 @@ textarea {
   border: 1px solid var(--border);
   border-radius: 4px;
   font: inherit;
-  background: transparent;
-  color: inherit;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+/* Chromium renders a <select>'s open option list against its own default
+   (light) popup background when the select has any author background/color
+   set, regardless of color-scheme — leaving inherited light-on-dark text
+   invisible except on the hovered/selected row. Options need their own
+   explicit background/color, not "transparent"/"inherit", to render
+   consistently in both themes. */
+select option {
+  background: var(--bg);
+  color: var(--fg);
 }
 
 table {
