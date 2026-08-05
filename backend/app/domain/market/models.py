@@ -49,6 +49,18 @@ class SyncStatus(enum.StrEnum):
     FAILED = "failed"
 
 
+class MarketDataProviderName(enum.StrEnum):
+    """Plain string column, not a Postgres enum type — adding a new market-
+    data or execution broker later needs only a new member here, never a
+    migration, matching the "swap a broker without touching a schema"
+    principle `BrokerPort`/`BaseMarketDataProvider` are both built around.
+    """
+
+    ANGEL_ONE = "angel_one"
+    SHOONYA = "shoonya"
+    MOCK = "mock"
+
+
 class Instrument(Base, UUIDPkMixin, TimestampMixin):
     __tablename__ = "instruments"
 
@@ -103,6 +115,65 @@ class InstrumentMasterSyncLog(Base, UUIDPkMixin):
     instruments_updated: Mapped[int] = mapped_column(Integer, default=0)
     contracts_added: Mapped[int] = mapped_column(Integer, default=0)
     contracts_expired: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[SyncStatus] = mapped_column(String(20))
+    detail: Mapped[str] = mapped_column(String(1000), default="")
+
+
+class BrokerSymbolMap(Base, UUIDPkMixin, TimestampMixin):
+    """Provider-keyed symbol/token mapping for an *existing* `Instrument`/
+    `OptionContract` row. Deliberately doesn't change what `Instrument.symbol`/
+    `OptionContract.symbol` mean (still whichever broker's `get_instrument_master`
+    populated them, today Shoonya's own tsym) — this table is the layer that
+    lets a *second* provider (Angel One, for live ticks) resolve that same
+    row to its own token, and a future third provider do the same again,
+    without ever touching the execution path's own symbol handling.
+    """
+
+    __tablename__ = "broker_symbol_map"
+
+    instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("instruments.id"), nullable=True
+    )
+    option_contract_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("option_contracts.id"), nullable=True
+    )
+    provider: Mapped[MarketDataProviderName] = mapped_column(String(20))
+    external_symbol: Mapped[str] = mapped_column(String(60))
+    external_token: Mapped[str] = mapped_column(String(40), default="")
+    exchange: Mapped[str] = mapped_column(String(20))
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "(instrument_id IS NOT NULL) <> (option_contract_id IS NOT NULL)",
+            name="ck_broker_symbol_map_exactly_one_of_instrument_or_contract",
+        ),
+        UniqueConstraint(
+            "instrument_id", "provider", name="uq_broker_symbol_map_instrument_provider"
+        ),
+        UniqueConstraint(
+            "option_contract_id",
+            "provider",
+            name="uq_broker_symbol_map_option_contract_provider",
+        ),
+        Index("ix_broker_symbol_map_provider_token", "provider", "external_token"),
+    )
+
+
+class ScripMasterSyncLog(Base, UUIDPkMixin):
+    """Same shape/spirit as `InstrumentMasterSyncLog` — a dedicated log
+    rather than reusing that table, since this sync's inputs (a provider's
+    scrip master file, not `BrokerPort.get_instrument_master`) and its output
+    (`broker_symbol_map` rows, not `Instrument`/`OptionContract` rows) are a
+    genuinely different operation.
+    """
+
+    __tablename__ = "scrip_master_sync_log"
+
+    provider: Mapped[MarketDataProviderName] = mapped_column(String(20))
+    run_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    rows_parsed: Mapped[int] = mapped_column(Integer, default=0)
+    rows_mapped: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[SyncStatus] = mapped_column(String(20))
     detail: Mapped[str] = mapped_column(String(1000), default="")
 

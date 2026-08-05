@@ -10,6 +10,15 @@ current price, force a square-off once IST wall-clock passes
 `cutoff_time`, watch for a margin breach on guarded-live/live sessions
 (Addendum hardening batch's narrow emergency-square-off trigger), and
 periodically run a polling reconciliation pass.
+
+**Price source**: stop/target/trail checks read live price from
+`market_data.provider_composition.get_market_data_provider()` (Angel One in
+production), not from the execution broker (Shoonya) — full market-data/
+execution decoupling, since Shoonya's own feed is the fragile one this
+system stopped trusting for anything price-critical. `broker.get_quote()`
+(Shoonya, via `get_execution_broker`) is still used for order placement
+(EOD/margin-breach square-off) and as a one-cycle fallback if the live feed
+hasn't delivered a fresh tick yet — see `_live_tick`.
 """
 
 from __future__ import annotations
@@ -39,9 +48,13 @@ from app.domain.session.models import (
 )
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerError
 from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.execution_engine.paper.service import evaluate_open_position
+from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
+from app.modules.market_data.provider_composition import get_market_data_provider
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.reconciliation.service import run_reconciliation
 
 logger = logging.getLogger("app.execution_engine.paper.position_manager")
@@ -59,6 +72,7 @@ class PositionManager:
         self,
         trading_session_id: uuid.UUID,
         broker: BrokerPort | None = None,
+        market_data_provider: BaseMarketDataProvider | None = None,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         reconcile_every_n_cycles: int = DEFAULT_RECONCILE_EVERY_N_CYCLES,
         session_factory: SessionFactory = session_scope,
@@ -69,14 +83,26 @@ class PositionManager:
         # is often constructed before a DB session is open (registry.py).
         # None means "resolve get_execution_broker(trading_session) fresh
         # every cycle in _run_cycle"; an explicit broker (tests, always)
-        # is used as-is, unchanged from before.
+        # is used as-is, unchanged from before. `broker` is still used here
+        # — for order placement (EOD/margin-breach square-off) and as the
+        # staleness fallback for live pricing (see _live_tick) — even though
+        # position pricing itself now reads from market_data_provider first.
         self._broker_override = broker
+        # Same optional-override shape as _broker_override, for the same
+        # reasons (tests construct this class directly, before any DB
+        # session/composition-root state exists).
+        self._market_data_provider_override = market_data_provider
         self._poll_interval_seconds = poll_interval_seconds
         self._reconcile_every_n_cycles = reconcile_every_n_cycles
         self._session_factory = session_factory
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._cycle_count = 0
+        # Symbols this instance has successfully subscribed on the market-
+        # data provider for pricing (see _ensure_symbol_subscribed) — a
+        # symbol that fails to subscribe is *not* added, so it's retried on
+        # the next cycle rather than silently given up on forever.
+        self._subscribed_symbols: set[str] = set()
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -210,8 +236,76 @@ class PositionManager:
         )
         db.commit()
 
+    def _ensure_symbol_subscribed(self, provider: BaseMarketDataProvider, symbol: str) -> None:
+        """Subscribes directly on `provider` — deliberately *not* via
+        `market_data.registry.ensure_ingestion_running`/
+        `MarketDataIngestionService`, whose default `session_factory` is the
+        production `session_scope`. A QC pass on an earlier version of this
+        change found that calling that registry function from paper
+        execution (`_open_position_from_fill`) spawned real background
+        streaming threads against the *real* dev database from ordinary
+        test runs — thousands of stray `quote_ticks` rows, since dozens of
+        existing tests call `dispatch_trade_intent` directly with no reason
+        to expect it to touch market data at all. A provider's own
+        `subscribe_ticks` only updates its in-memory latest-tick cache
+        (see `BaseMarketDataProvider.get_latest_tick`'s own docstring) —
+        no DB session anywhere in this call, so a test overriding
+        `market_data_provider` (or accepting the safe "mock" default) stays
+        fully isolated regardless.
+
+        Idempotent per instance (`_subscribed_symbols`) and best-effort: a
+        symbol that fails to subscribe is *not* recorded, so it's retried on
+        the next cycle rather than silently given up on forever — the
+        `_live_tick` fallback to `broker.get_quote` covers pricing in the
+        meantime.
+        """
+        if symbol in self._subscribed_symbols:
+            return
+        try:
+            provider.subscribe_ticks([symbol], on_tick=lambda _tick: None)
+            self._subscribed_symbols.add(symbol)
+        except Exception:
+            logger.exception(
+                "Failed to subscribe %s for live pricing; will retry next cycle", symbol
+            )
+
+    def _live_tick(
+        self, provider: BaseMarketDataProvider, symbol: str, broker: BrokerPort
+    ) -> Tick:
+        """Prices from the live market-data feed (Angel One in production) —
+        the "full decoupling" this system's stop/target/trail checks needed,
+        since Shoonya's own feed is the fragile one. Falls back to a
+        one-shot `broker.get_quote()` (Shoonya) for this cycle only when the
+        feed hasn't delivered anything fresh, reusing the same
+        LIVE/DEGRADED/STALE/DEAD classification `market_data.freshness`
+        already applies to persisted ticks — never leaves a stop-loss check
+        silently unevaluated just because the primary feed hiccuped for one
+        cycle, same "wrap a possibly-imperfect primitive in our own
+        supervision" discipline `market_data.ingestion`'s own WS -> REST
+        fallback already established.
+        """
+        self._ensure_symbol_subscribed(provider, symbol)
+        tick = provider.get_latest_tick(symbol)
+        if tick is not None:
+            state = classify_age(tick.ts, datetime.now(UTC), TICK_THRESHOLDS)
+            if state in (FreshnessState.LIVE, FreshnessState.DEGRADED):
+                return tick
+            logger.warning(
+                "live tick for %s is %s (age-based); falling back to broker.get_quote "
+                "for this cycle",
+                symbol,
+                state.value,
+            )
+        else:
+            logger.warning(
+                "no live tick yet for %s; falling back to broker.get_quote for this cycle",
+                symbol,
+            )
+        return broker.get_quote(symbol)
+
     def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
         broker = self._broker_override or get_execution_broker(trading_session)
+        market_data_provider = self._market_data_provider_override or get_market_data_provider()
         open_positions = (
             db.query(Position)
             .filter(
@@ -230,13 +324,15 @@ class PositionManager:
             option_contract = db.get(OptionContract, position.option_contract_id)
             if option_contract is None:
                 continue
-            tick = broker.get_quote(option_contract.symbol)
+            tick = self._live_tick(market_data_provider, option_contract.symbol, broker)
 
             underlying_price = underlying_price_cache.get(option_contract.instrument_id)
             if underlying_price is None:
                 instrument = db.get(Instrument, option_contract.instrument_id)
                 if instrument is not None:
-                    underlying_price = broker.get_quote(instrument.symbol).ltp
+                    underlying_price = self._live_tick(
+                        market_data_provider, instrument.symbol, broker
+                    ).ltp
                     underlying_price_cache[option_contract.instrument_id] = underlying_price
 
             evaluate_open_position(

@@ -330,6 +330,21 @@ def _open_position_from_fill(
     # close_position below.
     get_sleep_inhibitor().acquire(f"position:{position.id}")
 
+    # Deliberately does NOT subscribe this position's option-contract symbol
+    # for live pricing here — see PositionManager._ensure_symbol_subscribed's
+    # own docstring. Doing it in this function (called directly, with a
+    # test-owned `broker=`, from unit/integration tests all over this
+    # codebase) would repeat the exact `ensure_ingestion_running`-touches-
+    # production-`session_scope` trap this file's own module docstring
+    # already warns about for PositionManager itself: a real, live bug in an
+    # earlier version of this change spawned MarketDataIngestionService
+    # background threads against the *real* dev database from ordinary test
+    # runs (found via a QC pass — 3,400+ stray quote_ticks rows in the dev
+    # DB). PositionManager subscribes for its own tracked positions instead,
+    # directly on whichever market_data_provider it was given — no DB
+    # session, no registry singleton, nothing for a test's own broker/db
+    # fixtures to accidentally bypass.
+
     return position
 
 
@@ -463,6 +478,10 @@ def close_position(
         # Releases this position's half of the sleep inhibitor's reference
         # count — see the matching acquire in _open_position_from_fill.
         get_sleep_inhibitor().release(f"position:{position.id}")
+
+        # No matching unsubscribe call here — see _open_position_from_fill's
+        # own comment for why this module never touches market-data
+        # subscriptions at all. PositionManager owns that lifecycle.
 
         stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
         if stop_plan is not None and stop_plan.status not in (

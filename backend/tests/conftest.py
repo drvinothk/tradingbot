@@ -98,12 +98,21 @@ def _reset_broker_singleton() -> Generator[None, None, None]:
     wants a specific broker instance (a seeded one, or a fake) calls
     `composition.set_broker(...)` itself; this fixture only guarantees a
     clean slate either way.
+
+    `market_data.provider_composition` gets the identical treatment for the
+    identical reason — it's a second, independent module-level singleton
+    (`get_market_data_provider()`), not reset by `composition.reset_for_tests()`
+    above, that would otherwise leak a provider/`ScripMasterService` instance
+    across tests the same way an unreset broker singleton would.
     """
     from app.modules.broker_adapter import composition
+    from app.modules.market_data import provider_composition
 
     composition.reset_for_tests()
+    provider_composition.reset_for_tests()
     yield
     composition.reset_for_tests()
+    provider_composition.reset_for_tests()
 
 
 @pytest.fixture

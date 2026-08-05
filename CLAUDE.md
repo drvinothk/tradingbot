@@ -366,6 +366,142 @@ check, then exercise it live).
   `BrokerPort` adapter's `unsubscribe_quotes` (Shoonya's `ws_client.py`
   included) needs the same guarantee — "stopped" must mean no more
   callbacks fire, not just "asked to stop."
+- 👈 **Market-data/execution decoupling (Angel One)** — new work, not yet
+  live-verified, on top of everything above: since Shoonya's WS never once
+  worked live, market data now comes from a second, independent broker-
+  agnostic port, `BaseMarketDataProvider`
+  (`app/modules/market_data/providers/base.py`), separate from `BrokerPort`
+  — Shoonya stays execution-only, untouched. `AngelOneMarketDataProvider`
+  (`providers/angel_one.py`) does the real work: REST login (`loginByPassword`
+  + server-generated TOTP via `pyotp`, a genuine difference from Shoonya's
+  dormant `totp_secret`), then SmartStream over `smartapi-python`'s
+  `SmartWebSocketV2` — binary tick unpacking is delegated to that SDK
+  entirely (`angel_ws_client.py`'s own docstring explains why: a hand-rolled
+  byte-offset guess with no live account to verify against is a categorically
+  worse risk than a JSON parsing bug). A new `ScripMasterService`
+  (`market_data/scrip_master.py`) bridges Angel's own daily scrip-master file
+  to this system's *existing* `Instrument`/`OptionContract` rows by
+  structural match (underlying/expiry/strike/option_type — never string
+  comparison), storing the mapping in a new `broker_symbol_map` table
+  (migration `0012`) plus an in-memory cache; also writes a `shoonya`
+  passthrough mapping for interface symmetry, in case execution's own broker
+  changes later. `PositionManager` now prices stop/target/trail checks from
+  this live feed (`get_latest_tick`), falling back to a one-cycle
+  `broker.get_quote()` (Shoonya) read if the feed hasn't delivered a tick
+  fresh enough (`market_data.freshness`'s existing staleness classification,
+  reused) — full decoupling, per an explicit user call that Shoonya's own
+  feed is too fragile to keep pricing anything on. `MARKET_DATA_PROVIDER`
+  env var (`"angel_one"` / `"shoonya"` / `"mock"`, default `"mock"` — zero
+  behavior change unless opted in) selects the provider via
+  `market_data/provider_composition.get_market_data_provider()`, mirroring
+  `broker_adapter/composition.py`'s own lazy-singleton pattern. FINNIFTY is
+  indexed/mapped in the scrip-master parser for future-proofing only — not
+  wired into strategies, the mock universe, or Shoonya's own
+  `KNOWN_UNDERLYINGS` yet, by explicit scope decision. Two REST endpoints
+  (`loginByPassword`'s exact header/body shape, the scrip-master file schema
+  and its strike-×100/`DDMMMYYYY`-expiry quirks) are confirmed from a
+  user-supplied Angel One doc extraction; the historical-candle endpoint
+  (`get_price_history`, needed to preserve `MarketDataIngestionService`'s
+  existing WS→REST-fallback resilience feature) is this session's own
+  researched-not-live-verified addition, flagged in
+  `angel_rest_client.get_candle_data`'s own docstring the same way every
+  other unconfirmed Shoonya claim in this file already is. `smartapi-python`
+  pulled in two undeclared transitive dependencies (`logzero`,
+  `websocket-client`) discovered only by actually installing and importing
+  it — both pinned explicitly in `pyproject.toml` with that discovery
+  recorded in a comment. 412/412 backend tests pass (up from ~350),
+  `ruff`/`mypy` clean, migration `0012` tested both directions locally. **Not
+  live-verified against a real Angel One account** — no credentials exist
+  yet; first real test needs a populated `config/credentials/angel_one.env`
+  and a live market-hours session, same "deployed and reachable is step one,
+  not done" discipline this file's own Phase 5 section already learned the
+  hard way.
+  **QC pass findings** (same "always self-review, real-money system"
+  discipline as every other phase — see the top of this doc's process
+  notes): one real, serious bug caught and fixed before this landed —
+  `PositionManager`'s new per-position live-subscribe call (added to
+  `_open_position_from_fill`/`close_position` in the first cut) went through
+  `market_data.registry.ensure_ingestion_running`, whose default
+  `session_factory` is the *production* `session_scope`, not a test's own
+  isolated DB. That path is called directly, with test-owned brokers, by
+  dozens of existing tests across this codebase — exactly the same trap this
+  file's own Phase 3 section already documents for why `PositionManager`
+  itself is started explicitly rather than implicitly from dispatch. Caught
+  by manually diffing real dev-DB row counts before/after a full test run
+  (found via that check, not by a failing test — the inserts happened to
+  silently no-op since the test fixtures' symbols never existed in the real
+  dev DB, so no actual corruption occurred, confirmed by checking every
+  affected table's row timestamps against the run date). Fixed by having
+  `PositionManager` subscribe directly on its own `market_data_provider`
+  instance instead (in-memory only, no DB session in the call at all) and
+  tracking subscribed symbols per-instance rather than via the module-level
+  registry singleton. A second, related bug surfaced while fixing the
+  first: `MockBrokerAdapter`'s background stream thread has no
+  pre-subscribe delay, so a test that resolves the *default* market-data
+  provider (an unrelated `get_broker()` singleton, not the test's own
+  explicit `broker=` override) could race a real tick against the test's
+  intended price — fixed by giving `test_position_manager.py` a
+  `_NullMarketDataProvider` test double so every existing test keeps
+  exercising the deterministic `broker.get_quote` fallback path it always
+  relied on, plus two new dedicated tests
+  (`test_run_once_prices_from_the_live_feed_in_preference_to_broker_get_quote`,
+  `test_run_once_falls_back_to_broker_quote_when_live_tick_is_stale`) that
+  actually exercise the live-tick-takes-priority path itself, which had zero
+  coverage until this pass.
+  **2026-08-05 live deployment session** — deployed to the OCI VM
+  (`68.233.110.76`, no git on that box; deployed via a tarball over SSH,
+  not a git pull) with real Angel One credentials for the first time.
+  Found and fixed three more real, live-only bugs: (1) `_sync_angel_one_scrip_master`
+  read a `ScripMasterSyncLog` row's attributes after its `session_scope()`
+  had already closed — the identical `DetachedInstanceError` trap
+  `record_option_chain_snapshot`'s own docstring already warns about,
+  just a fresh instance of it; (2) the credentials file
+  (`config/credentials/angel_one.env`) had Windows CRLF line endings from
+  its Windows origin, and a shell `echo ... >>` append (adding
+  `ANGELONE_AUTH_PROXY` after the fact) landed with no preceding newline,
+  silently merging it onto the previous key's value — `pydantic-settings`
+  read it as `auth_proxy=""` with no error, so the bug only surfaced as a
+  mysterious "proxy configured but not applied" symptom, not a crash;
+  fixed by rewriting the file clean rather than trusting further shell
+  appends. **Live-confirmed, not guessed**: `apiconnect.angelone.in` (the
+  *authenticated* REST gateway) consistently times out from the OCI VM's
+  IP while Angel's own *public* scrip-master endpoint, Shoonya's API, and
+  general internet all respond instantly from that same IP — and the
+  identical authenticated request from an unrelated residential IP also
+  responds instantly. Confirmed a cloud-IP-range block (or an
+  unpropagated whitelist — can't fully distinguish the two from outside),
+  not a code bug. (3) Added `AngelOneSettings.auth_proxy`
+  (`ANGELONE_AUTH_PROXY`) — an optional HTTP(S) proxy `AngelOneRestClient`
+  routes both `loginByPassword` *and* `getCandleData` through (both hit
+  the same blocked gateway; there's no reason to expect one behaves
+  differently from the other), explicitly never applied to the WebSocket
+  (`angel_ws_client.py`, a different host, `smartapisocket.angelone.in`,
+  and latency-sensitive by design) or the scrip-master download (a third
+  host, already confirmed reachable directly). A user-supplied proxy fix
+  request also asked for proxy timeouts to raise `BrokerAuthError` —
+  implemented as `BrokerConnectivityError` instead (already what the
+  existing `except httpx.HTTPError` produces, `httpx.ProxyError` included)
+  since a proxy being unreachable is "retry next cycle," never "credentials
+  are dead" — misclassifying it would have risked
+  `PositionManager._handle_broker_auth_error` firing a spurious
+  `degraded_mode` transition on a guarded-live/live session over a
+  transient relay blip, not just an inaccurate label. **Result: the proxy
+  fix works** — `loginByPassword` now succeeds live, `_resume_strategy_runners`
+  reported "Resumed 1 strategy runner(s)" with zero auth errors, confirmed
+  via real systemd/journalctl logs on the OCI box, not just a local test.
+  **WebSocket still open**: `smartapisocket.angelone.in` (all 4 of its
+  resolved IPs) also timed out via a raw TLS test from the OCI VM,
+  contradicting the working assumption that only the REST gateway was
+  blocked — one connection attempt did briefly succeed (reached `on_open`)
+  before the subscribe failed with "socket is already closed," so this may
+  be flaky connectivity rather than an absolute block, or may simply be
+  the market being closed at test time (18:0x IST, well past close) closing
+  idle connections server-side — the two causes weren't distinguishable
+  from this session's evidence alone. Per explicit user decision, WS stays
+  direct (no proxy) for now; next step is retesting during real market
+  hours before touching this further — see `angel_ws_client.py`'s own
+  reconnect-backoff loop, which is already retrying on its own and needs no
+  new code either way.
 
 ## Known open items
 

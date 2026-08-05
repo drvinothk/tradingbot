@@ -124,6 +124,54 @@ def _sync_mock_instrument_universe() -> None:
         )
 
 
+def _sync_angel_one_scrip_master() -> None:
+    """No-op unless `MARKET_DATA_PROVIDER=angel_one` — no point fetching
+    Angel's master file (or starting its refresh scheduler) when it isn't
+    the active provider, same gating reasoning
+    `_sync_mock_instrument_universe` already applies for the mock adapter.
+    Runs after `_sync_mock_instrument_universe`/instrument sync (this sync
+    matches Angel rows against *existing* `Instrument`/`OptionContract` rows
+    — needs them to exist first) and before `_resume_strategy_runners`
+    (resumed ingestion needs the symbol/token mapping ready before it can
+    subscribe). Tolerant of failure — logs and continues, same as every
+    other startup step; a failed sync is recorded in `scrip_master_sync_log`
+    via `ScripMasterService.sync_to_db` itself, never raised past it.
+    """
+    from app.config.settings import get_settings
+    from app.core.db.session import session_scope
+    from app.modules.market_data.provider_composition import get_scrip_master
+    from app.modules.market_data.scrip_master_scheduler import (
+        ensure_scrip_master_refresh_scheduler_running,
+    )
+
+    if get_settings().market_data.provider != "angel_one":
+        return
+
+    scrip_master = get_scrip_master()
+    try:
+        rows_parsed = scrip_master.fetch_and_parse()
+        with session_scope() as db:
+            log = scrip_master.sync_to_db(db)
+            # Read while the session is still open — session_scope() closes
+            # on exit, and with the default expire_on_commit=True, touching
+            # an attribute afterward re-triggers a DB load against an
+            # already-closed session (DetachedInstanceError). Same trap
+            # record_option_chain_snapshot's own docstring already documents
+            # for this exact codebase.
+            status = log.status
+            rows_mapped = log.rows_mapped
+        logger.info(
+            "Angel One scrip master synced: status=%s rows_parsed=%d rows_mapped=%d",
+            status,
+            rows_parsed,
+            rows_mapped,
+        )
+    except Exception:
+        logger.exception("Angel One scrip master sync failed at startup — will retry hourly")
+
+    ensure_scrip_master_refresh_scheduler_running(scrip_master)
+
+
 def _run_startup_recovery_check() -> None:
     """For every trading_session left ACTIVE with at least one open Position
     (the signature of a crash/reboot mid-position, not a clean shutdown):
@@ -312,6 +360,7 @@ async def lifespan(app: FastAPI):
     # success path instead.
     try:
         _sync_mock_instrument_universe()
+        _sync_angel_one_scrip_master()
         _run_startup_recovery_check()
         _resume_strategy_runners()
 
@@ -330,10 +379,14 @@ async def lifespan(app: FastAPI):
 
     from app.core.locking import release_advisory_lock
     from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
+    from app.modules.market_data.scrip_master_scheduler import (
+        stop_scrip_master_refresh_scheduler,
+    )
     from app.modules.scheduler.health_check import stop_health_check_scheduler
 
     stop_all_position_managers()
     stop_health_check_scheduler()
+    stop_scrip_master_refresh_scheduler()
     release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
     singleton_connection.close()
     logger.info("Process singleton lock released; shutdown complete.")

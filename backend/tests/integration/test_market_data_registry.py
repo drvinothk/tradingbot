@@ -41,6 +41,7 @@ from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.market_data import registry as market_data_registry
 from app.modules.market_data.indicators import IndicatorEngine
 from app.modules.market_data.ingestion import MarketDataIngestionService
+from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
 
 EXPIRY = date(2026, 7, 31)
 
@@ -117,7 +118,9 @@ def test_one_shared_service_delivers_ticks_for_both_underlyings(
     universe, instrument_ids = seeded_universe
     broker = MockBrokerAdapter(instruments=universe, seed=42, tick_interval_seconds=0.05)
     service = MarketDataIngestionService(
-        broker, session_factory=test_session_factory, indicator_engine=IndicatorEngine()
+        BrokerPortMarketDataAdapter(broker),
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(),
     )
 
     service.start(["NIFTY"])
@@ -150,7 +153,7 @@ def test_ensure_ingestion_running_shares_one_service_and_is_idempotent_per_symbo
     starts: list[list[str]] = []
 
     class _FakeIngestionService:
-        def __init__(self, broker, session_factory=None, indicator_engine=None):
+        def __init__(self, provider, session_factory=None, indicator_engine=None):
             pass
 
         def start(self, symbols):
@@ -158,9 +161,9 @@ def test_ensure_ingestion_running_shares_one_service_and_is_idempotent_per_symbo
 
     monkeypatch.setattr(market_data_registry, "MarketDataIngestionService", _FakeIngestionService)
 
-    service_1 = market_data_registry.ensure_ingestion_running("NIFTY", broker=object())
-    service_2 = market_data_registry.ensure_ingestion_running("NIFTY", broker=object())
-    service_3 = market_data_registry.ensure_ingestion_running("BANKNIFTY", broker=object())
+    service_1 = market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    service_2 = market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    service_3 = market_data_registry.ensure_ingestion_running("BANKNIFTY", provider=object())
 
     assert service_1 is service_2 is service_3
     assert starts == [["NIFTY"], ["BANKNIFTY"]]  # the repeated "NIFTY" call was a no-op

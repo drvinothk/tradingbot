@@ -28,6 +28,7 @@ from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
 from app.modules.market_data.indicators.engine import IndicatorEngine
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 logger = logging.getLogger("app.market_data")
 
@@ -55,7 +56,14 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 
 class MarketDataIngestionService:
-    """`session_factory` defaults to the real app-wide `session_scope` (each
+    """Consumes ticks strictly through `BaseMarketDataProvider` — never a
+    concrete provider, never `BrokerPort` — so the strategy/indicator layer
+    downstream of this service is vendor-agnostic regardless of which live
+    feed (Angel One, a Shoonya/mock shim) is actually wired in behind it.
+    See `market_data/provider_composition.py`'s own docstring for the "why
+    a second port, not a bigger BrokerPort" reasoning.
+
+    `session_factory` defaults to the real app-wide `session_scope` (each
     streaming callback fires on a background thread, so it needs its own
     short-lived session rather than sharing a caller-provided one) — but is
     injectable so tests can point it at an isolated test database instead of
@@ -81,14 +89,14 @@ class MarketDataIngestionService:
 
     def __init__(
         self,
-        broker: BrokerPort,
+        provider: BaseMarketDataProvider,
         session_factory: SessionFactory = session_scope,
         indicator_engine: IndicatorEngine | None = None,
         *,
         ws_health_grace_seconds: float = _WS_HEALTH_GRACE_SECONDS,
         rest_poll_interval_seconds: float = _REST_POLL_INTERVAL_SECONDS,
     ) -> None:
-        self._broker = broker
+        self._provider = provider
         self._session_factory = session_factory
         self._indicator_engine = indicator_engine
         self._symbol_map: dict[str, _SymbolRef] = {}
@@ -126,7 +134,7 @@ class MarketDataIngestionService:
                 len(unknown),
                 sorted(unknown),
             )
-        self._broker.subscribe_quotes(
+        self._provider.subscribe_ticks(
             contract_symbols, on_tick=self._on_tick, on_depth=self._on_depth
         )
         for symbol in contract_symbols:
@@ -186,7 +194,7 @@ class MarketDataIngestionService:
         # repeatedly during 2026-08-05's restart-heavy session.
         self._last_polled_bucket[symbol] = self._latest_persisted_bucket(instrument_id)
         try:
-            self._broker.unsubscribe_quotes([symbol])
+            self._provider.unsubscribe_ticks([symbol])
         except Exception:
             logger.exception(
                 "Failed to unsubscribe %r from WS before starting REST fallback "
@@ -235,7 +243,7 @@ class MarketDataIngestionService:
             self._indicator_engine.timeframe_seconds if self._indicator_engine is not None else 60
         )
         now = datetime.now(UTC)
-        candles = self._broker.get_price_history(
+        candles = self._provider.get_price_history(
             symbol, now - _REST_POLL_LOOKBACK, now, timeframe_seconds
         )
         last_seen = self._last_polled_bucket.get(symbol)
@@ -312,7 +320,7 @@ class MarketDataIngestionService:
         fallback_here = [s for s in contract_symbols if s in self._fallback_symbols]
         still_ws = [s for s in contract_symbols if s not in self._fallback_symbols]
         if still_ws:
-            self._broker.unsubscribe_quotes(still_ws)
+            self._provider.unsubscribe_ticks(still_ws)
         for symbol in fallback_here:
             # Remove-then-join, not the reverse — `_poll_loop` checks
             # membership every 0.1s, so dropping it first is what actually

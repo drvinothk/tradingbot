@@ -29,8 +29,19 @@ from app.modules.broker_adapter.mock import MockBrokerAdapter
 from app.modules.market_data import MarketDataIngestionService, record_option_chain_snapshot
 from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
 from app.modules.market_data.indicators import IndicatorEngine
+from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
 
 EXPIRY = date(2026, 7, 31)
+
+
+def _provider(broker):
+    """MarketDataIngestionService now depends on BaseMarketDataProvider, not
+    BrokerPort directly (see that class's own updated docstring) — every
+    fake broker in this file already has BrokerPort's shape
+    (subscribe_quotes/unsubscribe_quotes/get_price_history), so wrapping it
+    here is all that's needed; none of the fakes themselves change.
+    """
+    return BrokerPortMarketDataAdapter(broker)  # type: ignore[arg-type]
 
 
 @pytest.fixture
@@ -118,7 +129,7 @@ def test_symbol_map_resolves_both_instruments_and_option_contracts(
     seeded_universe, test_session_factory
 ):
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=1)
-    service = MarketDataIngestionService(broker, session_factory=test_session_factory)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
 
     symbols = [i.symbol for i in seeded_universe[:5]]
     symbol_map = service._build_symbol_map(symbols)  # noqa: SLF001
@@ -128,7 +139,7 @@ def test_symbol_map_resolves_both_instruments_and_option_contracts(
 
 def test_unknown_symbol_does_not_raise(seeded_universe, test_session_factory, caplog):
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=1)
-    service = MarketDataIngestionService(broker, session_factory=test_session_factory)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
 
     symbol_map = service._build_symbol_map(["NOT-A-REAL-SYMBOL"])  # noqa: SLF001
     assert symbol_map == {}
@@ -139,7 +150,7 @@ def test_streamed_ticks_are_persisted_for_option_contract(
 ):
     option_symbol = next(i.symbol for i in seeded_universe if i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=2, tick_interval_seconds=0.1)
-    service = MarketDataIngestionService(broker, session_factory=test_session_factory)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
 
     service.start([option_symbol])
     time.sleep(0.35)
@@ -156,7 +167,7 @@ def test_streamed_ticks_are_persisted_for_underlying_instrument(
 ):
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=3, tick_interval_seconds=0.1)
-    service = MarketDataIngestionService(broker, session_factory=test_session_factory)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
 
     service.start([underlying_symbol])
     time.sleep(0.35)
@@ -176,7 +187,7 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
 
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=6)
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(timeframe_seconds=60),
     )
@@ -217,7 +228,7 @@ def test_completed_bars_are_persisted_for_underlying_instrument(
 
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(timeframe_seconds=60),
     )
@@ -289,7 +300,7 @@ def test_ws_health_watchdog_falls_back_to_rest_polling_when_no_tick_arrives(
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = _NeverTicksBroker()
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         ws_health_grace_seconds=0.05,
         rest_poll_interval_seconds=1000.0,  # won't fire again during this test
@@ -309,7 +320,7 @@ def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=1, tick_interval_seconds=0.02)
     service = MarketDataIngestionService(
-        broker, session_factory=test_session_factory, ws_health_grace_seconds=0.2
+        _provider(broker), session_factory=test_session_factory, ws_health_grace_seconds=0.2
     )
 
     service.start([underlying_symbol])
@@ -341,7 +352,7 @@ def test_rest_fallback_persists_a_completed_candle_and_skips_the_still_forming_o
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(timeframe_seconds=60),
         ws_health_grace_seconds=0.02,
@@ -378,7 +389,7 @@ def test_rest_fallback_does_not_repersist_a_bucket_already_seen(
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         ws_health_grace_seconds=0.02,
         rest_poll_interval_seconds=0.05,
@@ -450,7 +461,7 @@ def test_rest_fallback_seeds_last_polled_bucket_from_db_across_a_restart(
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         ws_health_grace_seconds=0.02,
         rest_poll_interval_seconds=0.05,
@@ -478,7 +489,7 @@ def test_stop_actually_joins_the_rest_poll_thread(seeded_universe, test_session_
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = _NeverTicksBroker()
     service = MarketDataIngestionService(
-        broker,  # type: ignore[arg-type]
+        _provider(broker),
         session_factory=test_session_factory,
         ws_health_grace_seconds=0.02,
         rest_poll_interval_seconds=0.05,
@@ -500,7 +511,7 @@ def test_depth_only_persisted_for_option_contracts_not_underlying(
     # mock adapter's ~30% random chance per tick.
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=4, tick_interval_seconds=0.05)
-    service = MarketDataIngestionService(broker, session_factory=test_session_factory)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
     service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
 
     from app.modules.broker_adapter.base.contracts import DepthLevel

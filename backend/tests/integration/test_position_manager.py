@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 
 import pytest
@@ -45,8 +45,41 @@ from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.position_manager import PositionManager
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 EXPIRY = date(2026, 7, 30)
+
+
+class _NullMarketDataProvider(BaseMarketDataProvider):
+    """Every test in this file controls pricing entirely through its own
+    `broker` fixture (or a wrapper around it) — `PositionManager` now tries
+    the live market-data feed *first* (see `_live_tick`), which by default
+    resolves to an unrelated `get_broker()` mock singleton whose own
+    background stream would race this test's carefully set-up prices with
+    irrelevant random ticks (found via a QC pass — see `_live_tick`'s own
+    docstring and `_ensure_symbol_subscribed`'s). Injecting this no-op
+    provider makes `get_latest_tick` always return `None`, so every test
+    deterministically exercises the `broker.get_quote` fallback path, same
+    as this class's entire behavior before market-data decoupling existed.
+    """
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def subscribe_ticks(self, symbols, on_tick, on_depth=None) -> None:
+        pass
+
+    def unsubscribe_ticks(self, symbols) -> None:
+        pass
+
+    def get_latest_tick(self, symbol):
+        return None
+
+    def get_price_history(self, underlying, start, end, timeframe_seconds=60):
+        return []
 
 
 @pytest.fixture
@@ -213,6 +246,109 @@ def _session_factory_for(db: Session):
     return _factory
 
 
+class _FakeLiveProvider(BaseMarketDataProvider):
+    """A controllable stand-in for the live market-data feed — unlike
+    `_NullMarketDataProvider`, this one actually returns a tick from
+    `get_latest_tick`, so tests can prove `PositionManager` prices from it
+    in preference to `broker.get_quote` (the "full decoupling" behavior
+    `_live_tick` implements), not just that it falls back correctly when
+    the feed has nothing.
+    """
+
+    def __init__(self) -> None:
+        self.ticks: dict[str, object] = {}
+        self.subscribed: list[str] = []
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    def subscribe_ticks(self, symbols, on_tick, on_depth=None) -> None:
+        self.subscribed.extend(symbols)
+
+    def unsubscribe_ticks(self, symbols) -> None:
+        pass
+
+    def get_latest_tick(self, symbol):
+        return self.ticks.get(symbol)
+
+    def get_price_history(self, underlying, start, end, timeframe_seconds=60):
+        return []
+
+
+def test_run_once_prices_from_the_live_feed_in_preference_to_broker_get_quote(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The actual "full decoupling" claim: with a live tick available,
+    PositionManager must act on *that* price, not on whatever the execution
+    broker's own get_quote would report — proven by setting the two sources
+    to disagree about whether the stop has been hit.
+    """
+    from app.modules.broker_adapter.base.contracts import Tick
+
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    # Execution broker reports a safe price...
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001
+    # ...but the live feed reports the stop has actually been breached.
+    provider = _FakeLiveProvider()
+    provider.ticks[option_contract.symbol] = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=60.0, bid=59.9, ask=60.1, volume=10, oi=None, ts=datetime.now(UTC),
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=provider,
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    assert option_contract.symbol in provider.subscribed
+
+
+def test_run_once_falls_back_to_broker_quote_when_live_tick_is_stale(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A live tick older than the freshness threshold must be treated the
+    same as no tick at all — `_live_tick` falls back to `broker.get_quote`
+    rather than acting on stale data.
+    """
+    from app.modules.broker_adapter.base.contracts import Tick
+
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - safe, must stay OPEN
+    provider = _FakeLiveProvider()
+    # Stale (well past TICK_THRESHOLDS.stale_after_seconds) and, if acted on,
+    # would have wrongly closed the position on a phantom stop-hit.
+    stale_ts = datetime.now(UTC) - timedelta(seconds=3600)
+    provider.ticks[option_contract.symbol] = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=60.0, bid=59.9, ask=60.1, volume=10, oi=None, ts=stale_ts,
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=provider,
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
 def test_run_once_exits_on_stop_hit(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -223,7 +359,10 @@ def test_run_once_exits_on_stop_hit(
     broker._prices[option_contract.symbol] = 60.0  # noqa: SLF001 - force a price below stop
 
     manager = PositionManager(
-        trading_session.id, broker=broker, session_factory=_session_factory_for(db)
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
     )
     manager.run_once()
 
@@ -269,6 +408,7 @@ def test_run_once_moves_guarded_live_session_to_degraded_mode_on_broker_auth_err
     manager = PositionManager(
         trading_session.id,
         broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
     manager.run_once()
@@ -301,6 +441,7 @@ def test_run_once_does_not_transition_a_paper_only_session_on_broker_auth_error(
     manager = PositionManager(
         trading_session.id,
         broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
     manager.run_once()  # must not raise
@@ -335,6 +476,7 @@ def test_run_once_is_idempotent_when_already_degraded(
     manager = PositionManager(
         trading_session.id,
         broker=_AuthFailingBroker(broker),  # type: ignore[arg-type]
+        market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
     manager.run_once()  # must not raise
@@ -381,6 +523,7 @@ def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_se
     manager = PositionManager(
         trading_session.id,
         broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
     manager.run_once()
@@ -422,6 +565,7 @@ def test_run_once_does_not_check_margin_for_paper_only_session(
     manager = PositionManager(
         trading_session.id,
         broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
     manager.run_once()
@@ -445,7 +589,10 @@ def test_run_once_leaves_position_open_when_price_is_fine(
     )
 
     manager = PositionManager(
-        trading_session.id, broker=broker, session_factory=_session_factory_for(db)
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
     )
     manager.run_once()
 
@@ -468,7 +615,10 @@ def test_run_once_exits_on_underlying_structure_break(
     broker._prices[instrument.symbol] = 21990.0  # noqa: SLF001
 
     manager = PositionManager(
-        trading_session.id, broker=broker, session_factory=_session_factory_for(db)
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
     )
     manager.run_once()
 
@@ -490,7 +640,10 @@ def test_run_once_force_closes_past_cutoff_time(
     db.flush()
 
     manager = PositionManager(
-        trading_session.id, broker=broker, session_factory=_session_factory_for(db)
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
     )
     manager.run_once()
 
@@ -504,6 +657,7 @@ def test_run_once_runs_reconciliation_every_n_cycles(
     manager = PositionManager(
         trading_session.id,
         broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
         reconcile_every_n_cycles=2,
         session_factory=_session_factory_for(db),
     )
@@ -527,7 +681,10 @@ def test_run_once_runs_reconciliation_every_n_cycles(
 
 def test_run_once_is_a_no_op_for_a_missing_or_inactive_session(db: Session, broker):
     manager = PositionManager(
-        uuid.uuid4(), broker=broker, session_factory=_session_factory_for(db)
+        uuid.uuid4(),
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
     )
     manager.run_once()  # must not raise
 
@@ -616,6 +773,7 @@ def test_manager_starts_and_stops_on_a_real_thread(real_commit_factory):
         manager = PositionManager(
             ids["trading_session_id"],
             broker=broker,
+            market_data_provider=_NullMarketDataProvider(),
             poll_interval_seconds=0.05,
             session_factory=real_commit_factory,
         )

@@ -124,6 +124,104 @@ class ShoonyaSettings(BaseSettings):
         return missing
 
 
+class MarketDataSettings(BaseSettings):
+    """Which live-tick provider `market_data.provider_composition.get_market_data_provider()`
+    resolves to — independent of `ShoonyaSettings`/execution entirely (see that
+    module's own docstring for why market data and execution are two separate
+    ports). `"mock"` is the safe default so every test and local dev run
+    behaves exactly as before this existed, unless explicitly opted in.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="MARKET_DATA_", env_file=DOTENV_PATH, extra="ignore"
+    )
+
+    provider: str = "mock"  # "angel_one" | "shoonya" | "mock"
+
+
+class AngelOneSettings(BaseSettings):
+    """Loaded from config/credentials/angel_one.env (gitignored, never the
+    tracked .env — same secrets discipline as ShoonyaSettings). Endpoint/
+    payload details are from the user-supplied Angel One SmartAPI doc
+    extraction (2026-08), not independently re-verified against a live
+    account yet — see AngelOneMarketDataProvider's own docstring for exactly
+    what's confirmed vs. still an assumption.
+
+    Unlike ShoonyaSettings.totp_secret (dormant — Shoonya's login happens in
+    the user's own browser, never read by this backend), `totp_secret` here
+    is genuinely read and used: Angel's `loginByPassword` is a direct
+    server-to-server REST call requiring a live TOTP code in the request
+    body, so this backend generates it itself via `pyotp.TOTP(...).now()`.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ANGELONE_",
+        env_file=CREDENTIALS_DIR / "angel_one.env",
+        extra="ignore",
+    )
+
+    api_key: str = ""
+    client_code: str = ""
+    password: SecretStr = SecretStr("")
+    totp_secret: SecretStr = SecretStr("")
+    # uuid.getnode() default is a real MAC, but not necessarily the one
+    # Angel's account/session expects registered — overridable via env with
+    # no redeploy, same "configurable, not hardcoded" pattern as
+    # ShoonyaSettings.ws_auth_source.
+    mac_address: str = ""
+    rest_host: str = "https://apiconnect.angelone.in"
+    ws_host: str = "wss://smartapisocket.angelone.in/smart-stream"
+    # Two known URLs for the scrip master file (a domain rebrand,
+    # angelbroking.com -> angelone.in) — see scrip_master.py's own module
+    # docstring for the "flagged, not silently picked" treatment.
+    scrip_master_url: str = (
+        "https://margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json"
+    )
+    scrip_master_url_fallback: str = (
+        "https://margincalculator.angelbroking.com/OpenAPI_MasterData/OpenAPIScripMaster.json"
+    )
+    # Empty by default: the login REST call goes direct, same as every other
+    # outbound call in this codebase. Live-confirmed 2026-08-05 (an A/B test —
+    # apiconnect.angelone.in times out from the OCI VM's IP but responds
+    # instantly to the identical request from an unrelated residential IP,
+    # even though Angel's own *public* scrip-master endpoint answers fine
+    # from the OCI IP) that Angel's authenticated gateway specifically
+    # rejects/drops that IP — set this to an HTTP(S) proxy URL
+    # (`http://host:port` or `https://user:pass@host:port`) you control to
+    # route just the login call through a different egress IP. Never point
+    # this at a public/third-party proxy: whoever runs it can see the
+    # plaintext login payload (API key, client code, password, TOTP code).
+    # The WebSocket connection (angel_ws_client.py) deliberately never reads
+    # this — it must stay a direct connection for latency, and SmartStream
+    # wasn't the endpoint that failed anyway.
+    auth_proxy: str = ""
+
+    def missing_required_fields(self) -> list[str]:
+        missing = []
+        if not self.api_key:
+            missing.append("ANGELONE_API_KEY")
+        if not self.client_code:
+            missing.append("ANGELONE_CLIENT_CODE")
+        if not self.password.get_secret_value():
+            missing.append("ANGELONE_PASSWORD")
+        if not self.totp_secret.get_secret_value():
+            missing.append("ANGELONE_TOTP_SECRET")
+        return missing
+
+    def resolved_mac_address(self) -> str:
+        """`uuid.getnode()`, formatted as a colon-separated MAC string, when
+        `mac_address` isn't explicitly configured. Local import: this is the
+        only place in `AngelOneSettings` that needs it, and importing `uuid`
+        at module scope for one rarely-called method isn't worth it.
+        """
+        if self.mac_address:
+            return self.mac_address
+        import uuid as _uuid
+
+        node = _uuid.getnode()
+        return ":".join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -8, -8))
+
+
 class RiskDefaults(BaseSettings):
     """System-default risk governance values — these seed `risk_limit_configs`
     on first run; day-to-day overrides live on `trading_sessions`, not here.
@@ -156,6 +254,8 @@ class Settings:
         self.db = DBSettings()
         self.redis = RedisSettings()
         self.shoonya = ShoonyaSettings()
+        self.market_data = MarketDataSettings()
+        self.angel_one = AngelOneSettings()
         self.risk_defaults = RiskDefaults()
 
 
