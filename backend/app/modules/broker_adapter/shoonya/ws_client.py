@@ -181,7 +181,11 @@ class ShoonyaWSClient:
         # actually see, per live attempt, whether `actid` came back from
         # `GenAcsTok` carrying an unexpected suffix (e.g. `_U`) rather than
         # guessing at it, per the still-open NOT_OK investigation.
-        logger.info(
+        # `.warning`, not `.info`: this app has no logging configuration
+        # anywhere (no basicConfig/setLevel), so with no handler attached,
+        # Python falls back to its "handler of last resort" — stderr,
+        # WARNING+ only. An .info call here would silently never appear.
+        logger.warning(
             "Shoonya WebSocket auth attempt: uid=%r actid=%r source=%r",
             self._uid,
             self._actid,
