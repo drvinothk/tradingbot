@@ -460,6 +460,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 access_token=self._auth_result.session_token,
                 on_tick=on_tick,
                 on_depth=on_depth,
+                source=self._settings.ws_auth_source,
             )
             self._ws.start()
 

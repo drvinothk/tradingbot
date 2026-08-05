@@ -25,6 +25,18 @@ identical point (the WebSocket connection itself always succeeds; only the
 post-connect auth frame is ever rejected). This rules out URL/host/field/
 token-type mistakes on this client's side. Next step is Shoonya's own API
 support, not further guessing at the wire format.
+
+**Two more narrow, still-untested variables**, added after an external
+second opinion on the `NOT_OK`: (1) `source` was always hardcoded `"API"`
+(the classic-QuickAuth convention) and never itself varied — now
+`ShoonyaSettings.ws_auth_source`, overridable via env with no redeploy,
+in case this session's OAuth-issued token registers its origin
+differently than a direct API login would; (2) `_authenticate` now logs
+the literal `uid`/`actid` values sent (never `susertoken`) so the next
+live attempt can actually see, rather than assume, whether `actid` (which
+flows through from `GenAcsTok`'s own response field, not a static config
+value — see `auth.py`'s `exchange_code_for_token`) comes back carrying an
+unexpected suffix.
 """
 
 from __future__ import annotations
@@ -80,6 +92,7 @@ class ShoonyaWSClient:
         access_token: str,
         on_tick: TickCallback,
         on_depth: DepthCallback | None = None,
+        source: str = "API",
     ) -> None:
         self._ws_host = ws_host
         self._uid = uid
@@ -87,6 +100,7 @@ class ShoonyaWSClient:
         self._access_token = access_token
         self._on_tick = on_tick
         self._on_depth = on_depth
+        self._source = source
 
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
         self._lock = threading.Lock()
@@ -162,6 +176,17 @@ class ShoonyaWSClient:
             self._stop.wait(delay)
 
     def _authenticate(self, ws: Connection) -> None:
+        # Deliberately logs uid/actid/source (account identifiers, not
+        # secrets) but never susertoken — this is the one place we can
+        # actually see, per live attempt, whether `actid` came back from
+        # `GenAcsTok` carrying an unexpected suffix (e.g. `_U`) rather than
+        # guessing at it, per the still-open NOT_OK investigation.
+        logger.info(
+            "Shoonya WebSocket auth attempt: uid=%r actid=%r source=%r",
+            self._uid,
+            self._actid,
+            self._source,
+        )
         ws.send(
             json.dumps(
                 {
@@ -169,7 +194,7 @@ class ShoonyaWSClient:
                     "uid": self._uid,
                     "actid": self._actid,
                     "susertoken": self._access_token,
-                    "source": "API",
+                    "source": self._source,
                 }
             )
         )

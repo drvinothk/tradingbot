@@ -93,6 +93,13 @@ class ShoonyaSettings(BaseSettings):
     api_host: str = "https://api.shoonya.com/NorenWClientAPI"
     ws_host: str = "wss://api.shoonya.com/NorenWSAPI/"
     oauth_authorize_url: str = "https://api.shoonya.com/OAuthlogin/authorize/oauth"
+    # WS auth handshake has never once succeeded live (see ws_client.py's own
+    # docstring for the full ruled-out list) — "API" is the classic-QuickAuth
+    # convention and was never itself varied. Made configurable, not hardcoded,
+    # so the next live session can try "WEB"/"MOB" via env var alone, no
+    # redeploy needed, since this session's OAuth-issued token may register
+    # its origin differently than a direct API login would.
+    ws_auth_source: str = "API"
 
     def missing_required_fields(self) -> list[str]:
         """Fields the OAuth login (`build_authorize_url`) + token exchange
