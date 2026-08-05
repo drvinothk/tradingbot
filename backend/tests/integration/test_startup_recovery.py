@@ -4,6 +4,15 @@ startup-recovery hook (a no-op stub since Phase 0): a trading_session left
 must come back up with its `PositionManager` resumed and an immediate
 reconciliation pass run, not idle. Requires real Postgres (dispatch/close
 and reconciliation all run under advisory locks).
+
+Also covers `app.main._resume_strategy_runners` — the equivalent gap for
+`StrategyRunner` (an in-process thread with even less durable state than
+`PositionManager`: before `StrategyRun.instrument_id`/`expiry_date` existed,
+a restart could never resume a run even in principle). `StrategyRunner`
+itself is monkeypatched to a no-op stand-in here, same reasoning
+`test_api_strategies.py`'s `_FakeRunner` exists for: the real one spawns a
+background thread against the *production* DB via its default
+`session_factory=session_scope`.
 """
 
 from __future__ import annotations
@@ -42,6 +51,27 @@ from app.modules.execution_engine.paper import registry
 from app.modules.execution_engine.paper.registry import get_running_position_manager
 
 EXPIRY = date(2026, 7, 30)
+
+
+class _FakeStrategyRunner:
+    """Records start/stop calls; never spawns a thread or touches any DB —
+    same reasoning as test_api_strategies.py's own _FakeRunner.
+    """
+
+    instances: list[_FakeStrategyRunner] = []
+
+    def __init__(self, strategy, strategy_run_id, interval_seconds=30.0, **kwargs):
+        self.strategy = strategy
+        self.strategy_run_id = strategy_run_id
+        self.interval_seconds = interval_seconds
+        self.started = False
+        _FakeStrategyRunner.instances.append(self)
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self) -> None:
+        pass
 
 
 @pytest.fixture
@@ -272,3 +302,196 @@ def test_startup_recovery_ignores_active_sessions_with_no_open_positions(
     _run_startup_recovery_check()
 
     assert get_running_position_manager(trading_session.id) is None
+
+
+@pytest.fixture(autouse=True)
+def _clear_fake_strategy_runners():
+    yield
+    _FakeStrategyRunner.instances.clear()
+    from app.api.v1.strategies import _RUNNERS
+
+    _RUNNERS.clear()
+
+
+def _patch_strategy_resume_collaborators(monkeypatch, db: Session):
+    """Everything `_resume_strategy_runners` locally imports that would
+    otherwise touch the production DB or spawn a real thread — mirrors
+    `test_api_strategies.py`'s `fake_runner` fixture, patched at each
+    collaborator's *source* module since the function under test re-imports
+    them fresh on every call (late-bound local imports, not module-level).
+    """
+
+    @contextmanager
+    def _fake_session_scope():
+        yield db
+
+    import app.core.db.session as db_session_module
+    import app.modules.execution_engine.paper.registry as position_manager_registry
+    import app.modules.market_data.registry as market_data_registry
+    import app.modules.strategy_engine.runner as runner_module
+
+    monkeypatch.setattr(db_session_module, "session_scope", _fake_session_scope)
+    monkeypatch.setattr(runner_module, "StrategyRunner", _FakeStrategyRunner)
+    monkeypatch.setattr(
+        position_manager_registry, "ensure_position_manager_running", lambda *a, **k: None
+    )
+    monkeypatch.setattr(market_data_registry, "ensure_ingestion_running", lambda *a, **k: None)
+
+
+def _active_session(db: Session, workspace, broker_account, user) -> TradingSession:
+    trading_session = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        status=TradingSessionStatus.ACTIVE,
+        started_at=datetime.now(UTC),
+        budget_amount=1_000_000,
+        daily_target_profit=1_000_000,
+        daily_loss_cap=1_000_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(trading_session)
+    db.flush()
+    return trading_session
+
+
+def _scanning_run(
+    db: Session, workspace, user, trading_session, *, expiry_date: date | None = None
+) -> tuple[StrategyRun, Instrument]:
+    """`expiry_date=None` (the default) builds a row with `instrument_id`/
+    `expiry_date` both left NULL — standing in for a pre-migration row that
+    can't be resumed. Pass `expiry_date=EXPIRY` for a fully resumable row.
+    """
+    strategy_config = StrategyConfig(
+        id=uuid.uuid4(), workspace_id=workspace.id, name=f"resume-test-{uuid.uuid4().hex[:8]}"
+    )
+    db.add(strategy_config)
+    db.flush()
+
+    instrument = Instrument(
+        id=uuid.uuid4(),
+        symbol=f"RESUME-{uuid.uuid4().hex[:6]}",
+        exchange="NFO",
+        lot_size=25,
+        tick_size=0.05,
+    )
+    db.add(instrument)
+    db.flush()
+
+    strategy_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+        instrument_id=instrument.id if expiry_date is not None else None,
+        expiry_date=expiry_date,
+    )
+    db.add(strategy_run)
+    db.flush()
+    return strategy_run, instrument
+
+
+def test_resume_strategy_runners_resumes_scanning_run_with_instrument_and_expiry(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert strategy_run.id in _RUNNERS
+    resumed = _RUNNERS[strategy_run.id]
+    assert isinstance(resumed, _FakeStrategyRunner)
+    assert resumed.started is True
+    assert resumed.strategy.instrument_id == instrument.id
+    assert resumed.strategy.expiry_date == EXPIRY
+
+
+def test_resume_strategy_runners_skips_runs_missing_instrument_id(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    """Simulates a row that predates the instrument_id/expiry_date columns —
+    must be left alone (still non-STOPPED, but not resumed), not crash the
+    whole resume pass or the rest of startup.
+    """
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, _instrument = _scanning_run(db, workspace, user, trading_session)
+    assert strategy_run.instrument_id is None
+    assert strategy_run.expiry_date is None
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert strategy_run.id not in _RUNNERS
+    assert _FakeStrategyRunner.instances == []
+
+
+def test_resume_strategy_runners_ignores_non_active_session(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    trading_session = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        status=TradingSessionStatus.ENDED,
+        started_at=datetime.now(UTC),
+        budget_amount=1_000_000,
+        daily_target_profit=1_000_000,
+        daily_loss_cap=1_000_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(trading_session)
+    db.flush()
+    strategy_run, _instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert strategy_run.id not in _RUNNERS
+    assert _FakeStrategyRunner.instances == []
+
+
+def test_resume_strategy_runners_ignores_stopped_runs(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, _instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    strategy_run.status = StrategyRunStatus.STOPPED
+    db.add(strategy_run)
+    db.flush()
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert strategy_run.id not in _RUNNERS
+    assert _FakeStrategyRunner.instances == []

@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -189,6 +190,110 @@ def _run_startup_recovery_check() -> None:
             )
 
 
+def _resume_strategy_runners() -> None:
+    """For every `StrategyRun` left non-`STOPPED` on a `trading_session`
+    still `ACTIVE` (the signature of a crash/restart mid-scan, not a clean
+    `stop_strategy` call): rebuild its `Strategy` object and resume its
+    `StrategyRunner` thread. Without this, `strategy_runs.status` stays
+    `scanning` forever after any restart — an in-process
+    `threading.Thread` (`api.v1.strategies._RUNNERS`) with nothing durable
+    behind it — while nothing is actually happening: no market-data
+    ingestion, no evaluate() cycles, no signals. `GET /strategies/running`
+    keeps reporting it as live regardless, since it reads `strategy_runs`
+    rows, not runner liveness. Found live: three real restarts in one
+    session (deploying the Shoonya WS diagnostic patch) each silently
+    zombied every running strategy this same way.
+
+    Only possible because `StrategyRun.instrument_id`/`expiry_date` are now
+    persisted (see that column's own docstring) — before, that information
+    only ever lived in the in-memory `Strategy` object inside the runner
+    thread itself, so a resume was impossible even in principle. Runs where
+    those are still `NULL` predate the column and are skipped, not
+    resumed — they need a manual stop + restart via the API, same as before
+    this fix existed.
+
+    A `trading_session` that isn't `ACTIVE` (kill_switch/degraded_mode/
+    reconciliation_lock/ended) is deliberately not resumed — same
+    "don't silently reanimate a session no longer in a tradeable state"
+    reasoning as the `PositionManager` resume above. One run's failure
+    (a stale `strategy_type`, a deleted `Instrument`) is caught and skipped
+    rather than aborting every other run's resume or startup itself.
+    """
+    from app.api.v1.strategies import _RUNNERS, _build_strategy
+    from app.core.db.session import session_scope
+    from app.core.sleep_inhibitor import get_sleep_inhibitor
+    from app.domain.market.models import Instrument
+    from app.domain.session.models import TradingSession
+    from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
+    from app.modules.execution_engine.paper.registry import ensure_position_manager_running
+    from app.modules.market_data.registry import ensure_ingestion_running
+    from app.modules.strategy_engine.runner import StrategyRunner
+
+    with session_scope() as db:
+        runs = (
+            db.query(StrategyRun)
+            .join(TradingSession, StrategyRun.trading_session_id == TradingSession.id)
+            .filter(
+                StrategyRun.status != StrategyRunStatus.STOPPED,
+                TradingSession.status == TradingSessionStatus.ACTIVE,
+            )
+            .all()
+        )
+        if not runs:
+            logger.info("Strategy-runner recovery check: no stale active runs found.")
+            return
+
+        resumed: list[uuid.UUID] = []
+        skipped_no_instrument: list[uuid.UUID] = []
+        for run in runs:
+            if run.instrument_id is None or run.expiry_date is None:
+                skipped_no_instrument.append(run.id)
+                continue
+
+            try:
+                strategy_config = db.get(StrategyConfig, run.strategy_config_id)
+                instrument = db.get(Instrument, run.instrument_id)
+                if strategy_config is None or instrument is None:
+                    logger.warning(
+                        "strategy_run %s references a missing config/instrument — "
+                        "skipping resume",
+                        run.id,
+                    )
+                    continue
+
+                strategy = _build_strategy(strategy_config, run.instrument_id, run.expiry_date)
+                interval = run.interval_seconds if run.interval_seconds is not None else 30.0
+                runner = StrategyRunner(strategy, run.id, interval_seconds=interval)
+                runner.start()
+                _RUNNERS[run.id] = runner
+
+                get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
+                ensure_ingestion_running(instrument.symbol)
+                ensure_position_manager_running(run.trading_session_id)
+
+                resumed.append(run.id)
+            except Exception:
+                logger.exception(
+                    "Failed to resume strategy_run %s — leaving it non-stopped but idle; "
+                    "stop and restart it manually via the API",
+                    run.id,
+                )
+
+        if resumed:
+            logger.warning(
+                "Resumed %d strategy runner(s) found active at startup: %s",
+                len(resumed),
+                [str(r) for r in resumed],
+            )
+        if skipped_no_instrument:
+            logger.warning(
+                "%d strategy_run(s) left non-stopped but predate instrument_id/expiry_date "
+                "and cannot be resumed — stop and restart them via the API: %s",
+                len(skipped_no_instrument),
+                [str(r) for r in skipped_no_instrument],
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _run_startup_health_checks()
@@ -208,6 +313,7 @@ async def lifespan(app: FastAPI):
     try:
         _sync_mock_instrument_universe()
         _run_startup_recovery_check()
+        _resume_strategy_runners()
 
         from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
 

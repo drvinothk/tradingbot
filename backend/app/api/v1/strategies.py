@@ -323,6 +323,14 @@ def start_strategy(
             status=StrategyRunStatus.SCANNING,
             started_at=_utcnow(),
             started_by_user_id=user.id,
+            # Persisted so a restart can rebuild this run's Strategy object
+            # (see app.main._resume_strategy_runners) — previously these were
+            # request-only params, never recorded anywhere once the runner
+            # thread was built, which is exactly why a restart could never
+            # resume a run even in principle.
+            instrument_id=body.instrument_id,
+            expiry_date=body.expiry_date,
+            interval_seconds=body.interval_seconds,
         )
         db.add(run)
         db.flush()

@@ -390,6 +390,13 @@ def test_start_strategy_creates_run_and_stop_ends_it(
         assert _FakeRunner.instances[0].stopped is True
     finally:
         with session_factory() as cleanup_db:
+            # strategy_runs.instrument_id now FKs to instruments.id (see that
+            # column's own docstring) — must clear referencing rows first,
+            # same FK-safe-order requirement as every other direct-DB test
+            # cleanup in this codebase.
+            cleanup_db.query(StrategyRun).filter(
+                StrategyRun.instrument_id == instrument_id
+            ).update({StrategyRun.instrument_id: None})
             cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
             cleanup_db.commit()
 

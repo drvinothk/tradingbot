@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
+    Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -99,6 +101,22 @@ class StrategyRun(Base, UUIDPkMixin):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_by_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    # `instrument_id`/`expiry_date`/`interval_seconds` were request params to
+    # POST /strategies/{id}/start, never persisted — the *only* place that
+    # combination lived was the in-memory Strategy object inside the runner
+    # thread (see api.v1.strategies.list_running_strategies' own
+    # data_freshness fallback: "None ... there's nothing to classify
+    # freshness *of* in that case" when no live runner is registered). That
+    # meant a StrategyRun could never be resumed after a restart even in
+    # principle — nothing durable recorded *what* it was scanning. Nullable
+    # since existing rows predate this column and can't be backfilled (the
+    # original request body is gone); a resume pass must skip any row where
+    # this is still NULL.
+    instrument_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("instruments.id"), nullable=True
+    )
+    expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    interval_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     __table_args__ = (
         Index("ix_strategy_runs_session", "trading_session_id"),
