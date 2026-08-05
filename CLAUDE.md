@@ -101,7 +101,16 @@ wired in later via a credentials file.
   still broken** — retested fresh during live market hours specifically to
   rule out a "market was closed" theory from the first session, and it
   still returns `NOT_OK` on every attempt; now a confirmed broker-side
-  issue, not a timing artifact. Since strategies need `price_bars` that
+  issue, not a timing artifact. A 2026-08-05 live session against the OCI
+  deployment (`68.233.110.76`) added a configurable `SHOONYA_WS_AUTH_SOURCE`
+  + uid/actid diagnostic logging (`ws_client.py`) and conclusively ruled out
+  two more candidate causes: the OAuth `client_id`'s `_U` suffix
+  (`FA44103_U`) does **not** leak into the WS frame — live-logged
+  `uid='FA44103' actid='FA44103'`, both clean, matching, exactly per the
+  reference implementation — and `source` makes no difference (`API`,
+  `WEB`, `MOB` all rejected identically, instantly). Every plausible
+  client-side cause is now exhausted; Shoonya support has been emailed with
+  this exact evidence. Since strategies need `price_bars` that
   only ever came from WS ticks, a broker-agnostic **REST-polling fallback**
   was built into `MarketDataIngestionService` (a health-watchdog falls an
   underlying back to polling `BrokerPort.get_price_history` if WS delivers
@@ -118,10 +127,11 @@ wired in later via a credentials file.
   multi-session paper soak (today produced no live signal — market closed
   minutes after the REST-fallback work finished), a reconciliation
   dry-run against real (empty) broker positions, and the paper-vs-live
-  signal comparison from the Addendum — none of these are done yet. Two
-  smaller Addendum items also remain open: broker error taxonomy for IP
+  signal comparison from the Addendum — none of these are done yet. One
+  smaller Addendum item also remains open: broker error taxonomy for IP
   mismatch/TOTP drift specifically (needs live `emsg` evidence that
-  doesn't exist), and Shoonya support hasn't yet been emailed about WS.
+  doesn't exist). (Shoonya support has now been emailed about WS, per
+  above.)
 - ✅ **Phase 7** — Strategies 4 & 5 (OI/Volume Confirmed, Liquidity
   Sweep/Reversal), built out of order ahead of Phase 6 since neither needs
   Shoonya — both paper-only, against the mock broker, five of six
@@ -514,6 +524,49 @@ check, then exercise it live).
   pass (up from 281), every batch live-verified against the real dev server.
   Full design reasoning and the specific safety/blast-radius checks run
   before each change in `docs/architecture/build-plan.md`'s own section.
+- ~~`StrategyRunner` never survived a backend restart~~ — **fixed
+  2026-08-05.** Found live: three real restarts in one session (deploying
+  the WS diagnostic patch above) each silently zombied every running
+  strategy — `strategy_runs.status` stayed `scanning` forever (an
+  in-process `threading.Thread`, `api.v1.strategies._RUNNERS`, with
+  nothing durable behind it), while nothing was actually happening: no
+  market-data ingestion, no `evaluate()` cycles, no signals.
+  `GET /strategies/running` kept reporting it as live regardless, since it
+  reads DB rows, not runner liveness. Root cause: `instrument_id`/
+  `expiry_date` were request-only params to `POST /strategies/{id}/start`,
+  never persisted anywhere — the only place that combination lived was the
+  in-memory `Strategy` object inside the runner thread itself, making a
+  resume impossible even in principle. Migration `0011` adds both (+
+  `interval_seconds`) as nullable columns (no backfill possible for
+  existing rows); `start_strategy` now persists them; a new
+  `app.main._resume_strategy_runners`, called from `lifespan` alongside
+  the existing `PositionManager` recovery check, rebuilds each `ACTIVE`
+  session's non-stopped runs on startup. Rows predating the migration are
+  skipped, not crashed on. Broker-agnostic — this is the orchestration
+  layer, unrelated to which `BrokerPort` adapter is wired in, so it
+  applies regardless of whether Shoonya or a future broker is in use.
+  370/370 backend tests pass (up from 366); migration tested both
+  directions locally before being written up here. **Not yet applied to
+  the live OCI database** — needs `alembic upgrade head` run there
+  deliberately as its own step, not bundled into a routine restart, given
+  it's a real schema change against live data.
+- ~~Stale `2026-08-06` mock-seeded option contracts polluting the NIFTY/
+  BANKNIFTY expiry dropdown~~ — **fixed 2026-08-05**: `UPDATE
+  option_contracts SET is_active = false WHERE expiry_date =
+  '2026-08-06'` run directly against the live OCI Postgres (84 rows,
+  verified read-only both before and after).
+- ~~Dropdown `<select>`/`<option>` text invisible in dark mode~~ — **fixed
+  and deployed 2026-08-05**: `select`/`option` used `background:
+  transparent`/`color: inherit`; Chromium renders the open popup against
+  its own default (light) background once the control has any author
+  color styling, but doesn't extend that to `option` unless set
+  explicitly, leaving light-on-dark text invisible except on the
+  hovered/selected row. Explicit `--bg`/`--fg` theme variables
+  (`frontend/src/index.css`) fix it for every dropdown in the app (all
+  plain `<select>`/`<option>`, no custom combobox components). Deployed to
+  the live OCI nginx site (`/var/www/trading-bot/dist`, a separate path
+  from the repo's own `frontend/dist` — worth remembering next frontend
+  deploy) — verified live via computed styles in both color schemes.
 - **GitHub repo**: [drvinothk/tradingbot](https://github.com/drvinothk/tradingbot),
   `main` branch. Phase 2 is committed locally (not yet pushed as of that commit);
   Phase 3's changes are uncommitted in the working tree as of this note — check
