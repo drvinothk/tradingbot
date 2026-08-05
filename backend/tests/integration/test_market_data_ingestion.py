@@ -392,6 +392,83 @@ def test_rest_fallback_does_not_repersist_a_bucket_already_seen(
     assert db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).count() == 1
 
 
+def test_rest_fallback_seeds_last_polled_bucket_from_db_across_a_restart(
+    seeded_universe, test_session_factory, db: Session
+):
+    """`_last_polled_bucket` is in-memory only and forgets everything across
+    a restart — a *fresh* MarketDataIngestionService instance (standing in
+    for the process having been restarted) must not re-attempt a bucket a
+    *previous* instance already persisted, and must still make forward
+    progress on a genuinely newer one in the same poll. Without seeding from
+    the DB, this reproduces the exact live failure from 2026-08-05: a
+    uq_price_bar_bucket UniqueViolation that rolls back the whole batch and
+    never advances, repeating forever.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    now = datetime.now(UTC)
+    already_persisted_bucket = now - timedelta(seconds=now.timestamp() % 60 + 120)
+    newer_bucket = already_persisted_bucket + timedelta(seconds=60)
+
+    # Stands in for "a previous service instance already wrote this bar
+    # before the process restarted" — must be a *real*, cross-connection-
+    # visible commit via test_session_factory, not the db fixture (whose
+    # transaction is never truly committed, only rolled back at teardown —
+    # see seeded_universe's own docstring for the same lesson). Using db
+    # here would leave the row invisible to the service's own connection,
+    # which would then treat the bucket as new, attempt to insert it too,
+    # and deadlock waiting on this test's still-open transaction to resolve
+    # a unique-constraint ambiguity it can't determine from MVCC alone.
+    with test_session_factory() as seed_db:
+        seed_db.add(
+            PriceBar(
+                id=uuid.uuid4(),
+                instrument_id=nifty.id,
+                timeframe="60s",
+                bucket_start=already_persisted_bucket,
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=0,
+            )
+        )
+
+    candles = [
+        PriceCandle(  # already in the DB — must be skipped, not re-inserted
+            bucket_start=already_persisted_bucket,
+            open=100.0,
+            high=101.0,
+            low=99.0,
+            close=100.5,
+            volume=0,
+        ),
+        PriceCandle(  # genuinely new — must still be persisted this cycle
+            bucket_start=newer_bucket, open=100.5, high=100.7, low=100.4, close=100.6, volume=0
+        ),
+    ]
+    broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
+    service = MarketDataIngestionService(
+        broker,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.02,
+        rest_poll_interval_seconds=0.05,
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.3)
+    service.stop([underlying_symbol])
+
+    bars = (
+        db.query(PriceBar)
+        .filter(PriceBar.instrument_id == nifty.id)
+        .order_by(PriceBar.bucket_start)
+        .all()
+    )
+    assert [b.bucket_start for b in bars] == [already_persisted_bucket, newer_bucket]
+
+
 def test_stop_actually_joins_the_rest_poll_thread(seeded_universe, test_session_factory):
     """Same "stopped must mean no more callbacks fire, not just asked to
     stop" discipline `ShoonyaWSClient.unsubscribe_quotes` already promises

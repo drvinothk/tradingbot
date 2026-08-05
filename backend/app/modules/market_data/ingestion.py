@@ -15,6 +15,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, timedelta
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.db.session import session_scope
@@ -101,7 +102,7 @@ class MarketDataIngestionService:
         self._last_tick_at: dict[str, datetime] = {}
         self._fallback_symbols: set[str] = set()
         self._poll_threads: dict[str, threading.Thread] = {}
-        self._last_polled_bucket: dict[str, datetime] = {}
+        self._last_polled_bucket: dict[str, datetime | None] = {}
 
     def _build_symbol_map(self, contract_symbols: list[str]) -> dict[str, _SymbolRef]:
         symbol_map: dict[str, _SymbolRef] = {}
@@ -174,6 +175,16 @@ class MarketDataIngestionService:
             return
         instrument_id = ref[1]
         self._fallback_symbols.add(symbol)
+        # `_last_polled_bucket` is in-memory only and forgets everything
+        # across a restart — without this seed, the first poll after any
+        # restart would re-consider every already-persisted bar within
+        # `_REST_POLL_LOOKBACK` as "new," hit `uq_price_bar_bucket`, and get
+        # stuck: `_persist_candle`'s writes for a whole poll cycle share one
+        # transaction, so a duplicate anywhere in the batch rolls all of it
+        # back, `_last_polled_bucket` never advances past it either, and the
+        # next cycle repeats the identical failure forever. Live-reproduced
+        # repeatedly during 2026-08-05's restart-heavy session.
+        self._last_polled_bucket[symbol] = self._latest_persisted_bucket(instrument_id)
         try:
             self._broker.unsubscribe_quotes([symbol])
         except Exception:
@@ -189,6 +200,21 @@ class MarketDataIngestionService:
         )
         self._poll_threads[symbol] = thread
         thread.start()
+
+    def _latest_persisted_bucket(self, instrument_id: uuid.UUID) -> datetime | None:
+        """The real, durable source of truth `_last_polled_bucket` should
+        have been seeded from all along — `None` for an instrument that has
+        genuinely never had a bar persisted, same as `_last_polled_bucket`'s
+        own prior default for a fresh symbol.
+        """
+        timeframe_seconds = (
+            self._indicator_engine.timeframe_seconds if self._indicator_engine is not None else 60
+        )
+        with self._session_factory() as db:
+            return db.query(func.max(PriceBarRow.bucket_start)).filter(
+                PriceBarRow.instrument_id == instrument_id,
+                PriceBarRow.timeframe == f"{timeframe_seconds}s",
+            ).scalar()
 
     def _poll_loop(self, symbol: str, instrument_id: uuid.UUID) -> None:
         while symbol in self._fallback_symbols:
