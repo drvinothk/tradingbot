@@ -27,6 +27,7 @@ from app.domain.market.models import PriceBar as PriceBarRow
 from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
+from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
 from app.modules.market_data.indicators.engine import IndicatorEngine
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
@@ -50,6 +51,11 @@ _REST_POLL_INTERVAL_SECONDS = 25.0
 # price_bars, cheap since TPSeries-class endpoints return a whole window in
 # one call regardless of span.
 _REST_POLL_LOOKBACK = timedelta(minutes=5)
+
+# Dedicated backoff for a rate-limit rejection specifically -- see
+# BrokerRateLimitedError's own docstring for why this needs to be much
+# longer than _REST_POLL_INTERVAL_SECONDS.
+_RATE_LIMIT_BACKOFF_SECONDS = 300.0
 
 _SymbolRef = tuple[str, uuid.UUID]  # ("instrument" | "option_contract", row id)
 SessionFactory = Callable[[], AbstractContextManager[Session]]
@@ -95,6 +101,7 @@ class MarketDataIngestionService:
         *,
         ws_health_grace_seconds: float = _WS_HEALTH_GRACE_SECONDS,
         rest_poll_interval_seconds: float = _REST_POLL_INTERVAL_SECONDS,
+        rate_limit_backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
     ) -> None:
         self._provider = provider
         self._session_factory = session_factory
@@ -107,6 +114,7 @@ class MarketDataIngestionService:
         # delivered nothing, not just a slow first tick.
         self._ws_health_grace_seconds = ws_health_grace_seconds
         self._rest_poll_interval_seconds = rest_poll_interval_seconds
+        self._rate_limit_backoff_seconds = rate_limit_backoff_seconds
         self._last_tick_at: dict[str, datetime] = {}
         self._fallback_symbols: set[str] = set()
         self._poll_threads: dict[str, threading.Thread] = {}
@@ -226,14 +234,36 @@ class MarketDataIngestionService:
 
     def _poll_loop(self, symbol: str, instrument_id: uuid.UUID) -> None:
         while symbol in self._fallback_symbols:
+            wait_seconds = self._rest_poll_interval_seconds
             try:
                 self._poll_once(symbol, instrument_id)
+            except BrokerRateLimitedError:
+                # A dedicated, much longer backoff than the normal retry
+                # cadence -- live-confirmed 2026-08-06 that continuing to
+                # poll at the usual ~25s interval after a rate-limit
+                # rejection just keeps hammering an already-limited
+                # endpoint, for no benefit (a relogin doesn't reset a
+                # rate-limit counter, so there is nothing a faster retry
+                # could accomplish here). Angel's own reset window isn't
+                # documented anywhere this codebase has found -- this is a
+                # conservative, not-guessed choice: long enough to
+                # meaningfully stop hammering, short enough not to leave
+                # price_bars dark for hours once the limit actually clears.
+                logger.exception(
+                    "REST poll rate-limited for %r; backing off %.0fs instead of the "
+                    "normal %.0fs interval",
+                    symbol,
+                    self._rate_limit_backoff_seconds,
+                    self._rest_poll_interval_seconds,
+                )
+                wait_seconds = self._rate_limit_backoff_seconds
             except Exception:
                 logger.exception("REST poll failed for %r; will retry next cycle", symbol)
             # Checked in short slices, not one long sleep, so `stop()`
             # dropping this symbol from `_fallback_symbols` is noticed
-            # promptly rather than up to a full interval late.
-            for _ in range(int(self._rest_poll_interval_seconds * 10)):
+            # promptly rather than up to a full interval (or the rate-limit
+            # backoff) late.
+            for _ in range(int(wait_seconds * 10)):
                 if symbol not in self._fallback_symbols:
                     return
                 threading.Event().wait(0.1)

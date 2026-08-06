@@ -25,6 +25,7 @@ from app.domain.market.models import (
     QuoteTick,
 )
 from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
+from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
 from app.modules.broker_adapter.mock import MockBrokerAdapter
 from app.modules.market_data import MarketDataIngestionService, record_option_chain_snapshot
 from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
@@ -273,6 +274,9 @@ class _NeverTicksBroker:
         self.unsubscribed: list[str] = []
         self.price_history_calls: list[tuple] = []
         self._candles_by_symbol = candles_by_symbol or {}
+        # Settable per test: raised from get_price_history instead of
+        # returning canned candles, when set.
+        self.get_price_history_error: Exception | None = None
 
     def subscribe_quotes(self, contract_symbols, on_tick, on_depth=None) -> None:
         self.subscribed.extend(contract_symbols)
@@ -284,6 +288,8 @@ class _NeverTicksBroker:
         self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
     ) -> list[PriceCandle]:
         self.price_history_calls.append((underlying, start, end, timeframe_seconds))
+        if self.get_price_history_error is not None:
+            raise self.get_price_history_error
         return self._candles_by_symbol.get(underlying, [])
 
     def __getattr__(self, name):
@@ -478,6 +484,41 @@ def test_rest_fallback_seeds_last_polled_bucket_from_db_across_a_restart(
         .all()
     )
     assert [b.bucket_start for b in bars] == [already_persisted_bucket, newer_bucket]
+
+
+def test_rest_fallback_backs_off_much_longer_on_a_rate_limit_error(
+    seeded_universe, test_session_factory
+):
+    """Live-confirmed 2026-08-06: continuing to poll at the normal fast
+    cadence after a rate-limit rejection just keeps hammering an
+    already-limited endpoint. A short rest_poll_interval_seconds with a
+    slightly-longer-but-still-test-fast rate_limit_backoff_seconds proves
+    the dedicated backoff actually takes effect — without it, the poll
+    count over this window would be far higher (one call roughly every
+    rest_poll_interval_seconds instead of one every
+    rate_limit_backoff_seconds).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    broker.get_price_history_error = BrokerRateLimitedError(
+        "Angel One getCandleData rate-limited (HTTP 403)"
+    )
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.02,
+        rest_poll_interval_seconds=0.02,
+        rate_limit_backoff_seconds=0.3,
+    )
+
+    service.start([underlying_symbol])
+    time.sleep(0.5)
+    service.stop([underlying_symbol])
+
+    # Without the dedicated backoff, ~0.5s / 0.02s interval would be ~25
+    # calls; with it, at most 2-3 (one immediately on fallback, one more if
+    # the 0.3s backoff elapses within the 0.5s window).
+    assert 1 <= len(broker.price_history_calls) <= 3
 
 
 def test_stop_actually_joins_the_rest_poll_thread(seeded_universe, test_session_factory):

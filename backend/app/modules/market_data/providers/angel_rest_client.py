@@ -17,7 +17,11 @@ import logging
 
 import httpx
 
-from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerConnectivityError
+from app.modules.broker_adapter.base.errors import (
+    BrokerAuthError,
+    BrokerConnectivityError,
+    BrokerRateLimitedError,
+)
 
 logger = logging.getLogger("app.market_data.angel_one")
 
@@ -219,6 +223,17 @@ class AngelOneRestClient:
             raise BrokerConnectivityError(f"Angel One getCandleData failed: {exc}") from exc
 
         if response.status_code >= 400:
+            # Live-confirmed 2026-08-06: a 403 specifically for exceeding
+            # the rate limit, distinct from every other 4xx/5xx this
+            # endpoint can return (bad request, server error, etc.) — only
+            # this specific case gets the dedicated rate-limit backoff
+            # treatment upstream (see BrokerRateLimitedError's own
+            # docstring); anything else stays a normal retry-next-cycle
+            # BrokerConnectivityError.
+            if response.status_code == 403 and "exceeding access rate" in response.text.lower():
+                raise BrokerRateLimitedError(
+                    f"Angel One getCandleData rate-limited (HTTP 403): {response.text[:500]}"
+                )
             raise BrokerConnectivityError(
                 f"Angel One getCandleData HTTP {response.status_code}: {response.text[:500]}"
             )
@@ -230,8 +245,18 @@ class AngelOneRestClient:
             ) from exc
 
         if not parsed.get("status"):
-            raise BrokerConnectivityError(
-                f"Angel One getCandleData rejected: {parsed.get('message', parsed)!r}"
-            )
+            message = str(parsed.get("message", parsed))
+            # Live-confirmed 2026-08-06: a stale/expired token comes back as
+            # a "soft" failure here (status: false, HTTP 200), not an HTTP
+            # 401 -- exactly the "Invalid Token" message observed live after
+            # a token outlived its server-side validity. BrokerAuthError
+            # (not BrokerConnectivityError) so the caller invalidates the
+            # cached token and the next call forces a fresh login, instead
+            # of retrying the same dead token forever (the actual root
+            # cause of that night's rate-limit exhaustion in the first
+            # place).
+            if message.strip().lower() == "invalid token":
+                raise BrokerAuthError(f"Angel One getCandleData rejected: {message!r}")
+            raise BrokerConnectivityError(f"Angel One getCandleData rejected: {message!r}")
         data = parsed.get("data")
         return list(data) if isinstance(data, list) else []

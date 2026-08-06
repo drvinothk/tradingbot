@@ -33,3 +33,19 @@ class BrokerConnectivityError(BrokerError):
     timeout. Distinct from `BrokerAuthError` because the natural response
     differs (retry next cycle vs. stop and ask for re-auth).
     """
+
+
+class BrokerRateLimitedError(BrokerConnectivityError):
+    """The broker rejected a call specifically for exceeding a rate/quota
+    limit, not for any other connectivity reason. A subclass of
+    `BrokerConnectivityError` (not `BrokerAuthError` — a fresh login doesn't
+    reset a rate-limit counter, so treating this like a dead credential
+    would just burn another call retrying immediately) so existing
+    `except BrokerConnectivityError` handling still catches it, while a
+    caller that wants a longer, dedicated backoff can catch this specific
+    type instead of the normal retry-next-cycle cadence. Added 2026-08-06
+    after a stale Angel One token silently retried `getCandleData` every
+    ~25s for ~12 hours overnight, exhausting the endpoint's rate-limit
+    budget before anyone noticed — continuing to retry at the normal
+    interval after that point risks prolonging the same penalty.
+    """

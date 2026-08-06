@@ -11,6 +11,7 @@ seam-injection style.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import httpx
@@ -18,7 +19,11 @@ import pytest
 from pydantic import SecretStr
 
 from app.config.settings import AngelOneSettings
-from app.modules.broker_adapter.base.errors import BrokerConnectivityError
+from app.modules.broker_adapter.base.errors import (
+    BrokerAuthError,
+    BrokerConnectivityError,
+    BrokerRateLimitedError,
+)
 from app.modules.market_data.providers import angel_one
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.angel_rest_client import (
@@ -207,16 +212,93 @@ def test_no_auth_proxy_means_a_plain_direct_client(monkeypatch):
     assert captured.get("proxy") is None
 
 
+# -- AngelOneRestClient.get_candle_data — error classification --------------
+
+
+def _candle_request(handler) -> tuple[AngelOneRestClient, Callable[[], list[list]]]:
+    client = _rest_client_with_transport(handler)
+
+    def call():
+        return client.get_candle_data(
+            "jwt1", "NSE", "26000", "2026-08-06 09:00", "2026-08-06 09:05", 60
+        )
+
+    return client, call
+
+
+def test_get_candle_data_raises_rate_limited_on_403_exceeding_access_rate():
+    """Live-confirmed 2026-08-06: distinct from every other 4xx/5xx this
+    endpoint can return -- only this specific case should get the dedicated
+    long backoff, not the normal retry-next-cycle cadence.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Access denied because of exceeding access rate")
+
+    _, call = _candle_request(handler)
+    with pytest.raises(BrokerRateLimitedError):
+        call()
+
+
+def test_get_candle_data_raises_connectivity_error_on_other_403():
+    """A 403 for some other reason must not be misclassified as the
+    rate-limit case and get the (much longer) dedicated backoff.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="Forbidden: missing scope")
+
+    _, call = _candle_request(handler)
+    with pytest.raises(BrokerConnectivityError) as exc_info:
+        call()
+    assert not isinstance(exc_info.value, BrokerRateLimitedError)
+
+
+def test_get_candle_data_raises_auth_error_on_invalid_token():
+    """Live-confirmed 2026-08-06: an expired token comes back as a "soft"
+    failure (status: false, HTTP 200), not an HTTP 401 -- BrokerAuthError so
+    the caller invalidates the cached token and forces a fresh login next
+    call, instead of retrying the same dead token forever.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": False, "message": "Invalid Token"})
+
+    _, call = _candle_request(handler)
+    with pytest.raises(BrokerAuthError):
+        call()
+
+
+def test_get_candle_data_raises_connectivity_error_on_other_rejection():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": False, "message": "Some other error"})
+
+    _, call = _candle_request(handler)
+    with pytest.raises(BrokerConnectivityError) as exc_info:
+        call()
+    assert not isinstance(exc_info.value, BrokerAuthError)
+
+
 # -- AngelOneMarketDataProvider --------------------------------------------------
 
 
 class _FakeRestClient:
     def __init__(self):
         self.login_calls: list[tuple] = []
+        self.candle_calls: list[tuple] = []
+        # Configurable per test: None (default) returns an empty candle
+        # list; an exception instance is raised instead.
+        self.candle_error: Exception | None = None
 
     def login_by_password(self, client_code, password, totp):
         self.login_calls.append((client_code, password, totp))
         return {"jwtToken": "jwt1", "refreshToken": "ref1", "feedToken": "feed1"}
+
+    def get_candle_data(self, jwt_token, exchange, symbol_token, from_dt, to_dt, timeframe_seconds):
+        self.candle_calls.append((jwt_token, exchange, symbol_token, from_dt, to_dt))
+        if self.candle_error is not None:
+            raise self.candle_error
+        return []
 
 
 class _FakeScripMaster:
@@ -361,3 +443,49 @@ def test_get_latest_tick_returns_none_for_never_subscribed_symbol(
     provider: AngelOneMarketDataProvider,
 ):
     assert provider.get_latest_tick("NEVER-SUBSCRIBED") is None
+
+
+# -- AngelOneMarketDataProvider.get_price_history — token invalidation ------
+
+
+def test_get_price_history_clears_cached_token_on_auth_error(
+    provider: AngelOneMarketDataProvider,
+):
+    """The actual root cause behind 2026-08-06's rate-limit exhaustion: a
+    dead token retried forever because nothing ever cleared it. Confirms
+    connect()'s own idempotency check (`if self._feed_token is not None:
+    return`) will trigger a genuine fresh login on the *next* call, instead
+    of silently reusing the same dead token.
+    """
+    provider.connect()
+    rest: _FakeRestClient = provider._rest  # type: ignore[assignment]  # noqa: SLF001
+    rest.candle_error = BrokerAuthError("Angel One getCandleData rejected: 'Invalid Token'")
+
+    with pytest.raises(BrokerAuthError):
+        provider.get_price_history(
+            "NIFTY", datetime(2026, 8, 6, 9, 0, tzinfo=UTC), datetime(2026, 8, 6, 9, 5, tzinfo=UTC)
+        )
+
+    assert provider._jwt_token is None  # noqa: SLF001
+    assert provider._feed_token is None  # noqa: SLF001
+
+
+def test_get_price_history_keeps_cached_token_on_rate_limit_error(
+    provider: AngelOneMarketDataProvider,
+):
+    """A rate-limit rejection is not an auth failure — clearing the token
+    here would just force a pointless fresh login that doesn't reset
+    Angel's rate-limit counter, wasting another call against an
+    already-limited endpoint.
+    """
+    provider.connect()
+    rest: _FakeRestClient = provider._rest  # type: ignore[assignment]  # noqa: SLF001
+    rest.candle_error = BrokerRateLimitedError("Angel One getCandleData rate-limited (HTTP 403)")
+
+    with pytest.raises(BrokerRateLimitedError):
+        provider.get_price_history(
+            "NIFTY", datetime(2026, 8, 6, 9, 0, tzinfo=UTC), datetime(2026, 8, 6, 9, 5, tzinfo=UTC)
+        )
+
+    assert provider._jwt_token == "jwt1"  # noqa: SLF001
+    assert provider._feed_token == "feed1"  # noqa: SLF001

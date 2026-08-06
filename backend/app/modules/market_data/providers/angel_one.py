@@ -22,6 +22,7 @@ import pyotp
 
 from app.config.settings import AngelOneSettings
 from app.modules.broker_adapter.base.contracts import DepthLevel, DepthSnapshot, PriceCandle, Tick
+from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.market_data.providers.angel_rest_client import AngelOneRestClient
 from app.modules.market_data.providers.angel_ws_client import (
     EXCHANGE_TYPE_NSE_CM,
@@ -241,14 +242,28 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
             return []
         segment = self._scrip_master.get_angel_exchange_segment(underlying) or "NSE"
 
-        rows = self._rest.get_candle_data(
-            self._jwt_token or "",
-            segment,
-            token,
-            start.strftime("%Y-%m-%d %H:%M"),
-            end.strftime("%Y-%m-%d %H:%M"),
-            timeframe_seconds,
-        )
+        try:
+            rows = self._rest.get_candle_data(
+                self._jwt_token or "",
+                segment,
+                token,
+                start.strftime("%Y-%m-%d %H:%M"),
+                end.strftime("%Y-%m-%d %H:%M"),
+                timeframe_seconds,
+            )
+        except BrokerAuthError:
+            # The cached token is dead server-side (live-confirmed 2026-08-06:
+            # a "soft" Invalid Token rejection, not an HTTP-level failure) --
+            # clear it so connect()'s own idempotency check (`if self.
+            # _feed_token is not None: return`) stops short-circuiting and
+            # the *next* call attempts a genuine fresh login, instead of
+            # retrying this same dead token indefinitely (what silently
+            # burned the REST rate-limit budget overnight in the first
+            # place). This call's own caller still sees the failure and
+            # retries next cycle, same as any other error here.
+            self._jwt_token = None
+            self._feed_token = None
+            raise
         candles: list[PriceCandle] = []
         for row in rows:
             try:
