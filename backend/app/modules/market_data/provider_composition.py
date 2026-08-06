@@ -27,6 +27,7 @@ from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
+from app.modules.market_data.providers.market_hours_gate import MarketHoursGatedProvider
 from app.modules.market_data.scrip_master import ScripMasterService
 
 _provider: BaseMarketDataProvider | None = None
@@ -49,15 +50,35 @@ def get_scrip_master() -> ScripMasterService:
 
 
 def get_market_data_provider() -> BaseMarketDataProvider:
+    """`"mock"` is deliberately never wrapped by `MarketHoursGatedProvider`
+    (`market_data/market_hours.py`) — it's the safe default every test and
+    local dev run resolves to unless a real provider is explicitly
+    configured, and a mock adapter has no real API/rate-limit/session
+    concept for a market-hours schedule to protect in the first place.
+    `"angel_one"` and `"shoonya"` both get the gate, uniformly, so the
+    08:30-16:00 IST policy stays in force regardless of which real
+    provider is selected — the whole point of wrapping at this
+    composition-root level instead of inside one concrete provider.
+    """
     global _provider
     if _provider is not None:
         return _provider
 
-    provider_name = get_settings().market_data.provider
+    settings = get_settings()
+    provider_name = settings.market_data.provider
     if provider_name == "angel_one":
-        _provider = AngelOneMarketDataProvider(get_settings().angel_one, get_scrip_master())
+        inner: BaseMarketDataProvider = AngelOneMarketDataProvider(
+            settings.angel_one, get_scrip_master()
+        )
     else:
-        _provider = BrokerPortMarketDataAdapter(get_broker())
+        inner = BrokerPortMarketDataAdapter(get_broker())
+
+    if provider_name == "mock":
+        _provider = inner
+    else:
+        _provider = MarketHoursGatedProvider(
+            inner, allow_offhours=settings.market_data.allow_offhours_testing
+        )
     return _provider
 
 

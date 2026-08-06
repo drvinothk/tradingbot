@@ -364,9 +364,13 @@ async def lifespan(app: FastAPI):
         _run_startup_recovery_check()
         _resume_strategy_runners()
 
+        from app.modules.market_data.market_data_scheduler import (
+            ensure_market_data_scheduler_running,
+        )
         from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
 
         ensure_health_check_scheduler_running()
+        ensure_market_data_scheduler_running()
     except Exception:
         from app.core.locking import release_advisory_lock
 
@@ -379,6 +383,7 @@ async def lifespan(app: FastAPI):
 
     from app.core.locking import release_advisory_lock
     from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
+    from app.modules.market_data.market_data_scheduler import stop_market_data_scheduler
     from app.modules.market_data.scrip_master_scheduler import (
         stop_scrip_master_refresh_scheduler,
     )
@@ -386,6 +391,7 @@ async def lifespan(app: FastAPI):
 
     stop_all_position_managers()
     stop_health_check_scheduler()
+    stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
     release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
     singleton_connection.close()

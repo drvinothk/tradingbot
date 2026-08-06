@@ -137,6 +137,15 @@ class MarketDataSettings(BaseSettings):
     )
 
     provider: str = "mock"  # "angel_one" | "shoonya" | "mock"
+    # Off by default: the 08:30-16:00 IST market-hours gate
+    # (market_data.market_hours / MarketHoursGatedProvider) applies to
+    # whichever real provider is selected. Set MARKET_DATA_ALLOW_OFFHOURS_
+    # TESTING=true for local/dev sessions that need to exercise a real
+    # provider outside those hours (e.g. testing a fix at night) without
+    # disabling the gate for everyone. Never applies to "mock" — that
+    # provider is never wrapped by the gate at all, see
+    # provider_composition.get_market_data_provider's own docstring.
+    allow_offhours_testing: bool = False
 
 
 class AngelOneSettings(BaseSettings):
