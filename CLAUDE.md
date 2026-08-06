@@ -502,6 +502,63 @@ check, then exercise it live).
   hours before touching this further — see `angel_ws_client.py`'s own
   reconnect-backoff loop, which is already retrying on its own and needs no
   new code either way.
+  **2026-08-06 live market-hours retest** — WebSocket retested specifically
+  during real trading hours (~11-13:00 IST) to finally settle the
+  "flaky connectivity vs market closed" question the prior session
+  couldn't resolve: still fails identically (`socket is already closed`
+  on subscribe), ruling out "market was closed" for good — this is a real,
+  persistent issue independent of timing. Two external suggestions were
+  evaluated against the actual installed `smartapi-python` SDK source
+  (not assumed): a claimed "malformed subscribe payload" bug doesn't
+  apply — `SUBSCRIBE_ACTION = 1` is a plain SDK-internal int this
+  codebase never touches, since `subscribe()` builds its own JSON
+  entirely inside the SDK; a claimed "binary parsing crash" fix doesn't
+  apply either, matching `angel_ws_client.py`'s own pre-existing
+  docstring reasoning for delegating parsing to the SDK. Same session
+  found and fixed two real, live bugs instead: (1) a stale Angel One
+  token retried `getCandleData` silently for ~12 hours overnight,
+  exhausting the endpoint's real rate-limit budget before anyone
+  noticed (`HTTP 403: Access denied because of exceeding access rate`)
+  — fixed with a `BrokerRateLimitedError` (a `BrokerConnectivityError`
+  subclass, deliberately not `BrokerAuthError` — relogin doesn't reset
+  a rate-limit counter) that backs the REST-poll loop off 300s instead
+  of the normal ~25s interval specifically on that rejection, plus
+  `BrokerAuthError` now also covering `get_candle_data`'s own
+  "Invalid Token" soft-failure (`status: false`, HTTP 200) so
+  `get_price_history` clears the cached token and forces a genuine
+  fresh login next call instead of retrying the same dead token
+  forever — the actual root cause of the overnight exhaustion. Each
+  fix has a dedicated test verified to fail without it and pass with
+  it (reverted in turn, confirmed the exact live error reproduces,
+  restored), not just written after the fact. (2) Nothing previously
+  stopped strategy scanning or market-data polling outside market
+  hours at all — added `MarketHoursGatedProvider`, wrapping at the
+  `BaseMarketDataProvider` composition level (`provider_composition.py`)
+  rather than inside any one concrete provider, so the 08:30-16:00 IST
+  policy applies uniformly regardless of which real provider
+  (`angel_one` today, `shoonya` if ever selected again) is configured
+  — deliberately excluding `"mock"`, which has no real API/rate-limit
+  concept to protect and is the default every test/local-dev run
+  resolves to (confirmed: full suite unaffected, mock-backed tests stay
+  time-of-day-independent). `MarketDataScheduler` (same background-
+  thread shape as `HealthCheckScheduler`) acts on the phase transitions:
+  a fresh login entering pre-market (08:30), a 5-minute liveness check
+  through pre-market, a hard disconnect at 16:00. `MARKET_DATA_
+  ALLOW_OFFHOURS_TESTING` (off by default, deliberately never set in the
+  tracked `.env` — a scoped `systemctl set-environment` for the live
+  deployment or an inline env var locally is the intended one-off
+  override, per explicit design discussion of the exact overnight-
+  hammering risk a permanent `true` would reintroduce) is the escape
+  hatch for testing a real provider outside those hours without
+  weakening the gate for everyone. 25 new tests, all via `run_once()`/
+  monkeypatched time, no real threading or wall-clock dependency.
+  447/447 passing, ruff/mypy clean, both fixes live-verified on the OCI
+  deployment (the new "backing off 300s" log line firing correctly; the
+  new "Market-data phase transition: startup -> active_market" line
+  firing correctly on restart at 12:59 PM IST). Full checksum-verified
+  sync between local, GitHub, and the OCI deployment confirmed after
+  each deploy, same discipline as every other live session recorded in
+  this file.
 
 ## Known open items
 
