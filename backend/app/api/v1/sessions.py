@@ -16,10 +16,11 @@ from app.config.settings import get_settings
 from app.core.clock import now_ist
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
-from app.core.modes import ModeTransitionError, enter_kill_switch
+from app.core.modes import ModeTransitionError, enter_kill_switch, transition_mode
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
+from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, User
 from app.domain.session.models import (
     FundingMode,
@@ -28,6 +29,7 @@ from app.domain.session.models import (
     TradingSessionStatus,
     TransitionTriggerType,
 )
+from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.reconciliation.service import run_reconciliation
@@ -253,6 +255,112 @@ def get_session(
     user: User = Depends(require_permission("strategy.view")),
 ) -> TradingSession:
     return _get_session_or_404(db, user, session_id)
+
+
+@router.post("/{session_id}/end", response_model=SessionOut)
+def end_session(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.stop")),
+) -> TradingSession:
+    """2026-08-11 addition, closing a real gap: nothing in this codebase
+    ever transitioned `TradingSession.status` to ENDED before this endpoint
+    existed (see `create_session`'s own comment on that gap) -- sessions
+    accumulated forever with no way to retire one, which is exactly what
+    let several genuinely-done paper sessions from earlier days keep
+    showing up indistinguishably next to the one actually in use, in every
+    Session picker in the app. Refuses (409) rather than silently stopping
+    anything on the caller's behalf if the session still has live activity
+    -- stop every strategy run and close every position first, the same
+    explicit-before-implicit discipline `PositionManager`/execution locking
+    already apply elsewhere in this codebase.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    if trading_session.status == TradingSessionStatus.ENDED:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Session is already ended")
+
+    live_runs = (
+        db.query(StrategyRun)
+        .filter(
+            StrategyRun.trading_session_id == session_id,
+            StrategyRun.status != StrategyRunStatus.STOPPED,
+        )
+        .count()
+    )
+    if live_runs:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{live_runs} strategy run(s) still active on this session -- stop them first",
+        )
+
+    open_positions = (
+        db.query(Position)
+        .filter(
+            Position.trading_session_id == session_id,
+            Position.status == PositionStatus.OPEN,
+        )
+        .count()
+    )
+    if open_positions:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{open_positions} open position(s) still on this session -- square off first",
+        )
+
+    trading_session.status = TradingSessionStatus.ENDED
+    trading_session.ended_at = datetime.now(UTC)
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.MANUAL_OVERRIDE,
+        event_type="session.ended",
+        entity_type="trading_session",
+        entity_id=session_id,
+        payload={},
+    )
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
+
+
+@router.post("/{session_id}/recover-from-kill-switch", response_model=SessionOut)
+def recover_from_kill_switch(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> TradingSession:
+    """2026-08-11 addition, closing a real gap found live: `kill_switch ->
+    paper_only` was already a legal edge in `transitions.py` (kill_switch
+    can only ever resume to paper_only, never straight to a live mode), but
+    nothing in `api/v1` ever exposed it -- the only way to *enter*
+    kill_switch had a button; recovering from it didn't, anywhere. Found
+    when kill-switching a session turned out to be the only stop-like
+    control visible in the UI and got used on a session that still had 6
+    live paper strategy runs under it, silently blocking every one of them
+    from ever dispatching a new trade (`risk_engine.evaluate_trade_intent`
+    rejects new entries outright while `mode == kill_switch`) with no way
+    back except this now-added endpoint. Gated on `risk.override`, not
+    `session.stop` -- matches `transitions.py`'s own required_permission for
+    this exact edge, deliberately a higher bar than entering kill_switch
+    needs, since clearing one is the more consequential direction.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    try:
+        transition_mode(
+            db,
+            trading_session,
+            SafeMode.PAPER_ONLY,
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="manual recovery from kill_switch",
+        )
+    except ModeTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
 
 
 @router.post("/{session_id}/kill-switch", response_model=SessionOut)

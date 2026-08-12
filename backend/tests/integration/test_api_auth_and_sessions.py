@@ -73,7 +73,13 @@ def seeded_admin(engine):
         db.add(role)
         db.flush()
         permission_ids: list[uuid.UUID] = []
-        for code in ("session.start", "session.stop", "strategy.view", "papertrade.execute"):
+        for code in (
+            "session.start",
+            "session.stop",
+            "strategy.view",
+            "papertrade.execute",
+            "risk.override",
+        ):
             permission = Permission(id=uuid.uuid4(), code=code, description="")
             db.add(permission)
             db.flush()
@@ -236,6 +242,150 @@ def test_kill_switch_accepts_reason_in_json_body(api_client: TestClient, seeded_
     assert response.json()["mode"] == "kill_switch"
 
 
+def test_recover_from_kill_switch_restores_paper_only(api_client: TestClient, seeded_admin):
+    """Regression test for a real live incident: entering kill_switch had a
+    button in the UI, but recovering from it (a legal edge in transitions.py
+    from day one) had no endpoint at all -- a session kill-switched by
+    mistake had no way back except this one.
+    """
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+    api_client.post(f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"})
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/recover-from-kill-switch")
+    assert response.status_code == 200
+    assert response.json()["mode"] == "paper_only"
+
+
+def test_recover_from_kill_switch_rejects_when_not_in_kill_switch(
+    api_client: TestClient, seeded_admin
+):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/recover-from-kill-switch")
+    assert response.status_code == 409
+
+
+def test_end_session_marks_status_ended(api_client: TestClient, seeded_admin):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    create_resp = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    )
+    session_id = create_resp.json()["id"]
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/end")
+    assert response.status_code == 200
+    assert response.json()["status"] == "ended"
+
+    # GET /sessions still returns it (history stays visible) — only the
+    # frontend's *picker* dropdowns filter to active, per StrategiesPage.tsx.
+    listed = api_client.get("/api/v1/sessions").json()
+    assert any(row["id"] == session_id and row["status"] == "ended" for row in listed)
+
+
+def test_end_session_rejects_already_ended(api_client: TestClient, seeded_admin):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+    api_client.post(f"/api/v1/sessions/{session_id}/end")
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/end")
+    assert response.status_code == 409
+
+
+def test_end_session_refuses_while_a_strategy_run_is_still_active(
+    api_client: TestClient, seeded_admin, engine
+):
+    """The whole point of `end_session` is to retire sessions nobody's using
+    any more — ending one that still has a live `scanning` run underneath it
+    would silently orphan that run with no session left to resume it under.
+    """
+    import uuid as uuid_module
+    from datetime import UTC, datetime
+
+    from app.domain.strategy.models import (
+        ExecutionMode,
+        StrategyConfig,
+        StrategyRun,
+        StrategyRunStatus,
+    )
+
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    config_id = uuid_module.uuid4()
+    run_id = uuid_module.uuid4()
+    with session_factory() as db:
+        db.add(
+            StrategyConfig(
+                id=config_id,
+                workspace_id=seeded_admin["workspace_id"],
+                name=f"end-session-test-{config_id.hex[:6]}",
+                strategy_type="orb",
+            )
+        )
+        db.flush()
+        db.add(
+            StrategyRun(
+                id=run_id,
+                strategy_config_id=config_id,
+                trading_session_id=uuid_module.UUID(session_id),
+                execution_mode=ExecutionMode.AUTO,
+                status=StrategyRunStatus.SCANNING,
+                started_at=datetime.now(UTC),
+                started_by_user_id=seeded_admin["user_id"],
+            )
+        )
+        db.commit()
+
+    try:
+        response = api_client.post(f"/api/v1/sessions/{session_id}/end")
+        assert response.status_code == 409
+
+        with session_factory() as db:
+            db.query(StrategyRun).filter(StrategyRun.id == run_id).update(
+                {"status": StrategyRunStatus.STOPPED}
+            )
+            db.commit()
+
+        response = api_client.post(f"/api/v1/sessions/{session_id}/end")
+        assert response.status_code == 200
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(StrategyRun).filter(StrategyRun.id == run_id).delete()
+            cleanup_db.query(StrategyConfig).filter(StrategyConfig.id == config_id).delete()
+            cleanup_db.commit()
+
+
 def test_daily_plan_updates_session_and_is_audited(api_client: TestClient, seeded_admin, engine):
     api_client.post(
         "/api/v1/auth/login",
@@ -360,10 +510,15 @@ def test_list_instruments_returns_active_instruments_with_expiry_dates(
     api_client: TestClient, seeded_admin, engine
 ):
     import uuid as uuid_module
-    from datetime import date
+    from datetime import date, timedelta
 
     from app.domain.market.models import Instrument, OptionContract, OptionType
 
+    # Relative to today, not a fixed calendar date: the picker now also
+    # filters out anything already past expiry (see instruments.py's own
+    # comment), so a hardcoded past date would make this assertion fail for
+    # a reason unrelated to what the test actually checks.
+    future_expiry = date.today() + timedelta(days=10)
     session_factory = sessionmaker(bind=engine, future=True)
     instrument_id = uuid_module.uuid4()
     try:
@@ -383,7 +538,7 @@ def test_list_instruments_returns_active_instruments_with_expiry_dates(
                 OptionContract(
                     id=uuid_module.uuid4(),
                     instrument_id=instrument_id,
-                    expiry_date=date(2026, 8, 6),
+                    expiry_date=future_expiry,
                     strike=20000,
                     option_type=OptionType.CE,
                     symbol=f"TESTIDX-{instrument_id.hex[:6]}-20000-CE",
@@ -400,7 +555,7 @@ def test_list_instruments_returns_active_instruments_with_expiry_dates(
         assert response.status_code == 200
         rows = {row["id"]: row for row in response.json()}
         assert str(instrument_id) in rows
-        assert rows[str(instrument_id)]["expiry_dates"] == ["2026-08-06"]
+        assert rows[str(instrument_id)]["expiry_dates"] == [future_expiry.isoformat()]
     finally:
         with session_factory() as cleanup_db:
             cleanup_db.query(OptionContract).filter(
