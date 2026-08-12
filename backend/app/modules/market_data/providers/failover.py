@@ -1,0 +1,360 @@
+"""`FailoverMarketDataProvider` — wraps a primary and a backup
+`BaseMarketDataProvider` and routes ticks/reads through whichever is
+currently healthy. Composed at `provider_composition.py`'s composition
+root, the same level `MarketHoursGatedProvider` already wraps at, and
+following that class's exact "delegate every method to an inner provider,
+add cross-cutting behavior" shape — this is not a rewrite of any concrete
+provider (Shoonya, Angel One), just a third thing sitting between them and
+`MarketDataIngestionService`/`PositionManager`.
+
+An externally-drafted proposal for this feature assumed an asyncio-native
+system (`asyncio.Queue`, `asyncio.create_task` watchdog) — rejected, since
+this codebase's market-data/broker core is deliberately synchronous and
+threading-based throughout (see `providers/base.py`'s own docstring). This
+class uses a daemon `threading.Thread` running `run_once()` on a fixed poll
+interval, matching `market_data_scheduler.MarketDataScheduler`'s and
+`scheduler.health_check.HealthCheckScheduler`'s own shape, including
+exposing `run_once()` separately so tests can drive it deterministically.
+The one real difference from those: ticks arrive asynchronously from a
+background WS thread, not synchronously with the poll loop, so unlike
+`MarketDataScheduler`'s pure simulated-time accumulator this needs an actual
+time source to correlate "when did the last primary tick land" against
+"how long has it been since" — hence the injectable `clock` (real
+`time.monotonic` in production, a controllable fake in tests) rather than
+accumulating elapsed time purely from `run_once()` calls.
+
+**Health is tracked as a single scalar, not per-symbol.** Per this
+project's own documented invariant that a broker connection is one shared
+stream, not one per instrument (`market_data/registry.py`'s own docstring),
+a real primary-provider failure drops every subscribed symbol at once — so
+"any tick from primary, on any symbol, within the last N seconds" is the
+whole signal. This is a different concern from
+`MarketDataIngestionService`'s own per-symbol WS-health-grace fallback
+(which exists for "did the very first tick ever arrive for this one
+symbol", not "did an established stream go silent").
+
+**Dual-subscribe, lazy-backup.** Primary is subscribed immediately and
+stays subscribed even while backup is active, so its recovery can be
+observed continuously (required for anti-flap). Backup is subscribed only
+on the first real failover trip — holding a live backup connection open at
+all times would mean an unconditional login on every process start for a
+feed this project has already flagged as fragile (Angel One's proxy
+dependency, rate limits), for zero benefit while primary is healthy. Once
+recovered, backup is explicitly unsubscribed again.
+
+Only the active leg's ticks are ever forwarded to the caller's `on_tick` —
+the inactive leg's ticks still update its own health timestamp (needed to
+detect backup failing) but are dropped, since two feeds writing the same
+`price_bars` bucket would violate `uq_price_bar_bucket`.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from collections.abc import Callable
+from datetime import datetime
+
+from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
+from app.modules.market_data.providers.base import BaseMarketDataProvider
+
+logger = logging.getLogger("app.market_data.failover")
+
+TickCallback = Callable[[Tick], None]
+DepthCallback = Callable[[DepthSnapshot], None]
+
+DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+
+
+class FailoverMarketDataProvider(BaseMarketDataProvider):
+    def __init__(
+        self,
+        primary: BaseMarketDataProvider,
+        backup: BaseMarketDataProvider,
+        *,
+        primary_name: str,
+        backup_name: str,
+        failover_threshold_seconds: float,
+        recovery_stabilization_seconds: float,
+        backup_retry_seconds: float,
+        poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._primary = primary
+        self._backup = backup
+        self._primary_name = primary_name
+        self._backup_name = backup_name
+        self._failover_threshold_seconds = failover_threshold_seconds
+        self._recovery_stabilization_seconds = recovery_stabilization_seconds
+        self._backup_retry_seconds = backup_retry_seconds
+        self._poll_interval_seconds = poll_interval_seconds
+        self._clock = clock
+
+        self._lock = threading.Lock()
+        self._active: str = primary_name
+        self._subscribed_at: float | None = None
+        self._last_primary_tick_at: float | None = None
+        self._recovery_started_at: float | None = None
+        self._backup_subscribed = False
+        self._next_backup_attempt_at: float | None = None
+
+        self._symbols: set[str] = set()
+        self._on_tick: TickCallback | None = None
+        self._on_depth: DepthCallback | None = None
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def active_provider_name(self) -> str:
+        with self._lock:
+            return self._active
+
+    # -- BaseMarketDataProvider -------------------------------------------
+
+    def connect(self) -> None:
+        self._primary.connect()
+
+    def disconnect(self) -> None:
+        self._stop_watchdog()
+        self._primary.disconnect()
+        if self._backup_subscribed:
+            self._backup.disconnect()
+        # Disconnect is a full teardown -- start clean on whatever the next
+        # subscribe_ticks() call turns out to be, rather than risking a
+        # resume with active/backup_subscribed left pointing at a backup
+        # leg that was just torn down and won't otherwise get resubscribed
+        # (a plain subscribe_ticks() call only ever (re)subscribes primary).
+        with self._lock:
+            self._active = self._primary_name
+            self._subscribed_at = None
+            self._recovery_started_at = None
+        self._backup_subscribed = False
+
+    def subscribe_ticks(
+        self,
+        symbols: list[str],
+        on_tick: TickCallback,
+        on_depth: DepthCallback | None = None,
+    ) -> None:
+        # Additive across calls, not a replacement -- MarketDataIngestionService
+        # calls this once per *new* underlying (registry.ensure_ingestion_running
+        # subscribes one symbol at a time), so a second strategy's subscribe
+        # must not drop the first strategy's symbol from what a later
+        # failover subscribes on backup.
+        new_symbols = [s for s in symbols if s not in self._symbols]
+        self._symbols |= set(symbols)
+        self._on_tick = on_tick
+        self._on_depth = on_depth
+        with self._lock:
+            if self._subscribed_at is None:
+                self._subscribed_at = self._clock()
+        self._primary.subscribe_ticks(
+            symbols,
+            self._make_tick_handler(self._primary_name),
+            self._make_depth_handler(self._primary_name),
+        )
+        if self._backup_subscribed and new_symbols:
+            self._backup.subscribe_ticks(
+                new_symbols,
+                self._make_tick_handler(self._backup_name),
+                self._make_depth_handler(self._backup_name),
+            )
+        self._start_watchdog()
+
+    def unsubscribe_ticks(self, symbols: list[str]) -> None:
+        self._primary.unsubscribe_ticks(symbols)
+        if self._backup_subscribed:
+            self._backup.unsubscribe_ticks(symbols)
+        self._symbols -= set(symbols)
+
+    def get_latest_tick(self, symbol: str) -> Tick | None:
+        active = self.active_provider_name
+        if active == self._primary_name:
+            return self._primary.get_latest_tick(symbol)
+        return self._backup.get_latest_tick(symbol)
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        active = self.active_provider_name
+        if active == self._primary_name:
+            return self._primary.get_price_history(underlying, start, end, timeframe_seconds)
+        return self._backup.get_price_history(underlying, start, end, timeframe_seconds)
+
+    def close(self) -> None:
+        self._stop_watchdog()
+        close = getattr(self._primary, "close", None)
+        if callable(close):
+            close()
+        if self._backup_subscribed:
+            close = getattr(self._backup, "close", None)
+            if callable(close):
+                close()
+
+    # -- tick routing -------------------------------------------------------
+
+    def _make_tick_handler(self, source_name: str) -> TickCallback:
+        def _handle(tick: Tick) -> None:
+            forward = False
+            with self._lock:
+                if source_name == self._primary_name:
+                    self._last_primary_tick_at = self._clock()
+                forward = self._active == source_name
+            if forward and self._on_tick is not None:
+                self._on_tick(tick)
+
+        return _handle
+
+    def _make_depth_handler(self, source_name: str) -> DepthCallback | None:
+        if self._on_depth is None:
+            return None
+
+        def _handle(depth: DepthSnapshot) -> None:
+            with self._lock:
+                forward = self._active == source_name
+            if forward and self._on_depth is not None:
+                self._on_depth(depth)
+
+        return _handle
+
+    # -- watchdog -------------------------------------------------------
+
+    def _start_watchdog(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _stop_watchdog(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._poll_interval_seconds + 5)
+            self._thread = None
+
+    def _loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self.run_once()
+            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
+                logger.exception("failover watchdog cycle failed")
+            self._stop_event.wait(self._poll_interval_seconds)
+
+    def run_once(self) -> None:
+        now = self._clock()
+        with self._lock:
+            active = self._active
+
+        if active == self._primary_name:
+            self._check_primary_health(now)
+        else:
+            self._check_recovery(now)
+
+    def _check_primary_health(self, now: float) -> None:
+        with self._lock:
+            last = self._last_primary_tick_at
+            subscribed_at = self._subscribed_at
+        if last is not None:
+            healthy = (now - last) <= self._failover_threshold_seconds
+        else:
+            # No primary tick has ever landed yet -- e.g. the first watchdog
+            # cycle can fire well before a real WS tick could possibly have
+            # arrived. Treat this as healthy until failover_threshold_seconds
+            # have elapsed since subscribing, matching
+            # MarketDataIngestionService's own WS-health-grace reasoning.
+            healthy = subscribed_at is not None and (
+                now - subscribed_at
+            ) <= self._failover_threshold_seconds
+        if healthy:
+            return
+
+        if not self._ensure_backup_subscribed(now):
+            return
+        with self._lock:
+            self._active = self._backup_name
+            self._recovery_started_at = None
+        logger.warning(
+            "FAILOVER: no tick from %r for > %.1fs — switched active market-data "
+            "provider to %r",
+            self._primary_name,
+            self._failover_threshold_seconds,
+            self._backup_name,
+        )
+
+    def _ensure_backup_subscribed(self, now: float) -> bool:
+        if self._backup_subscribed:
+            return True
+        with self._lock:
+            next_attempt = self._next_backup_attempt_at
+        if next_attempt is not None and now < next_attempt:
+            return False
+        try:
+            self._backup.subscribe_ticks(
+                sorted(self._symbols),
+                self._make_tick_handler(self._backup_name),
+                self._make_depth_handler(self._backup_name),
+            )
+        except Exception:
+            logger.critical(
+                "Failover backup provider %r failed to subscribe — both market-data "
+                "feeds are now unavailable; retrying in %.0fs",
+                self._backup_name,
+                self._backup_retry_seconds,
+                exc_info=True,
+            )
+            with self._lock:
+                self._next_backup_attempt_at = now + self._backup_retry_seconds
+            return False
+        self._backup_subscribed = True
+        return True
+
+    def _check_recovery(self, now: float) -> None:
+        with self._lock:
+            last = self._last_primary_tick_at
+        primary_healthy = last is not None and (now - last) <= self._failover_threshold_seconds
+
+        with self._lock:
+            if not primary_healthy:
+                if self._recovery_started_at is not None:
+                    logger.warning(
+                        "Failover recovery: %r dropped during the anti-flap stabilization "
+                        "window — resetting recovery timer",
+                        self._primary_name,
+                    )
+                self._recovery_started_at = None
+                return
+
+            if self._recovery_started_at is None:
+                self._recovery_started_at = now
+                logger.info(
+                    "Failover recovery: %r is back online — starting %.0fs "
+                    "stabilization window before switching back",
+                    self._primary_name,
+                    self._recovery_stabilization_seconds,
+                )
+                return
+
+            if (now - self._recovery_started_at) < self._recovery_stabilization_seconds:
+                return
+
+            self._active = self._primary_name
+            self._recovery_started_at = None
+
+        logger.warning(
+            "FAILOVER RECOVERY: %r stable for %.0fs — switching active market-data "
+            "provider back to %r",
+            self._primary_name,
+            self._recovery_stabilization_seconds,
+            self._primary_name,
+        )
+        try:
+            self._backup.unsubscribe_ticks(sorted(self._symbols))
+        except Exception:
+            logger.exception(
+                "Failed to unsubscribe backup provider %r after recovery — continuing "
+                "anyway, its ticks are simply dropped since it's no longer active",
+                self._backup_name,
+            )
+        self._backup_subscribed = False

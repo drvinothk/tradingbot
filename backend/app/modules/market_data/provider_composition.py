@@ -39,11 +39,17 @@ from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
+from app.modules.market_data.providers.failover import FailoverMarketDataProvider
 from app.modules.market_data.providers.market_hours_gate import MarketHoursGatedProvider
 from app.modules.market_data.providers.truedata_provider import TrueDataProvider
 from app.modules.market_data.scrip_master import ScripMasterService
 
 _RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
+# Backup legs supported for MARKET_DATA_FAILOVER_BACKUP_PROVIDER today --
+# narrower than _RECOGNIZED_PROVIDERS on purpose: TrueData is a deliberately
+# deferred scope call (not yet live-tested as a failover backup at all), and
+# "mock"/self-as-backup are never valid regardless of provider.
+_RECOGNIZED_FAILOVER_BACKUPS = ("angel_one",)
 
 _provider: BaseMarketDataProvider | None = None
 _scrip_master: ScripMasterService | None = None
@@ -64,6 +70,18 @@ def get_scrip_master() -> ScripMasterService:
     return _scrip_master
 
 
+def _build_provider(name: str, settings: object) -> BaseMarketDataProvider:
+    """Constructs a single raw provider by name -- shared by primary
+    selection and, when failover is enabled, backup selection below, so
+    the two don't duplicate this if/elif chain.
+    """
+    if name == "angel_one":
+        return AngelOneMarketDataProvider(settings.angel_one, get_scrip_master())  # type: ignore[attr-defined]
+    if name == "truedata":
+        return TrueDataProvider(settings.truedata)  # type: ignore[attr-defined]
+    return BrokerPortMarketDataAdapter(get_broker())
+
+
 def get_market_data_provider() -> BaseMarketDataProvider:
     """`"mock"` is deliberately never wrapped by `MarketHoursGatedProvider`
     (`market_data/market_hours.py`) — it's the safe default every test and
@@ -74,6 +92,14 @@ def get_market_data_provider() -> BaseMarketDataProvider:
     08:30-16:00 IST policy stays in force regardless of which real
     provider is selected — the whole point of wrapping at this
     composition-root level instead of inside one concrete provider.
+
+    When `market_data.failover_enabled` is set (and provider isn't
+    `"mock"`), the primary is wrapped in `FailoverMarketDataProvider`
+    against a second, independently-constructed backup provider *before*
+    the market-hours gate is applied — so the gate sits outermost and
+    covers both legs uniformly, matching the reasoning above. See
+    `failover.py`'s own docstring for the 5s-trip/90s-anti-flap state
+    machine this wraps in.
     """
     global _provider
     if _provider is not None:
@@ -88,14 +114,34 @@ def get_market_data_provider() -> BaseMarketDataProvider:
             "market data for an unimplemented or misspelled provider name."
         )
 
-    if provider_name == "angel_one":
-        inner: BaseMarketDataProvider = AngelOneMarketDataProvider(
-            settings.angel_one, get_scrip_master()
+    inner = _build_provider(provider_name, settings)
+
+    if provider_name != "mock" and settings.market_data.failover_enabled:
+        backup_name = settings.market_data.failover_backup_provider
+        if backup_name not in _RECOGNIZED_FAILOVER_BACKUPS:
+            raise ValueError(
+                f"Unrecognized MARKET_DATA_FAILOVER_BACKUP_PROVIDER={backup_name!r} — "
+                f"must be one of {_RECOGNIZED_FAILOVER_BACKUPS}. Refusing to silently run "
+                "with failover configured-but-inert for an unimplemented or misspelled "
+                "backup provider name."
+            )
+        if backup_name == provider_name:
+            raise ValueError(
+                f"MARKET_DATA_FAILOVER_BACKUP_PROVIDER={backup_name!r} must differ from "
+                f"MARKET_DATA_PROVIDER={provider_name!r} — a provider can't be its own "
+                "failover backup."
+            )
+        inner = FailoverMarketDataProvider(
+            primary=inner,
+            backup=_build_provider(backup_name, settings),
+            primary_name=provider_name,
+            backup_name=backup_name,
+            failover_threshold_seconds=settings.market_data.failover_threshold_seconds,
+            recovery_stabilization_seconds=(
+                settings.market_data.failover_recovery_stabilization_seconds
+            ),
+            backup_retry_seconds=settings.market_data.failover_backup_retry_seconds,
         )
-    elif provider_name == "truedata":
-        inner = TrueDataProvider(settings.truedata)
-    else:
-        inner = BrokerPortMarketDataAdapter(get_broker())
 
     if provider_name == "mock":
         _provider = inner

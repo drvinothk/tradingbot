@@ -157,6 +157,33 @@ class MarketDataSettings(BaseSettings):
     # via a scoped systemctl set-environment on a live box or an inline env
     # var locally, for the one evening session that actually needs it.
     is_replay_mode: bool = False
+    # Wraps the primary provider (whatever `provider` above resolves to) in
+    # FailoverMarketDataProvider, backed by `failover_backup_provider` --
+    # see that class's own docstring for the 5s-trip/90s-anti-flap-recovery
+    # state machine. Off by default: zero behavior change for every existing
+    # test/local/live run unless explicitly opted in, same discipline as
+    # every other flag in this class. Ignored entirely when provider ==
+    # "mock" (matches every other gate's mock exclusion).
+    failover_enabled: bool = False
+    # Only "angel_one" is supported today -- TrueData is a deliberately
+    # deferred scope call, not yet live-tested as a failover backup.
+    # get_market_data_provider validates this is recognized, not "mock", and
+    # not equal to `provider` itself; a bad value fails loud rather than
+    # silently resolving to a single-provider setup with failover quietly
+    # inert.
+    failover_backup_provider: str = "angel_one"
+    # How long the primary may go without a tick before failing over --
+    # matches the externally-reviewed proposal's own number, evaluated and
+    # kept as sound (see provider_composition's failover section).
+    failover_threshold_seconds: float = 5.0
+    # How long the primary must stream continuously-healthy ticks again
+    # before failover switches back -- anti-flap, same reasoning as above.
+    failover_recovery_stabilization_seconds: float = 90.0
+    # Backoff between retrying a *failed* backup subscribe attempt (e.g. an
+    # Angel One login failure) -- deliberately much longer than the 1s
+    # watchdog poll interval so a real backup outage doesn't hammer a
+    # failing login endpoint every cycle.
+    failover_backup_retry_seconds: float = 30.0
 
 
 class AngelOneSettings(BaseSettings):
