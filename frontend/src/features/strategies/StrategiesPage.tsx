@@ -214,11 +214,17 @@ function StartStrategyForm({
     <div className="row-actions" style={{ flexWrap: 'wrap' }}>
       <select value={sessionId} onChange={(e) => setSessionId(e.target.value)}>
         <option value="">Session...</option>
-        {sessions.map((s) => (
-          <option key={s.id} value={s.id}>
-            {s.id.slice(0, 8)} ({s.mode})
-          </option>
-        ))}
+        {/* Ended sessions have no business being startable against — same
+            reasoning end_session's own 409 guards enforce server-side; this
+            is what actually keeps stray old sessions from cluttering this
+            picker once they're ended via the Sessions page. */}
+        {sessions
+          .filter((s) => s.status === 'active')
+          .map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.id.slice(0, 8)} ({s.mode})
+            </option>
+          ))}
       </select>
       <select
         value={instrumentId}

@@ -67,6 +67,18 @@ export function SessionsPage() {
     onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Reconcile failed'),
   })
 
+  const endMutation = useMutation({
+    mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/end`),
+    onSuccess: invalidateSessions,
+    onError: (err) => setActionError(err instanceof ApiError ? err.message : 'End session failed'),
+  })
+
+  const recoverMutation = useMutation({
+    mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/recover-from-kill-switch`),
+    onSuccess: invalidateSessions,
+    onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Recover failed'),
+  })
+
   function handleCreate(event: FormEvent) {
     event.preventDefault()
     setFormError(null)
@@ -174,14 +186,37 @@ export function SessionsPage() {
               <td>{session.broker_account_id}</td>
               <td>
                 <div className="row-actions">
-                  <button onClick={() => squareOffMutation.mutate(session.id)}>Square off</button>
-                  <button onClick={() => reconcileMutation.mutate(session.id)}>Reconcile</button>
-                  <button
-                    className="danger"
-                    onClick={() => killSwitchMutation.mutate(session.id)}
-                  >
-                    Kill switch
-                  </button>
+                  {session.status === 'active' && (
+                    <>
+                      <button onClick={() => squareOffMutation.mutate(session.id)}>
+                        Square off
+                      </button>
+                      <button onClick={() => reconcileMutation.mutate(session.id)}>
+                        Reconcile
+                      </button>
+                      {session.mode === 'kill_switch' ? (
+                        <button
+                          disabled={recoverMutation.isPending}
+                          onClick={() => recoverMutation.mutate(session.id)}
+                        >
+                          Recover
+                        </button>
+                      ) : (
+                        <button
+                          className="danger"
+                          onClick={() => killSwitchMutation.mutate(session.id)}
+                        >
+                          Kill switch
+                        </button>
+                      )}
+                      <button
+                        disabled={endMutation.isPending}
+                        onClick={() => endMutation.mutate(session.id)}
+                      >
+                        End session
+                      </button>
+                    </>
+                  )}
                 </div>
               </td>
             </tr>
