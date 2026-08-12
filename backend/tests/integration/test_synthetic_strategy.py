@@ -268,6 +268,13 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
     db: Session, workspace, authorized_user, instrument, option_contract,
     strategy_run, trading_session, strategy_config,
 ):
+    # 2026-08-12: the daily trade cap now only protects real-money exposure
+    # (paper_only sessions are uncapped, see risk_engine.service's own
+    # docstring) -- set a live-capable mode so this test still exercises it.
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
     _seed_market_data(db, instrument, option_contract)
     create_new_risk_limit_config_version(
         db,

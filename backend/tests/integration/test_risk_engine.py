@@ -384,6 +384,15 @@ def test_evaluate_trade_intent_max_concurrent_positions(
 def test_evaluate_trade_intent_max_trades_per_day(
     db: Session, broker, workspace, authorized_user, trading_session, strategy_run, instrument
 ):
+    """2026-08-12: the cap only ever protects real-money exposure now — see
+    this test's sibling `test_paper_only_session_has_no_daily_trade_cap`
+    below for why `paper_only` is exempt. Set to a live-capable mode here
+    so this test still exercises the cap itself.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
     create_new_risk_limit_config_version(
         db,
         workspace.id,
@@ -410,6 +419,102 @@ def test_evaluate_trade_intent_max_trades_per_day(
 
     assert decision.decision == "rejected"
     assert "max_trades_per_day_reached" in decision.reasons
+
+
+def test_paper_only_session_has_no_daily_trade_cap(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run, instrument
+):
+    """2026-08-12: real gap found live — the cap used to count DISPATCHED
+    trade_intents across the whole session with no paper/live distinction,
+    so 5 trades from an earlier, unrelated, since-stopped batch of
+    strategies silently blocked every signal from a completely different
+    set of currently-running strategies for the rest of the day, on a
+    paper_only session where no capital was ever actually at risk. A paper
+    session's whole point is proving entry logic actually fires; capping
+    it defeats that. `trading_session` defaults to PAPER_ONLY (see its own
+    fixture).
+    """
+    create_new_risk_limit_config_version(
+        db,
+        workspace.id,
+        actor_user=authorized_user,
+        max_trades_per_day=1,
+        max_concurrent_positions=5,
+    )
+
+    c1 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22000, option_type=OptionType.CE, symbol="NIFTY26JUL22000CE-A",
+    )
+    c2 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22050, option_type=OptionType.CE, symbol="NIFTY26JUL22050CE-B",
+    )
+    db.add_all([c1, c2])
+    db.flush()
+
+    _dispatch(db, trading_session, strategy_run, c1, broker)
+
+    second = _make_trade_intent(db, trading_session, strategy_run, c2)
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert decision.decision == "approved"
+    assert "max_trades_per_day_reached" not in decision.reasons
+
+
+def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, instrument, user,
+):
+    """2026-08-12: the cap used to count DISPATCHED trade_intents across the
+    whole session regardless of which strategy dispatched them, so one
+    strategy hitting its own daily cap would silently block every other
+    strategy running in the same session too. Now scoped by
+    strategy_config_id (via strategy_run) — a second, unrelated strategy in
+    the same session, same day, must not be blocked by the first one's cap.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    create_new_risk_limit_config_version(
+        db, workspace.id, actor_user=authorized_user,
+        max_trades_per_day=1, max_concurrent_positions=5,
+    )
+
+    other_config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="other-strategy")
+    db.add(other_config)
+    db.flush()
+    other_run = StrategyRun(
+        id=uuid.uuid4(), strategy_config_id=other_config.id,
+        trading_session_id=trading_session.id, execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(other_run)
+    db.flush()
+
+    c1 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22000, option_type=OptionType.CE, symbol="NIFTY26JUL22000CE-A",
+    )
+    c2 = OptionContract(
+        id=uuid.uuid4(), instrument_id=instrument.id, expiry_date=date(2026, 7, 30),
+        strike=22050, option_type=OptionType.CE, symbol="NIFTY26JUL22050CE-B",
+    )
+    db.add_all([c1, c2])
+    db.flush()
+
+    # Strategy #1 dispatches its one allowed trade, hitting its own cap.
+    _dispatch(db, trading_session, strategy_run, c1, broker)
+
+    # Strategy #2 (different strategy_config, same session, same day) has
+    # dispatched nothing yet -- must still be approved.
+    second = _make_trade_intent(db, trading_session, other_run, c2)
+    decision = evaluate_trade_intent(db, second, trading_session, other_run)
+
+    assert decision.decision == "approved"
+    assert "max_trades_per_day_reached" not in decision.reasons
 
 
 def test_evaluate_trade_intent_consecutive_loss_pause(

@@ -404,16 +404,36 @@ def evaluate_trade_intent(
         if open_count >= risk_config.max_concurrent_positions:
             reasons.append("max_concurrent_positions_reached")
 
-        dispatched_today = (
-            db.query(TradeIntent)
-            .filter(
-                TradeIntent.trading_session_id == trading_session.id,
-                TradeIntent.status == TradeIntentStatus.DISPATCHED,
+        # 2026-08-12: real gap found and fixed — max_trades_per_day used to
+        # count DISPATCHED trade_intents across the *whole session*, with no
+        # paper/live distinction at all. That's the wrong rail for a paper
+        # session: it's meant to cap real-money exposure per strategy per
+        # day, not throttle how many times the paper-testing loop itself can
+        # prove a strategy's entry logic fires — live-found when 5 earlier
+        # trades from a since-stopped batch of strategies silently blocked
+        # every signal from a completely different set of strategies for the
+        # rest of the day, on a PAPER_ONLY session, with paper capital never
+        # actually at risk. `paper_only` now has no cap at all; every
+        # live-capable mode (`paper_plus_guarded_live`, `live_enabled` — the
+        # only two modes where a dispatched trade_intent could plausibly
+        # reach a real broker once Phase 6 exists) keeps the cap, scoped per
+        # `strategy_config_id` rather than per session, so one strategy
+        # hitting its daily cap doesn't block every other strategy running
+        # in the same session, and a restart of the same strategy (a new
+        # `strategy_run` row, same `strategy_config_id`) doesn't reset it.
+        if current_mode != SafeMode.PAPER_ONLY:
+            dispatched_today = (
+                db.query(TradeIntent)
+                .join(StrategyRun, StrategyRun.id == TradeIntent.strategy_run_id)
+                .filter(
+                    TradeIntent.trading_session_id == trading_session.id,
+                    StrategyRun.strategy_config_id == strategy_run.strategy_config_id,
+                    TradeIntent.status == TradeIntentStatus.DISPATCHED,
+                )
+                .count()
             )
-            .count()
-        )
-        if dispatched_today >= risk_config.max_trades_per_day:
-            reasons.append("max_trades_per_day_reached")
+            if dispatched_today >= risk_config.max_trades_per_day:
+                reasons.append("max_trades_per_day_reached")
 
         if trading_session.consecutive_losses >= risk_config.consecutive_loss_pause_threshold:
             reasons.append("consecutive_loss_pause_active")
