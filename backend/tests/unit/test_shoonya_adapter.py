@@ -473,6 +473,51 @@ def test_resolve_underlying_token_searches_nse_with_fixed_nifty_anchor_for_bankn
     assert search_calls == [("FA1", "NSE", "NIFTY")]
 
 
+def test_resolve_symbol_token_for_a_known_underlying_falls_back_to_a_live_search():
+    """2026-08-12: real gap found via a live-hours QC pass, not a live
+    account this time -- `MarketDataIngestionService` subscribes to an
+    underlying's own tick (via `subscribe_quotes` -> `_resolve_symbol_
+    token`) *before* any strategy has ever called `get_option_chain` for
+    it in this process, so the plain `_resolve_token` (no fallback) used
+    to raise `ShoonyaApiError` on the very first such subscribe of a
+    fresh session. `_resolve_symbol_token` now routes known underlyings
+    through `_resolve_underlying_token`'s existing cache+live-search
+    fallback instead, same as `get_price_history` already did.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+
+    exchange, token = adapter._resolve_symbol_token("NIFTY")
+
+    assert (exchange, token) == ("NSE", "26000")
+
+
+def test_resolve_symbol_token_for_a_known_underlying_uses_the_cache_when_already_resolved():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    adapter._resolve_underlying_token("NIFTY")  # warms the cache
+    rest.calls.clear()
+
+    exchange, token = adapter._resolve_symbol_token("NIFTY")
+
+    assert (exchange, token) == ("NSE", "26000")
+    assert rest.calls == [], "must not re-search once cached"
+
+
+def test_resolve_symbol_token_for_an_option_contract_still_raises_when_uncached():
+    """An option contract's token has no reasonable blind fallback (no
+    expiry/strike context to search on) -- only known underlyings get the
+    live-search fallback, an uncached option symbol must still raise
+    exactly as before this fix.
+    """
+    adapter, _ = _adapter()
+
+    with pytest.raises(ShoonyaApiError):
+        adapter._resolve_symbol_token("NIFTY18AUG26C24400")
+
+
 def test_get_option_chain_anchors_on_exact_expiry_option_contract():
     """Live-corrected three times against a real account for the tsym
     format itself ("NIFTY", "Nifty 50", and quote_plus-encoded "Nifty+50"

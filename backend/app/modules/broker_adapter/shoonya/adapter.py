@@ -490,8 +490,33 @@ class ShoonyaBrokerAdapter(BrokerPort):
             )
             self._ws.start()
 
-        entries = [(symbol, *self._resolve_token(symbol)) for symbol in contract_symbols]
+        entries = [(symbol, *self._resolve_symbol_token(symbol)) for symbol in contract_symbols]
         self._ws.subscribe(entries)
+
+    def _resolve_symbol_token(self, symbol: str) -> tuple[str, str]:
+        """2026-08-12: real gap found and fixed. `MarketDataIngestionService`
+        subscribes to an *underlying's* own tick (`"NIFTY"`, never an option
+        contract) to build `price_bars`/EMA — and does so from
+        `ensure_ingestion_running`, called at `start_strategy` time, *before*
+        the strategy runner itself has ever called `get_option_chain` for
+        that underlying in this process. `_resolve_token` alone has no
+        fallback (correctly so for an option contract — there's no expiry/
+        strike context to blind-search for one), so subscribing to an
+        underlying before anything else has warmed its token would always
+        raise `ShoonyaApiError` here, with nothing upstream (`subscribe_
+        quotes`, `BrokerPortMarketDataAdapter.subscribe_ticks`,
+        `ensure_ingestion_running`) catching it — the very first
+        `POST /strategies/{id}/start` against a fresh Shoonya-backed
+        `MARKET_DATA_PROVIDER` would 500. `get_price_history` never hit this
+        because it already routes through `_resolve_underlying_token`
+        (cache, then a live NSE search_scrip fallback) — this just applies
+        the same routing here, for known underlyings only; an option
+        contract symbol still goes through the plain, fallback-free
+        `_resolve_token` unchanged.
+        """
+        if symbol.upper() in KNOWN_UNDERLYINGS:
+            return self._resolve_underlying_token(symbol)
+        return self._resolve_token(symbol)
 
     def unsubscribe_quotes(self, contract_symbols: list[str]) -> None:
         if self._ws is not None:
