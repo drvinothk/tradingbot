@@ -606,6 +606,60 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-12: Shoonya WS is now the live `MARKET_DATA_PROVIDER`, real
+  end-to-end tick streaming confirmed.** `MARKET_DATA_PROVIDER=shoonya` set
+  on the OCI `.env`. Found and fixed three real, live-only bugs to get here:
+  (1) `ShoonyaWSClient._send` only wrote to the socket when handed an
+  explicit `ws=` — `subscribe()`/`unsubscribe()` from any thread other than
+  the background connection thread silently no-op'd on an already-open
+  connection, so a real subscribe request could be dropped forever with no
+  error (fixed via a tracked `self._live_ws` reference); (2) Noren's
+  touchline feed sends a complete snapshot once (`"tk"`/`"dk"`) then only
+  partial updates after that (`"tf"`/`"df"`, carrying just the changed
+  fields) — `parse_tick` required `lp` unconditionally, so any partial
+  update that didn't touch price raised `NormalizationError` and got
+  silently dropped, losing real ticks; fixed via a per-token
+  `_last_known_by_key` merge before parsing; (3) `subscribe_quotes` on an
+  underlying (not an option contract) had no fallback token resolution —
+  `MarketDataIngestionService` subscribes to the underlying's own tick
+  *before* any strategy has called `get_option_chain` in-process, so the
+  very first `start_strategy` against a fresh Shoonya-backed provider would
+  500. Also fixed: `app.main._sync_mock_instrument_universe` ran
+  unconditionally on every restart (mock is always the broker before a
+  human reconnects Shoonya), silently reactivating the mock's synthetic
+  "nearest Thursday" expiry over already-correct real data — now skipped
+  once real data exists; and `market_data.registry.reset_for_reconnect`,
+  called from `oauth_callback` when `MARKET_DATA_PROVIDER=shoonya`, so a
+  reconnect actually rebuilds ingestion against the new broker instead of
+  staying silently stuck on the mock-wrapped provider resolved at startup.
+  **Live-confirmed**: real, continuous `price_bars` for NIFTY/BANKNIFTY
+  with correct spot values, zero errors, after all fixes deployed. The
+  `/shoonya/ws-tick-diagnostic` endpoint itself still reports
+  `ticks_received: 0` when Shoonya is the active provider — not a
+  production bug, a diagnostic-tool limitation: `ShoonyaWSClient` is one
+  shared connection with a single `on_tick` callback fixed at
+  construction, and since ingestion now always subscribes first, the
+  diagnostic's own callback never gets wired in even though its
+  subscription is genuinely honored on the wire. Left as-is; the thing it
+  was built to verify (real ticks flowing) is proven true by the
+  `price_bars` data itself.
+- **Market-data provider priority is a user preference, not yet a codified
+  fallback mechanism — recorded here for whoever picks this up next.**
+  Current/default: Shoonya WS primary, Angel One WS as the intended
+  fallback (not yet built — `MARKET_DATA_PROVIDER` is a single string,
+  no automatic failover between providers exists; a provider outage today
+  just means no data, not a switchover). Explicitly acceptable to the user
+  for now — building the real fallback is deliberately deferred, not an
+  oversight. Two future scenarios already indicated, so any fallback
+  design should support swapping which provider is primary vs. fallback,
+  not hardcode Shoonya-primary: (a) subscribing to TrueData → TrueData
+  primary, Angel One fallback; (b) Angel One WS working without the proxy
+  workaround (see the Angel One section above — proxy currently required
+  from the OCI VM's IP) → Angel One primary, Shoonya fallback. Whoever
+  builds this: a provider-agnostic failover wrapper at the
+  `provider_composition.py` composition-root level (mirroring
+  `MarketHoursGatedProvider`'s own wrapping pattern) is the natural shape,
+  not a rewrite of any individual provider.
 - **2026-08-12: likely root cause found for the option-chain zero-price gap
   below — `SearchScrip` is returning an empty `token` field for every
   recently-synced NIFTY/BANKNIFTY option row.** Live evidence: the
