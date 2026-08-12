@@ -148,7 +148,7 @@ wired in later via a credentials file.
   regardless of auth succeeding. See `ws_client.py`'s own docstring for
   the full writeup.
   **2026-08-12 update — a second real bug found via that exact test,
-  fixed, not yet redeployed/reverified.** Ran `diagnose_ws_ticks` live
+  fixed and live-confirmed the same day.** Ran `diagnose_ws_ticks` live
   during real market hours (10:59 IST) against a real, correctly-tokened
   NIFTY contract (`NIFTY18AUG26C24400`): auth and warm-up both succeeded,
   `subscribe_quotes` raised nothing, but `ticks_received: 0`. Root cause:
@@ -166,16 +166,12 @@ wired in later via a credentials file.
   explains why auth succeeding never once produced a real tick. Fixed by
   having `_run` publish the live `Connection` to `self._live_ws` once
   connected, and having `_send` always write to whatever `_live_ws`
-  currently is rather than requiring the caller to supply one — two new
-  regression tests (`test_subscribe_sends_immediately_on_an_already_live_
-  connection`, `test_unsubscribe_sends_immediately_on_an_already_live_
-  connection`) exercise this directly. 496/496 tests pass, ruff/mypy
-  clean. **Not yet redeployed to OCI or reverified live** — this was
-  found and fixed in the same session as the symbol-format audit above;
-  next session (or later this one) needs to deploy this file, restart
-  the backend (kills running strategies — Shoonya reconnect + strategy
-  restart required after), and re-run the same live diagnostic to
-  confirm real ticks now arrive.
+  currently is rather than requiring the caller to supply one. Deployed
+  and redeployed the same day alongside two more real bugs the live
+  retest surfaced (touchline partial-update parsing, underlying token
+  resolution) — see "Known open items" below for the full account and
+  the live confirmation (real, continuous `price_bars` for NIFTY/
+  BANKNIFTY throughout a multi-hour market-hours session).
 - ✅ **Phase 7** — Strategies 4 & 5 (OI/Volume Confirmed, Liquidity
   Sweep/Reversal), built out of order ahead of Phase 6 since neither needs
   Shoonya — both paper-only, against the mock broker, five of six
