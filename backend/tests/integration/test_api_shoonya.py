@@ -266,6 +266,50 @@ def test_callback_resets_market_data_registry_when_shoonya_is_the_configured_pro
     assert len(reset_calls) == 1
 
 
+def test_callback_survives_reset_for_reconnect_raising(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-12 QC finding, fixed: reset_for_reconnect makes a real WS
+    subscribe call that can genuinely raise (unlike sync_instrument_master/
+    _seed_option_anchors above it, both exception-safe by construction) --
+    a transient failure there must not turn a successful login into a 500,
+    and the audit event for the successful login must still be recorded.
+    """
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    real_settings = shoonya_module.get_settings()
+
+    class _FakeMarketDataSettings:
+        provider = "shoonya"
+
+    class _FakeSettings:
+        shoonya = real_settings.shoonya
+        market_data = _FakeMarketDataSettings()
+
+    monkeypatch.setattr(shoonya_module, "get_settings", lambda: _FakeSettings())
+
+    def _raise():
+        raise ConnectionError("simulated WS subscribe failure")
+
+    monkeypatch.setattr("app.modules.market_data.registry.reset_for_reconnect", _raise)
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert "connected" in response.text.lower()
+    assert composition.is_shoonya_configured() is True
+
+
 def test_callback_does_not_reset_market_data_registry_for_a_non_shoonya_provider(
     api_client: TestClient, seeded_admin, monkeypatch
 ):

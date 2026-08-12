@@ -15,6 +15,7 @@ code it never uses.
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -31,6 +32,8 @@ from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured, set_broker
 from app.modules.broker_adapter.shoonya.auth import build_authorize_url, exchange_code_for_token
 from app.modules.scheduler.instrument_sync import sync_instrument_master
+
+logger = logging.getLogger("app.api.shoonya")
 
 router = APIRouter(prefix="/shoonya", tags=["shoonya"])
 
@@ -236,10 +239,27 @@ def oauth_callback(
     # silently keep quoting mock data forever under a real-looking
     # MARKET_DATA_PROVIDER=shoonya configuration. Gated to shoonya only —
     # Angel One/TrueData don't share this broker-reconnect coupling.
+    #
+    # 2026-08-12 QC finding, fixed: unlike sync_instrument_master/
+    # _seed_option_anchors above (both already exception-safe by
+    # construction), reset_for_reconnect makes a real WS subscribe call
+    # that can genuinely raise (a transient network hiccup, say) — left
+    # unguarded, that would 500 this entire request even though
+    # authentication and instrument sync both already succeeded, showing
+    # the user a failed-looking reconnect for a login that actually
+    # worked. A resubscribe hiccup here is real but recoverable (the next
+    # ensure_ingestion_running call, or the next reconnect, retries it) —
+    # log it and still return the success page, don't mask a real login.
     if get_settings().market_data.provider == "shoonya":
         from app.modules.market_data.registry import reset_for_reconnect
 
-        reset_for_reconnect()
+        try:
+            reset_for_reconnect()
+        except Exception:
+            logger.exception(
+                "reset_for_reconnect failed after a successful Shoonya login — "
+                "market-data ingestion may still be on the previous provider"
+            )
 
     record_event(
         db,
