@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.clock import now_ist
 from app.core.db.session import get_db
 from app.core.security.rbac import require_permission
 from app.domain.identity.models import User
@@ -54,8 +55,12 @@ def list_instruments(
                     # reasoning as this loop's own FUT*/decoy-row comment
                     # below: a calendar-past expiry has no business in the
                     # picker regardless of whether some sync ever flips its
-                    # `is_active` flag correctly.
-                    OptionContract.expiry_date >= date.today(),
+                    # `is_active` flag correctly. `now_ist().date()`, not
+                    # `date.today()` — this deployment's server clock runs
+                    # UTC, and `date.today()` would read yesterday's date
+                    # for the ~5.5 real hours each night IST has already
+                    # crossed midnight but UTC hasn't (2026-08-12 QC pass).
+                    OptionContract.expiry_date >= now_ist().date(),
                 )
                 .distinct()
             }
