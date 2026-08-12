@@ -38,9 +38,45 @@ from app.domain.strategy.models import (
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    compute_stop_target,
     get_open_position_for_run,
     get_recent_completed_bars,
 )
+
+
+class TestComputeStopTarget:
+    """2026-08-12 regression coverage for a real live bug: plain
+    round(price, 2) produces prices like 132.84 that aren't a multiple of a
+    real instrument's tick size, which risk_engine's tick-alignment check
+    then correctly rejects -- never surfaced against the mock adapter's
+    clean whole-number synthetic premiums, only once real, genuinely
+    fractional Shoonya-sourced premiums flowed into signal generation.
+    """
+
+    def test_rounds_to_the_instrument_tick_size(self):
+        stop, target = compute_stop_target(147.6, 0.10, 0.15, tick_size=0.05)
+        assert stop == 132.85  # 147.6 * 0.9 = 132.84 -- not tick-aligned, rounds to 132.85
+        assert target == 169.75  # 147.6 * 1.15 = 169.74 -- rounds to 169.75
+
+        # Confirm both are exact multiples of the tick size, not just
+        # visually rounded -- this is what risk_engine._is_tick_aligned
+        # actually checks (Decimal(str(price)) % Decimal(str(tick_size))).
+        from decimal import Decimal
+
+        assert Decimal(str(stop)) % Decimal("0.05") == 0
+        assert Decimal(str(target)) % Decimal("0.05") == 0
+
+    def test_zero_tick_size_falls_back_to_plain_rounding(self):
+        """No real tick size to hand (defensive default, see compute_stop_
+        target's own docstring) -- must not crash, old 2-decimal behavior."""
+        stop, target = compute_stop_target(147.6, 0.10, 0.15, tick_size=0.0)
+        assert stop == 132.84
+        assert target == 169.74
+
+    def test_already_aligned_price_is_unchanged(self):
+        stop, target = compute_stop_target(100.0, 0.10, 0.15, tick_size=0.05)
+        assert stop == 90.0
+        assert target == 115.0
 
 
 @pytest.fixture

@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 from abc import abstractmethod
 from datetime import datetime
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal
 
 from sqlalchemy.orm import Session
@@ -113,15 +114,43 @@ def compute_range_high_low(bars: list[PriceBar]) -> tuple[float, float]:
     return max(float(b.high) for b in bars), min(float(b.low) for b in bars)
 
 
+def _round_to_tick(price: float, tick_size: float) -> float:
+    """2026-08-12: real bug fixed here — plain `round(price, 2)` produces
+    prices like `132.84` that aren't a multiple of a real instrument's tick
+    size (e.g. `0.05`), which `risk_engine.evaluate_trade_intent`'s
+    `_is_tick_aligned` check then correctly rejects as
+    `tick_size_violation`. Never surfaced against the mock adapter's clean
+    whole-number synthetic premiums (any 0.9/1.15-style multiplier of a
+    whole number stays 0.05-aligned); live-found the first time real,
+    genuinely fractional Shoonya-sourced premiums flowed into a real
+    strategy's signal generation, rejecting the *entire* signal on this
+    alone in the vast majority of cases. Decimal-based, not float division,
+    so the result is an exact tick multiple rather than one that merely
+    looks aligned when printed.
+    """
+    if tick_size <= 0:
+        return round(price, 2)
+    price_dec = Decimal(str(price))
+    tick_dec = Decimal(str(tick_size))
+    ticks = (price_dec / tick_dec).to_integral_value(rounding=ROUND_HALF_UP)
+    return float(ticks * tick_dec)
+
+
 def compute_stop_target(
-    entry_price: float, stop_pct: float, target_pct: float
+    entry_price: float, stop_pct: float, target_pct: float, tick_size: float = 0.0
 ) -> tuple[float, float]:
     """The identical stop/target formula every strategy (synthetic, ORB,
-    VWAP Pullback, EMA Micro-pullback) computed inline — same percentage-off
-    -entry shape, same rounding, only the pct values differ per strategy.
+    VWAP Pullback, EMA Micro-pullback, OI/Volume Confirmed, Liquidity
+    Sweep/Reversal — all six, not just the original four) computed inline —
+    same percentage-off-entry shape, only the pct values differ per
+    strategy. `tick_size` rounds both prices to a real, tradable value for
+    the instrument (see `_round_to_tick`'s own docstring) — defaults to
+    `0.0` (plain 2-decimal rounding, the old behavior) only so a caller that
+    genuinely has no tick size to hand doesn't crash; every real strategy
+    call site passes the instrument's actual tick size.
     """
-    stop_price = round(entry_price * (1 - stop_pct), 2)
-    target_price = round(entry_price * (1 + target_pct), 2)
+    stop_price = _round_to_tick(entry_price * (1 - stop_pct), tick_size)
+    target_price = _round_to_tick(entry_price * (1 + target_pct), tick_size)
     return stop_price, target_price
 
 

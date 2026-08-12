@@ -13,7 +13,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
-from app.domain.market.models import OptionType, PriceBar
+from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
@@ -83,7 +83,11 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
             return None
 
         entry_price = top.ltp
-        stop_price, target_price = compute_stop_target(entry_price, self.stop_pct, self.target_pct)
+        instrument = db.get(Instrument, self.instrument_id)
+        tick_size = float(instrument.tick_size) if instrument is not None else 0.0
+        stop_price, target_price = compute_stop_target(
+            entry_price, self.stop_pct, self.target_pct, tick_size
+        )
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

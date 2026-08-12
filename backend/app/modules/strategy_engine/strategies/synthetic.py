@@ -19,6 +19,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
+from app.domain.market.models import Instrument
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import compute_stop_target
 from app.modules.strategy_engine.interface import Strategy, TradeProposal
@@ -52,7 +53,9 @@ class SyntheticStrategy(Strategy):
 
         top = ranked[0]
         entry_price = top.ltp
-        stop_price, target_price = compute_stop_target(entry_price, STOP_PCT, TARGET_PCT)
+        instrument = db.get(Instrument, self.instrument_id)
+        tick_size = float(instrument.tick_size) if instrument is not None else 0.0
+        stop_price, target_price = compute_stop_target(entry_price, STOP_PCT, TARGET_PCT, tick_size)
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,
