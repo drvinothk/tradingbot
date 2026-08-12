@@ -137,6 +137,13 @@ class ShoonyaWSClient:
         self._source = source
 
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
+        # Noren's own touchline-feed protocol: "tk"/"dk" (sent once, right
+        # after subscribing) is a *complete* snapshot; every "tf"/"df"
+        # after that is a *partial* update carrying only the fields that
+        # actually changed since the last push -- see `_handle_message`'s
+        # own docstring for the live evidence and full reasoning. Keyed the
+        # same as `_entries_by_key`.
+        self._last_known_by_key: dict[str, dict] = {}
         self._lock = threading.Lock()
 
         # The live connection object, set only while `_run`'s `with connect(...)`
@@ -202,6 +209,10 @@ class ShoonyaWSClient:
             ]
             for entry in to_remove:
                 del self._entries_by_key[entry.key]
+                # A later resubscribe (same or a different contract sharing
+                # the exchange|token key, however unlikely) must never
+                # inherit a stale merged snapshot from this subscription.
+                self._last_known_by_key.pop(entry.key, None)
         if to_remove:
             self._send_unsubscribe(to_remove)
 
@@ -329,6 +340,27 @@ class ShoonyaWSClient:
             self._handle_message(raw)
 
     def _handle_message(self, raw: str | bytes) -> None:
+        """2026-08-12: **real bug fixed here.** Live-observed on a real
+        account during market hours: `"tf"` (touchline feed) messages
+        arrive as genuine partial updates, e.g.
+        `{"t": "tf", "e": "NSE", "tk": "26000", "ft": "...", "toi": "..."}`
+        — no `lp` at all, because only open interest changed since the
+        last push. `parse_tick` requires `lp` unconditionally (correctly,
+        for a REST `GetQuotes` response, which is always a complete
+        snapshot), so every such partial update was raising
+        `NormalizationError` and being dropped — silently losing real
+        ticks (and spamming the log) any time an update didn't happen to
+        touch price. Noren's own protocol convention is that `"tk"`/`"dk"`
+        (sent once, right after subscribing) is the complete snapshot and
+        every following `"tf"`/`"df"` carries only the fields that
+        actually changed — so each message is now merged onto
+        `_last_known_by_key`'s running snapshot for that token before
+        parsing, giving `parse_tick`/`parse_depth` a complete picture even
+        from a partial wire message. A token with no snapshot at all yet
+        (partial update arrives before any full one — possible on a race
+        at subscribe time) still correctly fails to parse: there's
+        genuinely nothing to report yet.
+        """
         try:
             message = json.loads(raw)
         except ValueError:
@@ -336,15 +368,18 @@ class ShoonyaWSClient:
             return
 
         msg_type = message.get("t")
+        key = f"{message.get('e', '')}|{message.get('tk', '')}"
         with self._lock:
-            entry = self._entries_by_key.get(f"{message.get('e', '')}|{message.get('tk', '')}")
-        if entry is None:
-            return
+            entry = self._entries_by_key.get(key)
+            if entry is None:
+                return
+            merged = {**self._last_known_by_key.get(key, {}), **message}
+            self._last_known_by_key[key] = merged
 
         try:
             if msg_type in ("tk", "tf"):
-                self._on_tick(parse_tick(message, entry.contract_symbol))
+                self._on_tick(parse_tick(merged, entry.contract_symbol))
             elif msg_type in ("dk", "df") and self._on_depth is not None:
-                self._on_depth(parse_depth(message, entry.contract_symbol))
+                self._on_depth(parse_depth(merged, entry.contract_symbol))
         except NormalizationError:
-            logger.exception("Failed to normalize Shoonya WebSocket message: %r", message)
+            logger.exception("Failed to normalize Shoonya WebSocket message: %r", merged)

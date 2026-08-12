@@ -152,6 +152,56 @@ def test_handle_message_dispatches_depth_to_on_depth():
     assert depths[0].contract_symbol == "NIFTY30JUL26C24000"
 
 
+def test_handle_message_merges_a_partial_touchline_update_onto_the_last_snapshot():
+    """2026-08-12 regression, live-observed on a real account during market
+    hours: a real "tf" (touchline feed) update carries only the fields
+    that actually changed since the last push -- e.g. only OI, never
+    repeating 'lp' -- and must still parse successfully by inheriting the
+    last known 'lp' from the prior "tk" snapshot, not get dropped as a
+    NormalizationError. This is why the live diagnostic reported
+    ticks_received: 0 despite real ticks genuinely arriving on the wire.
+    """
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])
+
+    full_snapshot = json.dumps(
+        {"t": "tk", "e": "NFO", "tk": "12345", "lp": "123.45", "bp1": "123.0", "sp1": "124.0"}
+    )
+    client._handle_message(full_snapshot)
+
+    partial_update = json.dumps({"t": "tf", "e": "NFO", "tk": "12345", "oi": "500"})
+    client._handle_message(partial_update)
+
+    assert len(ticks) == 2
+    assert ticks[1].ltp == 123.45, "must inherit 'lp' from the last full snapshot"
+    assert ticks[1].oi == 500
+
+
+def test_handle_message_partial_update_before_any_snapshot_still_fails_to_parse():
+    """No prior snapshot to merge onto means there's genuinely nothing to
+    report yet -- this must still fail exactly as before the coalescing
+    fix, not be papered over with a fabricated price.
+    """
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])
+
+    partial_update = json.dumps({"t": "tf", "e": "NFO", "tk": "12345", "oi": "500"})
+    client._handle_message(partial_update)
+
+    assert ticks == []
+
+
+def test_unsubscribe_clears_the_cached_snapshot_for_that_key():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])
+    client._handle_message(json.dumps({"t": "tk", "e": "NFO", "tk": "12345", "lp": "123.45"}))
+    assert client._last_known_by_key != {}
+
+    client.unsubscribe(["NIFTY30JUL26C24000"])
+
+    assert client._last_known_by_key == {}
+
+
 def test_handle_message_ignores_unknown_token():
     client, ticks, _ = _client()
     client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])
