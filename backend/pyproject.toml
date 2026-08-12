@@ -42,6 +42,29 @@ dev = [
     "mypy>=1.11",
     "import-linter>=2.1",
 ]
+# Only for MARKET_DATA_PROVIDER=truedata (market_data/providers/
+# truedata_provider.py) — deliberately kept out of the main dependency
+# list and never installed into the shared .venv, same reasoning as the
+# backtest extra on branch backup/atr-backtest-session: `truedata` pulls
+# in pandas (confirmed via its own PyPI-published requires_dist), and
+# pandas' own numpy dependency ships stub files using Python 3.12+ syntax
+# that break `mypy app tests` (this project's python_version = "3.11"
+# target) the moment numpy exists anywhere in the environment. Confirmed
+# directly: pandas isn't in the main .venv today, and `mypy app tests`
+# is clean because of that — install this into its own separate venv only,
+# when actually running against real TrueData credentials.
+#
+# 2026-08-11: switched from `truedata-ws` (last released 5.0.11, Nov 2023,
+# no newer version published since) to `truedata` (7.0.1, Jul 2025) —
+# confirmed via PyPI directly to be the same project's current name
+# (identical GitHub repo, `kapilmar/truedata-ws`), not an unrelated
+# package, and it's what TrueData's own official docs' Python client
+# section now names. `truedata_provider.py` was rewritten against this
+# package's actual installed source (not a paraphrase) — see that
+# module's own docstring for the full list of what changed.
+truedata = [
+    "truedata>=7.0",
+]
 
 [build-system]
 requires = ["hatchling"]

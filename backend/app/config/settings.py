@@ -136,7 +136,7 @@ class MarketDataSettings(BaseSettings):
         env_prefix="MARKET_DATA_", env_file=DOTENV_PATH, extra="ignore"
     )
 
-    provider: str = "mock"  # "angel_one" | "shoonya" | "mock"
+    provider: str = "mock"  # "angel_one" | "shoonya" | "truedata" | "mock"
     # Off by default: the 08:30-16:00 IST market-hours gate
     # (market_data.market_hours / MarketHoursGatedProvider) applies to
     # whichever real provider is selected. Set MARKET_DATA_ALLOW_OFFHOURS_
@@ -146,6 +146,17 @@ class MarketDataSettings(BaseSettings):
     # provider is never wrapped by the gate at all, see
     # provider_composition.get_market_data_provider's own docstring.
     allow_offhours_testing: bool = False
+    # A deliberately *bounded* alternative to allow_offhours_testing, not a
+    # duplicate of it -- that flag removes the cutoff entirely (any time of
+    # day or night); this one keeps a real hard stop, just a later one
+    # (23:30 IST instead of 16:00), for exactly one scoped use case:
+    # TrueData's aftermarket "Full Market Feed Replay" server, which streams
+    # a prior real trading day back as though it were live in the evening.
+    # Off by default for the identical reason allow_offhours_testing's own
+    # docstring already gives -- never set this in the tracked .env, only
+    # via a scoped systemctl set-environment on a live box or an inline env
+    # var locally, for the one evening session that actually needs it.
+    is_replay_mode: bool = False
 
 
 class AngelOneSettings(BaseSettings):
@@ -231,6 +242,54 @@ class AngelOneSettings(BaseSettings):
         return ":".join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -8, -8))
 
 
+class TrueDataSettings(BaseSettings):
+    """Loaded from config/credentials/truedata.env (gitignored, never the
+    tracked .env — same secrets discipline as ShoonyaSettings/
+    AngelOneSettings). No credentials exist yet as of 2026-08-10 — nothing
+    here has been exercised against a live account. As of 2026-08-11, the
+    `TD_live(...)` constructor shape, `live_port`, and the
+    `replay.truedata.in` aftermarket-replay switch are all sourced from
+    directly reading the current official `truedata` PyPI package's own
+    installed source (not a paraphrase, and not the now-superseded
+    `truedata-ws` package this used to be built against) plus TrueData's
+    own official WebSocket API spec — see `TrueDataProvider`'s own
+    docstring for the full discrepancy writeup and exactly what's still
+    confirmed vs. inferred vs. an open question.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TRUEDATA_",
+        env_file=CREDENTIALS_DIR / "truedata.env",
+        extra="ignore",
+    )
+
+    username: str = ""
+    password: SecretStr = SecretStr("")
+    # push.truedata.in is the real production feed. replay.truedata.in
+    # streams a prior real trading day back as though it were live —
+    # confirmed real via truedata-ws's own official README (not guessed),
+    # explicitly intended for exactly this system's "test the paper-trading
+    # loop after hours" use case. Never leave this pointed at replay in a
+    # tracked .env — same "off by default, scoped override only" reasoning
+    # MarketDataSettings.allow_offhours_testing's own docstring gives for a
+    # different off-hours testing knob.
+    url: str = "push.truedata.in"
+    # 8084 = TrueData's own official spec's Production real-time WebSocket
+    # port (Sandbox is 8086) -- corrected 2026-08-11 from the prior 8082
+    # default, which came from truedata-ws's own README, not TrueData's own
+    # documentation. See TrueDataProvider's own docstring for the full
+    # discrepancy writeup before assuming this is the final word untested.
+    live_port: int = 8084
+
+    def missing_required_fields(self) -> list[str]:
+        missing = []
+        if not self.username:
+            missing.append("TRUEDATA_USERNAME")
+        if not self.password.get_secret_value():
+            missing.append("TRUEDATA_PASSWORD")
+        return missing
+
+
 class RiskDefaults(BaseSettings):
     """System-default risk governance values — these seed `risk_limit_configs`
     on first run; day-to-day overrides live on `trading_sessions`, not here.
@@ -265,6 +324,7 @@ class Settings:
         self.shoonya = ShoonyaSettings()
         self.market_data = MarketDataSettings()
         self.angel_one = AngelOneSettings()
+        self.truedata = TrueDataSettings()
         self.risk_defaults = RiskDefaults()
 
 

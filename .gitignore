@@ -5,6 +5,12 @@ backend/app/config/credentials/*
 *.env
 !*.env.example
 
+# Vendor-supplied docs/Postman exports have shown up here with real bearer
+# tokens embedded directly in them (found 2026-08-11, TrueData's own
+# Postman collections) — never let a folder like this become committable
+# even briefly, regardless of what it's named or when it gets deleted.
+Delete later/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -37,6 +43,12 @@ desktop.ini
 
 # DB backups — may contain real trading data
 ops/backups/
+
+# Backtest tooling outputs — regenerable (downloaded bhavcopy CSVs / a
+# generated report), not source; see mock_data_tester.py / query_backtest_
+# trades.py on the backup/atr-backtest-session branch.
+backend/mock_data/
+backend/trade_breakdown.txt
 
 # Claude
 .claude/settings.local.json
