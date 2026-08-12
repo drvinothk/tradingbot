@@ -102,8 +102,27 @@ def _sync_mock_instrument_universe() -> None:
     what that same instance actually quotes, so `get_option_chain()` calls
     against the live singleton (not a test's own explicitly seeded adapter)
     resolve to something real.
+
+    2026-08-12: **real bug found and fixed here.** This used to run
+    unconditionally on every startup whenever `get_broker()` resolved to
+    the mock — correct for a genuinely fresh dev/test DB, but on a real
+    deployment, *every* restart starts with the mock broker (before a user
+    manually reconnects Shoonya), so this fired again even after a real
+    Shoonya OAuth login had already populated real NIFTY/BANKNIFTY option
+    data in a prior session. It upserts into the *same* `Instrument`/
+    `OptionContract` rows (matched by symbol/exchange) real Shoonya data
+    uses, so it silently reactivated/inserted the mock's own synthetic
+    "nearest Thursday" expiry on top of already-correct real data —
+    live-confirmed: a routine restart reactivated 84 wrong `2026-08-13`
+    rows over the correct, already-synced `2026-08-18`/`2026-08-25` data,
+    caught during a post-deploy QC check, not by any test (nothing
+    previously exercised this function's real logic against a
+    non-empty DB). Now skipped outright whenever either known underlying
+    already has an `Instrument` row — this function's only real job is
+    seeding a DB that has never seen a real sync at all.
     """
     from app.core.db.session import session_scope
+    from app.domain.market.models import Instrument
     from app.modules.broker_adapter.composition import get_broker
     from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
     from app.modules.scheduler.instrument_sync import sync_instrument_master
@@ -113,6 +132,15 @@ def _sync_mock_instrument_universe() -> None:
         return
 
     with session_scope() as db:
+        already_synced = (
+            db.query(Instrument).filter(Instrument.symbol.in_(("NIFTY", "BANKNIFTY"))).count()
+        )
+        if already_synced:
+            logger.info(
+                "Skipping mock instrument universe sync — NIFTY/BANKNIFTY instrument "
+                "rows already exist (real data from a prior broker sync, most likely)."
+            )
+            return
         log = sync_instrument_master(db, broker, ["NFO"])
         logger.info(
             "Mock instrument universe synced: status=%s instruments_updated=%d "
