@@ -19,6 +19,32 @@ own 09:15-15:30 trading window sits inside the 09:00-16:00 "active_market"
 phase deliberately — the 15 minutes on each side are for a provider's own
 session warm-up/wind-down, not an attempt to model the exchange's own
 hours precisely.
+
+**2026-08-10: an optional, deliberately-bounded extension for TrueData's
+aftermarket "Full Market Feed Replay" server**, which streams a prior real
+trading day back as though it were live in the evening —
+`Settings.market_data.is_replay_mode` (`MARKET_DATA_IS_REPLAY_MODE`, off by
+default; see that field's own docstring) pushes the hard stop from 16:00 to
+23:30 IST, nothing else. Deliberately *not* named to match the skeleton this
+was requested from verbatim (a bare `IS_REPLAY_MODE` env var read via
+`os.getenv`) — matches this codebase's own already-established
+`MARKET_DATA_` prefix convention instead, the same rename
+`MARKET_DATA_ALLOW_OFFHOURS_TESTING` itself went through for the identical
+reason. Reuses `now_ist()`/`app.core.clock` for the IST conversion, not a
+new `pytz` dependency — this module already had zero-bug IST handling
+before today; the point of the 2026-08-10 Angel One fix was "use the
+existing correct primitive," not "add a second one."
+
+`current_phase`/`is_within_market_hours` both take an optional
+`replay_mode` override so tests can control this deterministically without
+monkeypatching settings — `None` (every real call site) means "read
+`Settings.market_data.is_replay_mode`," matching the same `now: time |
+None = None` pattern this module already uses for the identical reason.
+Both `MarketDataScheduler` (the 16:00/23:30 hard-disconnect trigger) and
+`MarketHoursGatedProvider` (the outbound-call gate) call these with no
+override at all, so they automatically pick up whichever cutoff is
+currently configured — one shared source of truth, unchanged from before
+today, now with one more input.
 """
 
 from __future__ import annotations
@@ -31,6 +57,9 @@ from app.core.clock import now_ist
 MARKET_OPEN = time(8, 30)
 PRE_MARKET_END = time(9, 0)
 MARKET_CLOSE = time(16, 0)
+# See module docstring's 2026-08-10 section -- only reached when
+# Settings.market_data.is_replay_mode is explicitly set.
+REPLAY_MODE_MARKET_CLOSE = time(23, 30)
 
 
 class MarketPhase(enum.Enum):
@@ -39,14 +68,27 @@ class MarketPhase(enum.Enum):
     CLOSED = "closed"
 
 
-def current_phase(now: time | None = None) -> MarketPhase:
+def _resolve_market_close(replay_mode: bool | None) -> time:
+    if replay_mode is None:
+        # Local import: same load-time-cycle caution this codebase already
+        # applies elsewhere (e.g. market_data_scheduler.ensure_market_data_
+        # scheduler_running's own local get_settings import) -- this module
+        # otherwise has zero app-level imports beyond app.core.clock.
+        from app.config.settings import get_settings
+
+        replay_mode = get_settings().market_data.is_replay_mode
+    return REPLAY_MODE_MARKET_CLOSE if replay_mode else MARKET_CLOSE
+
+
+def current_phase(now: time | None = None, replay_mode: bool | None = None) -> MarketPhase:
     t = now if now is not None else now_ist().time()
+    market_close = _resolve_market_close(replay_mode)
     if MARKET_OPEN <= t < PRE_MARKET_END:
         return MarketPhase.PRE_MARKET
-    if PRE_MARKET_END <= t < MARKET_CLOSE:
+    if PRE_MARKET_END <= t < market_close:
         return MarketPhase.ACTIVE_MARKET
     return MarketPhase.CLOSED
 
 
-def is_within_market_hours(now: time | None = None) -> bool:
-    return current_phase(now) is not MarketPhase.CLOSED
+def is_within_market_hours(now: time | None = None, replay_mode: bool | None = None) -> bool:
+    return current_phase(now, replay_mode) is not MarketPhase.CLOSED

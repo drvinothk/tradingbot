@@ -6,6 +6,7 @@ the real dev DB the default `session_scope` targets.
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from contextlib import contextmanager
@@ -641,3 +642,101 @@ def test_ensure_fresh_option_chain_reports_dead_on_broker_failure(
 
     assert state == FreshnessState.DEAD
     assert db.query(OptionChainSnapshot).count() == 0
+
+
+# -- _poll_once: silent-empty-poll observability (2026-08-10 static-audit fix) --
+# Calls `_poll_once` directly rather than `start()`+`sleep()` like the REST-
+# fallback tests above — this feature is about exact wall-clock stall
+# duration, and driving it through the background poll thread's own timing
+# would make the 90s threshold either untestable-fast or flaky-slow for no
+# benefit; `_poll_once` is already exposed as a standalone unit for this
+# same reason `PositionManager.run_once`/`StrategyRunner.run_cycle` are.
+
+
+def test_poll_once_stays_silent_on_the_very_first_empty_poll(
+    seeded_universe, test_session_factory, db: Session, caplog
+):
+    """No prior `_last_valid_data_time` entry for this symbol yet — nothing
+    to measure a stall against, so this must not warn off a missing
+    baseline (a fresh service instance, or a symbol that has simply never
+    once had data, must not immediately look like a stall).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    broker = _NeverTicksBroker()  # no candles configured for any symbol
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+
+    with caplog.at_level(logging.WARNING, logger="app.market_data"):
+        service._poll_once(underlying_symbol, nifty.id)  # noqa: SLF001
+
+    assert underlying_symbol not in service._last_valid_data_time  # noqa: SLF001
+    assert "silently throttling" not in caplog.text
+
+
+def test_poll_once_warns_once_the_empty_stall_exceeds_the_threshold(
+    seeded_universe, test_session_factory, db: Session, caplog
+):
+    """Live-motivated: `get_price_history` returning `HTTP 200, status: true,
+    data: []` for 5 straight days went completely unnoticed until manually
+    investigated. This is the fix — a stall past 90s of real elapsed time
+    (not a poll-cycle count, which would need to change every time the
+    poll interval or the broker does) must produce an explicit warning.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    broker = _NeverTicksBroker()  # no candles configured for any symbol
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._last_valid_data_time[underlying_symbol] = datetime.now(UTC) - timedelta(  # noqa: SLF001
+        seconds=95
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.market_data"):
+        service._poll_once(underlying_symbol, nifty.id)  # noqa: SLF001
+
+    assert "silently throttling" in caplog.text
+    assert underlying_symbol in caplog.text
+
+
+def test_poll_once_does_not_warn_before_the_threshold_elapses(
+    seeded_universe, test_session_factory, db: Session, caplog
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    broker = _NeverTicksBroker()  # no candles configured for any symbol
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._last_valid_data_time[underlying_symbol] = datetime.now(UTC) - timedelta(  # noqa: SLF001
+        seconds=10
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.market_data"):
+        service._poll_once(underlying_symbol, nifty.id)  # noqa: SLF001
+
+    assert "silently throttling" not in caplog.text
+
+
+def test_poll_once_resets_last_valid_data_time_when_candles_come_back(
+    seeded_universe, test_session_factory, db: Session
+):
+    """Proves this actually *resets* the marker on real data, not just
+    leaves an already-fresh value untouched — seeded with a stale marker
+    that would otherwise still read as a live stall if this were a no-op.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    now = datetime.now(UTC)
+    completed_bucket = now - timedelta(seconds=now.timestamp() % 60 + 60)
+    candles = [
+        PriceCandle(
+            bucket_start=completed_bucket, open=100.0, high=101.0, low=99.0, close=100.5, volume=0
+        )
+    ]
+    broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._last_valid_data_time[underlying_symbol] = now - timedelta(seconds=500)  # noqa: SLF001
+
+    before = datetime.now(UTC)
+    service._poll_once(underlying_symbol, nifty.id)  # noqa: SLF001
+    after = datetime.now(UTC)
+
+    recorded = service._last_valid_data_time[underlying_symbol]  # noqa: SLF001
+    assert before <= recorded <= after

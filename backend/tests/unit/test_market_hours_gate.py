@@ -112,3 +112,28 @@ def test_get_latest_tick_is_never_gated(monkeypatch):
     gated = _gated(inner, allow_offhours=False, blocked=True, monkeypatch=monkeypatch)
     gated.get_latest_tick("NIFTY")
     assert inner.latest_tick_calls == ["NIFTY"]
+
+
+def test_blocked_log_message_reports_the_extended_window_in_replay_mode(monkeypatch, caplog):
+    """The "blocked outside <window>" log text must say 23:30, not a stale
+    16:00, once replay mode is actually configured -- otherwise the log
+    itself becomes misleading during the one session it's meant to help
+    debug (2026-08-10).
+    """
+    import app.config.settings as settings_module
+
+    class _FakeMarketDataSettings:
+        is_replay_mode = True
+
+    class _FakeSettings:
+        market_data = _FakeMarketDataSettings()
+
+    monkeypatch.setattr(settings_module, "get_settings", lambda: _FakeSettings())
+    inner = _FakeInnerProvider()
+    gated = _gated(inner, allow_offhours=False, blocked=True, monkeypatch=monkeypatch)
+
+    with caplog.at_level("WARNING", logger="app.market_data.market_hours_gate"):
+        gated.connect()
+
+    assert "23:30" in caplog.text
+    assert "16:00" not in caplog.text

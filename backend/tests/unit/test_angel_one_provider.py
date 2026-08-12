@@ -325,13 +325,26 @@ class _FakeWSClient:
 
     instances: list[_FakeWSClient] = []
 
-    def __init__(self, *, auth_token, api_key, client_code, feed_token, on_tick, on_depth=None):
+    def __init__(
+        self,
+        *,
+        auth_token,
+        api_key,
+        client_code,
+        feed_token,
+        on_tick,
+        on_depth=None,
+        token_refresh_callback=None,
+        proxy_url="",
+    ):
+        self.proxy_url = proxy_url
         self.auth_token = auth_token
         self.api_key = api_key
         self.client_code = client_code
         self.feed_token = feed_token
         self.on_tick = on_tick
         self.on_depth = on_depth
+        self.token_refresh_callback = token_refresh_callback
         self.started = False
         self.subscribed: list[tuple] = []
         self.unsubscribed: list[tuple] = []
@@ -378,6 +391,31 @@ def test_connect_is_idempotent(provider: AngelOneMarketDataProvider):
     provider.connect()
     rest: _FakeRestClient = provider._rest  # type: ignore[assignment]  # noqa: SLF001
     assert len(rest.login_calls) == 1
+
+
+def test_force_fresh_login_bypasses_idempotency_and_relogs_in(
+    provider: AngelOneMarketDataProvider,
+):
+    provider.connect()
+    rest: _FakeRestClient = provider._rest  # type: ignore[assignment]  # noqa: SLF001
+    assert len(rest.login_calls) == 1
+
+    auth_token, feed_token = provider._force_fresh_login()  # noqa: SLF001
+
+    # A genuinely fresh REST call happened -- connect()'s own idempotency
+    # check (which _force_fresh_login deliberately bypasses) would have
+    # made this a no-op otherwise, same as test_connect_is_idempotent above.
+    assert len(rest.login_calls) == 2
+    assert auth_token == "jwt1"
+    assert feed_token == "feed1"
+
+
+def test_subscribe_ticks_wires_the_token_refresh_callback_into_the_ws_client(
+    provider: AngelOneMarketDataProvider,
+):
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    ws = _FakeWSClient.instances[0]
+    assert ws.token_refresh_callback == provider._force_fresh_login  # noqa: SLF001
 
 
 def test_subscribe_ticks_resolves_tokens_and_subscribes(provider: AngelOneMarketDataProvider):

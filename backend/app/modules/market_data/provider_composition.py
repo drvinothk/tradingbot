@@ -8,16 +8,28 @@ single shared resolver would defeat that by construction, the same reasoning
 and `get_execution_broker()` are already two separate slots on that side.
 
 `get_market_data_provider()` reads `Settings.market_data.provider`
-(`"angel_one"` | `"shoonya"` | `"mock"`, default `"mock"` so every existing
-test and local dev run behaves exactly as before this existed, unless
-explicitly opted in) and lazily constructs the matching provider.
-`"shoonya"` and `"mock"` both resolve to `BrokerPortMarketDataAdapter`
-wrapping `broker_adapter.composition.get_broker()`'s own current value —
-that function already dynamically resolves to the mock by default or a
-connected `ShoonyaBrokerAdapter` once OAuth completes, so duplicating that
-same dynamic choice into a second, independent static slot here would just
-be a second place for the two to disagree. Only `"angel_one"` gets a
-genuinely distinct instance.
+(`"angel_one"` | `"shoonya"` | `"truedata"` | `"mock"`, default `"mock"` so
+every existing test and local dev run behaves exactly as before this
+existed, unless explicitly opted in) and lazily constructs the matching
+provider. `"shoonya"` and `"mock"` both resolve to
+`BrokerPortMarketDataAdapter` wrapping `broker_adapter.composition
+.get_broker()`'s own current value — that function already dynamically
+resolves to the mock by default or a connected `ShoonyaBrokerAdapter` once
+OAuth completes, so duplicating that same dynamic choice into a second,
+independent static slot here would just be a second place for the two to
+disagree. `"angel_one"` and `"truedata"` each get a genuinely distinct
+instance. `"truedata"` is untested against a live account as of
+2026-08-10 — see `TrueDataProvider`'s own docstring for exactly what's
+confirmed vs. still inferred.
+
+An unrecognized `provider` value raises `ValueError` rather than falling
+through to the `"shoonya"`/`"mock"` branch — added 2026-08-10, before that a
+typo or a not-yet-implemented name (e.g. setting `MARKET_DATA_PROVIDER=
+truedata` before a real `TrueDataProvider` class exists) would silently
+serve Shoonya- or mock-sourced data with no indication anything was
+misconfigured. A market-data source is exactly the kind of dependency that
+should fail loud at first use, not quietly substitute a different broker's
+data for the one actually requested.
 """
 
 from __future__ import annotations
@@ -28,7 +40,10 @@ from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvid
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
 from app.modules.market_data.providers.market_hours_gate import MarketHoursGatedProvider
+from app.modules.market_data.providers.truedata_provider import TrueDataProvider
 from app.modules.market_data.scrip_master import ScripMasterService
+
+_RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
 
 _provider: BaseMarketDataProvider | None = None
 _scrip_master: ScripMasterService | None = None
@@ -66,10 +81,19 @@ def get_market_data_provider() -> BaseMarketDataProvider:
 
     settings = get_settings()
     provider_name = settings.market_data.provider
+    if provider_name not in _RECOGNIZED_PROVIDERS:
+        raise ValueError(
+            f"Unrecognized MARKET_DATA_PROVIDER={provider_name!r} — must be one of "
+            f"{_RECOGNIZED_PROVIDERS}. Refusing to silently fall back to Shoonya/mock "
+            "market data for an unimplemented or misspelled provider name."
+        )
+
     if provider_name == "angel_one":
         inner: BaseMarketDataProvider = AngelOneMarketDataProvider(
             settings.angel_one, get_scrip_master()
         )
+    elif provider_name == "truedata":
+        inner = TrueDataProvider(settings.truedata)
     else:
         inner = BrokerPortMarketDataAdapter(get_broker())
 

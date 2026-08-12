@@ -21,6 +21,7 @@ from datetime import UTC, datetime
 import pyotp
 
 from app.config.settings import AngelOneSettings
+from app.core.clock import IST
 from app.modules.broker_adapter.base.contracts import DepthLevel, DepthSnapshot, PriceCandle, Tick
 from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.market_data.providers.angel_rest_client import AngelOneRestClient
@@ -101,6 +102,25 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         self._jwt_token = None
         self._feed_token = None
 
+    def _force_fresh_login(self) -> tuple[str, str]:
+        """Bypasses `connect()`'s own idempotency check on purpose — that
+        method's contract (per `BaseMarketDataProvider`'s own docstring) is
+        "idempotent, must not re-authenticate if already connected," which
+        is correct for every other caller. This is the one narrow, explicit
+        exception: `AngelWSClient`'s reconnect loop, after enough
+        consecutive failures that the currently-held tokens are worth
+        discarding rather than trusting again (see that class's own
+        `_TOKEN_REFRESH_AFTER_CONSECUTIVE_FAILURES`). `pyotp.TOTP(...).now()`
+        inside `connect()` generates a fresh code at call time, so calling
+        this later than the original login needs no extra handling for TOTP
+        validity.
+        """
+        self._feed_token = None
+        self.connect()
+        assert self._jwt_token is not None
+        assert self._feed_token is not None
+        return self._jwt_token, self._feed_token
+
     def close(self) -> None:
         self.disconnect()
         self._rest.close()
@@ -126,6 +146,14 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
                 feed_token=self._feed_token or "",
                 on_tick=self._handle_raw_tick,
                 on_depth=self._handle_raw_depth,
+                token_refresh_callback=self._force_fresh_login,
+                # 2026-08-11, live-confirmed: Angel's WS gateway rejects a
+                # session whose streaming IP doesn't match the one its
+                # token was issued from -- the WS connection must go
+                # through the same proxy REST login uses, not connect
+                # directly, whenever one is configured. See
+                # AngelWSClient's own module docstring for the full finding.
+                proxy_url=self._settings.auth_proxy,
             )
             self._ws.start()
 
@@ -243,12 +271,25 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         segment = self._scrip_master.get_angel_exchange_segment(underlying) or "NSE"
 
         try:
+            # `start`/`end` arrive UTC-aware (every caller in this codebase
+            # passes `datetime.now(UTC)`-derived values) — `strftime` alone
+            # only formats the datetime's own wall-clock fields, it does not
+            # convert, so without `.astimezone(IST)` first this silently sent
+            # Angel's IST-expecting `fromdate`/`todate` the raw UTC clock
+            # digits: a real, ~5.5-hour-shifted query window on every single
+            # call, live since this method was first written. Caught
+            # 2026-08-10 investigating why `price_bars` for NIFTY had had no
+            # new row since 2026-08-05 despite the REST-poll fallback
+            # reporting success (HTTP 200) — the shifted window was landing
+            # on stretches with no genuine candle data to return, so
+            # `_poll_once` saw a real, non-erroring, empty response and
+            # silently persisted nothing, cycle after cycle.
             rows = self._rest.get_candle_data(
                 self._jwt_token or "",
                 segment,
                 token,
-                start.strftime("%Y-%m-%d %H:%M"),
-                end.strftime("%Y-%m-%d %H:%M"),
+                start.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
+                end.astimezone(IST).strftime("%Y-%m-%d %H:%M"),
                 timeframe_seconds,
             )
         except BrokerAuthError:

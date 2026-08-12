@@ -57,6 +57,19 @@ _REST_POLL_LOOKBACK = timedelta(minutes=5)
 # longer than _REST_POLL_INTERVAL_SECONDS.
 _RATE_LIMIT_BACKOFF_SECONDS = 300.0
 
+# How long a symbol may go with zero candles back from a REST poll before
+# it's worth a warning -- time-based, not a consecutive-empty-cycle count,
+# deliberately: a cycle count is only meaningful relative to one particular
+# `rest_poll_interval_seconds`, and this codebase already expects that to
+# vary (a slower/faster broker, a future TrueData provider, a caller like
+# `live_rest_paper_trader.py` driving its own 60s-aligned cadence instead of
+# this class's own free-running loop). A fixed wall-clock threshold means
+# "no real data in over 90s" reads the same regardless of what's polling or
+# how often. 90s is a little over 3x the default 25s poll interval -- long
+# enough that one or two genuinely-empty cycles (e.g. the first minute after
+# market open) don't misfire, short enough to catch a real stall quickly.
+_EMPTY_POLL_WARNING_THRESHOLD_SECONDS = 90.0
+
 _SymbolRef = tuple[str, uuid.UUID]  # ("instrument" | "option_contract", row id)
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
@@ -119,6 +132,14 @@ class MarketDataIngestionService:
         self._fallback_symbols: set[str] = set()
         self._poll_threads: dict[str, threading.Thread] = {}
         self._last_polled_bucket: dict[str, datetime | None] = {}
+        # Wall-clock time a REST poll last returned at least one candle for
+        # this symbol, broker-agnostic (Angel One, Shoonya, or a future
+        # TrueData provider all funnel through the same _poll_once) -- see
+        # _EMPTY_POLL_WARNING_THRESHOLD_SECONDS. Absent for a symbol that
+        # has never once had a successful poll since this instance started
+        # (startup, or every poll so far has come back empty) -- handled as
+        # "unknown, don't warn yet" in _poll_once, not treated as a stall.
+        self._last_valid_data_time: dict[str, datetime] = {}
 
     def _build_symbol_map(self, contract_symbols: list[str]) -> dict[str, _SymbolRef]:
         symbol_map: dict[str, _SymbolRef] = {}
@@ -276,6 +297,29 @@ class MarketDataIngestionService:
         candles = self._provider.get_price_history(
             symbol, now - _REST_POLL_LOOKBACK, now, timeframe_seconds
         )
+
+        if candles:
+            self._last_valid_data_time[symbol] = now
+        else:
+            # `_last_valid_data_time.get(symbol)` is None on this instance's
+            # very first poll for this symbol (nothing to measure a stall
+            # against yet) and on every cycle up to this one having also
+            # come back empty — in both cases there's no prior "last good"
+            # moment to diff against, so this is correctly silent rather
+            # than warning off a missing baseline.
+            last_valid = self._last_valid_data_time.get(symbol)
+            if last_valid is not None:
+                stall_seconds = (now - last_valid).total_seconds()
+                if stall_seconds > _EMPTY_POLL_WARNING_THRESHOLD_SECONDS:
+                    logger.warning(
+                        "REST poll for %r has returned zero candles for %.0fs (last real "
+                        "data at %s) — broker may be silently throttling (a successful, "
+                        "non-erroring response with no data) rather than erroring outright",
+                        symbol,
+                        stall_seconds,
+                        last_valid.isoformat(),
+                    )
+
         last_seen = self._last_polled_bucket.get(symbol)
         new_candles = [
             c

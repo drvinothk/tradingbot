@@ -1,6 +1,10 @@
 """`MarketDataScheduler`: acts on the phase transitions `market_data.
 market_hours.current_phase` defines — session start at 08:30 IST, a hard
-stop at 16:00 IST, and a low-frequency pre-market health check in between.
+stop at 16:00 IST (23:30 IST when `Settings.market_data.is_replay_mode` is
+set — see `market_hours`'s own 2026-08-10 docstring section; this class
+needs no changes of its own for that, since it calls `current_phase()` with
+no override and inherits whichever cutoff is currently configured), and a
+low-frequency pre-market health check in between.
 Same background-thread shape as `scheduler.health_check.HealthCheckScheduler`
 (daemon thread, a `stop_event` for clean shutdown, `run_once()` exposed
 separately so tests can drive it deterministically) — a single process-wide

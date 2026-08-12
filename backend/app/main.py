@@ -384,6 +384,7 @@ async def lifespan(app: FastAPI):
     from app.core.locking import release_advisory_lock
     from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
     from app.modules.market_data.market_data_scheduler import stop_market_data_scheduler
+    from app.modules.market_data.provider_composition import get_market_data_provider
     from app.modules.market_data.scrip_master_scheduler import (
         stop_scrip_master_refresh_scheduler,
     )
@@ -393,6 +394,24 @@ async def lifespan(app: FastAPI):
     stop_health_check_scheduler()
     stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
+    # 2026-08-11: found missing during a live-WS troubleshooting audit —
+    # `stop_market_data_scheduler()` only stops that class's own polling
+    # thread; it never tears down the actual provider connection.
+    # `MarketDataScheduler._handle_transition` only calls `disconnect()` on
+    # a MarketPhase.CLOSED transition, never on an explicit app shutdown, so
+    # every prior restart left any open WS connection (Angel One's
+    # `AngelWSClient`, if one had ever gotten far enough to hold one open)
+    # to die abruptly when the process exited instead of via a clean
+    # `close_connection()` call — indistinguishable, from the broker's own
+    # side, from a real network failure, and a plausible (unconfirmed)
+    # contributor if Angel enforces a per-account concurrent-connection cap.
+    # Guarded with getattr, same defensive pattern `set_market_data_provider`/
+    # `reset_for_tests` already use — "mock" has no close() at all, and a
+    # provider that was never actually connected (a fresh mock-only test
+    # run) shouldn't need special-casing here.
+    close = getattr(get_market_data_provider(), "close", None)
+    if callable(close):
+        close()
     release_advisory_lock(singleton_connection, LOCK_PROCESS_SINGLETON)
     singleton_connection.close()
     logger.info("Process singleton lock released; shutdown complete.")

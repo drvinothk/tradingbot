@@ -23,7 +23,12 @@ from collections.abc import Callable
 from datetime import datetime
 
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
-from app.modules.market_data.market_hours import is_within_market_hours
+from app.modules.market_data.market_hours import (
+    MARKET_CLOSE,
+    MARKET_OPEN,
+    REPLAY_MODE_MARKET_CLOSE,
+    is_within_market_hours,
+)
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 logger = logging.getLogger("app.market_data.market_hours_gate")
@@ -40,9 +45,27 @@ class MarketHoursGatedProvider(BaseMarketDataProvider):
     def _blocked(self) -> bool:
         return not self._allow_offhours and not is_within_market_hours()
 
+    def _window_description(self) -> str:
+        """For log messages only -- reads the live setting fresh each call
+        (not cached at construction, unlike `_allow_offhours`) so a log line
+        stays accurate if replay mode is toggled mid-process, same reasoning
+        `is_within_market_hours()`'s own `replay_mode=None` default already
+        applies to the actual gating decision.
+        """
+        from app.config.settings import get_settings
+
+        close = (
+            REPLAY_MODE_MARKET_CLOSE
+            if get_settings().market_data.is_replay_mode
+            else MARKET_CLOSE
+        )
+        return f"{MARKET_OPEN.strftime('%H:%M')}-{close.strftime('%H:%M')} IST"
+
     def connect(self) -> None:
         if self._blocked():
-            logger.warning("Market-hours gate: connect() blocked outside 08:30-16:00 IST")
+            logger.warning(
+                "Market-hours gate: connect() blocked outside %s", self._window_description()
+            )
             return
         self._inner.connect()
 
@@ -57,8 +80,9 @@ class MarketHoursGatedProvider(BaseMarketDataProvider):
     ) -> None:
         if self._blocked():
             logger.warning(
-                "Market-hours gate: subscribe_ticks(%r) blocked outside 08:30-16:00 IST",
+                "Market-hours gate: subscribe_ticks(%r) blocked outside %s",
                 symbols,
+                self._window_description(),
             )
             return
         self._inner.subscribe_ticks(symbols, on_tick, on_depth)
@@ -74,8 +98,9 @@ class MarketHoursGatedProvider(BaseMarketDataProvider):
     ) -> list[PriceCandle]:
         if self._blocked():
             logger.warning(
-                "Market-hours gate: get_price_history(%r) blocked outside 08:30-16:00 IST",
+                "Market-hours gate: get_price_history(%r) blocked outside %s",
                 underlying,
+                self._window_description(),
             )
             return []
         return self._inner.get_price_history(underlying, start, end, timeframe_seconds)
