@@ -226,6 +226,21 @@ def oauth_callback(
     sync_instrument_master(db, adapter, ["NFO"])
     _seed_option_anchors(db, adapter)
 
+    # 2026-08-12: when Shoonya is the configured market-data provider (not
+    # just execution), a fresh reconnect must also force market_data.
+    # registry's ingestion to rebuild against this new adapter — see
+    # reset_for_reconnect's own docstring for why: the market-data provider
+    # singleton is resolved once, at process startup, always against the
+    # startup-default mock (a real Shoonya session is process-memory-only
+    # and can't exist yet at that point) — without this, ingestion would
+    # silently keep quoting mock data forever under a real-looking
+    # MARKET_DATA_PROVIDER=shoonya configuration. Gated to shoonya only —
+    # Angel One/TrueData don't share this broker-reconnect coupling.
+    if get_settings().market_data.provider == "shoonya":
+        from app.modules.market_data.registry import reset_for_reconnect
+
+        reset_for_reconnect()
+
     record_event(
         db,
         workspace_id=user.workspace_id,

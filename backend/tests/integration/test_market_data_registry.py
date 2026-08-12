@@ -167,3 +167,63 @@ def test_ensure_ingestion_running_shares_one_service_and_is_idempotent_per_symbo
 
     assert service_1 is service_2 is service_3
     assert starts == [["NIFTY"], ["BANKNIFTY"]]  # the repeated "NIFTY" call was a no-op
+
+
+def test_reset_for_reconnect_stops_and_rebuilds_every_previously_subscribed_symbol(
+    monkeypatch,
+):
+    """2026-08-12 regression: `get_market_data_provider()` is a lazy
+    singleton resolved once, at process startup, always against the
+    startup-default mock (a real Shoonya session can't exist yet at that
+    point). Without `reset_for_reconnect`, ingestion would silently keep
+    quoting whatever it first resolved to forever, even after a real
+    Shoonya reconnect moments later. This proves the actual mechanics:
+    every previously-subscribed symbol is stopped on the old service, the
+    `provider_composition` singleton is cleared, and every one of those
+    symbols is immediately re-subscribed against a freshly-built service.
+    """
+    starts: list[list[str]] = []
+    stops: list[list[str]] = []
+
+    class _FakeIngestionService:
+        def __init__(self, provider, session_factory=None, indicator_engine=None):
+            pass
+
+        def start(self, symbols):
+            starts.append(list(symbols))
+
+        def stop(self, symbols):
+            stops.append(list(symbols))
+
+    monkeypatch.setattr(market_data_registry, "MarketDataIngestionService", _FakeIngestionService)
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.get_market_data_provider",
+        lambda: object(),
+    )
+    set_calls: list[object | None] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.set_market_data_provider",
+        set_calls.append,
+    )
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    market_data_registry.ensure_ingestion_running("BANKNIFTY", provider=object())
+    starts.clear()  # only the re-subscribe after reset matters below
+
+    market_data_registry.reset_for_reconnect()
+
+    assert stops == [["BANKNIFTY", "NIFTY"]], "both symbols stopped on the old service"
+    assert set_calls == [None], "provider_composition singleton must be cleared"
+    assert starts == [["BANKNIFTY"], ["NIFTY"]], "both symbols re-subscribed on the new service"
+
+
+def test_reset_for_reconnect_is_a_harmless_noop_with_nothing_subscribed(monkeypatch):
+    set_calls: list[object | None] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.set_market_data_provider",
+        set_calls.append,
+    )
+
+    market_data_registry.reset_for_reconnect()  # must not raise
+
+    assert set_calls == [None]

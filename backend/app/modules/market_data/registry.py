@@ -73,3 +73,47 @@ def reset() -> None:
     global _service
     _service = None
     _subscribed_symbols.clear()
+
+
+def reset_for_reconnect() -> None:
+    """2026-08-12: real gap found while switching `MARKET_DATA_PROVIDER` to
+    `shoonya` — `get_market_data_provider()` is a lazy singleton
+    (`provider_composition._provider`) resolved once, on first use, then
+    cached forever. `_resume_strategy_runners` calls `ensure_ingestion_
+    running` unconditionally at process startup — *before* a human has had
+    any chance to click "Connect Shoonya" (its session is process-memory
+    only, wiped on every restart, so this ordering is unavoidable, not a
+    one-off timing fluke). For `MARKET_DATA_PROVIDER=shoonya`, that means
+    the very first resolution always wraps `get_broker()`'s startup default
+    (the mock), and nothing previously invalidated that cache once the user
+    reconnected moments later — ingestion would silently keep quoting mock
+    data forever under a real-looking "shoonya" configuration, with no
+    error anywhere to notice by.
+
+    Called from `api.v1.shoonya.oauth_callback` (only when `MARKET_DATA_
+    PROVIDER=shoonya` — no reason to churn this for Angel One/TrueData,
+    which don't share this broker-reconnect coupling at all) right after
+    `set_broker(adapter)`, so `get_broker()` already resolves to the fresh
+    adapter by the time this rebuilds. Cleanly unsubscribes every
+    previously-streaming underlying from whatever the *old* provider was
+    (matters most for a same-process Shoonya *re*-connect mid-day, where
+    the old provider held a real, still-open WS connection — a cold
+    startup's mock provider has nothing real to leak, but the same call
+    handles both cases identically rather than special-casing one), then
+    immediately re-subscribes every one of them against the new provider —
+    so already-running strategies don't go dark until something unrelated
+    happens to call `ensure_ingestion_running` again.
+    """
+    global _service
+    previously_subscribed = sorted(_subscribed_symbols)
+    if _service is not None and previously_subscribed:
+        _service.stop(previously_subscribed)
+
+    from app.modules.market_data.provider_composition import set_market_data_provider
+
+    set_market_data_provider(None)
+    _service = None
+    _subscribed_symbols.clear()
+
+    for symbol in previously_subscribed:
+        ensure_ingestion_running(symbol)

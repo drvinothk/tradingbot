@@ -222,6 +222,81 @@ def test_callback_success_installs_broker_and_audits(
         assert len(events) == 1
 
 
+def test_callback_resets_market_data_registry_when_shoonya_is_the_configured_provider(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-12 regression: without this reset, a Shoonya reconnect under
+    `MARKET_DATA_PROVIDER=shoonya` would leave ingestion silently stuck on
+    whatever it first resolved to at process startup (always the mock —
+    see `market_data.registry.reset_for_reconnect`'s own docstring for
+    the full ordering-gap writeup).
+    """
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    real_settings = shoonya_module.get_settings()
+
+    class _FakeMarketDataSettings:
+        provider = "shoonya"
+
+    class _FakeSettings:
+        shoonya = real_settings.shoonya
+        market_data = _FakeMarketDataSettings()
+
+    monkeypatch.setattr(shoonya_module, "get_settings", lambda: _FakeSettings())
+
+    reset_calls: list[None] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.registry.reset_for_reconnect",
+        lambda: reset_calls.append(None),
+    )
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert len(reset_calls) == 1
+
+
+def test_callback_does_not_reset_market_data_registry_for_a_non_shoonya_provider(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """Default test settings' `market_data.provider` is `"mock"` — no
+    reason to churn Angel One/TrueData's own ingestion on a Shoonya
+    reconnect when Shoonya isn't even the configured market-data source.
+    """
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    reset_calls: list[None] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.registry.reset_for_reconnect",
+        lambda: reset_calls.append(None),
+    )
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert reset_calls == []
+
+
 def test_callback_failure_returns_html_error_without_installing_broker(
     api_client: TestClient, seeded_admin, monkeypatch
 ):
