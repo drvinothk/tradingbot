@@ -703,15 +703,26 @@ check, then exercise it live).
   + 22 pre-existing deep-OTM rows from before the token bug, silently
   reactivated by the normal sync's own not-yet-expired-contract
   reactivation logic once `SearchScrip` echoed them again).
-  **Deliberately deferred to a future session**: the real daily-download
-  pipeline (scheduled fetch, parse, bulk upsert, `SearchScrip` demoted to
-  fallback) -- this session's fix is a manual, one-time correction only,
-  chosen explicitly over rushing a permanent pipeline late in an
-  already-long session. When building it, mirror
-  `AngelOneMarketDataProvider`'s own `ScripMasterService` pattern
-  (`market_data/scrip_master.py`) rather than inventing a new shape --
-  same problem, same broker family (Noren-based), already-proven design
-  in this codebase.
+  **Deferred at the time to a future session, built and live-verified the
+  same day (2026-08-12, later that evening, off-market-hours) — see
+  `broker_adapter/shoonya/scrip_master.py`.** The real daily-download
+  pipeline this note originally deferred: `ShoonyaBrokerAdapter.
+  get_instrument_master`'s NFO path now downloads and parses Shoonya's own
+  static `NFO_symbols.txt.zip` first (confirmed real, public, no-auth,
+  daily-updated by downloading and inspecting it directly), demoting
+  `SearchScrip` to a fallback used only when the static file is
+  unreachable. Mirrors `AngelOneMarketDataProvider`'s own
+  `ScripMasterService` pattern in spirit (same problem, same broker family)
+  but not its exact shape — Angel bridges to a separate `broker_symbol_map`
+  table since Angel isn't the source of truth for `option_contracts`;
+  Shoonya *is*, so this upserts through the existing `sync_instrument_
+  master` path unchanged, via the same `InstrumentInfo` contract
+  `get_instrument_master` always returned. **Live-verified same day**: a
+  single sync added 6,028 contracts with zero empty `broker_token`s across
+  all 30 NIFTY/BANKNIFTY expiry groups (previously the core bug) — a
+  complete real chain for every listed expiry (18 for NIFTY alone,
+  weeklies through far-dated LEAPS), not just the two expiries the earlier
+  manual fix covered.
   **2026-08-12, follow-up: the CE/PE-suffix symbol convention this
   codebase has treated as confirmed-correct for months may itself trace
   back to the same bad Aug-13 dataset.** The scrip-master-corrected rows
@@ -757,7 +768,17 @@ check, then exercise it live).
   ticks) — see that module's own docstring for the confirmed API shape.
   **Not implemented** — this is the designated fallback plan if Shoonya's
   gap turns out to be persistent/systemic rather than a one-off, not
-  something built into the code yet. Whoever picks this up next: it would
+  something built into the code yet. **2026-08-12 update**: the empty-
+  `broker_token` bug (this file's own Known Open Items entry just above)
+  plausibly explained this same symptom — `GetQuotes`'s per-strike pricing
+  calls need a real token, same as WS subscribe did — and that root cause
+  is now fixed via the real scrip-master pipeline. Not yet re-tested
+  during real market hours (`GetQuotes` only returns meaningful live
+  prices when the market is actually open, so this couldn't be verified
+  off-hours) — check this first, before building the TrueData fallback,
+  next time a real market-hours session runs.
+
+  Whoever ends up building the TrueData fallback anyway: it would
   mean `BrokerPort.get_option_chain`'s current Shoonya-only scope needs
   either a second implementation route or a provider-agnostic seam
   (mirroring the market-data/execution split `BaseMarketDataProvider`
