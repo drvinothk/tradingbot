@@ -122,7 +122,7 @@ def test_place_order_sends_payload_and_parses_ack():
         return httpx.Response(200, json={"stat": "Ok", "norenordno": "999"})
 
     client = _client(handler)
-    result = client.place_order({"uid": "FA1", "tsym": "NIFTY30JUL2624000CE"})
+    result = client.place_order({"uid": "FA1", "tsym": "NIFTY30JUL26C24000"})
     assert result["norenordno"] == "999"
 
 

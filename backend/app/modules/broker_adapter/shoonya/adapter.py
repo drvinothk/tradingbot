@@ -35,11 +35,14 @@ plan's Phase 5 section.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
+import time
 from datetime import UTC, date, datetime
 
 import httpx
+from websockets.sync.client import connect as _ws_connect
 
 from app.config.settings import ShoonyaSettings
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
@@ -423,6 +426,29 @@ class ShoonyaBrokerAdapter(BrokerPort):
             f"for {underlying!r}: {sorted(available_expiries)}",
         )
 
+    def seed_option_anchor(self, underlying: str, expiry: date, tsym: str) -> None:
+        """Lets a caller that already knows a good `(underlying, expiry)`
+        -> anchor `tsym` mapping (e.g. from this system's own already-
+        synced `option_contracts`) pre-populate the same cache
+        `_resolve_option_anchor_tsym` otherwise only ever fills via a live
+        `SearchScrip` call.
+
+        2026-08-12: `SearchScrip` has shown itself to be genuinely
+        unreliable — live-confirmed returning an *empty* result for a
+        real, currently-listed underlying+expiry multiple times in the
+        same session (see this module's own history / the build plan's
+        "Known open items" for the full writeup), not just occasionally
+        slow. For an exact calendar expiry, the anchor tsym can never
+        change once known — there's no correctness reason to ever prefer
+        a fresh, unreliable live call over data this system already knows
+        is correct. This adapter deliberately has no DB access of its own
+        (`BrokerPort`'s broker-agnostic boundary — see this module's own
+        top-level docstring), so the DB lookup that produces the value
+        passed in here lives in the caller, not here.
+        """
+        with self._token_lock:
+            self._option_anchor_cache[(underlying, expiry)] = tsym
+
     # -- BrokerPort: quotes / depth -------------------------------------------
 
     def get_quote(self, contract_symbol: str) -> Tick:
@@ -470,6 +496,119 @@ class ShoonyaBrokerAdapter(BrokerPort):
     def unsubscribe_quotes(self, contract_symbols: list[str]) -> None:
         if self._ws is not None:
             self._ws.unsubscribe(contract_symbols)
+
+    def diagnose_ws_auth(self) -> dict:
+        """One-shot, synchronous connect+auth against `ws_host` — bypasses
+        `ShoonyaWSClient`'s background reconnect loop so a live diagnostic
+        call gets an immediate answer instead of grepping logs. 2026-08-11:
+        re-added per the exact recipe this codebase's own project memory
+        anticipated for "once Shoonya support finally replies" — this time
+        to verify the new "t": "a"/"accesstoken" payload Shoonya support
+        specified (see `ws_client.py`'s own docstring) actually works
+        against a real account. Sends the identical payload
+        `ShoonyaWSClient._authenticate` sends, so a pass/fail here predicts
+        the real client's own behavior.
+        """
+        try:
+            with _ws_connect(self._settings.ws_host, open_timeout=10) as ws:
+                ws.send(
+                    json.dumps(
+                        {
+                            "t": "a",
+                            "uid": self._uid,
+                            "actid": self._actid,
+                            "accesstoken": self._auth_result.session_token,
+                            "source": self._settings.ws_auth_source,
+                        }
+                    )
+                )
+                ack_raw = ws.recv(timeout=10)
+                ack = json.loads(ack_raw)
+                return {
+                    "connected": True,
+                    "auth_ok": ack.get("t") == "ak" and ack.get("s") == "OK",
+                    "ack": ack,
+                }
+        except Exception as exc:
+            return {"connected": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def diagnose_ws_ticks(
+        self,
+        contract_symbols: list[str],
+        duration_seconds: float = 15.0,
+        *,
+        warm_underlying: str | None = None,
+        warm_expiry: date | None = None,
+    ) -> dict:
+        """2026-08-12, Phase 0 of verifying Shoonya WS end-to-end: unlike
+        `diagnose_ws_auth` (auth handshake only), this exercises the *real*
+        production `subscribe_quotes` -> `ShoonyaWSClient` path — the exact
+        code any real caller would use — and reports whatever ticks
+        actually arrive in `duration_seconds`. Auth succeeding (confirmed
+        2026-08-11) says nothing about whether `subscribe`/`tk`/`tf`
+        messages actually flow after that; this is what answers that.
+        Cleans up after itself (unsubscribes, stops the WS client) so it
+        leaves no persistent connection behind — this is a diagnostic, not
+        a way to start real streaming for a session.
+
+        `_resolve_token` needs a broker token already cached in this
+        adapter instance's own in-memory `_token_by_symbol` — populated by
+        `get_instrument_master`/`get_option_chain`, never read back from
+        the DB. Real strategies always call `get_option_chain` before
+        picking a strike, so this is always warm in real usage; a bare
+        diagnostic call skips that step, so `warm_underlying`/
+        `warm_expiry`, when given, call `get_option_chain` first to
+        replicate it.
+        """
+        if warm_underlying is not None and warm_expiry is not None:
+            try:
+                self.get_option_chain(warm_underlying, warm_expiry)
+            except Exception as exc:
+                return {
+                    "error": f"warm-up get_option_chain failed: {type(exc).__name__}: {exc}",
+                    "ticks_received": 0,
+                    "sample": [],
+                }
+
+        received: list[dict] = []
+        lock = threading.Lock()
+
+        def _collect(tick: Tick) -> None:
+            with lock:
+                received.append(
+                    {
+                        "contract_symbol": tick.contract_symbol,
+                        "ltp": tick.ltp,
+                        "bid": tick.bid,
+                        "ask": tick.ask,
+                        "volume": tick.volume,
+                        "ts": tick.ts.isoformat(),
+                    }
+                )
+
+        try:
+            self.subscribe_quotes(contract_symbols, on_tick=_collect)
+        except Exception as exc:
+            return {"error": f"{type(exc).__name__}: {exc}", "ticks_received": 0, "sample": []}
+
+        try:
+            time.sleep(duration_seconds)
+        finally:
+            try:
+                self.unsubscribe_quotes(contract_symbols)
+            except Exception:
+                logger.exception("Failed to unsubscribe after ws-tick diagnostic")
+            # Only tear down the shared connection if nothing else is still
+            # subscribed on it — this slot is process-wide, not owned by
+            # this diagnostic call alone (see `ShoonyaWSClient.
+            # has_subscriptions`'s own docstring for the incident class
+            # this guards against).
+            if self._ws is not None and not self._ws.has_subscriptions():
+                self._ws.stop()
+                self._ws = None
+
+        with lock:
+            return {"ticks_received": len(received), "sample": received[:5]}
 
     # -- BrokerPort: orders ----------------------------------------------------
 

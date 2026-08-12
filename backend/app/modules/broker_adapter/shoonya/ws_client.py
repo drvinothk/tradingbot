@@ -12,31 +12,65 @@ this project's pinned minimum) rather than an asyncio event loop in a
 thread, which is simpler and matches `MockBrokerAdapter._stream_loop`'s own
 plain-`threading.Thread` shape exactly.
 
-**Live-tested against a real account, still unresolved**: the auth
-handshake (`_authenticate`) consistently gets `{"t": "ck", "s": "NOT_OK"}`
-back, even though every other candidate cause was checked and ruled out —
-`susertoken` (not the OAuth `access_token`) is confirmed used, the message
-fields match the reference `NorenApi.py` implementation exactly (including
-`uid`/`actid` both being the same value, per that reference), REST and WS
-both connect from the same whitelisted IP, and both `NorenWSAPI` and
-`NorenWSTP` hosts were tried, as were three URL forms (bare, `?token=`,
-`?access_token=`) — every attempt gets the identical rejection at the
-identical point (the WebSocket connection itself always succeeds; only the
-post-connect auth frame is ever rejected). This rules out URL/host/field/
-token-type mistakes on this client's side. Next step is Shoonya's own API
-support, not further guessing at the wire format.
+**2026-08-11: ROOT CAUSE FOUND, FIXED, LIVE-CONFIRMED.** Root cause
+identified by Shoonya's own support team via a personalized reply
+(addressed to this account's actual client ID) after months of `NOT_OK`
+on every attempt: their recent OAuth migration changed the WS auth
+payload shape. The connect message type is now `"t": "a"` (not `"t":
+"c"`), the token field is `"accesstoken"` (not `susertoken`), and the
+success ack is `{"t": "ak", "s": "OK"}` (not `{"t": "ck", "s": "OK"}`).
+REST host/WS host are unchanged (`NorenWClientAPI`/`NorenWSAPI` — Shoonya
+support's reply confirmed the same paths already configured here, not a
+change).
 
-**Two more narrow, still-untested variables**, added after an external
-second opinion on the `NOT_OK`: (1) `source` was always hardcoded `"API"`
-(the classic-QuickAuth convention) and never itself varied — now
-`ShoonyaSettings.ws_auth_source`, overridable via env with no redeploy,
-in case this session's OAuth-issued token registers its origin
-differently than a direct API login would; (2) `_authenticate` now logs
-the literal `uid`/`actid` values sent (never `susertoken`) so the next
-live attempt can actually see, rather than assume, whether `actid` (which
-flows through from `GenAcsTok`'s own response field, not a static config
-value — see `auth.py`'s `exchange_code_for_token`) comes back carrying an
-unexpected suffix.
+**Live-confirmed the same day**, via `ShoonyaBrokerAdapter.
+diagnose_ws_auth`'s one-shot connect+auth (re-added per the recipe this
+file's own history had already anticipated for exactly this moment): real
+account, real response —
+`{"connected": true, "auth_ok": true, "ack": {"t": "ak", "s": "OK", "uid":
+"FA44103"}}`. The WebSocket connection itself accepts the new auth frame
+for the first time ever. **Not yet confirmed**: real tick streaming past
+the auth handshake (`_receive_loop`, real `subscribe`/`tk`/`tf` messages)
+— the diagnostic only exercises `_authenticate` in isolation, the same
+scope `ShoonyaWSClient._authenticate` itself has. That's the next concrete
+verification step, ideally during real market hours since a closed market
+may not stream ticks regardless of auth succeeding.
+
+**Prior investigation (now superseded, kept for context)**: every other
+candidate cause under the *old* payload shape was ruled out first —
+`susertoken` (matching the reference `NorenApi.py` implementation),
+`uid`/`actid` both correct, REST and WS on the same whitelisted IP, both
+`NorenWSAPI`/`NorenWSTP` hosts and three URL forms tried, `source`
+variants (`API`/`WEB`/`MOB`) all identical — every attempt still got
+`NOT_OK` at the identical point. That exhaustive process is what
+established this was a genuine protocol-level mismatch rather than a
+configuration mistake on this client's side, which is what prompted
+escalating to Shoonya support directly rather than continuing to guess.
+
+**2026-08-12: a second, real, client-side bug found and fixed — this is
+why auth succeeding still produced zero ticks.** Live-tested during real
+market hours via `diagnose_ws_ticks` against a real, correctly-tokened
+NIFTY contract: `subscribe_quotes` raised nothing, but `ticks_received`
+came back `0`. Root cause: `_send` only ever wrote to the socket when a
+caller passed an explicit `ws=` — and only `_run`'s own background
+thread, via `_resubscribe_all`/the heartbeat, ever did. `subscribe()`/
+`unsubscribe()`, called from any other thread (a real strategy's
+ingestion thread, or this diagnostic), went through the same `_send`
+with no `ws`, which silently did nothing beyond updating
+`_entries_by_key` — correct only on the theory that a *future*
+reconnect's `_resubscribe_all` would pick it up. On an already-connected
+client (the normal case: connect once via `subscribe_quotes`, then every
+later call just extends the same subscription) there is no future
+reconnect, so the subscribe request was dropped forever with no error
+anywhere. Fixed by having `_run` publish the live `Connection` object to
+`self._live_ws` (guarded by `_send_lock`) once connected, and having
+`_send` always write to whatever `_live_ws` currently is, rather than
+requiring the caller to hand one in — `_resubscribe_all`/heartbeat now
+go through the same path instead of a separate explicit-`ws` one.
+Between reconnects `_live_ws` is `None` and `_send` still silently
+no-ops, same as before (recovered by `_resubscribe_all` next connect).
+**Not yet re-verified live** — this fix hasn't been redeployed/retested
+against a real account yet; that's the next concrete step once deployed.
 """
 
 from __future__ import annotations
@@ -105,6 +139,13 @@ class ShoonyaWSClient:
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
         self._lock = threading.Lock()
 
+        # The live connection object, set only while `_run`'s `with connect(...)`
+        # block holds one — see `_send`'s own docstring for why this exists:
+        # a bare `_entries_by_key` update from `subscribe()` alone never
+        # reaches the wire on an already-open connection.
+        self._live_ws: Connection | None = None
+        self._send_lock = threading.Lock()
+
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._connected = threading.Event()
@@ -127,6 +168,18 @@ class ShoonyaWSClient:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+
+    def has_subscriptions(self) -> bool:
+        """Lets a caller that only owns *some* of this shared connection's
+        subscriptions (e.g. a diagnostic call) check whether anything else
+        is still relying on it before deciding to `stop()` the whole thing
+        — this connection is shared per-process (see this module's own
+        docstring), never one-per-caller, so tearing it down unconditionally
+        after one caller's own `unsubscribe` would silently kill every other
+        subscriber's stream too.
+        """
+        with self._lock:
+            return bool(self._entries_by_key)
 
     def subscribe(self, entries: list[tuple[str, str, str]]) -> None:
         """`entries` is `(contract_symbol, exchange, broker_token)` triples —
@@ -160,12 +213,17 @@ class ShoonyaWSClient:
             try:
                 with connect(self._ws_host, open_timeout=10) as ws:
                     self._authenticate(ws)
-                    self._resubscribe_all(ws)
+                    with self._send_lock:
+                        self._live_ws = ws
+                    self._resubscribe_all()
                     self._connected.set()
                     backoff_index = 0
                     self._receive_loop(ws)
             except Exception:
                 logger.exception("Shoonya WebSocket connection dropped; reconnecting")
+            finally:
+                with self._send_lock:
+                    self._live_ws = None
             self._connected.clear()
             if self._stop.is_set():
                 return
@@ -176,11 +234,11 @@ class ShoonyaWSClient:
             self._stop.wait(delay)
 
     def _authenticate(self, ws: Connection) -> None:
+        # 2026-08-11: payload shape per Shoonya support's own reply (see
+        # module docstring) — "t": "a" / "accesstoken", replacing the old
+        # "t": "c" / "susertoken" pair that never once got past NOT_OK.
         # Deliberately logs uid/actid/source (account identifiers, not
-        # secrets) but never susertoken — this is the one place we can
-        # actually see, per live attempt, whether `actid` came back from
-        # `GenAcsTok` carrying an unexpected suffix (e.g. `_U`) rather than
-        # guessing at it, per the still-open NOT_OK investigation.
+        # secrets) but never accesstoken.
         # `.warning`, not `.info`: this app has no logging configuration
         # anywhere (no basicConfig/setLevel), so with no handler attached,
         # Python falls back to its "handler of last resort" — stderr,
@@ -194,52 +252,68 @@ class ShoonyaWSClient:
         ws.send(
             json.dumps(
                 {
-                    "t": "c",
+                    "t": "a",
                     "uid": self._uid,
                     "actid": self._actid,
-                    "susertoken": self._access_token,
+                    "accesstoken": self._access_token,
                     "source": self._source,
                 }
             )
         )
         ack_raw = ws.recv(timeout=10)
         ack = json.loads(ack_raw)
-        if ack.get("t") != "ck" or ack.get("s") != "OK":
+        if ack.get("t") != "ak" or ack.get("s") != "OK":
             raise ConnectionError(f"Shoonya WebSocket auth rejected: {ack!r}")
 
-    def _resubscribe_all(self, ws: Connection) -> None:
+    def _resubscribe_all(self) -> None:
         with self._lock:
             entries = list(self._entries_by_key.values())
         if entries:
-            self._send_subscribe(entries, ws=ws)
+            self._send_subscribe(entries)
 
-    def _send_subscribe(
-        self, entries: list[_SubscriptionEntry], *, ws: Connection | None = None
-    ) -> None:
+    def _send_subscribe(self, entries: list[_SubscriptionEntry]) -> None:
         if not entries:
             return
         keys = "#".join(entry.key for entry in entries)
-        self._send({"t": "t", "k": keys}, ws=ws)
+        self._send({"t": "t", "k": keys})
         if self._on_depth is not None:
-            self._send({"t": "d", "k": keys}, ws=ws)
+            self._send({"t": "d", "k": keys})
 
     def _send_unsubscribe(self, entries: list[_SubscriptionEntry]) -> None:
         keys = "#".join(entry.key for entry in entries)
         self._send({"t": "u", "k": keys})
 
-    def _send(self, message: dict, *, ws: Connection | None = None) -> None:
-        """No-ops rather than raising when there's no live connection to
-        send on — a `subscribe` call between reconnect attempts is
-        recovered by `_resubscribe_all` on the next successful connect, so
-        losing this particular send isn't a correctness gap.
+    def _send(self, message: dict) -> None:
+        """2026-08-12: **real bug fixed here** — the old signature only ever
+        wrote to the socket when a caller passed an explicit `ws=` (only
+        `_run`'s own thread, via `_resubscribe_all`/heartbeat, ever did).
+        `subscribe()`/`unsubscribe()`, called from any *other* thread (a
+        real strategy's ingestion thread, this module's own diagnostic),
+        went through this same method with no `ws` — silently doing
+        nothing beyond updating `_entries_by_key`, on the theory that a
+        *future* reconnect's `_resubscribe_all` would send it. On an
+        already-connected client (the common case — `subscribe_quotes`
+        connects once, then every later call just adds to the existing
+        subscription) there is no future reconnect, so the request was
+        dropped forever with no error. Live-confirmed 2026-08-12 via
+        `diagnose_ws_ticks` against a real, correctly-tokened NIFTY
+        contract during market hours: `ticks_received: 0` even though
+        auth succeeded and `subscribe_quotes` raised nothing. Fixed by
+        always sending on whichever connection `_run` currently holds
+        (`self._live_ws`, set/cleared only by `_run` itself) — still
+        silently no-ops between reconnects (recovered by
+        `_resubscribe_all` on the next successful connect, unchanged),
+        but no longer no-ops on an already-open connection just because
+        the caller isn't the background thread.
         """
-        target = ws
-        if target is None:
-            return
-        try:
-            target.send(json.dumps(message))
-        except Exception:
-            logger.exception("Shoonya WebSocket send failed for %r", message)
+        with self._send_lock:
+            target = self._live_ws
+            if target is None:
+                return
+            try:
+                target.send(json.dumps(message))
+            except Exception:
+                logger.exception("Shoonya WebSocket send failed for %r", message)
 
     def _receive_loop(self, ws: Connection) -> None:
         last_heartbeat = time.monotonic()
@@ -248,7 +322,7 @@ class ShoonyaWSClient:
                 raw = ws.recv(timeout=1.0)
             except TimeoutError:
                 if time.monotonic() - last_heartbeat >= _HEARTBEAT_INTERVAL_SECONDS:
-                    self._send({"t": "h"}, ws=ws)
+                    self._send({"t": "h"})
                     last_heartbeat = time.monotonic()
                 continue
 

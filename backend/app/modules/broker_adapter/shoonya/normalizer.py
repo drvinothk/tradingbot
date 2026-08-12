@@ -14,6 +14,31 @@ Every parse function raises `NormalizationError` with the offending raw
 payload on a missing/unexpected field, rather than a bare `KeyError`,
 specifically so a real-account mismatch is immediately legible instead of
 an obscure traceback three frames away from the actual bad assumption.
+
+**2026-08-12: Shoonya's real option trading-symbol format is confirmed --
+`DDMMMYY` + `C`/`P` + strike (e.g. `NIFTY18AUG26C24400`), never a `CE`/`PE`
+suffix (`NIFTY18AUG2624400CE`).** This module's own `_TSYM_STRIKE_SUFFIX`
+regex and `_strike_from_tsym`'s docstring already had this right, built
+from a real, live-observed row (`NIFTY04AUG26C18500`) months ago -- but a
+*different*, unverified `CE`/`PE`-suffix assumption had separately crept
+into this Shoonya module's own test fixtures and a one-off data-correction
+script, and was never actually tested against a real broker call until it
+got live-rejected: `GetOptionChain: HTTP 400 {"stat":"Not_Ok","emsg":
+"Invalid Input : BANKNIFTY25AUG2657900PE is Invalid Trading Symbol."}`.
+Root cause: that wrong convention traces back to the same stale/non-existent
+`2026-08-13` expiry data this whole system spent two days treating as
+correct (see the build plan's "Known open items" for the full incident) --
+once that data's origin is suspect, so is anything modeled after it,
+including symbol format. The fix was two one-off DB corrections (not a
+code bug in this file, which already parsed correctly), plus updating this
+module's own previously-misleading test fixtures to match. **This is
+Shoonya-specific** -- Angel One, TrueData, and the mock adapter each have
+their own, unrelated, already-correct symbol conventions; nothing about
+this finding applies to them, and nothing in their own modules should be
+changed on the strength of it. `to_place_order_payload` below was never
+actually a construction bug either -- it always passed `request.
+contract_symbol` through verbatim; the wrong format only ever entered via
+data that was wrong before it reached this module.
 """
 
 from __future__ import annotations

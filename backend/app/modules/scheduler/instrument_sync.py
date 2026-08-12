@@ -9,7 +9,9 @@ changes here.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from collections import defaultdict
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
@@ -18,6 +20,8 @@ from sqlalchemy.orm import Session
 from app.domain.market.models import Instrument, InstrumentMasterSyncLog, OptionContract, SyncStatus
 from app.domain.market.models import OptionType as MarketOptionType
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+
+logger = logging.getLogger("app.scheduler.instrument_sync")
 
 
 def _utcnow() -> datetime:
@@ -34,6 +38,29 @@ def sync_instrument_master(
     failed sync is recorded, not thrown, since a scheduled job dying
     silently is worse than a logged failure the Scheduler's health check
     can act on.
+
+    2026-08-11/12: a diff-based deactivation pass (any previously-active,
+    not-yet-expired contract an underlying's own sync queried but didn't
+    see again gets deactivated too, not just calendar-expired ones) was
+    added, then **reverted the next day after live evidence showed it's
+    unsafe against this real broker's actual behavior**: two real
+    `SearchScrip` calls for the same underlying (`BANKNIFTY`), ~2.5 minutes
+    apart, returned **completely different, non-overlapping expiry sets**
+    (`2026-08-13` in one call, `2026-08-25` in the next) — confirmed via a
+    live spot-price cross-check against Angel One's own feed
+    (BANKNIFTY ~57,446 at the time) that `2026-08-13`'s ~51,000 strikes were
+    the real, current data and `2026-08-25`'s ~31,000 strikes were the
+    stale ones. A diff pass scoped to "what this one call returned" flips
+    valid data inactive whenever a call happens to return a partial/
+    different subset of the true chain, which this broker's `SearchScrip`
+    demonstrably does — not a one-off fluke, reproduced twice in the same
+    session. Time-based expiry (below) doesn't have this failure mode since
+    it never depends on what any single call did or didn't return, so it's
+    what's left. The specific stale-row problem the diff pass was built
+    for (a wrong expiry surviving indefinitely because it's still
+    calendar-future) is real and still open — see the build plan's "Known
+    open items" for the current plan (manual, targeted cleanup of
+    confirmed-bad rows, not a general per-sync heuristic).
     """
     run_at = _utcnow()
     instruments_updated = 0
@@ -45,6 +72,27 @@ def sync_instrument_master(
             infos = broker.get_instrument_master(exchange)
             underlying_infos = [i for i in infos if not i.is_option]
             option_infos = [i for i in infos if i.is_option]
+
+            # 2026-08-12 temporary diagnostic: the diff-deactivation block
+            # below deactivated a previously-correct 84-contract batch
+            # (NIFTY+BANKNIFTY's real Aug-13 series) the first time it ran
+            # for real, with zero new contracts added in the same run --
+            # this logs exactly what SearchScrip actually returned, per
+            # underlying, so that can be root-caused instead of guessed at.
+            # `.warning` since this app has no logging config (see
+            # ws_client.py's own identical reasoning) -- remove once the
+            # 2026-08-12 NIFTY-instrument-missing investigation is closed.
+            expiries_by_underlying: dict[str, set[date]] = defaultdict(set)
+            for info in option_infos:
+                if info.underlying and info.expiry is not None:
+                    expiries_by_underlying[info.underlying].add(info.expiry)
+            logger.warning(
+                "sync_instrument_master(%s): %d option rows from broker; "
+                "expiries seen per underlying: %s",
+                exchange,
+                len(option_infos),
+                {u: sorted(exps) for u, exps in expiries_by_underlying.items()},
+            )
 
             symbol_to_instrument_id: dict[str, uuid.UUID] = {}
             for info in underlying_infos:

@@ -49,6 +49,13 @@ def list_instruments(
                 .filter(
                     OptionContract.instrument_id == instrument.id,
                     OptionContract.is_active.is_(True),
+                    # Belt-and-suspenders alongside `is_active`, same
+                    # "filter at the read side, not just at sync time"
+                    # reasoning as this loop's own FUT*/decoy-row comment
+                    # below: a calendar-past expiry has no business in the
+                    # picker regardless of whether some sync ever flips its
+                    # `is_active` flag correctly.
+                    OptionContract.expiry_date >= date.today(),
                 )
                 .distinct()
             }

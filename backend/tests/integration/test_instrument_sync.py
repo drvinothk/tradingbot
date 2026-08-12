@@ -131,6 +131,46 @@ def test_expired_contracts_are_deactivated_not_deleted(db: Session):
     assert second_log.contracts_expired == 0
 
 
+def test_a_still_future_contract_survives_a_later_sync_that_omits_it(db: Session):
+    """Regression test for the reverted 2026-08-11 diff-deactivation
+    attempt: live evidence on 2026-08-12 showed Shoonya's real `SearchScrip`
+    returns different, non-overlapping partial subsets of an underlying's
+    true option chain across separate calls (confirmed via a real spot-
+    price cross-check — see this module's own docstring). A not-yet-expired
+    contract must stay active even when a later sync's response happens not
+    to mention it again — deactivating on "not seen in this one call" flips
+    genuinely-valid data inactive whenever a call returns a partial result,
+    which this broker demonstrably does.
+    """
+    first_expiry = date.today() + timedelta(days=7)
+    second_expiry = date.today() + timedelta(days=14)
+
+    broker = MockBrokerAdapter(instruments=build_mock_universe(first_expiry), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+    first_run_contracts = (
+        db.query(OptionContract).filter(OptionContract.expiry_date == first_expiry).all()
+    )
+    assert len(first_run_contracts) == 84
+    assert all(c.is_active for c in first_run_contracts)
+
+    # A later sync's response happens not to mention `first_expiry` at all
+    # (a partial/different subset, not a genuine "this expiry is gone").
+    broker2 = MockBrokerAdapter(instruments=build_mock_universe(second_expiry), seed=1)
+    sync_instrument_master(db, broker2, exchanges=["NFO"])
+
+    still_there = db.query(OptionContract).filter(OptionContract.expiry_date == first_expiry).all()
+    assert len(still_there) == 84
+    assert all(c.is_active for c in still_there), (
+        "a still-future contract must never be deactivated just because one "
+        "later sync call didn't happen to mention it"
+    )
+
+    fresh = db.query(OptionContract).filter(OptionContract.expiry_date == second_expiry).all()
+    assert len(fresh) == 84
+    assert all(c.is_active for c in fresh)
+
+
 def test_option_with_unknown_underlying_is_skipped_not_crashed(db: Session):
     orphan = InstrumentInfo(
         symbol="GHOST31JUL2610000CE",

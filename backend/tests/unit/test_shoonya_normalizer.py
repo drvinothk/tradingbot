@@ -25,7 +25,7 @@ def test_parse_instrument_master_row_underlying():
 
 def test_parse_instrument_master_row_option():
     row = {
-        "tsym": "NIFTY30JUL2624000CE",
+        "tsym": "NIFTY30JUL26C24000",
         "ls": "25",
         "ti": "0.05",
         "token": "12345",
@@ -115,8 +115,8 @@ def test_parse_option_type_unknown_raises():
 
 def test_parse_tick():
     raw = {"lp": "123.45", "bp1": "123.0", "sp1": "124.0", "v": "5000", "oi": "20000"}
-    tick = normalizer.parse_tick(raw, "NIFTY30JUL2624000CE")
-    assert tick.contract_symbol == "NIFTY30JUL2624000CE"
+    tick = normalizer.parse_tick(raw, "NIFTY30JUL26C24000")
+    assert tick.contract_symbol == "NIFTY30JUL26C24000"
     assert tick.ltp == 123.45
     assert tick.bid == 123.0
     assert tick.ask == 124.0
@@ -163,7 +163,7 @@ def test_map_order_status_unknown_raises():
 def test_to_place_order_payload_shape():
     request = OrderRequest(
         idempotency_key="key-1",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
@@ -172,7 +172,7 @@ def test_to_place_order_payload_shape():
     payload = normalizer.to_place_order_payload(request, uid="FA1", actid="FA1")
     assert payload["uid"] == "FA1"
     assert payload["exch"] == "NFO"
-    assert payload["tsym"] == "NIFTY30JUL2624000CE"
+    assert payload["tsym"] == "NIFTY30JUL26C24000"
     assert payload["trantype"] == "B"
     assert payload["prctyp"] == "LMT"
     assert payload["remarks"] == "key-1"
@@ -191,7 +191,7 @@ def test_parse_order_result_defaults_to_pending_without_status():
 
 def test_parse_position_signed_qty():
     position = normalizer.parse_position(
-        {"tsym": "NIFTY30JUL2624000CE", "netqty": "-25", "netavgprc": "119.5"}
+        {"tsym": "NIFTY30JUL26C24000", "netqty": "-25", "netavgprc": "119.5"}
     )
     assert position.qty == -25
     assert position.avg_price == 119.5

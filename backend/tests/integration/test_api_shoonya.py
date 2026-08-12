@@ -243,3 +243,62 @@ def _fake_settings(shoonya_settings):
         shoonya = shoonya_settings
 
     return _Settings()
+
+
+class _FakeAdapterWithSeedMethod:
+    def __init__(self):
+        self.seeded: list[tuple] = []
+
+    def seed_option_anchor(self, underlying, expiry, tsym):
+        self.seeded.append((underlying, expiry, tsym))
+
+
+def test_seed_option_anchors_seeds_every_active_expiry_from_the_db(db):
+    """2026-08-12: closes the gap that made starting a strategy against an
+    already-correctly-synced expiry still depend on a live `SearchScrip`
+    call (unreliable — see `ShoonyaBrokerAdapter.seed_option_anchor`'s own
+    docstring). Only active contracts get seeded; a second expiry with no
+    active rows must be left alone.
+    """
+    import uuid as uuid_module
+    from datetime import date
+
+    from app.domain.market.models import Instrument, OptionContract, OptionType
+
+    instrument_id = uuid_module.uuid4()
+    db.add(
+        Instrument(
+            id=instrument_id, symbol="NIFTY", exchange="NFO", lot_size=65, tick_size=0.05
+        )
+    )
+    db.flush()
+    db.add(
+        OptionContract(
+            id=uuid_module.uuid4(),
+            instrument_id=instrument_id,
+            expiry_date=date(2026, 8, 18),
+            strike=24400,
+            option_type=OptionType.CE,
+            symbol="NIFTY18AUG26C24400",
+            is_active=True,
+        )
+    )
+    db.add(
+        OptionContract(
+            id=uuid_module.uuid4(),
+            instrument_id=instrument_id,
+            expiry_date=date(2026, 8, 6),
+            strike=24000,
+            option_type=OptionType.CE,
+            symbol="NIFTY06AUG26C24000",
+            is_active=False,
+        )
+    )
+    db.flush()
+
+    fake_adapter = _FakeAdapterWithSeedMethod()
+    shoonya_module._seed_option_anchors(db, fake_adapter)
+
+    assert ("NIFTY", date(2026, 8, 18), "NIFTY18AUG26C24400") in fake_adapter.seeded
+    seeded_expiries = {call[1] for call in fake_adapter.seeded if call[0] == "NIFTY"}
+    assert date(2026, 8, 6) not in seeded_expiries, "an inactive contract must never be seeded"

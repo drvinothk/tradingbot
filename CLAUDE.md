@@ -132,6 +132,50 @@ wired in later via a credentials file.
   mismatch/TOTP drift specifically (needs live `emsg` evidence that
   doesn't exist). (Shoonya support has now been emailed about WS, per
   above.)
+  **2026-08-11 update — WS auth root-caused and fixed, live-confirmed.**
+  Shoonya support replied (personalized to this account's client ID):
+  their recent OAuth migration changed the WS auth payload shape entirely
+  — connect message type `"t": "a"` (not `"t": "c"`), token field
+  `"accesstoken"` (not `susertoken`), success ack `{"t": "ak", "s": "OK"}`
+  (not `{"t": "ck", "s": "OK"}`). REST/WS hosts unchanged. Applied in
+  `ws_client.py`'s `_authenticate`, live-verified the same day via a
+  one-shot diagnostic against the real account: `{"connected": true,
+  "auth_ok": true, "ack": {"t": "ak", "s": "OK", "uid": "FA44103"}}` — the
+  auth handshake succeeds for the first time since Phase 5 began. **Not
+  yet confirmed**: real tick streaming past the auth handshake itself
+  (`_receive_loop`, real `subscribe`/`tk`/`tf` messages) — needs a test
+  during real market hours, since a closed market may not stream
+  regardless of auth succeeding. See `ws_client.py`'s own docstring for
+  the full writeup.
+  **2026-08-12 update — a second real bug found via that exact test,
+  fixed, not yet redeployed/reverified.** Ran `diagnose_ws_ticks` live
+  during real market hours (10:59 IST) against a real, correctly-tokened
+  NIFTY contract (`NIFTY18AUG26C24400`): auth and warm-up both succeeded,
+  `subscribe_quotes` raised nothing, but `ticks_received: 0`. Root cause:
+  `ShoonyaWSClient._send` only ever wrote to the socket when given an
+  explicit `ws=` connection object — only `_run`'s own background thread
+  ever passed one (via `_resubscribe_all`/heartbeat). `subscribe()`/
+  `unsubscribe()`, called from any other thread (a real strategy's
+  ingestion thread, or the diagnostic itself), went through the same
+  `_send` with no `ws=`, which silently did nothing beyond updating
+  `_entries_by_key` — correct only if a *future* reconnect would pick it
+  up via `_resubscribe_all`. On an already-connected client (the normal
+  case — connect once, then every later call just extends the same
+  subscription) there is no future reconnect, so the subscribe request
+  was dropped forever with zero error anywhere in the stack. This fully
+  explains why auth succeeding never once produced a real tick. Fixed by
+  having `_run` publish the live `Connection` to `self._live_ws` once
+  connected, and having `_send` always write to whatever `_live_ws`
+  currently is rather than requiring the caller to supply one — two new
+  regression tests (`test_subscribe_sends_immediately_on_an_already_live_
+  connection`, `test_unsubscribe_sends_immediately_on_an_already_live_
+  connection`) exercise this directly. 496/496 tests pass, ruff/mypy
+  clean. **Not yet redeployed to OCI or reverified live** — this was
+  found and fixed in the same session as the symbol-format audit above;
+  next session (or later this one) needs to deploy this file, restart
+  the backend (kills running strategies — Shoonya reconnect + strategy
+  restart required after), and re-run the same live diagnostic to
+  confirm real ticks now arrive.
 - ✅ **Phase 7** — Strategies 4 & 5 (OI/Volume Confirmed, Liquidity
   Sweep/Reversal), built out of order ahead of Phase 6 since neither needs
   Shoonya — both paper-only, against the mock broker, five of six
@@ -562,6 +606,113 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-12: likely root cause found for the option-chain zero-price gap
+  below — `SearchScrip` is returning an empty `token` field for every
+  recently-synced NIFTY/BANKNIFTY option row.** Live evidence: the
+  `option_contracts` rows synced before ~2026-08-10 (an old, since-
+  deactivated BANKNIFTY batch, 22 rows) have a real `broker_token`; every
+  row synced since (all of NIFTY's current 42 active rows, and BANKNIFTY's
+  current 42) has `broker_token=''`. Symbols/strikes/expiries in the same
+  rows are correct — only the token is missing. Confirmed live via
+  `/shoonya/ws-tick-diagnostic`: `resolve_token` fails with "no cached
+  broker token" for a real, currently-listed NIFTY contract, because
+  `ShoonyaBrokerAdapter._remember_token` only caches a token when one is
+  actually present (`if token: ...`) — an empty string from the broker is
+  silently never cached. Without a token, nothing can subscribe to or
+  quote that contract via WS *or* REST — this plausibly explains the
+  zero-price `GetQuotes` symptom below too (same missing token feeding
+  `GetOptionChain`'s per-strike pricing calls), not just today's WS-tick
+  test. Timing lines up with Shoonya's own OAuth migration (same one that
+  broke the WS auth payload, fixed 2026-08-11). **Not yet raised with
+  Shoonya support** — worth doing given they were responsive and fixed the
+  WS issue quickly; cite the exact before/after `broker_token` evidence
+  above, not just "GetQuotes returns zero."
+  **2026-08-12, same session -- bigger correction underneath this:**
+  Shoonya's own official static scrip master
+  (`https://api.shoonya.com/NFO_symbols.txt.zip`, a real, live, public,
+  daily-updated file -- confirmed by downloading and inspecting it
+  directly, not assumed) shows NIFTY's and BANKNIFTY's real current
+  near-term expiries are **18-AUG-2026 and 25-AUG-2026 respectively --
+  both Tuesday** -- and **`13-AUG-2026` does not exist in that file at
+  all**. The "confirmed correct" `13-AUG-2026` (Thursday) data this
+  session spent two days treating as ground truth (including a live
+  spot-price cross-check that seemed to validate it) was itself wrong --
+  likely a `SearchScrip`-side echo of stale/legacy data, not a real
+  listed contract. The earlier "BANKNIFTY 25-AUG-2026 is stale, ~31,000
+  strikes are unrealistic" conclusion was also wrong -- that was an
+  under-sampled read (3 rows, not sorted by strike) of what's actually a
+  complete, real, correctly-priced chain spanning up through ~59,000
+  (right at real spot). **Immediate fix applied** via a one-off script
+  (deliberately not committed to the repo, not integrated into
+  `sync_instrument_master` -- see below): deactivated the wrong
+  `2026-08-13` rows for both underlyings (84 rows), and upserted 284
+  real, ATM-centered contracts for `2026-08-18` (NIFTY) / `2026-08-25`
+  (BANKNIFTY) with real broker tokens read directly from the scrip
+  master file. Final DB state verified correct: NIFTY 162 active
+  contracts (all real tokens), BANKNIFTY 144 active (122 newly inserted
+  + 22 pre-existing deep-OTM rows from before the token bug, silently
+  reactivated by the normal sync's own not-yet-expired-contract
+  reactivation logic once `SearchScrip` echoed them again).
+  **Deliberately deferred to a future session**: the real daily-download
+  pipeline (scheduled fetch, parse, bulk upsert, `SearchScrip` demoted to
+  fallback) -- this session's fix is a manual, one-time correction only,
+  chosen explicitly over rushing a permanent pipeline late in an
+  already-long session. When building it, mirror
+  `AngelOneMarketDataProvider`'s own `ScripMasterService` pattern
+  (`market_data/scrip_master.py`) rather than inventing a new shape --
+  same problem, same broker family (Noren-based), already-proven design
+  in this codebase.
+  **2026-08-12, follow-up: the CE/PE-suffix symbol convention this
+  codebase has treated as confirmed-correct for months may itself trace
+  back to the same bad Aug-13 dataset.** The scrip-master-corrected rows
+  above were initially given reconstructed symbols in that CE/PE-suffix
+  style (`BANKNIFTY25AUG2657900PE`) to match existing convention --
+  live-rejected by a real `GetOptionChain` call: `HTTP 400 Invalid
+  Trading Symbol`. Shoonya's own scrip master (and the one older
+  BANKNIFTY batch that predates the token bug and was genuinely
+  resynced successfully) both use a **P/C-suffix** format instead
+  (`BANKNIFTY25AUG26P57900`) -- fixed for these 284 rows via a second
+  one-off script (symbol column only, nothing else touched).
+  **Audited the same day, made P/C-suffix the default wherever a
+  Shoonya symbol appears in code.** Result: `normalizer.py` itself was
+  never actually wrong -- `_strike_from_tsym`'s own regex and its
+  docstring already expected P/C-suffix, built months ago from a real,
+  live-observed row (`NIFTY04AUG26C18500`); `to_place_order_payload`
+  never constructs a symbol at all, it passes `request.contract_symbol`
+  through verbatim, so a correct DB value flows through correctly with
+  no code change needed. The wrong convention existed only in two
+  places: this session's own one-off correction script (already fixed)
+  and Shoonya's test fixtures across `test_shoonya_normalizer.py`,
+  `test_shoonya_rest_client.py`, `test_shoonya_adapter.py`,
+  `test_shoonya_ws_client.py`, `test_api_shoonya.py` (all updated to
+  P/C-suffix for consistency, even where the exact string was only ever
+  opaque pass-through data functionally) -- see `normalizer.py`'s own
+  module docstring for the full, authoritative writeup, now the single
+  place this format is documented. **Deliberately scoped to Shoonya
+  only** -- Angel One, TrueData, and the mock adapter each have their
+  own, unrelated, already-correct conventions and were left untouched.
+- **Designated fallback for Shoonya's option-chain zero-price gap: TrueData's
+  live option-chain REST API.** Live-found 2026-08-11: Shoonya's own
+  `GetQuotes`-per-contract option-chain pricing returned zero live price on
+  every strike, continuously, for a full paper session (both before and
+  after market close) — no exceptions, no parse errors, just no usable
+  price, which `market_data/freshness.py`'s `classify_option_chain` then
+  correctly refuses to trade on (forces `DEAD`, skips the strategy cycle,
+  by design — see that function's own docstring). Root cause on Shoonya's
+  side still unconfirmed as of this note. TrueData has a genuine, separate
+  live option-chain source that isn't Shoonya-dependent at all —
+  `getoptionchain` on `analytics.truedata.in` (REST, poll-based) and/or
+  `TD_live.start_option_chain(...)` (WS-native, continuously updating off
+  the same real-time feed `TrueDataProvider` already uses for underlying
+  ticks) — see that module's own docstring for the confirmed API shape.
+  **Not implemented** — this is the designated fallback plan if Shoonya's
+  gap turns out to be persistent/systemic rather than a one-off, not
+  something built into the code yet. Whoever picks this up next: it would
+  mean `BrokerPort.get_option_chain`'s current Shoonya-only scope needs
+  either a second implementation route or a provider-agnostic seam
+  (mirroring the market-data/execution split `BaseMarketDataProvider`
+  already established for ticks) — a real architecture decision, not a
+  drop-in swap.
 - **Shoonya IP whitelist / static-IP situation** — user was checking with Airtel
   about CGNAT vs static IP; outcome not yet recorded here. Relevant when Phase 5
   configures `SHOONYA_PRIMARY_IP`/`SHOONYA_BACKUP_IP`.

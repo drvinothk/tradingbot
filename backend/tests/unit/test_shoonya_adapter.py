@@ -117,7 +117,7 @@ class _FakeRestClient:
 
     def position_book(self, uid, actid):
         self._record("position_book", uid, actid)
-        return [{"tsym": "NIFTY30JUL2624000CE", "netqty": "25", "netavgprc": "119.5"}]
+        return [{"tsym": "NIFTY30JUL26C24000", "netqty": "25", "netavgprc": "119.5"}]
 
     def close(self):
         pass
@@ -240,14 +240,14 @@ def test_get_instrument_master_skips_unparseable_rows_rather_than_aborting():
 def test_get_quote_requires_resolved_token_first():
     adapter, _ = _adapter()
     with pytest.raises(ShoonyaApiError, match="no cached broker token"):
-        adapter.get_quote("NIFTY30JUL2624000CE")
+        adapter.get_quote("NIFTY30JUL26C24000")
 
 
 def test_get_quote_after_instrument_master_resolves_token():
     rest = _FakeRestClient()
     rest.search_scrip_response = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "ls": "25",
             "ti": "0.05",
             "token": "12345",
@@ -261,7 +261,7 @@ def test_get_quote_after_instrument_master_resolves_token():
     adapter, _ = _adapter(rest)
     adapter.get_instrument_master("NFO")
 
-    tick = adapter.get_quote("NIFTY30JUL2624000CE")
+    tick = adapter.get_quote("NIFTY30JUL26C24000")
     assert tick.ltp == 100.0
 
 
@@ -270,7 +270,7 @@ def test_place_order_is_idempotent_on_key():
     adapter, _ = _adapter(rest)
     request = OrderRequest(
         idempotency_key="key-1",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
@@ -293,7 +293,7 @@ def test_place_order_follows_up_with_status_when_pending():
 
     request = OrderRequest(
         idempotency_key="key-2",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.MARKET,
         qty=25,
@@ -330,7 +330,7 @@ def test_place_order_ack_timeout_finds_the_real_order_via_order_history():
     adapter, _ = _adapter(rest)
     request = OrderRequest(
         idempotency_key="key-timeout-1",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
@@ -360,7 +360,7 @@ def test_place_order_ack_timeout_reraises_when_order_genuinely_not_found():
     adapter, _ = _adapter(rest)
     request = OrderRequest(
         idempotency_key="key-timeout-2",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
@@ -383,7 +383,7 @@ def test_place_order_clean_rejection_does_not_trigger_order_history_fallback():
     adapter, _ = _adapter(rest)
     request = OrderRequest(
         idempotency_key="key-rejected-1",
-        contract_symbol="NIFTY30JUL2624000CE",
+        contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
@@ -418,7 +418,7 @@ def _configure_search_scrip_for_option_chain(
     rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
     rest.search_scrip_response_by_exchange["NFO"] = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": expiry.strftime("%d-%b-%Y").upper(),
@@ -431,7 +431,7 @@ def _configure_search_scrip_for_option_chain(
 
 def test_get_option_chain_resolves_underlying_token_on_nse_not_nfo():
     """Live-corrected against a real account: NFO only lists derivative
-    contracts on NIFTY/BANKNIFTY (e.g. NIFTY30JUL2624000CE), never a bare
+    contracts on NIFTY/BANKNIFTY (e.g. NIFTY30JUL26C24000), never a bare
     "NIFTY" tsym — only NSE (the cash/index segment) has the underlying
     itself. Even on NSE, the index's own tsym isn't the bare underlying
     name — it's "Nifty 50", confirmed via a live diagnostic log of real
@@ -496,21 +496,21 @@ def test_get_option_chain_anchors_on_exact_expiry_option_contract():
         # exact-expiry match are doing real work, not just picking whatever
         # comes back first.
         {
-            "tsym": "NIFTYBEES30JUL2624000CE",
+            "tsym": "NIFTYBEES30JUL26C24000",
             "instname": "OPTSTK",
             "symname": "NIFTYBEES",
             "exd": "30-JUL-2026",
             "token": "1",
         },
         {
-            "tsym": "NIFTY06AUG2624000CE",
+            "tsym": "NIFTY06AUG26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": "06-AUG-2026",
             "token": "2",
         },
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": "30-JUL-2026",
@@ -523,8 +523,33 @@ def test_get_option_chain_anchors_on_exact_expiry_option_contract():
     search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
     assert ("FA1", "NFO", "NIFTY") in search_calls
     chain_calls = [call[1] for call in rest.calls if call[0] == "get_option_chain"]
-    assert chain_calls[0][2] == "NIFTY30JUL2624000CE"
+    assert chain_calls[0][2] == "NIFTY30JUL26C24000"
     assert chain_calls[0][1] == "NFO"
+
+
+def test_seed_option_anchor_avoids_a_live_search_scrip_call():
+    """2026-08-12: `SearchScrip` proved itself unreliable live (returning
+    empty results for a real, currently-listed underlying+expiry, more
+    than once in the same session) -- `seed_option_anchor` lets a caller
+    that already knows a good anchor from this system's own DB skip the
+    live call entirely for that `(underlying, expiry)`, since an exact
+    calendar expiry's anchor can never go stale once known.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+
+    adapter.seed_option_anchor("NIFTY", date(2026, 8, 18), "NIFTY18AUG26C24400")
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    rest.search_scrip_response_by_exchange["NFO"] = []  # would fail resolution if ever called
+
+    adapter.get_option_chain("NIFTY", date(2026, 8, 18))
+
+    nfo_calls = [
+        call[1] for call in rest.calls if call[0] == "search_scrip" and call[1][1] == "NFO"
+    ]
+    assert nfo_calls == [], "a seeded anchor must never trigger a live NFO SearchScrip call"
+    chain_calls = [call[1] for call in rest.calls if call[0] == "get_option_chain"]
+    assert chain_calls[0][2] == "NIFTY18AUG26C24400"
 
 
 def test_resolve_option_anchor_tsym_raises_when_no_matching_expiry_exists():
@@ -566,7 +591,7 @@ def test_resolve_option_anchor_tsym_caches_by_underlying_and_expiry():
     expiry = date(2026, 7, 30)
     rest.search_scrip_response_by_exchange["NFO"] = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": "30-JUL-2026",
@@ -577,7 +602,7 @@ def test_resolve_option_anchor_tsym_caches_by_underlying_and_expiry():
     first = adapter._resolve_option_anchor_tsym("NIFTY", expiry)
     second = adapter._resolve_option_anchor_tsym("NIFTY", expiry)
 
-    assert first == second == "NIFTY30JUL2624000CE"
+    assert first == second == "NIFTY30JUL26C24000"
     search_calls = [call for call in rest.calls if call[0] == "search_scrip"]
     assert len(search_calls) == 1
 
@@ -591,14 +616,14 @@ def test_resolve_option_anchor_tsym_refetches_for_a_different_expiry():
     adapter, _ = _adapter(rest)
     rest.search_scrip_response_by_exchange["NFO"] = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": "30-JUL-2026",
             "token": "3",
         },
         {
-            "tsym": "NIFTY06AUG2624000CE",
+            "tsym": "NIFTY06AUG26C24000",
             "instname": "OPTIDX",
             "symname": "NIFTY",
             "exd": "06-AUG-2026",
@@ -609,8 +634,8 @@ def test_resolve_option_anchor_tsym_refetches_for_a_different_expiry():
     first = adapter._resolve_option_anchor_tsym("NIFTY", date(2026, 7, 30))
     second = adapter._resolve_option_anchor_tsym("NIFTY", date(2026, 8, 6))
 
-    assert first == "NIFTY30JUL2624000CE"
-    assert second == "NIFTY06AUG2624000CE"
+    assert first == "NIFTY30JUL26C24000"
+    assert second == "NIFTY06AUG26C24000"
     search_calls = [call for call in rest.calls if call[0] == "search_scrip"]
     assert len(search_calls) == 2
 
@@ -648,14 +673,14 @@ def test_get_option_chain_entries_include_live_per_strike_quotes():
     _configure_search_scrip_for_option_chain(rest)
     rest.get_option_chain_response = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "token": "111",
             "strprc": "24000.00",
             "optt": "CE",
             "instname": "OPTIDX",
         },
         {
-            "tsym": "NIFTY30JUL2624000PE",
+            "tsym": "NIFTY30JUL26P24000",
             "token": "112",
             "strprc": "24000.00",
             "optt": "PE",
@@ -674,7 +699,7 @@ def test_get_option_chain_entries_include_live_per_strike_quotes():
 
     assert len(snapshot.entries) == 2
     entry = snapshot.entries[0]
-    assert entry.contract_symbol == "NIFTY30JUL2624000CE"
+    assert entry.contract_symbol == "NIFTY30JUL26C24000"
     assert entry.ltp == 142.35
     assert entry.bid == 142.00
     assert entry.ask == 142.70
@@ -695,7 +720,7 @@ def test_get_option_chain_zero_fills_entry_when_live_quote_fetch_fails():
     _configure_search_scrip_for_option_chain(rest)
     rest.get_option_chain_response = [
         {
-            "tsym": "NIFTY30JUL2624000CE",
+            "tsym": "NIFTY30JUL26C24000",
             "token": "111",
             "strprc": "24000.00",
             "optt": "CE",
