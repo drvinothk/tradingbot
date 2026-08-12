@@ -12,12 +12,15 @@ instance just returns the `AuthResult` it was built with; it does not
 attempt to (and cannot) run the OAuth flow itself.
 
 **Only ever syncs NIFTY/BANKNIFTY** — deliberately, not a literal "every
-tradable instrument on the exchange." `get_instrument_master` is
-implemented via `SearchScrip` against this system's own known-underlyings
-list (matching `mock_universe.py`'s hardcoded `NIFTY`/`BANKNIFTY` scope),
-not a bulk scrip-master file download — this system never trades anything
-else, so syncing thousands of irrelevant stock F&O contracts would be pure
-waste, not fidelity to the interface's literal wording.
+tradable instrument on the exchange" (matching `mock_universe.py`'s own
+hardcoded `NIFTY`/`BANKNIFTY` scope). `get_instrument_master`'s NFO path
+(2026-08-12) now reads Shoonya's own bulk scrip-master file first,
+filtered down to just those two underlyings' index options at parse time
+(see `shoonya.scrip_master`'s own docstring) — this system never trades
+anything else, so keeping thousands of irrelevant stock F&O rows around
+would be pure waste, not fidelity to the interface's literal wording.
+`SearchScrip` (this method's *only* NFO source before today) is now a
+fallback, kept for when the static file is unreachable.
 
 **Error-to-mode-transition mapping is not fully wired yet.** Phase 5's spec
 calls for invalid-credentials/IP-mismatch/TOTP-drift/mid-session-expiry/
@@ -59,6 +62,7 @@ from app.modules.broker_adapter.base.contracts import (
     Tick,
 )
 from app.modules.broker_adapter.shoonya import normalizer
+from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.rest_client import (
     ShoonyaApiError,
     ShoonyaRestClient,
@@ -166,6 +170,39 @@ class ShoonyaBrokerAdapter(BrokerPort):
     # -- BrokerPort: instrument / chain data ----------------------------------
 
     def get_instrument_master(self, exchange: str) -> list[InstrumentInfo]:
+        """2026-08-12: for `exchange == "NFO"`, tries Shoonya's own official
+        static scrip master file first (`shoonya.scrip_master`, a real,
+        public, no-auth, daily-updated download) — live evidence this same
+        session showed `SearchScrip` returning different, non-overlapping
+        expiry subsets across separate calls for the same underlying, and
+        an empty `broker_token` for every recently-synced option row. The
+        static file has neither failure mode (confirmed by downloading and
+        inspecting it directly). `SearchScrip` is demoted to a fallback —
+        used only if the static file's download/parse fails or returns
+        nothing — never removed, so an unreachable file degrades to
+        exactly today's existing (imperfect but working) behavior, never
+        worse. Every other exchange keeps the original `SearchScrip`-only
+        path unchanged.
+        """
+        if exchange == "NFO":
+            zip_bytes = None
+            with httpx.Client(timeout=30.0) as client:
+                zip_bytes = shoonya_scrip_master.download_nfo_scrip_master(client)
+            if zip_bytes is not None:
+                infos = shoonya_scrip_master.parse_nfo_scrip_master(zip_bytes)
+                if infos:
+                    for info in infos:
+                        self._remember_token(info.symbol, exchange, info.broker_token)
+                    return infos
+                logger.warning(
+                    "Shoonya scrip master file parsed to zero NIFTY/BANKNIFTY rows — "
+                    "falling back to SearchScrip"
+                )
+            else:
+                logger.warning("Shoonya scrip master download failed — falling back to SearchScrip")
+        return self._get_instrument_master_via_search_scrip(exchange)
+
+    def _get_instrument_master_via_search_scrip(self, exchange: str) -> list[InstrumentInfo]:
         infos: list[InstrumentInfo] = []
         for underlying in KNOWN_UNDERLYINGS:
             rows = self._rest.search_scrip(self._uid, exchange, underlying)

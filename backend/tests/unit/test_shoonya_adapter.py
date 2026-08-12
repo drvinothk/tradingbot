@@ -9,10 +9,13 @@ from pydantic import SecretStr
 from app.config.settings import ShoonyaSettings
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
+    InstrumentInfo,
+    OptionType,
     OrderRequest,
     OrderSide,
     OrderType,
 )
+from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 from app.modules.broker_adapter.shoonya.rest_client import ShoonyaApiError
 
@@ -136,7 +139,42 @@ def test_authenticate_returns_the_held_auth_result():
     assert adapter.authenticate() == AUTH_RESULT
 
 
-def test_get_instrument_master_queries_known_underlyings_only():
+def test_get_instrument_master_prefers_the_static_scrip_master_for_nfo(monkeypatch):
+    """2026-08-12: the real gap this closes — SearchScrip live-confirmed to
+    return different, non-overlapping expiry subsets across separate calls
+    and an empty broker_token for recently-synced rows; the static file has
+    neither failure mode. `SearchScrip` must not be called at all when the
+    static file succeeds.
+    """
+    static_info = InstrumentInfo(
+        symbol="NIFTY18AUG26C18550",
+        exchange="NFO",
+        lot_size=65,
+        tick_size=0.05,
+        is_option=True,
+        underlying="NIFTY",
+        expiry=date(2026, 8, 18),
+        strike=18550.0,
+        option_type=OptionType.CE,
+        broker_token="48407",
+    )
+    monkeypatch.setattr(
+        shoonya_scrip_master, "download_nfo_scrip_master", lambda client: b"fake-zip-bytes"
+    )
+    monkeypatch.setattr(
+        shoonya_scrip_master, "parse_nfo_scrip_master", lambda zip_bytes: [static_info]
+    )
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+
+    infos = adapter.get_instrument_master("NFO")
+
+    assert infos == [static_info]
+    assert not any(call[0] == "search_scrip" for call in rest.calls)
+
+
+def test_get_instrument_master_falls_back_to_search_scrip_when_download_fails(monkeypatch):
+    monkeypatch.setattr(shoonya_scrip_master, "download_nfo_scrip_master", lambda client: None)
     rest = _FakeRestClient()
     rest.search_scrip_response = [
         {"tsym": "NIFTY", "ls": "25", "ti": "0.05", "token": "26000", "instname": "IDX"}
@@ -144,6 +182,56 @@ def test_get_instrument_master_queries_known_underlyings_only():
     adapter, _ = _adapter(rest)
 
     infos = adapter.get_instrument_master("NFO")
+
+    assert any(call[0] == "search_scrip" for call in rest.calls)
+    assert len(infos) == 2  # one row per underlying in this fake, via the fallback
+
+
+def test_get_instrument_master_falls_back_to_search_scrip_when_parse_yields_nothing(monkeypatch):
+    """A reachable file that parses to zero NIFTY/BANKNIFTY rows (e.g. a
+    genuinely empty or entirely-unrelated download) must fall back exactly
+    like a failed download -- not silently return an empty instrument
+    master.
+    """
+    monkeypatch.setattr(
+        shoonya_scrip_master, "download_nfo_scrip_master", lambda client: b"fake-zip-bytes"
+    )
+    monkeypatch.setattr(shoonya_scrip_master, "parse_nfo_scrip_master", lambda zip_bytes: [])
+    rest = _FakeRestClient()
+    rest.search_scrip_response = [
+        {"tsym": "NIFTY", "ls": "25", "ti": "0.05", "token": "26000", "instname": "IDX"}
+    ]
+    adapter, _ = _adapter(rest)
+
+    infos = adapter.get_instrument_master("NFO")
+
+    assert any(call[0] == "search_scrip" for call in rest.calls)
+    assert len(infos) == 2
+
+
+def test_get_instrument_master_non_nfo_exchange_never_tries_the_static_file(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        shoonya_scrip_master,
+        "download_nfo_scrip_master",
+        lambda client: calls.append("download") or None,
+    )
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+
+    adapter.get_instrument_master("NSE")
+
+    assert calls == []
+
+
+def test_get_instrument_master_queries_known_underlyings_only():
+    rest = _FakeRestClient()
+    rest.search_scrip_response = [
+        {"tsym": "NIFTY", "ls": "25", "ti": "0.05", "token": "26000", "instname": "IDX"}
+    ]
+    adapter, _ = _adapter(rest)
+
+    infos = adapter._get_instrument_master_via_search_scrip("NFO")
 
     searched_underlyings = [call[1][2] for call in rest.calls if call[0] == "search_scrip"]
     assert searched_underlyings == ["NIFTY", "BANKNIFTY"]
@@ -182,7 +270,7 @@ def test_get_instrument_master_skips_futures_rows():
     ]
     adapter, _ = _adapter(rest)
 
-    infos = adapter.get_instrument_master("NFO")
+    infos = adapter._get_instrument_master_via_search_scrip("NFO")
 
     # One kept row (IDX) per underlying searched (NIFTY, BANKNIFTY) in this
     # fake — both futures rows skipped for both.
@@ -227,7 +315,7 @@ def test_get_instrument_master_skips_unparseable_rows_rather_than_aborting():
     ]
     adapter, _ = _adapter(rest)
 
-    infos = adapter.get_instrument_master("NFO")
+    infos = adapter._get_instrument_master_via_search_scrip("NFO")
 
     # Two underlyings searched (NIFTY, BANKNIFTY), each returning the same
     # two canned rows in this fake — one bad + one good per underlying, so
@@ -259,7 +347,7 @@ def test_get_quote_after_instrument_master_resolves_token():
         }
     ]
     adapter, _ = _adapter(rest)
-    adapter.get_instrument_master("NFO")
+    adapter._get_instrument_master_via_search_scrip("NFO")
 
     tick = adapter.get_quote("NIFTY30JUL26C24000")
     assert tick.ltp == 100.0
