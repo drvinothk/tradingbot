@@ -331,6 +331,7 @@ def _cleanup_instrument_and_dependents(engine, instrument_id: uuid.UUID) -> None
         TradeOutcome,
         TrailPlan,
     )
+    from app.domain.market.models import OptionChainSnapshot
     from app.domain.risk.models import RiskDecision
     from app.domain.strategy.models import PendingTradeApproval, Signal, TradeIntent
 
@@ -397,6 +398,15 @@ def _cleanup_instrument_and_dependents(engine, instrument_id: uuid.UUID) -> None
         db.query(OptionContract).filter(OptionContract.instrument_id == instrument_id).delete(
             synchronize_session=False
         )
+        # New since the Stage 1 price-source fix: real EOD/margin-breach
+        # square-off (current_contract_price -> ensure_fresh_option_chain)
+        # can now genuinely write an OptionChainSnapshot row for this
+        # instrument, which didn't happen before (that path used
+        # broker.get_quote() directly, no DB write) -- must be cleaned up
+        # before the Instrument delete or it FK-violates.
+        db.query(OptionChainSnapshot).filter(
+            OptionChainSnapshot.instrument_id == instrument_id
+        ).delete(synchronize_session=False)
         db.query(Instrument).filter(Instrument.id == instrument_id).delete()
         db.commit()
 

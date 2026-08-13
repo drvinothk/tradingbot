@@ -12,13 +12,18 @@ current price, force a square-off once IST wall-clock passes
 periodically run a polling reconciliation pass.
 
 **Price source**: stop/target/trail checks read live price from
-`market_data.provider_composition.get_market_data_provider()` (Angel One in
-production), not from the execution broker (Shoonya) — full market-data/
-execution decoupling, since Shoonya's own feed is the fragile one this
-system stopped trusting for anything price-critical. `broker.get_quote()`
-(Shoonya, via `get_execution_broker`) is still used for order placement
-(EOD/margin-breach square-off) and as a one-cycle fallback if the live feed
-hasn't delivered a fresh tick yet — see `_live_tick`.
+`market_data.provider_composition.get_market_data_provider()` first (works
+reliably for underlyings, unreliable-to-nonexistent for individual option
+contracts in this deployment — see `_live_tick`). For **underlyings**,
+falling back to `broker.get_quote()` (the execution broker, always the mock
+today) is still fine, since the live feed rarely misses there. For
+**option contracts** specifically, `_live_tick`/`broker.get_quote()` is
+*not* used as the fallback — see `execution_engine.paper.service
+.current_contract_price`, which falls back to the same REST-based
+`OptionChainSnapshot` the strategy itself proposed the trade from, since
+`broker.get_quote()` would otherwise price the position from the mock's
+own synthetic, strategy-independent seed (the exact price-source mismatch
+this module's history had before this fix).
 """
 
 from __future__ import annotations
@@ -26,8 +31,8 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -51,7 +56,10 @@ from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerError
 from app.modules.broker_adapter.composition import get_execution_broker
-from app.modules.execution_engine.paper.service import evaluate_open_position
+from app.modules.execution_engine.paper.service import (
+    current_contract_price,
+    evaluate_open_position,
+)
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
@@ -175,7 +183,11 @@ class PositionManager:
             )
 
     def _check_margin_breach(
-        self, db: Session, trading_session: TradingSession, broker: BrokerPort
+        self,
+        db: Session,
+        trading_session: TradingSession,
+        broker: BrokerPort,
+        market_data_provider: BaseMarketDataProvider,
     ) -> None:
         """Addendum hardening batch's one narrow automatic emergency-square-
         off trigger (build-plan.md: "a detected margin breach on a live
@@ -209,7 +221,9 @@ class PositionManager:
         # run_eod_square_off's import in _run_cycle below.
         from app.modules.scheduler.eod_square_off import run_margin_breach_square_off
 
-        run_margin_breach_square_off(db, broker, trading_session)
+        run_margin_breach_square_off(
+            db, broker, trading_session, market_data_provider=market_data_provider
+        )
 
         reason = f"margin breach: available_margin={margin.available_margin:.2f}"[:500]
         db.add(
@@ -320,16 +334,52 @@ class PositionManager:
         # its current price once per cycle regardless of how many
         # positions reference it.
         underlying_price_cache: dict[uuid.UUID, float] = {}
+
+        @contextmanager
+        def _same_session() -> Iterator[Session]:
+            # Reuses this cycle's already-open db/transaction for any
+            # option-chain refresh current_contract_price triggers, same
+            # reasoning as strategy_engine.runner.run_cycle's own
+            # _same_session — keeps the refresh atomic with the rest of
+            # this cycle rather than opening a second, independently-
+            # committing connection.
+            yield db
+
         for position in open_positions:
             option_contract = db.get(OptionContract, position.option_contract_id)
             if option_contract is None:
                 continue
-            tick = self._live_tick(market_data_provider, option_contract.symbol, broker)
+            # Still subscribe (idempotent, tracked in self._subscribed_symbols)
+            # even though this deployment's per-contract WS never actually
+            # delivers anything today — current_contract_price only *reads*
+            # the provider's cache, it doesn't subscribe, so without this the
+            # "try live tick first" branch could never succeed even after a
+            # future WS-for-contracts fix landed.
+            self._ensure_symbol_subscribed(market_data_provider, option_contract.symbol)
+            # Option-contract pricing: prefers a live WS tick (works today
+            # for free if a future per-contract WS fix lands), otherwise
+            # falls back to the same REST OptionChainSnapshot the strategy
+            # itself proposed this trade from — not broker.get_quote()
+            # directly, which (get_execution_broker() always being the
+            # mock) would price this contract from the mock's own
+            # synthetic, strategy-independent seed. See
+            # current_contract_price's own docstring.
+            tick = current_contract_price(
+                db,
+                option_contract,
+                broker,
+                market_data_provider=market_data_provider,
+                session_factory=_same_session,
+            )
 
             underlying_price = underlying_price_cache.get(option_contract.instrument_id)
             if underlying_price is None:
                 instrument = db.get(Instrument, option_contract.instrument_id)
                 if instrument is not None:
+                    # Underlyings are unaffected by this change -- WS ticks
+                    # for NIFTY/BANKNIFTY are reliable, unlike per-contract
+                    # ticks, so this stays on the existing live-feed ->
+                    # broker.get_quote fallback.
                     underlying_price = self._live_tick(
                         market_data_provider, instrument.symbol, broker
                     ).ltp
@@ -347,7 +397,7 @@ class PositionManager:
             )
 
         if open_positions and SafeMode(trading_session.mode) in _MARGIN_BREACH_MODES:
-            self._check_margin_breach(db, trading_session, broker)
+            self._check_margin_breach(db, trading_session, broker, market_data_provider)
 
         # Local import: same load-time-cycle reasoning as
         # run_eod_square_off's import just below —
@@ -368,7 +418,9 @@ class PositionManager:
             # risk_engine.service.
             from app.modules.scheduler.eod_square_off import run_eod_square_off
 
-            run_eod_square_off(db, broker, trading_session)
+            run_eod_square_off(
+                db, broker, trading_session, market_data_provider=market_data_provider
+            )
 
         self._cycle_count += 1
         if self._cycle_count % self._reconcile_every_n_cycles == 0:

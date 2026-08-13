@@ -23,6 +23,7 @@ from app.core.db.session import session_scope
 from app.domain.market.models import Instrument
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.market_data.ingestion import SessionFactory, record_option_chain_snapshot
 
@@ -105,6 +106,41 @@ def _latest_chain_snapshot(
         .order_by(OptionChainSnapshotRow.ts.desc())
         .first()
     )
+
+
+def latest_snapshot_tick(
+    db: Session, instrument_id: uuid.UUID, expiry_date: date, contract_symbol: str
+) -> Tick | None:
+    """A specific contract's price from the latest `OptionChainSnapshot` for
+    its instrument+expiry -- the same REST-sourced data every strategy's
+    `rank_from_latest_snapshot` (`strategy_engine.strike_ranking.engine`)
+    already reads to propose a trade, so pricing an already-open position
+    against this agrees with whatever number the strategy itself reasoned
+    about, instead of an independent source (see
+    `execution_engine.paper.service.current_contract_price`, the caller
+    this exists for).
+
+    `None` if no snapshot exists yet for this instrument+expiry, or this
+    contract isn't in it (chain data for a contract that expired/rolled off
+    between snapshots, say) -- a real gap the caller must have its own
+    further fallback for, never silently trade on nothing.
+    """
+    snapshot = _latest_chain_snapshot(db, instrument_id, expiry_date)
+    if snapshot is None:
+        return None
+    entries: list[dict] = snapshot.chain_data or []  # type: ignore[assignment]
+    for entry in entries:
+        if entry.get("contract_symbol") == contract_symbol:
+            return Tick(
+                contract_symbol=contract_symbol,
+                ltp=float(entry.get("ltp", 0.0) or 0.0),
+                bid=float(entry.get("bid", 0.0) or 0.0),
+                ask=float(entry.get("ask", 0.0) or 0.0),
+                volume=int(entry.get("volume", 0) or 0),
+                oi=entry.get("oi"),
+                ts=snapshot.ts,
+            )
+    return None
 
 
 def _snapshot_has_live_prices(snapshot: OptionChainSnapshotRow) -> bool:

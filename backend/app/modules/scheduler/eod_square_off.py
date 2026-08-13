@@ -18,17 +18,26 @@ no-op, and `close_position` itself no-ops on an already-closed position.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from sqlalchemy.orm import Session
 
 from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
 from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.execution_engine.paper.service import close_position
+from app.modules.execution_engine.paper.service import close_position, current_contract_price
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 
 def _square_off_all_open_positions(
-    db: Session, broker: BrokerPort, trading_session: TradingSession, exit_reason: ExitReason
+    db: Session,
+    broker: BrokerPort,
+    trading_session: TradingSession,
+    exit_reason: ExitReason,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
 ) -> list[TradeOutcome]:
     open_positions = (
         db.query(Position)
@@ -39,12 +48,32 @@ def _square_off_all_open_positions(
         .all()
     )
 
+    @contextmanager
+    def _same_session() -> Iterator[Session]:
+        # Without this, current_contract_price's option-chain refresh would
+        # default to a brand new, independently-committing session_scope()
+        # -- a real, previously-documented trap in this codebase (a second
+        # connection can't see this transaction's own uncommitted rows,
+        # e.g. a test's own not-yet-committed Instrument/OptionContract).
+        yield db
+
     outcomes: list[TradeOutcome] = []
     for position in open_positions:
         option_contract = db.get(OptionContract, position.option_contract_id)
         if option_contract is None:
             continue
-        tick = broker.get_quote(option_contract.symbol)
+        # Same REST-option-chain-snapshot-preferring price source as every
+        # other paper-execution price decision -- was broker.get_quote()
+        # directly, which (since get_execution_broker() always resolves to
+        # the mock) returned the mock's own synthetic, strategy-independent
+        # price, same as the bug current_contract_price exists to close.
+        tick = current_contract_price(
+            db,
+            option_contract,
+            broker,
+            market_data_provider=market_data_provider,
+            session_factory=_same_session,
+        )
         outcome = close_position(
             db, trading_session, position, exit_reason, tick.ltp, broker=broker
         )
@@ -54,12 +83,32 @@ def _square_off_all_open_positions(
 
 
 def run_eod_square_off(
-    db: Session, broker: BrokerPort, trading_session: TradingSession
+    db: Session,
+    broker: BrokerPort,
+    trading_session: TradingSession,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
 ) -> list[TradeOutcome]:
-    return _square_off_all_open_positions(db, broker, trading_session, ExitReason.EOD_SQUARE_OFF)
+    return _square_off_all_open_positions(
+        db,
+        broker,
+        trading_session,
+        ExitReason.EOD_SQUARE_OFF,
+        market_data_provider=market_data_provider,
+    )
 
 
 def run_margin_breach_square_off(
-    db: Session, broker: BrokerPort, trading_session: TradingSession
+    db: Session,
+    broker: BrokerPort,
+    trading_session: TradingSession,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
 ) -> list[TradeOutcome]:
-    return _square_off_all_open_positions(db, broker, trading_session, ExitReason.MARGIN_BREACH)
+    return _square_off_all_open_positions(
+        db,
+        broker,
+        trading_session,
+        ExitReason.MARGIN_BREACH,
+        market_data_provider=market_data_provider,
+    )

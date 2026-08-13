@@ -50,6 +50,7 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.config.settings import get_settings
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
@@ -76,10 +77,20 @@ from app.domain.session.models import TradingSession
 from app.domain.strategy.models import SignalSide, TradeIntent
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, Tick
 from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSide
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
-from app.modules.broker_adapter.composition import get_execution_broker
+from app.modules.broker_adapter.composition import get_broker, get_execution_broker
+from app.modules.market_data.freshness import (
+    OPTION_CHAIN_THRESHOLDS,
+    TICK_THRESHOLDS,
+    FreshnessState,
+    classify_age,
+    ensure_fresh_option_chain,
+    latest_snapshot_tick,
+)
+from app.modules.market_data.ingestion import SessionFactory
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.reconciliation.service import run_reconciliation
 
 logger = logging.getLogger("app.execution_engine.paper.service")
@@ -126,6 +137,21 @@ def _map_status(status: BrokerOrderStatus) -> OrderStatus:
     return OrderStatus(status.value)
 
 
+def _apply_slippage(price: Decimal, order_side: SignalSide, slippage_pct: Decimal) -> Decimal:
+    """Worse execution than the reference price, in whichever direction
+    actually hurts the trader for *this order's own side* -- a BUY (opening
+    a long, or closing a short) fills slightly higher; a SELL (closing a
+    long, or opening a short) fills slightly lower. The same rule works
+    uniformly for both an entry order and an exit order without needing to
+    know which one this is -- only the order's own side matters.
+    """
+    if slippage_pct == 0:
+        return price
+    if order_side == SignalSide.BUY:
+        return price * (Decimal("1") + slippage_pct)
+    return price * (Decimal("1") - slippage_pct)
+
+
 def dispatch_trade_intent(
     db: Session,
     trading_session: TradingSession,
@@ -161,6 +187,17 @@ def dispatch_trade_intent(
         qty = trade_intent.qty_lots * instrument.lot_size
         now = _utcnow()
 
+        # trade_intent.entry_price is already the strategy's real,
+        # REST-option-chain-derived proposed price (see every strategy's
+        # rank_from_latest_snapshot() call) -- pass it through as the fill
+        # basis instead of leaving MockBrokerAdapter to fill at its own
+        # independent synthetic price. order_type stays MARKET (existing
+        # contract/tests expect it); limit_price here is paper-mode fill
+        # plumbing only -- a real broker adapter must not send this
+        # unchanged on an actual MARKET order.
+        slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
+        limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, slippage_pct))
+
         order_result = broker.place_order(
             OrderRequest(
                 idempotency_key=trade_intent.idempotency_key,
@@ -168,6 +205,7 @@ def dispatch_trade_intent(
                 side=_to_broker_side(side),
                 order_type=BrokerOrderType.MARKET,
                 qty=qty,
+                limit_price=limit_price,
             )
         )
 
@@ -383,6 +421,16 @@ def close_position(
             db.query(Order).filter(Order.idempotency_key == exit_idempotency_key).one_or_none()
         )
         if exit_order is None:
+            # intended_price is already the price level that justified this
+            # exit (stop/target/trail/structure-break/spread-blowout, or the
+            # current market price for EOD/manual) -- pass it through as the
+            # fill basis, same reasoning as the entry side in
+            # dispatch_trade_intent, instead of leaving MockBrokerAdapter to
+            # fill at its own independent synthetic price.
+            slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
+            exit_limit_price = float(
+                _apply_slippage(_dec(intended_price), exit_side, slippage_pct)
+            )
             order_result = broker.place_order(
                 OrderRequest(
                     idempotency_key=exit_idempotency_key,
@@ -390,6 +438,7 @@ def close_position(
                     side=_to_broker_side(exit_side),
                     order_type=BrokerOrderType.MARKET,
                     qty=position.qty,
+                    limit_price=exit_limit_price,
                 )
             )
             exit_order = Order(
@@ -703,3 +752,68 @@ def evaluate_open_position(
                 )
 
     return None
+
+
+def current_contract_price(
+    db: Session,
+    option_contract: OptionContract,
+    broker: BrokerPort,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
+    session_factory: SessionFactory | None = None,
+) -> Tick:
+    """The current price for one option contract, preferring a live WS tick
+    and otherwise falling back to the same REST-based `OptionChainSnapshot`
+    every strategy's own `rank_from_latest_snapshot` already reads
+    (refreshed via `market_data.freshness.ensure_fresh_option_chain`,
+    threshold-gated -- not a REST call every poll) rather than
+    `broker.get_quote()`. That fallback matters: since `get_execution_broker()`
+    always resolves to the mock regardless of session mode, `broker.get_quote()`
+    would return the mock's own synthetic, strategy-independent price -- the
+    exact price-source mismatch this whole change exists to close. Shared by
+    `PositionManager._run_cycle` (open-position stop/target/trail pricing)
+    and `scheduler.eod_square_off._square_off_all_open_positions` (forced
+    square-off pricing) so the fallback chain lives in exactly one place.
+
+    This function only *reads* `market_data_provider`'s cache -- it never
+    subscribes. `PositionManager` calls its own idempotent
+    `_ensure_symbol_subscribed` first, so its live-tick branch has a real
+    chance of succeeding (today, or automatically once a future per-contract
+    WS fix lands, with no re-work needed here). `eod_square_off.py` doesn't
+    subscribe before calling this -- a one-shot square-off subscribing
+    right before immediately reading wouldn't have a tick ready anyway -- so
+    its live-tick branch is normally a harmless no-op, straight to the
+    REST-snapshot fallback.
+
+    Only ever falls through to `broker.get_quote()` as an absolute last
+    resort, matching `evaluate_open_position`'s own "never leave a stop
+    check silently unevaluated" discipline -- always returns *something*.
+    """
+    if market_data_provider is not None:
+        tick = market_data_provider.get_latest_tick(option_contract.symbol)
+        if tick is not None:
+            state = classify_age(tick.ts, datetime.now(UTC), TICK_THRESHOLDS)
+            if state in (FreshnessState.LIVE, FreshnessState.DEGRADED):
+                return tick
+
+    freshness_state = ensure_fresh_option_chain(
+        db,
+        get_broker(),
+        option_contract.instrument_id,
+        option_contract.expiry_date,
+        thresholds=OPTION_CHAIN_THRESHOLDS,
+        session_factory=session_factory,
+    )
+    if freshness_state not in (FreshnessState.STALE, FreshnessState.DEAD):
+        snapshot_tick = latest_snapshot_tick(
+            db, option_contract.instrument_id, option_contract.expiry_date, option_contract.symbol
+        )
+        if snapshot_tick is not None:
+            return snapshot_tick
+
+    logger.warning(
+        "no live tick or usable option-chain snapshot for %s; falling back to "
+        "broker.get_quote as a last resort",
+        option_contract.symbol,
+    )
+    return broker.get_quote(option_contract.symbol)

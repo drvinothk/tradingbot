@@ -274,6 +274,27 @@ def test_dispatch_creates_order_position_stop_and_trail(
     )
 
 
+def test_dispatch_fills_at_the_trade_intents_own_proposed_price(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The Stage 1 fix's own acceptance criterion: the fill price (and thus
+    Position.entry_price) must equal what the strategy actually proposed
+    (TradeIntent.entry_price), not MockBrokerAdapter's independent
+    synthetic price for this symbol -- proven by seeding the mock's own
+    price to something else entirely and confirming it has no effect.
+    """
+    broker._prices[option_contract.symbol] = 999.0  # noqa: SLF001 - must be ignored
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+
+    order = dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+
+    assert _price(order.avg_fill_price) == pytest.approx(80.0)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    assert float(position.entry_price) == pytest.approx(float(trade_intent.entry_price))
+
+
 def test_dispatch_uses_per_strategy_trail_fractions_when_set(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -318,12 +339,6 @@ def test_close_position_computes_pnl_and_slippage_on_stop(
     position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
     entry_price = _price(order.avg_fill_price)
 
-    # MockBrokerAdapter.place_order fills at the current cached price for
-    # the symbol, which is otherwise unchanged between dispatch and close in
-    # this test (nothing ticks it) — force a real price move so this test
-    # exercises actual P&L/slippage math instead of a trivial 0.0 no-op.
-    broker._prices[option_contract.symbol] = entry_price - 9.0  # noqa: SLF001
-
     outcome = close_position(
         db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
     )
@@ -333,11 +348,18 @@ def test_close_position_computes_pnl_and_slippage_on_stop(
     assert position.status == PositionStatus.CLOSED
     assert position.closing_order_id is not None
 
+    # Exit fills at intended_price itself (0.0 default slippage in this
+    # test, PAPER_FILL_SLIPPAGE_PCT unset) -- the fix this test now pins:
+    # close_position's exit order fills at the price that actually justified
+    # the exit, not at MockBrokerAdapter's own independent synthetic price
+    # (previously forced here via a broker._prices[...] reach-in that no
+    # longer has any effect on the fill, by design). See
+    # test_apply_slippage_direction (tests/unit) for the nonzero-slippage
+    # case.
     exit_fill_price = float(outcome.exit_price)
-    assert exit_fill_price == pytest.approx(entry_price - 9.0)
+    assert exit_fill_price == pytest.approx(72.0)
     assert outcome.realized_pnl == pytest.approx((exit_fill_price - entry_price) * 25)
-    assert outcome.realized_pnl == pytest.approx(-9.0 * 25)
-    assert outcome.slippage == pytest.approx((exit_fill_price - 72.0) * 25)
+    assert outcome.slippage == pytest.approx(0.0)
 
     stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
     assert stop_plan.status == "triggered"

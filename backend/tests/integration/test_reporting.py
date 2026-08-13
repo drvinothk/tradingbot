@@ -130,11 +130,19 @@ def _closed_trade(
 ) -> None:
     """Builds a Signal/TradeIntent directly (bypassing Risk Service, same as
     the other Phase 3 test files) and drives it through a real dispatch +
-    close, with the mock broker's price forced at each step so the
-    resulting realized_pnl/slippage are exact, known numbers.
+    close for exact, known realized_pnl/slippage numbers.
+
+    Since the Stage 1 price-source fix, entry/exit fills come from
+    `entry_price`/`intended_price` themselves (plus PAPER_FILL_SLIPPAGE_PCT,
+    0.0 unless configured), not from MockBrokerAdapter's own independent
+    price -- the `broker._prices[...]` assignments below are now a no-op as
+    far as the actual fill goes; `exit_price` is accepted for call-site
+    readability at existing callers but no longer drives the result (that's
+    `intended_price`'s job now). Callers where `exit_price == intended_price`
+    are unaffected either way.
     """
     now = datetime.now(UTC)
-    broker._prices[option_contract.symbol] = entry_price  # noqa: SLF001
+    broker._prices[option_contract.symbol] = entry_price  # noqa: SLF001 - no longer affects the fill
 
     signal = Signal(
         id=uuid.uuid4(),
@@ -176,7 +184,7 @@ def _closed_trade(
     dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
     position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
 
-    broker._prices[option_contract.symbol] = exit_price  # noqa: SLF001
+    broker._prices[option_contract.symbol] = exit_price  # noqa: SLF001 - no longer affects the fill
     outcome = close_position(
         db, trading_session, position, exit_reason, intended_price, broker=broker
     )
@@ -191,17 +199,18 @@ def test_build_daily_report_matches_hand_computed_stats(
         db, workspace, trading_session, user, "daily-report-strategy"
     )
 
-    # Trade A: win, no slippage.
+    # Trade A: win. Fills at its own intended_price (target, 120) -- exit_price
+    # here is a no-op leftover, see _closed_trade's own docstring.
     _closed_trade(
         db, broker, trading_session, strategy_run, _contract(db, instrument, 22000, "A"),
         entry_price=100.0, exit_price=120.0, intended_price=120.0, exit_reason=ExitReason.TARGET,
     )
-    # Trade B: loss, unfavorable slippage (filled 2 worse than the stop level).
+    # Trade B: loss. Fills at its own intended_price (stop, 92).
     _closed_trade(
         db, broker, trading_session, strategy_run, _contract(db, instrument, 22050, "B"),
         entry_price=100.0, exit_price=90.0, intended_price=92.0, exit_reason=ExitReason.STOP,
     )
-    # Trade C: win, favorable slippage (filled 5 better than target).
+    # Trade C: win. Fills at its own intended_price (target, 110).
     _closed_trade(
         db, broker, trading_session, strategy_run, _contract(db, instrument, 22100, "C"),
         entry_price=100.0, exit_price=115.0, intended_price=110.0, exit_reason=ExitReason.TARGET,
@@ -209,17 +218,22 @@ def test_build_daily_report_matches_hand_computed_stats(
 
     report = build_daily_report(db, trading_session)
 
+    # A: (120-100)*25 = 500 win. B: (92-100)*25 = -200 loss.
+    # C: (110-100)*25 = 250 win. PAPER_FILL_SLIPPAGE_PCT unset (0.0) in every
+    # test run unless a test explicitly configures it, so every fill lands
+    # exactly on its own intended_price and slippage is 0.0 throughout --
+    # see test_paper_slippage.py (tests/unit) for the nonzero-slippage case.
     assert report.trading_session_id == trading_session.id
     assert report.trade_count == 3
     assert report.win_count == 2
     assert report.loss_count == 1
     assert report.win_rate == pytest.approx(2 / 3)
-    assert report.avg_win == pytest.approx((500.0 + 375.0) / 2)
-    assert report.avg_loss == pytest.approx(-250.0)
-    assert report.profit_factor == pytest.approx(875.0 / 250.0)
-    assert report.max_drawdown == pytest.approx(250.0)
-    assert report.total_realized_pnl == pytest.approx(625.0)
-    assert report.total_slippage == pytest.approx(0.0 + (-50.0) + 125.0)
+    assert report.avg_win == pytest.approx((500.0 + 250.0) / 2)
+    assert report.avg_loss == pytest.approx(-200.0)
+    assert report.profit_factor == pytest.approx(750.0 / 200.0)
+    assert report.max_drawdown == pytest.approx(200.0)
+    assert report.total_realized_pnl == pytest.approx(550.0)
+    assert report.total_slippage == pytest.approx(0.0)
     assert report.signal_count == 3
     assert report.dispatched_count == 3
     assert report.filled_count == 3

@@ -341,6 +341,25 @@ class AppSettings(BaseSettings):
     session_ttl_minutes: int = 60 * 12
 
 
+class PaperTradingSettings(BaseSettings):
+    """Paper-trade fill mechanics -- deliberately separate from RiskDefaults
+    (governance limits, not fill simulation) and from MarketDataSettings
+    (source of ticks, not what price mock fills execute at).
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PAPER_", env_file=DOTENV_PATH, extra="ignore")
+
+    # Applied unfavorably (worse than the reference price) on every mock
+    # fill -- entries pay slightly more, exits receive slightly less -- so
+    # paper P&L doesn't overstate real performance by assuming perfect
+    # fills. 0.0 by default: zero behavior change (beyond the price-source
+    # fix itself, which is not optional) for every existing test/deployment
+    # unless explicitly configured. A small nonzero value (e.g. 0.001-0.005)
+    # is recommended for realistic paper performance once this is
+    # live-verified.
+    fill_slippage_pct: float = 0.0
+
+
 class Settings:
     """Aggregate accessor — import `get_settings()`, not the sub-classes directly."""
 
@@ -353,6 +372,7 @@ class Settings:
         self.angel_one = AngelOneSettings()
         self.truedata = TrueDataSettings()
         self.risk_defaults = RiskDefaults()
+        self.paper_trading = PaperTradingSettings()
 
 
 @lru_cache
