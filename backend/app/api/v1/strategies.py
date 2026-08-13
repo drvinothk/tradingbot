@@ -104,22 +104,80 @@ VWAP_PULLBACK_PARAM_KEYS = {
 # identical key set. EMAMicroPullbackStrategy doesn't accept the three
 # VWAP-only trend/choppiness keys above; aliasing would let those leak into
 # an EMA strategy_config's allowlist and raise a TypeError at
-# start_strategy time.
+# start_strategy time. No `pullback_tolerance_frac` here (unlike VWAP) --
+# EMAMicroPullbackStrategy's Bone Zone pullback replaced the old
+# touch_and_confirm-based entry logic, and there's no tolerance band left
+# to configure.
 EMA_MICRO_PULLBACK_PARAM_KEYS = {
-    "pullback_tolerance_frac",
     "stop_pct",
     "target_pct",
     "trail_activation_fraction",
     "trail_lock_fraction",
+    "ema_expansion_lookback",
+    "min_body_ratio",
+    "ema_morning_window_start",
+    "ema_morning_window_end",
+    "ema_afternoon_window_start",
+    "ema_afternoon_window_end",
+    "ema_max_trades_per_session",
 }
+# Deliberately NOT in the allowlist above: ema_expiry_time_decay_exit,
+# ema_expiry_time_decay_bars, ema_expiry_quick_exit_rr -- stored in
+# strategy_configs.params inertly for a future phase to read, same
+# "no matching constructor kwarg, so don't forward it" reasoning as ORB's
+# own expiry-day-only config hooks above.
 OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "lookback_bars",
     "stop_pct",
     "target_pct",
     "trail_activation_fraction",
     "trail_lock_fraction",
+    "oi_use_futures_volume_confirmation",
+    "oi_futures_volume_multiplier",
+    "oi_use_atm_oi_buildup",
+    "min_range_nifty_points",
+    "max_range_nifty_points",
+    "min_range_banknifty_points",
+    "max_range_banknifty_points",
+    "min_body_ratio",
+    "oi_morning_window_start",
+    "oi_morning_window_end",
+    "oi_afternoon_window_start",
+    "oi_afternoon_window_end",
+    "oi_max_trades_per_session",
 }
-LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = OI_VOLUME_CONFIRMED_PARAM_KEYS
+# Its own explicit literal, not `= OI_VOLUME_CONFIRMED_PARAM_KEYS` -- that
+# alias was only ever safe because both strategies happened to accept an
+# identical 5-key set. LiquiditySweepReversalStrategy is a genuinely
+# different pattern (break-and-reverse, no _fired_directions cap -- see its
+# own module docstring); its range-width/distance/body-ratio/time-window
+# params below are its own independent config (same pick_by_underlying
+# *shape* as OI/Volume Confirmed's, different key names and defaults, since
+# a 10-bar rolling window behaves differently from a 5-bar one) -- aliasing
+# either strategy's key set to the other's would leak keys the other
+# constructor doesn't accept and raise a TypeError at start_strategy time.
+LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
+    "lookback_bars",
+    "stop_pct",
+    "target_pct",
+    "trail_activation_fraction",
+    "trail_lock_fraction",
+    "min_sweep_distance_nifty_points",
+    "min_sweep_distance_banknifty_points",
+    "sweep_min_range_width_nifty_points",
+    "sweep_max_range_width_nifty_points",
+    "sweep_min_range_width_banknifty_points",
+    "sweep_max_range_width_banknifty_points",
+    "min_body_ratio",
+    "sweep_morning_window_start",
+    "sweep_morning_window_end",
+    "sweep_afternoon_window_start",
+    "sweep_afternoon_window_end",
+    "sweep_max_trades_per_session",
+}
+# Deliberately NOT in the allowlist above: any sweep_expiry_* hooks a
+# future phase adds -- same "inert JSON, no matching constructor kwarg"
+# reasoning as ORB's own expiry-day-only config hooks.
 
 
 def _build_strategy(

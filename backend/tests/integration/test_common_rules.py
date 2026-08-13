@@ -7,8 +7,9 @@ strategy needs.
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -23,7 +24,13 @@ from app.domain.execution.models import (
     PositionStatus,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
-from app.domain.market.models import Instrument, OptionContract, OptionType, PriceBar
+from app.domain.market.models import (
+    IndicatorSnapshot,
+    Instrument,
+    OptionContract,
+    OptionType,
+    PriceBar,
+)
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -38,9 +45,11 @@ from app.domain.strategy.models import (
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    _parse_hhmm,
     compute_stop_target,
     get_open_position_for_run,
     get_recent_completed_bars,
+    get_recent_indicator_values,
 )
 
 
@@ -387,3 +396,104 @@ class TestConfirmationFilterStrategy:
 
         assert result is None
         assert strategy.calls == []
+
+
+def _seed_indicator_values(
+    db: Session, instrument: Instrument, indicator_name: str, *,
+    values: list[float], start: datetime,
+) -> None:
+    for i, value in enumerate(values):
+        db.add(IndicatorSnapshot(
+            id=uuid.uuid4(), instrument_id=instrument.id, indicator_name=indicator_name,
+            timeframe=BAR_TIMEFRAME, value=value, ts=start + timedelta(minutes=i),
+        ))
+    db.flush()
+
+
+class TestGetRecentIndicatorValues:
+    def test_returns_ascending_order(self, db: Session, instrument: Instrument):
+        start = datetime(2026, 7, 24, 9, 15, tzinfo=UTC)
+        _seed_indicator_values(db, instrument, "EMA9", values=[1.0, 2.0, 3.0], start=start)
+
+        values = get_recent_indicator_values(db, instrument.id, "EMA9", BAR_TIMEFRAME)
+        assert values == [1.0, 2.0, 3.0]
+
+    def test_limit_returns_the_most_recent_n(self, db: Session, instrument: Instrument):
+        start = datetime(2026, 7, 24, 9, 15, tzinfo=UTC)
+        _seed_indicator_values(
+            db, instrument, "EMA9", values=[1.0, 2.0, 3.0, 4.0, 5.0], start=start
+        )
+
+        values = get_recent_indicator_values(db, instrument.id, "EMA9", BAR_TIMEFRAME, limit=2)
+        assert values == [4.0, 5.0]
+
+    def test_since_until_bounds_a_fixed_window(self, db: Session, instrument: Instrument):
+        start = datetime(2026, 7, 24, 9, 15, tzinfo=UTC)
+        _seed_indicator_values(
+            db, instrument, "EMA9", values=[1.0, 2.0, 3.0, 4.0, 5.0], start=start
+        )
+
+        values = get_recent_indicator_values(
+            db, instrument.id, "EMA9", BAR_TIMEFRAME,
+            since=start + timedelta(minutes=1), until=start + timedelta(minutes=3),
+        )
+        assert values == [2.0, 3.0]
+
+    def test_different_indicator_name_is_excluded(self, db: Session, instrument: Instrument):
+        start = datetime(2026, 7, 24, 9, 15, tzinfo=UTC)
+        _seed_indicator_values(db, instrument, "EMA9", values=[1.0], start=start)
+        _seed_indicator_values(db, instrument, "EMA20", values=[2.0], start=start)
+
+        values = get_recent_indicator_values(db, instrument.id, "EMA9", BAR_TIMEFRAME)
+        assert values == [1.0]
+
+    def test_different_instrument_is_excluded(self, db: Session, instrument: Instrument):
+        other = Instrument(
+            id=uuid.uuid4(), symbol="BANKNIFTY", exchange="NFO", lot_size=15, tick_size=0.05
+        )
+        db.add(other)
+        db.flush()
+        start = datetime(2026, 7, 24, 9, 15, tzinfo=UTC)
+        _seed_indicator_values(db, instrument, "EMA9", values=[1.0], start=start)
+        _seed_indicator_values(db, other, "EMA9", values=[2.0], start=start)
+
+        values = get_recent_indicator_values(db, instrument.id, "EMA9", BAR_TIMEFRAME)
+        assert values == [1.0]
+
+
+class TestParseHHMM:
+    def test_parses_valid_time_string(self):
+        assert _parse_hhmm("09:31") == time(9, 31)
+        assert _parse_hhmm("15:09") == time(15, 9)
+
+    def test_rejects_malformed_input(self):
+        with pytest.raises(ValueError):
+            _parse_hhmm("not-a-time")
+
+
+class TestLogOnce:
+    def test_logs_the_first_occurrence(self, caplog: pytest.LogCaptureFixture):
+        strategy = _RecordingStrategy(uuid.uuid4())
+        logger = logging.getLogger("test.log_once")
+        with caplog.at_level(logging.INFO, logger="test.log_once"):
+            strategy._log_once(logger, "key", "hello %s", "world")  # noqa: SLF001
+        assert caplog.messages == ["hello world"]
+
+    def test_does_not_repeat_for_the_same_key(self, caplog: pytest.LogCaptureFixture):
+        strategy = _RecordingStrategy(uuid.uuid4())
+        logger = logging.getLogger("test.log_once")
+        with caplog.at_level(logging.INFO, logger="test.log_once"):
+            strategy._log_once(logger, "key", "first")  # noqa: SLF001
+            strategy._log_once(logger, "key", "second")  # noqa: SLF001
+        assert caplog.messages == ["first"]
+
+    def test_independent_keys_each_log_their_own_first_occurrence(
+        self, caplog: pytest.LogCaptureFixture
+    ):
+        strategy = _RecordingStrategy(uuid.uuid4())
+        logger = logging.getLogger("test.log_once")
+        with caplog.at_level(logging.INFO, logger="test.log_once"):
+            strategy._log_once(logger, "a", "message a")  # noqa: SLF001
+            strategy._log_once(logger, "b", "message b")  # noqa: SLF001
+            strategy._log_once(logger, "a", "message a again")  # noqa: SLF001
+        assert caplog.messages == ["message a", "message b"]

@@ -177,38 +177,107 @@ def _seed_vwap_pullback(db, instrument: Instrument) -> None:
 
 
 def _seed_ema_pullback(db, instrument: Instrument) -> None:
-    ema9 = 22000.0
-    _seed_indicator(db, instrument, "EMA9", ema9)
-    _seed_indicator(db, instrument, "EMA20", 21950.0)
-    base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
-    _seed_bar(db, instrument, base, o=22010, h=22015, l=ema9, c=22005)
-    _seed_bar(db, instrument, base + timedelta(minutes=1), o=22010, h=22030, l=22008, c=22025)
+    """3 expanding bullish EMA9/EMA20 spreads (20 -> 35 -> 50), 8 filler
+    bars with healthy bodies, then a Bone Zone setup bar (low inside the
+    EMA9/EMA20 zone, closes above EMA20) and a confirmation bar closing
+    above the setup bar's high -- same shape as
+    test_ema_micro_pullback_strategy.py's own _seed_bullish_baseline.
+    IST 09:41 -- EMA Micro-pullback's own morning trade window is
+    09:31-11:00 IST, independent of runner.TRADE_WINDOW_START/END (which
+    this file's own _fixed_trade_window_clock fixture pins separately).
+    """
+    ema20 = 21950.0
+    base = datetime(2026, 7, 24, 9, 41, tzinfo=IST)
+    history_start = base - timedelta(minutes=10)
+    for i, spread in enumerate([20.0, 35.0, 50.0]):
+        ts = history_start + timedelta(minutes=i)
+        db.add(IndicatorSnapshot(
+            id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="EMA9",
+            timeframe=BAR_TIMEFRAME, value=ema20 + spread, ts=ts,
+        ))
+        db.add(IndicatorSnapshot(
+            id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="EMA20",
+            timeframe=BAR_TIMEFRAME, value=ema20, ts=ts,
+        ))
+    for i in range(8):
+        _seed_bar(
+            db, instrument, history_start + timedelta(minutes=i),
+            o=21900, h=21909, l=21899, c=21908,
+        )
+    _seed_bar(db, instrument, base - timedelta(minutes=1), o=21980, h=21995, l=21960, c=21985)
+    _seed_bar(db, instrument, base, o=21990, h=22015, l=21988, c=22010)
 
 
 def _seed_oivol_breakout(db, instrument: Instrument) -> None:
-    """5-bar rolling window flat at [21950, 22050] (OIVolumeConfirmedStrategy's
-    default lookback_bars=5), then a bar closing above it."""
-    base = datetime(2026, 7, 24, 11, 0, tzinfo=UTC)
-    mid = 22000.0
-    _seed_bar(db, instrument, base, o=mid, h=22050.0, l=mid - 5, c=mid)
-    _seed_bar(db, instrument, base + timedelta(minutes=1), o=mid, h=mid + 5, l=21950.0, c=mid)
-    for i in range(2, 5):
-        _seed_bar(db, instrument, base + timedelta(minutes=i), o=mid, h=mid + 5, l=mid - 5, c=mid)
-    _seed_bar(db, instrument, base + timedelta(minutes=5), o=22050, h=22080, l=22045, c=22070)
+    """4 filler bars + a 5-bar rolling window flat at [21990, 22030] (width
+    40 -- inside OIVolumeConfirmedStrategy's default NIFTY range filter of
+    15-60, and healthy-bodied enough that the aggregate 10-bar body ratio
+    clears the default 0.40 filter), then a bar closing above it. IST 09:41
+    -- OI/Volume Confirmed's own morning trade window is 09:31-11:00 IST,
+    independent of runner.TRADE_WINDOW_START/END.
+    """
+    base = datetime(2026, 7, 24, 9, 41, tzinfo=IST)
+    start = base - timedelta(minutes=10)
+    for i in range(4):
+        _seed_bar(
+            db, instrument, start + timedelta(minutes=i),
+            o=21900, h=21909, l=21899, c=21908,
+        )
+    window_specs = [
+        (22010, 22030, 22000, 22020),
+        (22010, 22020, 21990, 22000),
+        (22000, 22020, 22000, 22020),
+        (22020, 22020, 22000, 22000),
+        (22000, 22020, 22000, 22020),
+    ]
+    for i, (o, h, low, c) in enumerate(window_specs):
+        _seed_bar(db, instrument, start + timedelta(minutes=4 + i), o=o, h=h, l=low, c=c)
+    _seed_bar(db, instrument, base, o=22030, h=22055, l=22028, c=22050)
 
 
-def _seed_liquidity_sweep(db, instrument: Instrument) -> None:
-    """10-bar rolling window flat at [21950, 22050]
-    (LiquiditySweepReversalStrategy's default lookback_bars=10), then a bar
-    that sweeps the window high but closes back inside it -> bearish
-    reversal (PE)."""
-    base = datetime(2026, 7, 24, 12, 0, tzinfo=UTC)
-    mid = 22000.0
-    _seed_bar(db, instrument, base, o=mid, h=22050.0, l=mid - 5, c=mid)
-    _seed_bar(db, instrument, base + timedelta(minutes=1), o=mid, h=mid + 5, l=21950.0, c=mid)
-    for i in range(2, 10):
-        _seed_bar(db, instrument, base + timedelta(minutes=i), o=mid, h=mid + 5, l=mid - 5, c=mid)
-    _seed_bar(db, instrument, base + timedelta(minutes=10), o=22030, h=22070, l=22020, c=22040)
+def _seed_liquidity_sweep(db, instrument: Instrument) -> PriceBar:
+    """10-bar rolling window flat at [21950, 22050] (width 100 -- inside
+    LiquiditySweepReversalStrategy's default NIFTY range filter of
+    30-120), then a bar that sweeps the window high but closes back inside
+    it -> bearish reversal (PE) pending confirmation. Deliberately does NOT
+    also seed the confirmation bar -- see
+    test_liquidity_sweep_reversal_strategy.py's own _seed_bullish_sweep
+    docstring for why (the sweep bar's own run_cycle must process it first,
+    while it's genuinely the latest persisted bar). IST 09:45 -- Liquidity
+    Sweep/Reversal's own morning trade window is 09:31-11:00 IST.
+    """
+    base = datetime(2026, 7, 24, 9, 45, tzinfo=IST)
+    start = base - timedelta(minutes=12)
+    mid, window_high, window_low = 22000.0, 22050.0, 21950.0
+    q = (window_high - window_low) / 4
+    window_specs = [
+        (mid, window_high, mid - q, mid + q),
+        (mid, mid + q, window_low, mid - q),
+        (mid - q, mid + q, mid - q, mid + q),
+        (mid + q, mid + q, mid - q, mid - q),
+        (mid - q, mid + q, mid - q, mid + q),
+    ]
+    for i in range(10):
+        o, h, low, c = window_specs[i % len(window_specs)]
+        _seed_bar(db, instrument, start + timedelta(minutes=i), o=o, h=h, l=low, c=c)
+    sweep_bar = PriceBar(
+        id=uuid.uuid4(), instrument_id=instrument.id, timeframe=BAR_TIMEFRAME,
+        bucket_start=base - timedelta(minutes=1),
+        open=window_high - 20, high=window_high + 20, low=window_high - 25, close=window_high - 10,
+        volume=1000,
+    )
+    db.add(sweep_bar)
+    db.flush()
+    return sweep_bar
+
+
+def _seed_liquidity_sweep_confirmation(db, instrument: Instrument, sweep_bar: PriceBar) -> None:
+    """Closes below the sweep bar's own low -- the confirmation candle
+    that actually fires the trade. Call only after the sweep bar has
+    already been through a run_cycle."""
+    base = datetime(2026, 7, 24, 9, 45, tzinfo=IST)
+    low = float(sweep_bar.low)
+    _seed_bar(db, instrument, base, o=low - 5, h=low, l=low - 30, c=low - 25)
 
 
 def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
@@ -318,7 +387,7 @@ def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     _seed_vwap_pullback(db, instruments["vwap"])
     _seed_ema_pullback(db, instruments["ema"])
     _seed_oivol_breakout(db, instruments["oivol"])
-    _seed_liquidity_sweep(db, instruments["sweep"])
+    sweep_bar = _seed_liquidity_sweep(db, instruments["sweep"])
 
     strategies = {
         "orb": ORBStrategy(instruments["orb"].id, EXPIRY),
@@ -330,8 +399,24 @@ def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     # Each strategy's bar/chain data is already fully seeded above, so one
     # direct run_cycle call per run reaches the same end state real polling
     # would've converged to -- deterministic, no thread/timing dependency.
+    # Liquidity Sweep/Reversal is the exception: its confirmation-candle
+    # gate needs two cycles -- the sweep bar's own cycle just records it as
+    # pending, only the *next* bar (seeded now, after that first cycle)
+    # actually fires the confirmed trade.
     for tag, strategy in strategies.items():
+        if tag == "sweep":
+            continue
         run_cycle(db, strategy, strategy_runs[tag], session_by_tag[tag], strategy_configs[tag])
+
+    run_cycle(
+        db, strategies["sweep"], strategy_runs["sweep"],
+        session_by_tag["sweep"], strategy_configs["sweep"],
+    )
+    _seed_liquidity_sweep_confirmation(db, instruments["sweep"], sweep_bar)
+    run_cycle(
+        db, strategies["sweep"], strategy_runs["sweep"],
+        session_by_tag["sweep"], strategy_configs["sweep"],
+    )
 
     orb_intent = (
         db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_runs["orb"].id).one()

@@ -18,16 +18,31 @@ or restarted run still computes the same range), while VWAP Pullback/EMA
 Micro-pullback only need a handful of recent bars. `get_recent_completed_bars`
 supports both via `since`/`until` (a fixed window) or `limit` (a trailing
 window) — each strategy's `check_setup` calls it with whatever shape it
-actually needs.
+actually needs. `get_recent_indicator_values` is the identical shape for
+`IndicatorSnapshot` rows instead of `PriceBar` rows — EMA Micro-pullback's
+expansion filter needs the last few EMA9/EMA20 values, not just the single
+latest scalar `get_latest_indicator_value` returns.
+
+`_log_once` (on `ConfirmationFilterStrategy`) and `_parse_hhmm` are also
+shared here rather than per-strategy: ORB was first to need a "log this
+skip reason once per run, not once per bar" pattern and a configured
+"HH:MM" cutoff string, but EMA Micro-pullback's own time-window/max-trades/
+body-ratio/expansion/bone-zone gates need the identical two things — a
+second copy-pasted set of boolean flags per strategy was the wrong shape
+once a second (now third) consumer showed up. `common_rules.py` is this
+codebase's existing "shared among confirmation-filter strategies, not
+promoted to `app.core.clock`/global utilities" home, same reasoning
+`touch_and_confirm`/`compute_stop_target` already live here for.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 from abc import abstractmethod
-from datetime import datetime
+from datetime import datetime, time
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from typing import Literal, TypeVar
 
 from sqlalchemy.orm import Session
 
@@ -40,6 +55,24 @@ from app.modules.strategy_engine.interface import Strategy, TradeProposal
 # (f"{IndicatorEngine.timeframe_seconds}s") for the system-wide 60s bar —
 # the only timeframe anything in this codebase persists.
 BAR_TIMEFRAME = "60s"
+
+_T = TypeVar("_T")
+
+
+def pick_by_underlying(symbol: str, *, nifty: _T, banknifty: _T) -> _T:
+    """Picks `nifty` or `banknifty` by the instrument's own symbol —
+    `"BANKNIFTY" in symbol.upper()` (a substring match, not exact equality,
+    matching every real production/test `instrument.symbol` seen so far),
+    else `nifty`. Generic over whatever shape the caller needs — a
+    `(min, max)` threshold pair for a range-width filter, a single float
+    floor for a distance filter, ... — ORB, OI/Volume Confirmed, and
+    Liquidity Sweep/Reversal each keep their own independently configured
+    threshold *values* (different config key names, different defaults);
+    only this symbol-lookup shape is shared.
+    """
+    if "BANKNIFTY" in symbol.upper():
+        return banknifty
+    return nifty
 
 
 def get_open_position_for_run(db: Session, strategy_run: StrategyRun) -> Position | None:
@@ -105,6 +138,51 @@ def get_latest_indicator_value(
     return float(row.value) if row is not None else None
 
 
+def get_recent_indicator_values(
+    db: Session,
+    instrument_id: uuid.UUID,
+    indicator_name: str,
+    timeframe: str = BAR_TIMEFRAME,
+    *,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    limit: int | None = None,
+) -> list[float]:
+    """`get_recent_completed_bars`'s identical shape for `IndicatorSnapshot`
+    rows — ascending by `ts` (oldest first) regardless of which filters are
+    supplied. EMA9 and EMA20 are always persisted together, from the same
+    bar-completion event (`IndicatorEngine.on_tick`), so calling this once
+    per indicator name with the same `limit` and zipping the two results
+    positionally gives correctly-paired same-bar values — the same
+    assumption `EMAMicroPullbackStrategy` already made comparing single
+    latest EMA9/EMA20 scalars before this function existed.
+    """
+    query = db.query(IndicatorSnapshot.value).filter(
+        IndicatorSnapshot.instrument_id == instrument_id,
+        IndicatorSnapshot.indicator_name == indicator_name,
+        IndicatorSnapshot.timeframe == timeframe,
+    )
+    if since is not None:
+        query = query.filter(IndicatorSnapshot.ts >= since)
+    if until is not None:
+        query = query.filter(IndicatorSnapshot.ts < until)
+    query = query.order_by(IndicatorSnapshot.ts.desc())
+    if limit is not None:
+        query = query.limit(limit)
+    return [float(v) for (v,) in reversed(query.all())]
+
+
+def _parse_hhmm(value: str) -> time:
+    """"HH:MM" -> `time`. Raises `ValueError` on malformed input, same as
+    every other strategy param — nothing in `_build_strategy` validates
+    config values before passing them to a strategy's constructor, so
+    failing loudly here (at strategy construction, not silently at some
+    later bar) is consistent with that existing behavior.
+    """
+    hour_str, minute_str = value.split(":")
+    return time(int(hour_str), int(minute_str))
+
+
 def compute_range_high_low(bars: list[PriceBar]) -> tuple[float, float]:
     """(high, low) across a window of completed bars — the range-boundary
     computation ORB does over its fixed, session-anchored opening-range
@@ -114,6 +192,25 @@ def compute_range_high_low(bars: list[PriceBar]) -> tuple[float, float]:
     before calling this.
     """
     return max(float(b.high) for b in bars), min(float(b.low) for b in bars)
+
+
+def compute_body_ratio(bars: list[PriceBar]) -> float:
+    """Mean(`|close-open|`) / mean(`high-low`) across `bars` — a chop/
+    indecision filter (small bodies relative to range = wicky, indecisive
+    candles) EMA Micro-pullback and OI/Volume Confirmed both use, over
+    their own respective bar windows. Deliberately a ratio of means, not a
+    mean of per-bar ratios — those aren't the same computation. Returns
+    `0.0` (never raises) when the mean range is `0.0` (a run of perfectly
+    flat bars), so that value then naturally fails any real
+    `min_body_ratio` threshold at the call site rather than needing a
+    zero-guard duplicated at every caller. Assumes `bars` is non-empty,
+    same convention `compute_range_high_low` already uses.
+    """
+    bodies = [abs(float(b.close) - float(b.open)) for b in bars]
+    ranges = [float(b.high) - float(b.low) for b in bars]
+    avg_body = sum(bodies) / len(bodies)
+    avg_range = sum(ranges) / len(ranges)
+    return 0.0 if avg_range == 0.0 else avg_body / avg_range
 
 
 def _round_to_tick(price: float, tick_size: float) -> float:
@@ -203,6 +300,24 @@ class ConfirmationFilterStrategy(Strategy):
         self.instrument_id = instrument_id
         self.timeframe = timeframe
         self._last_seen_bucket_start: datetime | None = None
+        self._logged_keys: set[str] = set()
+
+    def _log_once(self, logger: logging.Logger, key: str, msg: str, *args: object) -> None:
+        """Logs `msg % args` at most once per `key` for this strategy
+        instance's lifetime — a fresh instance is constructed per
+        `StrategyRun` (see `api.v1.strategies._build_strategy`), so this is
+        effectively "once per run," not just once per process. Needed
+        because `check_setup` runs on every newly-completed bar for the
+        rest of the session once triggered — an un-gated skip-reason log
+        would repeat for hours on a single filtered-out day. `key`
+        distinguishes independent skip reasons (e.g. "cutoff" vs
+        "range_filter") so each logs its own first occurrence once,
+        independent of the others.
+        """
+        if key in self._logged_keys:
+            return
+        self._logged_keys.add(key)
+        logger.info(msg, *args)
 
     def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
         if get_open_position_for_run(db, strategy_run) is not None:

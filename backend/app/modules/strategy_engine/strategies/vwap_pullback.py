@@ -66,7 +66,6 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         self.trend_lookback_bars = trend_lookback_bars
         self.max_vwap_crosses_in_lookback = max_vwap_crosses_in_lookback
         self.min_trend_side_fraction = min_trend_side_fraction
-        self._env_metrics_logged = False
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -179,8 +178,8 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
     def _env_metrics(self, db: Session) -> EnvPayload:
         env = get_latest_env_metrics(db, self.instrument_id)
         if env is None:
-            if not self._env_metrics_logged:
-                logger.info("VWAP env metrics unavailable; env filters disabled")
-                self._env_metrics_logged = True
+            self._log_once(
+                logger, "env_metrics", "VWAP env metrics unavailable; env filters disabled"
+            )
             return {}
         return env

@@ -50,9 +50,11 @@ from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     ConfirmationFilterStrategy,
+    _parse_hhmm,
     compute_range_high_low,
     compute_stop_target,
     get_recent_completed_bars,
+    pick_by_underlying,
 )
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
@@ -68,19 +70,6 @@ QTY_LOTS = 1
 ORB_SESSION_OPEN_IST = time(9, 15)
 
 logger = logging.getLogger("app.strategy_engine.orb")
-
-
-def _parse_hhmm(value: str) -> time:
-    """"HH:MM" -> `time`. Deliberately local to this module, not a shared
-    `app.core.clock` helper -- no other strategy parses a configured
-    time-of-day string yet. Raises `ValueError` on malformed input, same as
-    every other strategy param -- nothing in `_build_strategy` validates
-    config values before passing them to a strategy's constructor, so
-    failing loudly here (at strategy construction, not silently at some
-    later bar) is consistent with that existing behavior.
-    """
-    hour_str, minute_str = value.split(":")
-    return time(int(hour_str), int(minute_str))
 
 
 class ORBStrategy(ConfirmationFilterStrategy):
@@ -115,14 +104,13 @@ class ORBStrategy(ConfirmationFilterStrategy):
         self.min_or_range_banknifty_points = min_or_range_banknifty_points
         self.max_or_range_banknifty_points = max_or_range_banknifty_points
         self._fired_directions: set[OptionType] = set()
-        self._or_range_logged = False
-        self._range_filter_logged = False
-        self._cutoff_logged = False
 
     def _range_thresholds(self, symbol: str) -> tuple[float, float]:
-        if "BANKNIFTY" in symbol.upper():
-            return self.min_or_range_banknifty_points, self.max_or_range_banknifty_points
-        return self.min_or_range_nifty_points, self.max_or_range_nifty_points
+        return pick_by_underlying(
+            symbol,
+            nifty=(self.min_or_range_nifty_points, self.max_or_range_nifty_points),
+            banknifty=(self.min_or_range_banknifty_points, self.max_or_range_banknifty_points),
+        )
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -142,32 +130,29 @@ class ORBStrategy(ConfirmationFilterStrategy):
         or_high, or_low = compute_range_high_low(or_bars)
         range_width = or_high - or_low
 
-        if not self._or_range_logged:
-            logger.info(
-                "run %s: opening range OR[%.2f-%.2f] width=%.2f",
-                strategy_run.id, or_low, or_high, range_width,
-            )
-            self._or_range_logged = True
+        self._log_once(
+            logger, "or_range",
+            "run %s: opening range OR[%.2f-%.2f] width=%.2f",
+            strategy_run.id, or_low, or_high, range_width,
+        )
 
         instrument = db.get(Instrument, self.instrument_id)
         symbol = instrument.symbol if instrument is not None else ""
         min_range, max_range = self._range_thresholds(symbol)
         if range_width < min_range or range_width > max_range:
-            if not self._range_filter_logged:
-                logger.info(
-                    "run %s: opening range width %.2f outside [%.2f, %.2f], skipping",
-                    strategy_run.id, range_width, min_range, max_range,
-                )
-                self._range_filter_logged = True
+            self._log_once(
+                logger, "range_filter",
+                "run %s: opening range width %.2f outside [%.2f, %.2f], skipping",
+                strategy_run.id, range_width, min_range, max_range,
+            )
             return None
 
         if bar_ist.time() > self.orb_entry_cutoff_time:
-            if not self._cutoff_logged:
-                logger.info(
-                    "run %s: skipped breakout after cutoff time %s",
-                    strategy_run.id, self.orb_entry_cutoff_time.strftime("%H:%M"),
-                )
-                self._cutoff_logged = True
+            self._log_once(
+                logger, "cutoff",
+                "run %s: skipped breakout after cutoff time %s",
+                strategy_run.id, self.orb_entry_cutoff_time.strftime("%H:%M"),
+            )
             return None
 
         close = float(latest_bar.close)
