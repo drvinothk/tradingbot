@@ -73,8 +73,10 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         self._feed_token: str | None = None
 
         self._ws: AngelWSClient | None = None
-        self._on_tick_external: TickCallback | None = None
-        self._on_depth_external: DepthCallback | None = None
+        # Per-symbol, not a single shared slot -- see this class's own
+        # subscribe_ticks docstring for why (live bug, 2026-08-13).
+        self._on_tick_by_symbol: dict[str, TickCallback] = {}
+        self._on_depth_by_symbol: dict[str, DepthCallback] = {}
 
         self._lock = threading.Lock()
         self._token_by_symbol: dict[str, str] = {}
@@ -133,10 +135,25 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         on_tick: TickCallback,
         on_depth: DepthCallback | None = None,
     ) -> None:
+        """Per-symbol callback dispatch, not a single shared slot -- a
+        single `self._on_tick_external`/`self._on_depth_external` attribute
+        (overwritten on every call) used to mean `PositionManager`
+        subscribing an option contract's price on this same shared provider
+        would silently overwrite `MarketDataIngestionService`'s own
+        underlying callback, breaking `quote_ticks`/`price_bars` persistence
+        for everything, system-wide, the moment any position opened --
+        live-confirmed 2026-08-13 (see broker_port_shim.py's identical fix,
+        same root cause, for the full incident writeup). Safe to key by
+        symbol instead since the two real callers subscribe disjoint symbol
+        sets and each always resubscribes with its own same callback.
+        """
         if self._feed_token is None:
             self.connect()
-        self._on_tick_external = on_tick
-        self._on_depth_external = on_depth
+        with self._lock:
+            for symbol in symbols:
+                self._on_tick_by_symbol[symbol] = on_tick
+                if on_depth is not None:
+                    self._on_depth_by_symbol[symbol] = on_depth
 
         if self._ws is None:
             self._ws = AngelWSClient(
@@ -187,11 +204,11 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         self._ws.subscribe(entries)
 
     def unsubscribe_ticks(self, symbols: list[str]) -> None:
-        if self._ws is None:
-            return
         entries: list[tuple[str, int]] = []
         with self._lock:
             for symbol in symbols:
+                self._on_tick_by_symbol.pop(symbol, None)
+                self._on_depth_by_symbol.pop(symbol, None)
                 token = self._token_by_symbol.pop(symbol, None)
                 if token is None:
                     continue
@@ -199,7 +216,8 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
                 self._latest_ticks.pop(symbol, None)
                 segment = self._scrip_master.get_angel_exchange_segment(symbol) or "NFO"
                 entries.append((token, _exchange_segment_to_type(segment)))
-        self._ws.unsubscribe(entries)
+        if self._ws is not None:
+            self._ws.unsubscribe(entries)
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
         with self._lock:
@@ -228,17 +246,20 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         )
         with self._lock:
             self._latest_ticks[symbol] = tick
-        if self._on_tick_external is not None:
-            self._on_tick_external(tick)
+            callback = self._on_tick_by_symbol.get(symbol)
+        if callback is not None:
+            callback(tick)
 
     def _handle_raw_depth(self, raw_depth: RawAngelDepth) -> None:
-        if self._on_depth_external is None:
-            return
         with self._lock:
             symbol = self._symbol_by_token.get(raw_depth.token)
         if symbol is None:
             symbol = self._scrip_master.get_symbol_for_angel_token(raw_depth.token)
         if symbol is None:
+            return
+        with self._lock:
+            callback = self._on_depth_by_symbol.get(symbol)
+        if callback is None:
             return
 
         depth = DepthSnapshot(
@@ -253,7 +274,7 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
             ),
             ts=raw_depth.ts,
         )
-        self._on_depth_external(depth)
+        callback(depth)
 
     # -- BaseMarketDataProvider: history --------------------------------------
 

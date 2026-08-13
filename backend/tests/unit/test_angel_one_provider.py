@@ -428,6 +428,43 @@ def test_subscribe_ticks_resolves_tokens_and_subscribes(provider: AngelOneMarket
     assert ("26000", 1) in ws.subscribed  # NSE exchange type
 
 
+def test_two_symbols_subscribed_separately_with_different_callbacks_do_not_cross_talk(
+    provider: AngelOneMarketDataProvider,
+):
+    """Regression, 2026-08-13: a single shared on_tick_external slot meant a
+    second subscribe_ticks call (e.g. PositionManager subscribing an option
+    contract) silently broke the first caller's own callback (e.g.
+    MarketDataIngestionService's underlying tick persistence) for its own
+    symbol. Two separate subscribe_ticks calls, two different callbacks --
+    each symbol's ticks must reach only its own callback.
+    """
+    from app.modules.market_data.providers.angel_ws_client import RawAngelTick
+
+    underlying_ticks: list = []
+    option_ticks: list = []
+    provider.subscribe_ticks(["NIFTY"], on_tick=underlying_ticks.append)
+    provider.subscribe_ticks(["NIFTY30JUL2624000CE"], on_tick=option_ticks.append)
+    ws = _FakeWSClient.instances[0]
+
+    ws.on_tick(
+        RawAngelTick(
+            token="26000", ltp=24300.0, bid=24299.5, ask=24300.5, volume=0, oi=None,
+            ts=datetime.now(UTC),
+        )
+    )
+    ws.on_tick(
+        RawAngelTick(
+            token="111", ltp=131.1, bid=130.9, ask=131.3, volume=25, oi=1000,
+            ts=datetime.now(UTC),
+        )
+    )
+
+    assert len(underlying_ticks) == 1
+    assert underlying_ticks[0].contract_symbol == "NIFTY"
+    assert len(option_ticks) == 1
+    assert option_ticks[0].contract_symbol == "NIFTY30JUL2624000CE"
+
+
 def test_subscribe_ticks_skips_unmapped_symbols_without_raising(
     provider: AngelOneMarketDataProvider,
 ):

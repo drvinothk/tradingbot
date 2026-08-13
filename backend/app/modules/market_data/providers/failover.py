@@ -100,8 +100,18 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._next_backup_attempt_at: float | None = None
 
         self._symbols: set[str] = set()
-        self._on_tick: TickCallback | None = None
-        self._on_depth: DepthCallback | None = None
+        # Per-symbol, not a single shared slot -- both the primary and
+        # backup tick handlers dispatch through this same dict regardless
+        # of which leg is active, keyed by symbol rather than one shared
+        # attribute. A single slot (overwritten on every subscribe_ticks
+        # call) meant PositionManager subscribing an option contract on
+        # this same shared provider would silently overwrite
+        # MarketDataIngestionService's own underlying callback, breaking
+        # quote_ticks/price_bars persistence for everything, system-wide,
+        # the moment any position opened -- live-confirmed 2026-08-13, same
+        # root cause and fix as broker_port_shim.py/angel_one.py.
+        self._on_tick_by_symbol: dict[str, TickCallback] = {}
+        self._on_depth_by_symbol: dict[str, DepthCallback] = {}
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -145,21 +155,23 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         # failover subscribes on backup.
         new_symbols = [s for s in symbols if s not in self._symbols]
         self._symbols |= set(symbols)
-        self._on_tick = on_tick
-        self._on_depth = on_depth
         with self._lock:
+            for symbol in symbols:
+                self._on_tick_by_symbol[symbol] = on_tick
+                if on_depth is not None:
+                    self._on_depth_by_symbol[symbol] = on_depth
             if self._subscribed_at is None:
                 self._subscribed_at = self._clock()
         self._primary.subscribe_ticks(
             symbols,
             self._make_tick_handler(self._primary_name),
-            self._make_depth_handler(self._primary_name),
+            self._make_depth_handler(self._primary_name) if on_depth is not None else None,
         )
         if self._backup_subscribed and new_symbols:
             self._backup.subscribe_ticks(
                 new_symbols,
                 self._make_tick_handler(self._backup_name),
-                self._make_depth_handler(self._backup_name),
+                self._make_depth_handler(self._backup_name) if on_depth is not None else None,
             )
         self._start_watchdog()
 
@@ -168,6 +180,10 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         if self._backup_subscribed:
             self._backup.unsubscribe_ticks(symbols)
         self._symbols -= set(symbols)
+        with self._lock:
+            for symbol in symbols:
+                self._on_tick_by_symbol.pop(symbol, None)
+                self._on_depth_by_symbol.pop(symbol, None)
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
         active = self.active_provider_name
@@ -197,25 +213,25 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
 
     def _make_tick_handler(self, source_name: str) -> TickCallback:
         def _handle(tick: Tick) -> None:
-            forward = False
+            callback = None
             with self._lock:
                 if source_name == self._primary_name:
                     self._last_primary_tick_at = self._clock()
-                forward = self._active == source_name
-            if forward and self._on_tick is not None:
-                self._on_tick(tick)
+                if self._active == source_name:
+                    callback = self._on_tick_by_symbol.get(tick.contract_symbol)
+            if callback is not None:
+                callback(tick)
 
         return _handle
 
-    def _make_depth_handler(self, source_name: str) -> DepthCallback | None:
-        if self._on_depth is None:
-            return None
-
+    def _make_depth_handler(self, source_name: str) -> DepthCallback:
         def _handle(depth: DepthSnapshot) -> None:
+            callback = None
             with self._lock:
-                forward = self._active == source_name
-            if forward and self._on_depth is not None:
-                self._on_depth(depth)
+                if self._active == source_name:
+                    callback = self._on_depth_by_symbol.get(depth.contract_symbol)
+            if callback is not None:
+                callback(depth)
 
         return _handle
 

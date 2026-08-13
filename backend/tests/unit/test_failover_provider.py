@@ -334,8 +334,10 @@ def test_depth_is_also_gated_to_the_active_leg(make_provider):
     forwarded: list[DepthSnapshot] = []
     primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
     provider = make_provider(primary, backup, clock)
+    # Must match the subscribed symbol -- depth routing is per-symbol now
+    # (2026-08-13 fix), not one shared slot that fired for any symbol.
     depth = DepthSnapshot(
-        contract_symbol="NIFTY26AUGC24000", bid_levels=(), ask_levels=(), ts=datetime.now(UTC)
+        contract_symbol="NIFTY", bid_levels=(), ask_levels=(), ts=datetime.now(UTC)
     )
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None, on_depth=forwarded.append)
 
@@ -376,3 +378,56 @@ def test_close_and_disconnect_duck_type_close_both_legs_and_stop_thread(make_pro
 
     assert primary.close_calls == 1
     assert backup.close_calls == 1
+
+
+def test_two_symbols_with_different_callbacks_do_not_cross_talk(make_provider):
+    """Regression, 2026-08-13: a single shared on_tick slot (not per-symbol)
+    meant a second subscribe_ticks call for a different symbol (e.g.
+    PositionManager subscribing an option contract) silently broke the
+    first call's own callback for its own symbol (e.g.
+    MarketDataIngestionService's underlying tick persistence).
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    underlying_ticks: list[Tick] = []
+    option_ticks: list[Tick] = []
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=underlying_ticks.append)
+    provider.subscribe_ticks(["NIFTY18AUG26C24400"], on_tick=option_ticks.append)
+
+    primary.fire_tick(_tick("NIFTY"))
+    primary.fire_tick(_tick("NIFTY18AUG26C24400"))
+
+    assert len(underlying_ticks) == 1
+    assert underlying_ticks[0].contract_symbol == "NIFTY"
+    assert len(option_ticks) == 1
+    assert option_ticks[0].contract_symbol == "NIFTY18AUG26C24400"
+
+
+def test_per_symbol_routing_composes_correctly_with_active_leg_routing(make_provider):
+    """Two symbols, two callbacks, subscribed before a failover trip -- once
+    tripped to backup, ticks for each symbol from backup must still reach
+    only their own correct callback (not just "some" callback).
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    underlying_ticks: list[Tick] = []
+    option_ticks: list[Tick] = []
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=underlying_ticks.append)
+    provider.subscribe_ticks(["NIFTY18AUG26C24400"], on_tick=option_ticks.append)
+    _trip_to_backup(provider, primary, clock)
+    # _trip_to_backup's own internal primary.fire_tick() (default symbol
+    # "NIFTY") legitimately reaches underlying_ticks too, since primary was
+    # still active at that moment -- clear both lists so what follows only
+    # counts ticks from *this* test's own backup.fire_tick calls below.
+    underlying_ticks.clear()
+    option_ticks.clear()
+
+    backup.fire_tick(_tick("NIFTY"))
+    backup.fire_tick(_tick("NIFTY18AUG26C24400"))
+
+    assert len(underlying_ticks) == 1
+    assert underlying_ticks[0].contract_symbol == "NIFTY"
+    assert len(option_ticks) == 1
+    assert option_ticks[0].contract_symbol == "NIFTY18AUG26C24400"
