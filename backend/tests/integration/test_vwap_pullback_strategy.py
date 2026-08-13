@@ -217,6 +217,36 @@ def _seed_bar(
     return bar
 
 
+def _seed_trending_history(
+    db: Session,
+    instrument: Instrument,
+    base: datetime,
+    side: str,
+    *,
+    count: int = 18,
+) -> None:
+    """`count` bars, all closing consistently on one side of VWAP (no
+    crosses), ending right before `base` -- the trend/choppiness filter's
+    default `trend_lookback_bars=20` needs this much history in addition to
+    the pullback+confirmation bars a test seeds itself, or `_trend_direction`
+    returns None (insufficient history) regardless of how clean the actual
+    touch+confirm pattern is.
+    """
+    price = VWAP + 20.0 if side == "bullish" else VWAP - 20.0
+    for i in range(count, 0, -1):
+        db.add(
+            PriceBar(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                timeframe=BAR_TIMEFRAME,
+                bucket_start=base - timedelta(minutes=i),
+                open=price, high=price + 5, low=price - 5, close=price,
+                volume=1000,
+            )
+        )
+    db.flush()
+
+
 class TestVWAPPullbackStrategy:
     def test_bullish_pullback_confirmation_fires_buy_ce(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
@@ -224,6 +254,7 @@ class TestVWAPPullbackStrategy:
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_vwap(db, instrument, VWAP)
         base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bullish")
         # Pullback bar: dips to touch VWAP (low right at VWAP), closes above it.
         _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
         # Confirmation bar: closes above the pullback bar's high, still above VWAP.
@@ -245,6 +276,7 @@ class TestVWAPPullbackStrategy:
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_vwap(db, instrument, VWAP)
         base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bearish")
         # Pullback bar: rallies to touch VWAP (high right at VWAP), closes below it.
         _seed_bar(db, instrument, base, open=21985, high=VWAP, low=21980, close=21990)
         confirmation = _seed_bar(
@@ -270,6 +302,94 @@ class TestVWAPPullbackStrategy:
         confirmation = _seed_bar(
             db, instrument, base + timedelta(minutes=1),
             open=22110, high=22140, low=22105, close=22130,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_no_signal_when_trend_history_is_insufficient(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """A valid touch+confirm pattern with no trend history before it
+        (fewer than trend_lookback_bars=20 total) -- the same "wait for next
+        cycle, never trade off data we can't vouch for" philosophy as the
+        option-chain freshness gate.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_vwap(db, instrument, VWAP)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_trend_history_from_a_previous_day_is_not_counted(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """18 bars of a clean bullish trend seeded on the PREVIOUS IST
+        calendar day must not count toward today's trend_lookback_bars=20 --
+        otherwise a fresh trading day with only a couple of today's own bars
+        would borrow yesterday's trend to justify a signal. Regression test
+        for the cross-day bar-contamination bug in `_trend_direction`.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_vwap(db, instrument, VWAP)
+        yesterday_base = datetime(2026, 7, 23, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, yesterday_base, "bullish")
+        today_base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_bar(db, instrument, today_base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, today_base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_no_signal_when_market_is_choppy(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """18 bars alternating sides of VWAP (well over max_vwap_crosses_in_
+        lookback=3), then an otherwise-valid bullish touch+confirm -- the
+        filter must block on chop even though the setup itself is clean.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_vwap(db, instrument, VWAP)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        for i in range(18, 0, -1):
+            price = VWAP + 10.0 if i % 2 == 0 else VWAP - 10.0
+            _seed_bar(
+                db, instrument, base - timedelta(minutes=i),
+                open=price, high=price + 5, low=price - 5, close=price,
+            )
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_no_signal_when_trend_conflicts_with_setup_direction(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """A clean bearish trend (18 bars below VWAP) followed by a valid
+        *bullish* touch+confirm pattern -- the setup direction must match
+        the prevailing trend, not just be internally consistent on its own.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_vwap(db, instrument, VWAP)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bearish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
         )
 
         strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)

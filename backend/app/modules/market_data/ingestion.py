@@ -406,6 +406,18 @@ class MarketDataIngestionService:
             if thread is not None:
                 thread.join(timeout=5.0)
 
+    def reset_daily_indicators(self) -> None:
+        """Called once per trading day (see `market_data_scheduler
+        .MarketDataScheduler`'s PRE_MARKET transition) so VWAP — a
+        session-cumulative value, see `IndicatorEngine.reset_session`'s own
+        docstring — actually starts fresh each day instead of accumulating
+        across days for the life of this process. No-op when constructed
+        without an `indicator_engine` (mirrors every other `if self.
+        _indicator_engine is not None` guard already in this class).
+        """
+        if self._indicator_engine is not None:
+            self._indicator_engine.reset_session()
+
     def _on_tick(self, tick: Tick) -> None:
         ref = self._symbol_map.get(tick.contract_symbol)
         if ref is None:

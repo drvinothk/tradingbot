@@ -731,10 +731,15 @@ approvals correctly.
   `evaluate()` enforces full-candle-completion (never re-fires on the same
   bar) and no-signal-while-in-position, then delegates to each strategy's
   `check_setup(db, strategy_run, latest_bar)`. `get_recent_completed_bars`
-  supports both a fixed window (`since`/`until` — ORB's opening range, anchored
-  to `strategy_run.started_at` so a runner restart mid-session can't shift it)
-  and a trailing window (`limit` — VWAP Pullback/EMA Micro-pullback's last-N-bars
-  need).
+  supports both a fixed window (`since`/`until` — ORB's opening range) and a
+  trailing window (`limit` — VWAP Pullback/EMA Micro-pullback's last-N-bars
+  need). **2026-08-13 correction**: ORB's window was originally anchored to
+  `strategy_run.started_at` (restart-safe, but not actually the real 9:15-9:30
+  NSE opening range if a run started later than 9:15) — changed to a fixed
+  9:15 IST anchor derived from the bar's own timestamp, which is both the
+  real opening range *and* restart-safe (doesn't depend on `started_at` at
+  all). Guards against a gapped 9:15-9:30 window (fewer than `or_minutes`
+  persisted bars) by skipping rather than computing from partial data.
 - **The strategy runner was generalized, not duplicated a fourth time** —
   Phase 2's `SyntheticStrategyRunner` (bespoke, hardcoded to one class) is
   gone; `strategy_engine/runner.py`'s `StrategyRunner` + standalone `run_cycle`
@@ -750,7 +755,8 @@ approvals correctly.
   `POST /strategies` validates it against a known-types set at creation time.
 - **Entry logic, concretely** (no per-strategy spec existed anywhere before
   this phase): ORB fires on the first bar closing beyond the opening range
-  (`or_minutes`, anchored to `started_at`) in either direction, once per
+  (`or_minutes`, anchored to the fixed 9:15 IST session open as of
+  2026-08-13 — see correction above) in either direction, once per
   direction per run; VWAP Pullback/EMA Micro-pullback both fire on a
   pullback-bar-touches-then-confirmation-bar-closes-back-through pattern
   against VWAP or EMA9 (with EMA9>EMA20/EMA9<EMA20 as the trend filter)

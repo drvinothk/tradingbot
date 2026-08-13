@@ -64,5 +64,9 @@ class SyntheticStrategy(Strategy):
             entry_price=entry_price,
             stop_price=stop_price,
             target_price=target_price,
-            payload={"strike_score": top.score, "breakdown": top.breakdown},
+            payload={
+                "strategy": "synthetic",
+                "strike_score": top.score,
+                "breakdown": top.breakdown,
+            },
         )

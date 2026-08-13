@@ -20,10 +20,11 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from datetime import date
+from datetime import date, time
 
 from sqlalchemy.orm import Session
 
+from app.core.clock import now_ist
 from app.core.db.session import session_scope
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
@@ -37,6 +38,21 @@ from app.modules.strategy_engine.service import submit_signal
 logger = logging.getLogger("app.strategy_engine.runner")
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
+
+# The only window new entries may fire in, IST. Deliberately distinct from
+# `market_data.market_hours`'s ~08:30-16:00 data-connectivity window --
+# REST/WS may still connect and flow data outside this range, it just must
+# never result in a new trade. The upper bound matches `TradingSession
+# .cutoff_time`'s new default (see `app/domain/session/models.py`) so a
+# position can never be opened in the same instant EOD force-close fires --
+# end is exclusive for that same reason.
+TRADE_WINDOW_START = time(9, 31)
+TRADE_WINDOW_END = time(15, 9)
+
+
+def is_within_trade_window(now: time | None = None) -> bool:
+    t = now if now is not None else now_ist().time()
+    return TRADE_WINDOW_START <= t < TRADE_WINDOW_END
 
 
 def run_cycle(
@@ -60,6 +76,11 @@ def run_cycle(
     entirely (same as a normal "no signal" cycle) if data is still STALE/DEAD
     after that refresh attempt — a broker hiccup should mean "wait for next
     cycle," never "trade off data we can't vouch for."
+
+    The freshness-check + `evaluate()` + `submit_signal()` block only runs
+    inside `is_within_trade_window()` (09:31-15:09 IST) — outside it, this
+    is a normal "no signal" cycle too, but the status-refresh below still
+    always runs so an already-open position's status stays ground-truth.
     """
     decision: RiskDecision | None = None
 
@@ -71,27 +92,28 @@ def run_cycle(
         # connection — keeps the refresh atomic with the rest of this cycle.
         yield db
 
-    freshness = ensure_fresh_option_chain(
-        db,
-        get_broker(),
-        strategy.instrument_id,
-        strategy.expiry_date,
-        session_factory=_same_session,
-    )
-    if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
-        logger.warning(
-            "run %s: option-chain data %s for instrument %s expiry %s — skipping cycle",
-            strategy_run.id,
-            freshness.value,
+    if is_within_trade_window():
+        freshness = ensure_fresh_option_chain(
+            db,
+            get_broker(),
             strategy.instrument_id,
             strategy.expiry_date,
+            session_factory=_same_session,
         )
-        proposal = None
-    else:
-        proposal = strategy.evaluate(db, strategy_run)
+        if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
+            logger.warning(
+                "run %s: option-chain data %s for instrument %s expiry %s — skipping cycle",
+                strategy_run.id,
+                freshness.value,
+                strategy.instrument_id,
+                strategy.expiry_date,
+            )
+            proposal = None
+        else:
+            proposal = strategy.evaluate(db, strategy_run)
 
-    if proposal is not None:
-        decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
+        if proposal is not None:
+            decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
 
     if strategy_run.status != StrategyRunStatus.STOPPED:
         has_position = get_open_position_for_run(db, strategy_run) is not None

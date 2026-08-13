@@ -169,6 +169,36 @@ def test_ensure_ingestion_running_shares_one_service_and_is_idempotent_per_symbo
     assert starts == [["NIFTY"], ["BANKNIFTY"]]  # the repeated "NIFTY" call was a no-op
 
 
+def test_reset_daily_indicators_delegates_to_the_shared_service(monkeypatch):
+    """Pure bookkeeping check, no real thread/DB — same fake-service shape
+    as test_ensure_ingestion_running_shares_one_service_and_is_idempotent_
+    per_symbol above.
+    """
+    reset_calls = 0
+
+    class _FakeIngestionService:
+        def __init__(self, provider, session_factory=None, indicator_engine=None):
+            pass
+
+        def start(self, symbols):
+            pass
+
+        def reset_daily_indicators(self):
+            nonlocal reset_calls
+            reset_calls += 1
+
+    monkeypatch.setattr(market_data_registry, "MarketDataIngestionService", _FakeIngestionService)
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    market_data_registry.reset_daily_indicators()
+
+    assert reset_calls == 1
+
+
+def test_reset_daily_indicators_is_a_harmless_noop_before_any_service_exists():
+    market_data_registry.reset_daily_indicators()  # must not raise
+
+
 def test_reset_for_reconnect_stops_and_rebuilds_every_previously_subscribed_symbol(
     monkeypatch,
 ):

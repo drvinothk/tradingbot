@@ -61,6 +61,14 @@ MARKET_CLOSE = time(16, 0)
 # Settings.market_data.is_replay_mode is explicitly set.
 REPLAY_MODE_MARKET_CLOSE = time(23, 30)
 
+# This system only ever trades these two underlyings -- kept here (not
+# imported from a specific broker adapter, e.g. `broker_adapter.shoonya
+# .adapter.KNOWN_UNDERLYINGS`) since `MarketDataScheduler` works with
+# whichever `BaseMarketDataProvider` is configured, not a specific broker's
+# execution adapter -- same market-data/execution decoupling this module's
+# own docstring already applies to phase timing.
+TRADABLE_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
+
 
 class MarketPhase(enum.Enum):
     PRE_MARKET = "pre_market"

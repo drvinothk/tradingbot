@@ -65,7 +65,7 @@ class TradingSession(Base, UUIDPkMixin, TimestampMixin):
 
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    cutoff_time: Mapped[time] = mapped_column(Time, default=time(15, 20))
+    cutoff_time: Mapped[time] = mapped_column(Time, default=time(15, 9))
 
     # Daily plan — pre-filled from risk_limit_configs, editable at session
     # start. Field names deliberately match risk_limit_configs 1:1.

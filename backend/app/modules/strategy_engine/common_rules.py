@@ -11,12 +11,14 @@ duplicated per strategy:
   `StrategyRunStatus.IN_POSITION` refresh — one query, two uses.
 
 Deliberately does *not* try to hand every strategy a single shared lookback
-window of bars: ORB needs a fixed window anchored to `strategy_run
-.started_at` (which can be much older than "the last N bars" once the market
-has moved on), while VWAP Pullback/EMA Micro-pullback only need a handful of
-recent bars. `get_recent_completed_bars` supports both via `since`/`until`
-(a fixed window) or `limit` (a trailing window) — each strategy's
-`check_setup` calls it with whatever shape it actually needs.
+window of bars: ORB needs a fixed window anchored to the real 9:15 IST
+session open (see `strategies/orb.py`'s own docstring — derived from the
+bar's own timestamp, not `strategy_run.started_at`, specifically so a late
+or restarted run still computes the same range), while VWAP Pullback/EMA
+Micro-pullback only need a handful of recent bars. `get_recent_completed_bars`
+supports both via `since`/`until` (a fixed window) or `limit` (a trailing
+window) — each strategy's `check_setup` calls it with whatever shape it
+actually needs.
 """
 
 from __future__ import annotations

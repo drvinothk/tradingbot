@@ -195,6 +195,44 @@ class TestIndicatorEngine:
         assert "VWAP" not in results
         assert instrument_id not in engine._vwap
 
+    def test_reset_session_clears_vwap_but_not_ema(self):
+        """VWAP is session-cumulative and must restart from zero each
+        trading day; EMA deliberately does not (trend continuity across
+        sessions is the whole point of an exponential average) -- see
+        `reset_session`'s own docstring.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        for i in range(10):
+            engine.on_tick(
+                instrument_id,
+                Tick("NIFTY", ltp=100.0 + i, bid=0, ask=0, volume=10, oi=None, ts=_ts(i * 60)),
+            )
+        assert engine._vwap[instrument_id].value is not None
+        ema9_before_reset = engine._ema9[instrument_id].value
+
+        engine.reset_session()
+
+        assert engine._vwap[instrument_id].value is None
+        assert engine._ema9[instrument_id].value == ema9_before_reset
+
+    def test_reset_session_for_one_instrument_leaves_others_untouched(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_a, instrument_b = uuid.uuid4(), uuid.uuid4()
+        engine.on_tick(
+            instrument_a,
+            Tick("NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(0)),
+        )
+        engine.on_tick(
+            instrument_b,
+            Tick("BANKNIFTY", ltp=200.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(0)),
+        )
+
+        engine.reset_session(instrument_a)
+
+        assert engine._vwap[instrument_a].value is None
+        assert engine._vwap[instrument_b].value is not None
+
     def test_on_completed_bar_never_touches_bar_aggregator_state(self):
         """This path bypasses `BarAggregator` entirely — the candle is
         already a finished bar with real broker-side high/low,

@@ -77,15 +77,41 @@ ORB_PARAM_KEYS = {
     "target_pct",
     "trail_activation_fraction",
     "trail_lock_fraction",
+    "orb_entry_cutoff_time",
+    "min_or_range_nifty_points",
+    "max_or_range_nifty_points",
+    "min_or_range_banknifty_points",
+    "max_or_range_banknifty_points",
 }
+# Deliberately NOT in the allowlist above: enabled_on_expiry_day,
+# expiry_orb_entry_cutoff_time, expiry_strike_bias. Phase 2 stores these in
+# strategy_configs.params inertly for Phase 3 to read later -- ORBStrategy's
+# constructor has no matching kwargs for them, so forwarding them here would
+# raise a TypeError at start_strategy time instead of leaving them as inert
+# config, defeating the point.
 VWAP_PULLBACK_PARAM_KEYS = {
     "pullback_tolerance_frac",
     "stop_pct",
     "target_pct",
     "trail_activation_fraction",
     "trail_lock_fraction",
+    "trend_lookback_bars",
+    "max_vwap_crosses_in_lookback",
+    "min_trend_side_fraction",
 }
-EMA_MICRO_PULLBACK_PARAM_KEYS = VWAP_PULLBACK_PARAM_KEYS
+# Its own explicit literal, not `= VWAP_PULLBACK_PARAM_KEYS` — that alias
+# was only ever safe because both strategies happened to accept an
+# identical key set. EMAMicroPullbackStrategy doesn't accept the three
+# VWAP-only trend/choppiness keys above; aliasing would let those leak into
+# an EMA strategy_config's allowlist and raise a TypeError at
+# start_strategy time.
+EMA_MICRO_PULLBACK_PARAM_KEYS = {
+    "pullback_tolerance_frac",
+    "stop_pct",
+    "target_pct",
+    "trail_activation_fraction",
+    "trail_lock_fraction",
+}
 OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "lookback_bars",
     "stop_pct",

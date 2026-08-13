@@ -8,11 +8,14 @@ trend has resumed, not just a random tick back above VWAP.
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import date
+from datetime import date, datetime, time
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
+from app.core.clock import IST
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
@@ -23,7 +26,8 @@ from app.modules.strategy_engine.common_rules import (
     get_recent_completed_bars,
     touch_and_confirm,
 )
-from app.modules.strategy_engine.interface import TradeProposal
+from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
+from app.modules.strategy_engine.interface import EnvPayload, TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
     pick_top_by_type,
@@ -31,6 +35,8 @@ from app.modules.strategy_engine.strike_ranking.engine import (
 )
 
 QTY_LOTS = 1
+
+logger = logging.getLogger("app.strategy_engine.vwap_pullback")
 
 
 class VWAPPullbackStrategy(ConfirmationFilterStrategy):
@@ -45,6 +51,9 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         trail_activation_fraction: float = 0.5,
         trail_lock_fraction: float = 0.5,
         timeframe: str = BAR_TIMEFRAME,
+        trend_lookback_bars: int = 20,
+        max_vwap_crosses_in_lookback: int = 3,
+        min_trend_side_fraction: float = 0.70,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -54,6 +63,10 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         self.target_pct = target_pct
         self.trail_activation_fraction = trail_activation_fraction
         self.trail_lock_fraction = trail_lock_fraction
+        self.trend_lookback_bars = trend_lookback_bars
+        self.max_vwap_crosses_in_lookback = max_vwap_crosses_in_lookback
+        self.min_trend_side_fraction = min_trend_side_fraction
+        self._env_metrics_logged = False
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -68,12 +81,23 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
             return None
 
         direction = touch_and_confirm(prev_bar, latest_bar, vwap, self.pullback_tolerance_frac)
+        if direction is None:
+            return None
+
+        trend = self._trend_direction(db, vwap, latest_bar)
+        if trend != direction:
+            logger.info(
+                "run %s: vwap trend/choppiness filter blocked a %s setup (trend=%s)",
+                strategy_run.id,
+                direction,
+                trend,
+            )
+            return None
+
         if direction == "bullish":
             option_type, structure_level = OptionType.CE, float(prev_bar.low)
-        elif direction == "bearish":
-            option_type, structure_level = OptionType.PE, float(prev_bar.high)
         else:
-            return None
+            option_type, structure_level = OptionType.PE, float(prev_bar.high)
 
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
@@ -104,5 +128,59 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
                 "vwap": vwap,
                 "strike_score": top.score,
                 "breakdown": top.breakdown,
+                "env": self._env_metrics(db),
             },
         )
+
+    def _trend_direction(
+        self, db: Session, current_vwap: float, latest_bar: PriceBar
+    ) -> Literal["bullish", "bearish"] | None:
+        """Which side of VWAP the last `trend_lookback_bars` bars mostly sat
+        on, or `None` if there isn't enough history yet or the market's too
+        choppy to call a trend. Compares each bar's close against *today's
+        current* VWAP, not the VWAP that was actually live when that bar
+        closed — VWAP is only ever queryable as a single latest scalar
+        (`common_rules.get_latest_indicator_value`), no historical per-bar
+        series exists. A reasonable approximation over a lookback this
+        short (VWAP moves slowly relative to price), not an exact one.
+
+        Bars are bounded to `latest_bar`'s own IST calendar day (`since=
+        day_start`, derived from the bar's own timestamp, same "anchor to
+        the bar, not wall-clock now()" reasoning `ORBStrategy` uses for its
+        opening-range window) — without this, `limit=N` alone would pull
+        bars from the *previous* trading day for the first ~N minutes of
+        every day after the instrument's first, comparing yesterday's
+        closes against today's freshly-relevant VWAP. `len(bars) <
+        trend_lookback_bars` then correctly means "today doesn't have N
+        bars yet," not just "this instrument has never had N bars."
+        """
+        day_start = datetime.combine(
+            latest_bar.bucket_start.astimezone(IST).date(), time.min, tzinfo=IST
+        )
+        bars = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, since=day_start, limit=self.trend_lookback_bars
+        )
+        if len(bars) < self.trend_lookback_bars:
+            return None
+
+        sides = ["bullish" if float(b.close) > current_vwap else "bearish" for b in bars]
+        crosses = sum(1 for i in range(1, len(sides)) if sides[i] != sides[i - 1])
+        if crosses > self.max_vwap_crosses_in_lookback:
+            return None
+
+        bullish_frac = sides.count("bullish") / len(sides)
+        bearish_frac = sides.count("bearish") / len(sides)
+        if bullish_frac >= self.min_trend_side_fraction:
+            return "bullish"
+        if bearish_frac >= self.min_trend_side_fraction:
+            return "bearish"
+        return None
+
+    def _env_metrics(self, db: Session) -> EnvPayload:
+        env = get_latest_env_metrics(db, self.instrument_id)
+        if env is None:
+            if not self._env_metrics_logged:
+                logger.info("VWAP env metrics unavailable; env filters disabled")
+                self._env_metrics_logged = True
+            return {}
+        return env

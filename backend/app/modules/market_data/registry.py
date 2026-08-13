@@ -64,6 +64,19 @@ def unsubscribe_symbol(symbol: str) -> None:
     _subscribed_symbols.discard(symbol)
 
 
+def reset_daily_indicators() -> None:
+    """Called from `MarketDataScheduler`'s daily PRE_MARKET transition so
+    VWAP (session-cumulative) actually resets each trading day instead of
+    accumulating across days for the life of this process — `_service` is a
+    process-lifetime singleton (see module docstring), never rebuilt on its
+    own between days. Safe to call before `_service` exists yet (nothing to
+    reset), same "safe to call early" contract `unsubscribe_symbol` already
+    has.
+    """
+    if _service is not None:
+        _service.reset_daily_indicators()
+
+
 def reset() -> None:
     """Test/composition-root hook, same reasoning as
     `broker_adapter.composition.set_broker` — lets tests (and a future

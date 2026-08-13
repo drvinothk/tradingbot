@@ -16,6 +16,8 @@ from datetime import UTC, date, datetime
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+import app.modules.strategy_engine.runner as runner_module
+from app.core.clock import IST
 from app.domain.audit.models import AuditEvent
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
@@ -37,6 +39,18 @@ from app.modules.strategy_engine.runner import StrategyRunner, run_cycle
 from app.modules.strategy_engine.strategies.synthetic import SyntheticStrategy
 
 EXPIRY = date(2026, 7, 30)
+
+
+@pytest.fixture(autouse=True)
+def _fixed_trade_window_clock(monkeypatch):
+    """This file exercises run_cycle/StrategyRunner with real signal-dispatch
+    assertions, without regard to wall-clock time -- pin `now_ist()` inside
+    the 09:31-15:09 IST trade-firing window (runner.TRADE_WINDOW_START/END)
+    so those assertions don't depend on what time of day the suite runs.
+    """
+    monkeypatch.setattr(
+        runner_module, "now_ist", lambda: datetime(2026, 1, 1, 11, 0, tzinfo=IST)
+    )
 
 
 @pytest.fixture
@@ -262,6 +276,35 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
 
     ok, broken_id = verify_chain(db)
     assert ok, f"audit chain broken at {broken_id}"
+
+
+def test_run_cycle_fires_nothing_outside_the_trade_window(
+    monkeypatch,
+    db: Session,
+    instrument,
+    option_contract,
+    strategy_run,
+    trading_session,
+    strategy_config,
+):
+    """The exact same market data that fires a dispatch inside the window
+    (test_run_cycle_dispatches_and_closes_and_audits_full_loop) must yield
+    no signal at all outside 09:31-15:09 IST -- evaluate() must not even be
+    called, since a discarded-but-evaluated proposal would burn a
+    fire-once strategy's in-memory state for nothing.
+    """
+    monkeypatch.setattr(
+        runner_module, "now_ist", lambda: datetime(2026, 1, 1, 9, 0, tzinfo=IST)
+    )
+    _seed_market_data(db, instrument, option_contract)
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+
+    assert decision is None
+    assert (
+        db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
+    )
 
 
 def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(

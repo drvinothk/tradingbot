@@ -27,7 +27,11 @@ from __future__ import annotations
 import logging
 import threading
 
-from app.modules.market_data.market_hours import MarketPhase, current_phase
+from app.modules.market_data.market_hours import (
+    TRADABLE_UNDERLYINGS,
+    MarketPhase,
+    current_phase,
+)
 from app.modules.market_data.provider_composition import get_market_data_provider
 
 logger = logging.getLogger("app.market_data.scheduler")
@@ -93,8 +97,42 @@ class MarketDataScheduler:
             # actually torn down, not just reused.
             provider.disconnect()
             provider.connect()
+            self._subscribe_known_underlyings()
+            self._reset_daily_indicators()
+        elif to_phase is MarketPhase.ACTIVE_MARKET and from_phase is None:
+            # Process started (or restarted) mid-day, already past
+            # pre_market -- pre_market's own connect+subscribe never ran
+            # this process lifetime, so do it here instead. The normal
+            # daily pre_market -> active_market transition (from_phase is
+            # already PRE_MARKET) stays a genuine no-op, unchanged.
+            provider.connect()
+            self._subscribe_known_underlyings()
         elif to_phase is MarketPhase.CLOSED:
             provider.disconnect()
+
+    def _subscribe_known_underlyings(self) -> None:
+        # Local import matches this codebase's existing convention for this
+        # exact call (api/v1/strategies.py, main.py both import it locally)
+        # -- market-data ingestion for NIFTY/BANKNIFTY should start the
+        # moment the exchange session begins, independent of any strategy
+        # being manually started. Idempotent per symbol
+        # (registry._subscribed_symbols), so safe to call again if this
+        # transition shape is ever observed twice.
+        from app.modules.market_data.registry import ensure_ingestion_running
+
+        for symbol in TRADABLE_UNDERLYINGS:
+            ensure_ingestion_running(symbol)
+
+    def _reset_daily_indicators(self) -> None:
+        # Local import, same convention as _subscribe_known_underlyings
+        # above -- VWAP is session-cumulative and must restart from zero
+        # each trading day (see IndicatorEngine.reset_session's own
+        # docstring); EMA is untouched by this, deliberately (trend
+        # continuity across sessions is the whole point of an exponential
+        # average).
+        from app.modules.market_data.registry import reset_daily_indicators
+
+        reset_daily_indicators()
 
     def _pre_market_health_check(self) -> None:
         logger.warning("Pre-market health check: confirming provider connection is alive")

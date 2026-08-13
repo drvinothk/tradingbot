@@ -18,10 +18,46 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import date
+from typing import TypedDict
 
 from sqlalchemy.orm import Session
 
 from app.domain.strategy.models import SignalSide, StrategyRun
+
+
+class EnvPayload(TypedDict, total=False):
+    """VIX/PCR environment metrics — always empty until the real data
+    pipeline exists (`strategy_engine.env_metrics.get_latest_env_metrics`
+    is a stub returning `None`). `total=False` since every key is
+    independently optional, not a real runtime-validated shape (TypedDicts
+    are mypy-only — this buys static typing, not validation).
+    """
+
+    vix: float | None
+    pcr_oi: float | None
+    pcr_vol: float | None
+
+
+class TradePayload(TypedDict, total=False):
+    """Union of every key any of the six strategies' payload dicts sets
+    today, plus `env` for whenever env metrics are wired in. Deliberately
+    one shared, all-optional shape rather than six near-duplicate
+    per-strategy TypedDicts — payload is never runtime-validated either
+    way, so per-strategy exactness wouldn't buy real safety, just more
+    types to keep in sync.
+    """
+
+    strategy: str
+    strike_score: float
+    breakdown: dict[str, float]  # matches strike_ranking.engine.RankedContract.breakdown
+    or_high: float
+    or_low: float
+    vwap: float
+    ema9: float
+    ema20: float
+    window_high: float
+    window_low: float
+    env: EnvPayload
 
 
 @dataclass(frozen=True)
@@ -43,7 +79,7 @@ class TradeProposal:
     # target_price, which are on the option premium. None means no
     # structure-break exit is tracked for this position.
     structure_level: float | None = None
-    payload: dict = field(default_factory=dict)
+    payload: TradePayload = field(default_factory=lambda: TradePayload())
 
 
 class Strategy(ABC):

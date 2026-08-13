@@ -222,6 +222,45 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
     assert "EMA20" not in names_after_warmup
 
 
+def test_reset_daily_indicators_resets_the_underlying_engine(
+    seeded_universe, test_session_factory
+):
+    """The daily VWAP-reset call `MarketDataScheduler`'s PRE_MARKET
+    transition makes — proves it reaches the real `IndicatorEngine`, not
+    just that `IndicatorEngine.reset_session` itself works in isolation
+    (already covered in test_indicators.py).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=6)
+    engine = IndicatorEngine(timeframe_seconds=60)
+    service = MarketDataIngestionService(
+        _provider(broker), session_factory=test_session_factory, indicator_engine=engine
+    )
+    service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
+    instrument_id = next(
+        row_id for kind, row_id in service._symbol_map.values() if kind == "instrument"  # noqa: SLF001
+    )
+
+    base_ts = broker.get_quote(underlying_symbol).ts
+    service._on_tick(  # noqa: SLF001
+        Tick(underlying_symbol, ltp=100.0, bid=99.9, ask=100.1, volume=10, oi=None, ts=base_ts)
+    )
+    assert engine._vwap[instrument_id].value is not None  # noqa: SLF001
+
+    service.reset_daily_indicators()
+
+    assert engine._vwap[instrument_id].value is None  # noqa: SLF001
+
+
+def test_reset_daily_indicators_is_a_harmless_noop_without_an_indicator_engine(
+    seeded_universe, test_session_factory
+):
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=6)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+
+    service.reset_daily_indicators()  # must not raise
+
+
 def test_completed_bars_are_persisted_for_underlying_instrument(
     seeded_universe, test_session_factory, db: Session
 ):
