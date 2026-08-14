@@ -340,6 +340,45 @@ def test_does_not_create_a_second_session_if_todays_already_exists(
     assert all_sessions[0].id == existing.id
 
 
+def test_does_not_spawn_strategies_against_a_non_active_todays_session(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    """A human already ended today's session (kill_switch/manual end) before
+    a restart re-ran this same-day bootstrap tick -- todays_session exists
+    but isn't ACTIVE. Must not attach a fresh StrategyRun to it: _resume_
+    strategy_runners only ever resumes runs on an ACTIVE session, so that
+    run would be a zombie no runner thread ever picks up.
+    """
+    spawn_calls: list[None] = []
+    monkeypatch.setattr(
+        bootstrapper_module,
+        "spawn_enabled_strategies",
+        lambda *a, **kw: spawn_calls.append(None),
+    )
+
+    todays_start = datetime(2026, 8, 18, 4, 0, tzinfo=UTC)  # 09:30 IST today
+    existing = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        status=TradingSessionStatus.ENDED,
+        started_at=todays_start,
+        ended_at=todays_start,
+        budget_amount=50_000,
+        daily_target_profit=5_000,
+        daily_loss_cap=5_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(existing)
+    db.flush()
+
+    run_daily_bootstrap(session_factory=_same_session(db))
+
+    assert spawn_calls == []
+
+
 def test_no_prior_session_skips_creation_without_error(db: Session, workspace):
     # A workspace with zero trading_session history ever -- run_daily_bootstrap
     # iterates distinct workspace_ids *from* trading_sessions, so this
@@ -364,3 +403,60 @@ def test_resume_strategy_runners_is_called(
     run_daily_bootstrap(session_factory=_same_session(db))
 
     assert len(_no_real_resume) == 1
+
+
+def test_auto_spawner_runs_against_todays_freshly_created_session(
+    db: Session, workspace, broker_account, user, instrument, monkeypatch
+):
+    """Ops-Hardening Phase 6: run_daily_bootstrap must hand the auto-spawner
+    the *same* TradingSession it just created, not a stale/None reference --
+    this is the actual bridge Phase 6 exists to build.
+    """
+    import app.modules.strategy_engine.auto_spawner as auto_spawner_module
+
+    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: True)
+    monkeypatch.setattr(
+        auto_spawner_module, "record_option_chain_snapshot", lambda *a, **kw: None
+    )
+    monkeypatch.setattr(auto_spawner_module, "get_broker", lambda: object())
+
+    _yesterday_session(
+        db,
+        workspace=workspace,
+        broker_account=broker_account,
+        user=user,
+        status=TradingSessionStatus.ENDED,
+    )
+    option_contract_fixture = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 8, 20),
+        strike=24000,
+        option_type=OptionType.CE,
+        symbol=f"NIFTY-{uuid.uuid4().hex[:6]}",
+    )
+    db.add(option_contract_fixture)
+    config = StrategyConfig(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        name="orb-nifty",
+        strategy_type="orb",
+        is_enabled=True,
+        underlying_symbol="NIFTY",
+    )
+    db.add(config)
+    db.flush()
+
+    run_daily_bootstrap(session_factory=_same_session(db))
+
+    new_session = (
+        db.query(TradingSession)
+        .filter(
+            TradingSession.workspace_id == workspace.id,
+            TradingSession.status == TradingSessionStatus.ACTIVE,
+        )
+        .one()
+    )
+    run = db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).one()
+    assert run.trading_session_id == new_session.id
+    assert run.expiry_date == date(2026, 8, 20)

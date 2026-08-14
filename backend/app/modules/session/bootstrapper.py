@@ -28,6 +28,13 @@ UTC-aware `started_at`'s raw `.date()` against an IST calendar date (which
 `api.v1.sessions.create_session`'s own existing "today" check does) is
 wrong near the IST midnight boundary; this module deliberately doesn't
 repeat that pattern.
+
+**Ops-Hardening Phase 6 (Auto-Spawner)**: `run_daily_bootstrap` now calls
+`strategy_engine.auto_spawner.spawn_enabled_strategies` immediately after
+resolving each workspace's today's `TradingSession`, closing the gap this
+module always left open -- a session existed, but nothing traded until a
+human clicked Start on every strategy. See that module's own docstring for
+why it only creates `StrategyRun` rows and never starts a thread itself.
 """
 
 from __future__ import annotations
@@ -53,6 +60,7 @@ from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.main import _resume_strategy_runners
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
+from app.modules.strategy_engine.auto_spawner import spawn_enabled_strategies
 
 logger = logging.getLogger("app.session.bootstrapper")
 
@@ -124,7 +132,14 @@ def _close_if_safe(db: Session, stale_session: TradingSession) -> None:
     )
 
 
-def _bootstrap_workspace(db: Session, workspace_id: uuid.UUID, today_ist: date) -> None:
+def _bootstrap_workspace(
+    db: Session, workspace_id: uuid.UUID, today_ist: date
+) -> TradingSession | None:
+    """Returns today's `TradingSession` (existing or freshly created) so the
+    caller can hand it to Phase 6's auto-spawner -- `None` only for the
+    "no prior session ever, nothing to bootstrap from" skip case, where
+    there's genuinely no session for the spawner to attach runs to either.
+    """
     stale_active = (
         db.query(TradingSession)
         .filter(
@@ -138,16 +153,18 @@ def _bootstrap_workspace(db: Session, workspace_id: uuid.UUID, today_ist: date) 
             continue  # today's own session, not stale -- left for the check below
         _close_if_safe(db, stale_session)
 
-    already_today = any(
-        to_ist(s.started_at).date() == today_ist
-        for s in db.query(TradingSession).filter(TradingSession.workspace_id == workspace_id).all()
+    all_sessions = (
+        db.query(TradingSession).filter(TradingSession.workspace_id == workspace_id).all()
     )
-    if already_today:
+    todays_session = next(
+        (s for s in all_sessions if to_ist(s.started_at).date() == today_ist), None
+    )
+    if todays_session is not None:
         logger.info(
             "Daily bootstrap: today's trading_session already exists for workspace %s",
             workspace_id,
         )
-        return
+        return todays_session
 
     most_recent = (
         db.query(TradingSession)
@@ -161,7 +178,7 @@ def _bootstrap_workspace(db: Session, workspace_id: uuid.UUID, today_ist: date) 
             "from -- skipping (create the first session manually via the UI/API).",
             workspace_id,
         )
-        return
+        return None
 
     defaults = get_settings().risk_defaults
     new_session = TradingSession(
@@ -198,6 +215,7 @@ def _bootstrap_workspace(db: Session, workspace_id: uuid.UUID, today_ist: date) 
         new_session.broker_account_id,
         most_recent.id,
     )
+    return new_session
 
 
 def run_daily_bootstrap(*, session_factory: SessionFactory = session_scope) -> None:
@@ -211,7 +229,20 @@ def run_daily_bootstrap(*, session_factory: SessionFactory = session_scope) -> N
         # this loop entirely.
         workspace_ids = {row[0] for row in db.query(Workspace.id).all()}
         for workspace_id in workspace_ids:
-            _bootstrap_workspace(db, workspace_id, today_ist)
+            todays_session = _bootstrap_workspace(db, workspace_id, today_ist)
+            # Ops-Hardening Phase 6: creates committed StrategyRun rows only
+            # (no thread starting here) -- _resume_strategy_runners below
+            # picks them up, same as it would any other non-STOPPED run with
+            # no live thread yet. `todays_session` can be `None` ("no prior
+            # session ever" skip case) or non-ACTIVE (a human already ended
+            # today's session, e.g. kill_switch/manual end, before a restart
+            # re-ran this same-day bootstrap tick) -- both must be skipped,
+            # not just the None case: _resume_strategy_runners only ever
+            # resumes runs on an ACTIVE session, so attaching a fresh run to
+            # an already-ended one would create a zombie StrategyRun no
+            # runner thread ever picks up.
+            if todays_session is not None and todays_session.status == TradingSessionStatus.ACTIVE:
+                spawn_enabled_strategies(db, todays_session, today_ist)
 
     # Resuming strategy runners is idempotent and self-contained (queries
     # fresh state each call) -- safe to call unconditionally here even

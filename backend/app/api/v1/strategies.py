@@ -248,14 +248,25 @@ class StrategyConfigOut(BaseModel):
     status: str
     is_enabled: bool
     runtime_mode: str | None
+    underlying_symbol: str | None
 
     model_config = {"from_attributes": True}
+
+
+def _validate_underlying_symbol_or_404(db: Session, underlying_symbol: str) -> None:
+    exists = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one_or_none()
+    if exists is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"No Instrument found for underlying_symbol {underlying_symbol!r}",
+        )
 
 
 class CreateStrategyRequest(BaseModel):
     name: str
     strategy_type: str = "synthetic"
     params: dict = {}
+    underlying_symbol: str | None = None
 
 
 @router.get("/strategies", response_model=list[StrategyConfigOut])
@@ -290,12 +301,16 @@ def create_strategy(
     if existing is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "A strategy with this name already exists")
 
+    if body.underlying_symbol is not None:
+        _validate_underlying_symbol_or_404(db, body.underlying_symbol)
+
     config = StrategyConfig(
         id=uuid.uuid4(),
         workspace_id=user.workspace_id,
         name=body.name,
         strategy_type=body.strategy_type,
         params=body.params,
+        underlying_symbol=body.underlying_symbol,
     )
     db.add(config)
     db.commit()
@@ -317,6 +332,7 @@ def _get_strategy_config_or_404(db: Session, user: User, strategy_id: uuid.UUID)
 class UpdateStrategyRequest(BaseModel):
     is_enabled: bool | None = None
     runtime_mode: StrategyRuntimeMode | None = None
+    underlying_symbol: str | None = None
 
 
 @router.patch("/strategies/{strategy_id}", response_model=StrategyConfigOut)
@@ -326,24 +342,30 @@ def update_strategy(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("strategy.edit")),
 ) -> StrategyConfig:
-    """Ops-Hardening Phase 1. Toggles `is_enabled`/`runtime_mode` only —
-    `status` (the graduation ladder) and `strategy_type`/`params` are
-    untouched here, deliberately not folded into one catch-all PATCH.
+    """Ops-Hardening Phase 1 (`is_enabled`/`runtime_mode`) + Phase 6
+    (`underlying_symbol`). `status` (the graduation ladder) and
+    `strategy_type`/`params` are untouched here, deliberately not folded
+    into one catch-all PATCH.
 
-    `runtime_mode: null` explicitly clears any tactical override, distinct
-    from omitting the field entirely (which leaves it untouched) — the two
-    are distinguished via `model_fields_set` since both parse to the same
+    `runtime_mode: null`/`underlying_symbol: null` explicitly clear the
+    field, distinct from omitting it entirely (which leaves it untouched) —
+    distinguished via `model_fields_set` since both parse to the same
     Python `None` otherwise. `is_enabled` has no such "clear" case (it's a
     plain, non-nullable bool), so a plain `is not None` check is enough.
 
-    Neither field has any live effect yet — nothing in this codebase reads
-    `is_enabled`/`runtime_mode` at runtime today (that's Phase 4's daily
-    bootstrapper and a later phase's dispatch gating, respectively). This
-    endpoint only ever updates the DB row; a currently-running `StrategyRun`
-    started before this call is completely unaffected by it.
+    `runtime_mode` feeds `broker_adapter.composition.get_execution_broker`'s
+    live-routing check (Phase 6); `underlying_symbol` feeds the daily
+    auto-spawner (`strategy_engine.auto_spawner`, also Phase 6) — an
+    `is_enabled` config with no `underlying_symbol` set is skipped there,
+    alerted rather than guessed. This endpoint only ever updates the DB row;
+    a currently-running `StrategyRun` started before this call is
+    completely unaffected by it.
     """
     config = _get_strategy_config_or_404(db, user, strategy_id)
     fields_set = body.model_fields_set
+
+    if body.underlying_symbol is not None:
+        _validate_underlying_symbol_or_404(db, body.underlying_symbol)
 
     changes: dict[str, object] = {}
     if body.is_enabled is not None and body.is_enabled != config.is_enabled:
@@ -353,6 +375,10 @@ def update_strategy(
     if "runtime_mode" in fields_set and body.runtime_mode != config.runtime_mode:
         changes["runtime_mode"] = body.runtime_mode.value if body.runtime_mode is not None else None
         config.runtime_mode = body.runtime_mode
+
+    if "underlying_symbol" in fields_set and body.underlying_symbol != config.underlying_symbol:
+        changes["underlying_symbol"] = body.underlying_symbol
+        config.underlying_symbol = body.underlying_symbol
 
     if changes:
         db.flush()

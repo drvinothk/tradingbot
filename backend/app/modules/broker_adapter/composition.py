@@ -62,7 +62,7 @@ from app.domain.execution.models import OrderMode
 from app.domain.execution.models import Position as PositionRow
 from app.domain.market.mock_universe import build_mock_universe
 from app.domain.session.models import SafeMode
-from app.domain.strategy.models import StrategyConfig, StrategyStatus
+from app.domain.strategy.models import StrategyConfig, StrategyRuntimeMode, StrategyStatus
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -312,11 +312,15 @@ def get_execution_broker(
        reconciliation_lock)` → mock, unconditionally, regardless of
        `strategy_run`.
     3. `mode == live_enabled`, or `mode == paper_plus_guarded_live` and
-       `strategy_run`'s own `StrategyConfig.status == LIVE` (graduated) →
-       real broker, gated on `allow_real_money_dispatch` (raises
-       `ConfigurationError` rather than falling back to paper if it's off
-       — a missing/false flag must never be silently read as "use paper
-       instead," per explicit design intent).
+       `strategy_run`'s own `StrategyConfig.status == LIVE` (graduated) AND
+       `runtime_mode != FORCE_PAPER` → real broker, gated on
+       `allow_real_money_dispatch` (raises `ConfigurationError` rather than
+       falling back to paper if it's off — a missing/false flag must never
+       be silently read as "use paper instead," per explicit design intent).
+       `runtime_mode.FORCE_PAPER` (Ops-Hardening Phase 1) is the tactical,
+       same-day override this check completes -- Phase 1's own docstring
+       named this exact gap ("a later phase's dispatch gating") and it had
+       zero runtime effect anywhere until Phase 6 wired it in here.
     4. Otherwise (`paper_plus_guarded_live` with no `strategy_run`, or a
        not-yet-graduated one) → mock. Missing strategy-graduation
        information must never default *up* to real money.
@@ -346,7 +350,11 @@ def get_execution_broker(
         db = object_session(strategy_run)
         if db is not None:
             config = db.get(StrategyConfig, strategy_run.strategy_config_id)
-            strategy_is_live = config is not None and config.status == StrategyStatus.LIVE
+            strategy_is_live = (
+                config is not None
+                and config.status == StrategyStatus.LIVE
+                and config.runtime_mode != StrategyRuntimeMode.FORCE_PAPER
+            )
 
     if mode == SafeMode.LIVE_ENABLED or (
         mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live

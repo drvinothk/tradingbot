@@ -111,6 +111,14 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     runtime_mode: Mapped[StrategyRuntimeMode | None] = mapped_column(
         String(30), nullable=True, default=None
     )
+    # Ops-Hardening Phase 6 (Auto-Spawner): which underlying (Instrument.symbol,
+    # e.g. "NIFTY"/"BANKNIFTY") the daily auto-spawner should resolve an
+    # instrument_id/expiry_date for. Nullable -- an is_enabled config with no
+    # underlying_symbol set is skipped (alerted, not guessed) by the spawner.
+    # Previously this was request-only (POST /strategies/{id}/start's own
+    # instrument_id), never persisted at the config level, since nothing
+    # needed to auto-start a run without a human picking an instrument first.
+    underlying_symbol: Mapped[str | None] = mapped_column(String(60), nullable=True)
 
     __table_args__ = (UniqueConstraint("workspace_id", "name", name="uq_strategy_config_name"),)
 

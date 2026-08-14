@@ -24,3 +24,14 @@ WEEKLY_EXPIRY_WEEKDAY = 1
 
 def is_expiry_day(instrument_id: uuid.UUID, check_date: date) -> bool:
     return check_date.weekday() == WEEKLY_EXPIRY_WEEKDAY
+
+
+# TODO: same gap as WEEKLY_EXPIRY_WEEKDAY above -- ignores exchange holidays.
+# An NSE holiday landing on a weekday is misclassified as a trading day until
+# a real holiday calendar is integrated (DB table or broker/exchange API).
+def is_trading_day(check_date: date) -> bool:
+    """Monday-Friday only. Ops-Hardening Phase 6 (Auto-Spawner): the guard
+    that keeps the daily strategy auto-spawner from hammering the DB/broker
+    on weekends.
+    """
+    return check_date.weekday() < 5

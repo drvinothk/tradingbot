@@ -32,6 +32,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
@@ -92,13 +93,20 @@ def trading_session(db: Session, workspace, broker_account, user: User) -> Tradi
 
 
 def _strategy_run(
-    db: Session, *, workspace, trading_session, user, status: StrategyStatus
+    db: Session,
+    *,
+    workspace,
+    trading_session,
+    user,
+    status: StrategyStatus,
+    runtime_mode: StrategyRuntimeMode | None = None,
 ) -> StrategyRun:
     config = StrategyConfig(
         id=uuid.uuid4(),
         workspace_id=workspace.id,
         name=f"orb-{uuid.uuid4().hex[:6]}",
         status=status,
+        runtime_mode=runtime_mode,
     )
     db.add(config)
     db.flush()
@@ -170,6 +178,30 @@ def test_guarded_live_with_graduated_strategy_but_no_flag_raises(
 
     with pytest.raises(ConfigurationError):
         composition.get_execution_broker(trading_session, run)
+
+
+def test_guarded_live_with_graduated_strategy_but_force_paper_returns_mock(
+    db: Session, workspace, trading_session, user, monkeypatch
+):
+    """Ops-Hardening Phase 6: `runtime_mode.FORCE_PAPER` overrides a graduated
+    (LIVE) strategy's routing back to mock, even with the flag on and a real
+    broker connected -- the tactical same-day downgrade Phase 1 introduced
+    but left with zero runtime effect until this wiring.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
+    )
+
+    broker = composition.get_execution_broker(trading_session, run)
+
+    assert isinstance(broker, MockBrokerAdapter)
 
 
 # -- position-aware exit gating ------------------------------------------

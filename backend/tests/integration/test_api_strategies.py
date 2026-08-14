@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 
 import pytest
@@ -850,3 +851,88 @@ def test_patch_rejects_unknown_runtime_mode_value(api_client: TestClient, seeded
     )
 
     assert response.status_code == 422
+
+
+@contextmanager
+def _seeded_instrument(engine, symbol: str):
+    """Instrument has no workspace scoping (shared exchange-wide data), same
+    as the instrument seeded in test_start_strategy_creates_run_and_stop_ends_it
+    above — a plain `session_factory(bind=engine)` commit bypasses the `db`
+    fixture's per-test rollback, so it must be deleted explicitly or it
+    leaks into every later test in the same run (found live: broke
+    test_instrument_sync.py's exact-count assertions).
+    """
+    instrument_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        db.add(
+            Instrument(
+                id=instrument_id, symbol=symbol, exchange="NFO", lot_size=25, tick_size=0.05
+            )
+        )
+        db.commit()
+    try:
+        yield instrument_id
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
+def test_create_strategy_with_valid_underlying_symbol(api_client: TestClient, seeded_admin, engine):
+    with _seeded_instrument(engine, "NIFTY-UND-1"):
+        _login(api_client, seeded_admin)
+
+        response = api_client.post(
+            "/api/v1/strategies",
+            json={"name": "orb-underlying-valid", "underlying_symbol": "NIFTY-UND-1"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["underlying_symbol"] == "NIFTY-UND-1"
+
+
+def test_create_strategy_with_unknown_underlying_symbol_is_400(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+
+    response = api_client.post(
+        "/api/v1/strategies",
+        json={"name": "orb-underlying-unknown", "underlying_symbol": "NOSUCHTHING"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_patch_sets_and_clears_underlying_symbol(api_client: TestClient, seeded_admin, engine):
+    with _seeded_instrument(engine, "NIFTY-UND-2"):
+        _login(api_client, seeded_admin)
+        strategy_id = api_client.post(
+            "/api/v1/strategies", json={"name": "orb-patch-underlying"}
+        ).json()["id"]
+
+        set_resp = api_client.patch(
+            f"/api/v1/strategies/{strategy_id}", json={"underlying_symbol": "NIFTY-UND-2"}
+        )
+        assert set_resp.status_code == 200
+        assert set_resp.json()["underlying_symbol"] == "NIFTY-UND-2"
+
+        clear_resp = api_client.patch(
+            f"/api/v1/strategies/{strategy_id}", json={"underlying_symbol": None}
+        )
+        assert clear_resp.status_code == 200
+        assert clear_resp.json()["underlying_symbol"] is None
+
+
+def test_patch_rejects_unknown_underlying_symbol(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-underlying-invalid"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"underlying_symbol": "NOSUCHTHING"}
+    )
+
+    assert response.status_code == 400
