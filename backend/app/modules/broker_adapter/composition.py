@@ -51,16 +51,19 @@ instance execution always uses today, entirely independent of whatever
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy.orm import object_session
+from sqlalchemy.orm import Session, object_session
 
 from app.config.settings import get_settings
 from app.domain.execution.models import Order as OrderRow
 from app.domain.execution.models import OrderMode
 from app.domain.execution.models import Position as PositionRow
 from app.domain.market.mock_universe import build_mock_universe
+from app.domain.market.models import Instrument
+from app.domain.ops.models import DEFAULT_ACTIVE_LIVE_INSTRUMENTS, InstrumentFirewallConfig
 from app.domain.session.models import SafeMode
 from app.domain.strategy.models import StrategyConfig, StrategyRuntimeMode, StrategyStatus
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
@@ -266,6 +269,24 @@ def _position_opened_live(position: PositionRow) -> bool:
     return opening_order is not None and opening_order.mode == OrderMode.LIVE
 
 
+def _instrument_firewall_allows(db: Session, workspace_id: uuid.UUID, symbol: str) -> bool:
+    """Ops-Hardening Phase 7. `InstrumentFirewallConfig` is workspace-scoped
+    (one row per workspace, see that model's own docstring) -- a workspace
+    with no row yet (created after this feature shipped, before its first
+    PATCH) falls back to `DEFAULT_ACTIVE_LIVE_INSTRUMENTS`, never to
+    "everything allowed."
+    """
+    config = (
+        db.query(InstrumentFirewallConfig)
+        .filter(InstrumentFirewallConfig.workspace_id == workspace_id)
+        .one_or_none()
+    )
+    allowed = (
+        config.active_live_instruments if config is not None else DEFAULT_ACTIVE_LIVE_INSTRUMENTS
+    )
+    return symbol in allowed
+
+
 def _real_broker_or_raise(reason: str) -> BrokerPort:
     """The single, uniform gate every real-broker path in `get_execution_broker`
     routes through -- both checks apply regardless of *why* real execution
@@ -325,6 +346,18 @@ def get_execution_broker(
        not-yet-graduated one) → mock. Missing strategy-graduation
        information must never default *up* to real money.
 
+    **Ops-Hardening Phase 7**: whenever step 3 is about to return a real
+    broker AND a `strategy_run` is given (i.e. this is a genuine new-order
+    dispatch, not reconciliation/EOD-square-off/margin-check call sites
+    that call this with `strategy_run=None`), `strategy_run.instrument_id`
+    is checked against that workspace's `InstrumentFirewallConfig
+    .active_live_instruments` — an instrument not on the list raises
+    `ConfigurationError`, same "never silently fall back to paper" contract
+    as `allow_real_money_dispatch`. Deliberately does **not** apply to the
+    `position`-aware override in step 1 — closing an already-live position
+    must never be blocked by a firewall change made after that position was
+    opened, same reasoning `kill_switch` already can't block it either.
+
     Real-adapter resolution never constructs a new `ShoonyaBrokerAdapter`
     here (this module never imports that class at all, by design — see
     the module's own docstring) — it reuses whatever `get_broker()`
@@ -359,6 +392,18 @@ def get_execution_broker(
     if mode == SafeMode.LIVE_ENABLED or (
         mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
     ):
+        if strategy_run is not None:
+            db = object_session(strategy_run)
+            if db is not None and strategy_run.instrument_id is not None:
+                instrument = db.get(Instrument, strategy_run.instrument_id)
+                if instrument is not None and not _instrument_firewall_allows(
+                    db, trading_session.workspace_id, instrument.symbol
+                ):
+                    raise ConfigurationError(
+                        f"trading_session {trading_session.id}: instrument "
+                        f"{instrument.symbol!r} is not on the active_live_instruments "
+                        "firewall -- refusing real dispatch."
+                    )
         return _real_broker_or_raise(f"trading_session {trading_session.id} mode={mode.value}")
 
     return _get_or_create_execution_mock()

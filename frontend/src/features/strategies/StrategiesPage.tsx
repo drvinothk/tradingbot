@@ -6,10 +6,12 @@ import { useStrategies } from '../../shared/hooks/useStrategies'
 import type {
   ExecutionMode,
   InstrumentOut,
+  RuntimeMode,
   SessionOut,
   StrategyConfigOut,
   StrategyRunOut,
   StrategyType,
+  UnderlyingSymbol,
 } from '../../shared/api/types'
 
 const STRATEGY_TYPES: StrategyType[] = [
@@ -20,6 +22,11 @@ const STRATEGY_TYPES: StrategyType[] = [
   'oi_volume_confirmed',
   'liquidity_sweep_reversal',
 ]
+
+// Matches api.v1.system_settings.RECOGNIZED_FIREWALL_INSTRUMENTS -- the only
+// two underlyings this system trades, same hardcoded-list convention as
+// STRATEGY_TYPES above (no OpenAPI-codegen, see shared/api/types.ts).
+const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
 
 export function StrategiesPage() {
   const queryClient = useQueryClient()
@@ -127,6 +134,9 @@ export function StrategiesPage() {
             <th>Name</th>
             <th>Type</th>
             <th>Status</th>
+            <th>Power</th>
+            <th>Safety</th>
+            <th>Instrument</th>
             <th>Start</th>
             <th></th>
           </tr>
@@ -137,6 +147,7 @@ export function StrategiesPage() {
               <td>{strategy.name}</td>
               <td>{strategy.strategy_type}</td>
               <td>{strategy.status}</td>
+              <StrategyPatchControls strategy={strategy} onSuccess={invalidateStrategies} />
               <td>
                 <StartStrategyForm
                   strategyId={strategy.id}
@@ -162,6 +173,71 @@ export function StrategiesPage() {
         </tbody>
       </table>
     </div>
+  )
+}
+
+// Three `<td>`s (Power/Safety/Instrument) rendered as siblings of the
+// caller's own `<td>`s within the same `<tr>` -- each control PATCHes
+// independently on change, matching stopMutation's own
+// mutate-then-invalidate pattern elsewhere on this page rather than a
+// single combined form with its own submit button.
+function StrategyPatchControls({
+  strategy,
+  onSuccess,
+}: {
+  strategy: StrategyConfigOut
+  onSuccess: () => void
+}) {
+  const patchMutation = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      api.patch<StrategyConfigOut>(`/strategies/${strategy.id}`, body),
+    onSuccess,
+  })
+
+  return (
+    <>
+      <td>
+        <label className="row-actions" style={{ gap: '0.4rem' }}>
+          <input
+            type="checkbox"
+            checked={strategy.is_enabled}
+            disabled={patchMutation.isPending}
+            onChange={(e) => patchMutation.mutate({ is_enabled: e.target.checked })}
+          />
+          {strategy.is_enabled ? 'On' : 'Off'}
+        </label>
+      </td>
+      <td>
+        <select
+          value={strategy.runtime_mode ?? ''}
+          disabled={patchMutation.isPending}
+          onChange={(e) =>
+            patchMutation.mutate({
+              runtime_mode: (e.target.value || null) as RuntimeMode | null,
+            })
+          }
+        >
+          <option value="">Default</option>
+          <option value="force_paper">Force paper</option>
+        </select>
+      </td>
+      <td>
+        <select
+          value={strategy.underlying_symbol ?? ''}
+          disabled={patchMutation.isPending}
+          onChange={(e) =>
+            patchMutation.mutate({ underlying_symbol: e.target.value || null })
+          }
+        >
+          <option value="">Unset</option>
+          {UNDERLYING_SYMBOLS.map((symbol) => (
+            <option key={symbol} value={symbol}>
+              {symbol}
+            </option>
+          ))}
+        </select>
+      </td>
+    </>
   )
 }
 

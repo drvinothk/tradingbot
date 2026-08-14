@@ -5,10 +5,18 @@ import { useSessions } from '../../shared/hooks/useSessions'
 import type {
   BrokerAccountOut,
   FundingMode,
+  InstrumentFirewallOut,
+  ProviderPreferenceOut,
   SessionOut,
   ShoonyaLoginUrlOut,
   ShoonyaStatusOut,
+  UnderlyingSymbol,
 } from '../../shared/api/types'
+
+// Matches api.v1.system_settings.RECOGNIZED_FIREWALL_INSTRUMENTS.
+const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
+// Matches api.v1.market_data.RECOGNIZED_OVERRIDE_PROVIDERS.
+const FAILOVER_PROVIDERS = ['shoonya', 'angel_one'] as const
 
 export function SessionsPage() {
   const queryClient = useQueryClient()
@@ -99,6 +107,7 @@ export function SessionsPage() {
       </div>
 
       <ShoonyaConnectionCard />
+      <GlobalSettingsCard />
 
       <div className="card">
         <h3>Start a new session</h3>
@@ -271,6 +280,96 @@ function ShoonyaConnectionCard() {
         Opens Shoonya's own login page in a new tab. After you log in there, come back to this
         tab — the status above updates automatically.
       </p>
+    </div>
+  )
+}
+
+// Ops-Hardening Phase 7: instrument firewall checkboxes (Task 2) + the
+// market-data failover manual-override dropdown (Task 2's backend from
+// Ops-Hardening Phase 4, which never had frontend controls until now).
+// Two independent mutations, each PATCHing on change -- no combined
+// submit button, matching StrategyPatchControls' own per-field pattern.
+function GlobalSettingsCard() {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+
+  const firewallQuery = useQuery({
+    queryKey: ['system-settings', 'instrument-firewall'],
+    queryFn: () => api.get<InstrumentFirewallOut>('/system-settings/instrument-firewall'),
+  })
+  const providerPrefQuery = useQuery({
+    queryKey: ['market-data', 'provider-preference'],
+    queryFn: () => api.get<ProviderPreferenceOut>('/market-data/provider-preference'),
+  })
+
+  const firewallMutation = useMutation({
+    mutationFn: (active_live_instruments: string[]) =>
+      api.patch<InstrumentFirewallOut>('/system-settings/instrument-firewall', {
+        active_live_instruments,
+      }),
+    onSuccess: (data) =>
+      queryClient.setQueryData(['system-settings', 'instrument-firewall'], data),
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Firewall update failed'),
+  })
+
+  const providerPrefMutation = useMutation({
+    mutationFn: (active_provider: string | null) =>
+      api.patch<ProviderPreferenceOut>('/market-data/provider-preference', { active_provider }),
+    onSuccess: (data) => queryClient.setQueryData(['market-data', 'provider-preference'], data),
+    onError: (err) =>
+      setError(err instanceof ApiError ? err.message : 'Provider preference update failed'),
+  })
+
+  const activeLiveInstruments = firewallQuery.data?.active_live_instruments ?? []
+
+  function toggleInstrument(symbol: UnderlyingSymbol, checked: boolean) {
+    const next = checked
+      ? [...activeLiveInstruments, symbol]
+      : activeLiveInstruments.filter((s) => s !== symbol)
+    firewallMutation.mutate(next)
+  }
+
+  return (
+    <div className="card">
+      <h3>Global settings</h3>
+      {error && <p className="error">{error}</p>}
+
+      <div className="form-row">
+        <label>Live instrument firewall</label>
+        <div className="row-actions">
+          {UNDERLYING_SYMBOLS.map((symbol) => (
+            <label key={symbol} style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={activeLiveInstruments.includes(symbol)}
+                disabled={firewallMutation.isPending || firewallQuery.isLoading}
+                onChange={(e) => toggleInstrument(symbol, e.target.checked)}
+              />
+              {symbol}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="form-row">
+        <label htmlFor="failover-override">Market-data failover override</label>
+        <select
+          id="failover-override"
+          value={providerPrefQuery.data?.active_provider ?? ''}
+          disabled={providerPrefMutation.isPending || providerPrefQuery.isLoading}
+          onChange={(e) => providerPrefMutation.mutate(e.target.value || null)}
+        >
+          <option value="">Automatic (no override)</option>
+          {FAILOVER_PROVIDERS.map((provider) => (
+            <option key={provider} value={provider}>
+              {provider}
+            </option>
+          ))}
+        </select>
+        {providerPrefQuery.data?.live_active_leg && (
+          <span className="badge">live: {providerPrefQuery.data.live_active_leg}</span>
+        )}
+      </div>
     </div>
   )
 }

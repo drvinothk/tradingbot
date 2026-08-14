@@ -24,6 +24,7 @@ from app.domain.execution.models import (
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.ops.models import InstrumentFirewallConfig
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -100,6 +101,7 @@ def _strategy_run(
     user,
     status: StrategyStatus,
     runtime_mode: StrategyRuntimeMode | None = None,
+    instrument_id: uuid.UUID | None = None,
 ) -> StrategyRun:
     config = StrategyConfig(
         id=uuid.uuid4(),
@@ -118,6 +120,7 @@ def _strategy_run(
         status=StrategyRunStatus.SCANNING,
         started_at=trading_session.started_at,
         started_by_user_id=user.id,
+        instrument_id=instrument_id,
     )
     db.add(run)
     db.flush()
@@ -202,6 +205,106 @@ def test_guarded_live_with_graduated_strategy_but_force_paper_returns_mock(
     broker = composition.get_execution_broker(trading_session, run)
 
     assert isinstance(broker, MockBrokerAdapter)
+
+
+# -- Ops-Hardening Phase 7: instrument firewall gating -------------------
+
+
+@pytest.fixture
+def banknifty(db: Session) -> Instrument:
+    inst = Instrument(
+        id=uuid.uuid4(), symbol="BANKNIFTY", exchange="NFO", lot_size=15, tick_size=0.05
+    )
+    db.add(inst)
+    db.flush()
+    return inst
+
+
+def test_guarded_live_with_instrument_on_firewall_returns_real(
+    db: Session, workspace, trading_session, user, monkeypatch
+):
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    nifty = Instrument(id=uuid.uuid4(), symbol="NIFTY", exchange="NFO", lot_size=25, tick_size=0.05)
+    db.add(nifty)
+    db.flush()
+    db.add(InstrumentFirewallConfig(workspace_id=workspace.id, active_live_instruments=["NIFTY"]))
+    db.flush()
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        instrument_id=nifty.id,
+    )
+
+    broker = composition.get_execution_broker(trading_session, run)
+
+    assert not isinstance(broker, MockBrokerAdapter)
+
+
+def test_guarded_live_with_instrument_not_on_firewall_raises(
+    db: Session, workspace, trading_session, user, banknifty, monkeypatch
+):
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    db.add(InstrumentFirewallConfig(workspace_id=workspace.id, active_live_instruments=["NIFTY"]))
+    db.flush()
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        instrument_id=banknifty.id,
+    )
+
+    with pytest.raises(ConfigurationError, match="firewall"):
+        composition.get_execution_broker(trading_session, run)
+
+
+def test_guarded_live_with_no_firewall_row_defaults_to_nifty_only(
+    db: Session, workspace, trading_session, user, banknifty, monkeypatch
+):
+    # No InstrumentFirewallConfig row seeded at all -- must fall back to
+    # DEFAULT_ACTIVE_LIVE_INSTRUMENTS ("NIFTY",), never "everything allowed".
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        instrument_id=banknifty.id,
+    )
+
+    with pytest.raises(ConfigurationError, match="firewall"):
+        composition.get_execution_broker(trading_session, run)
+
+
+def test_guarded_live_with_no_instrument_id_on_run_skips_firewall_check(
+    db: Session, workspace, trading_session, user, monkeypatch
+):
+    # A strategy_run predating the instrument_id column (still NULL) --
+    # nothing to check against, so the firewall doesn't block it (same
+    # "skip, don't crash on legacy NULL data" reasoning as _resume_
+    # strategy_runners's own instrument_id/expiry_date NULL check.
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        instrument_id=None,
+    )
+
+    broker = composition.get_execution_broker(trading_session, run)
+
+    assert not isinstance(broker, MockBrokerAdapter)
 
 
 # -- position-aware exit gating ------------------------------------------

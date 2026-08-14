@@ -94,3 +94,34 @@ class MarketDataProviderPreference(Base, UUIDPkMixin, TimestampMixin):
     # StrategyConfig.runtime_mode (Ops-Hardening Phase 1) -- not an empty
     # string sentinel.
     active_provider: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+
+# Ops-Hardening Phase 7: the only two underlyings this system ever trades
+# (same scoping as api.v1.shoonya._KNOWN_UNDERLYINGS / adapter.py's
+# KNOWN_UNDERLYINGS) -- used both as the DB seed value and as the fallback
+# `broker_adapter.composition._instrument_firewall_allows` returns to when a
+# workspace genuinely has no row yet (never fail open to "everything
+# allowed").
+DEFAULT_ACTIVE_LIVE_INSTRUMENTS: tuple[str, ...] = ("NIFTY",)
+
+
+class InstrumentFirewallConfig(Base, UUIDPkMixin, TimestampMixin):
+    """Ops-Hardening Phase 7. One row per workspace -- the DB-backed
+    replacement for what would otherwise be a hardcoded instrument allowlist.
+    `get_execution_broker` (`broker_adapter/composition.py`) checks this on
+    every *new* live-money dispatch (never on closes/reconciliation/margin
+    reads, which have no "which instrument is this opening" question to ask)
+    before routing a trade to the real broker -- an instrument not on this
+    list gets a `ConfigurationError`, never a silent downgrade to paper, same
+    "never silently fall back for a live-intent trade" principle
+    `ALLOW_REAL_MONEY_DISPATCH`/the 1-lot hardcap already established in
+    Phase 5.
+    """
+
+    __tablename__ = "instrument_firewall_configs"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"), unique=True)
+    # JSONB list of Instrument.symbol strings, matching every other
+    # list/dict-shaped column in this codebase (StrategyConfig.params,
+    # OptionChainSnapshot.chain_data) rather than a native Postgres ARRAY.
+    active_live_instruments: Mapped[list[str]] = mapped_column(JSONB)

@@ -31,7 +31,12 @@
    (`reporting/export_scheduler.py`, Ops-Hardening Phase 3): once daily at
    15:35 IST, exports the day's completed trades to a per-workspace Excel
    workbook under `reports/`, one tab per (underlying, expiry) cycle.
-7. Daily bootstrap scheduler — starts `DailyBootstrapScheduler`
+7. Contract sync scheduler — starts `ContractSyncScheduler`
+   (`scheduler/contract_sync_scheduler.py`, Ops-Hardening Phase 7): once
+   daily at 08:30 IST, re-syncs `instruments`/`option_contracts` from
+   Shoonya (skipped, not failed, if Shoonya isn't connected yet) so the
+   09:00 auto-spawner below has fresh local expiry data to query.
+8. Daily bootstrap scheduler — starts `DailyBootstrapScheduler`
    (`session/bootstrapper.py`, Ops-Hardening Phase 4): once daily at 09:00
    IST, safely closes any prior-day session left ACTIVE with no open
    positions/live runs (alerts instead of closing if it isn't empty),
@@ -59,6 +64,7 @@ from app.api.v1 import (
     shoonya,
     strategies,
     system_alerts,
+    system_settings,
 )
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
@@ -450,12 +456,16 @@ async def lifespan(app: FastAPI):
         from app.modules.reporting.export_scheduler import (
             ensure_trade_log_export_scheduler_running,
         )
+        from app.modules.scheduler.contract_sync_scheduler import (
+            ensure_contract_sync_scheduler_running,
+        )
         from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
         from app.modules.session.bootstrapper import ensure_daily_bootstrap_scheduler_running
 
         ensure_health_check_scheduler_running()
         ensure_market_data_scheduler_running()
         ensure_trade_log_export_scheduler_running()
+        ensure_contract_sync_scheduler_running()
         ensure_daily_bootstrap_scheduler_running()
     except Exception:
         from app.core.locking import release_advisory_lock
@@ -475,6 +485,7 @@ async def lifespan(app: FastAPI):
         stop_scrip_master_refresh_scheduler,
     )
     from app.modules.reporting.export_scheduler import stop_trade_log_export_scheduler
+    from app.modules.scheduler.contract_sync_scheduler import stop_contract_sync_scheduler
     from app.modules.scheduler.health_check import stop_health_check_scheduler
     from app.modules.session.bootstrapper import stop_daily_bootstrap_scheduler
 
@@ -483,6 +494,7 @@ async def lifespan(app: FastAPI):
     stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
     stop_trade_log_export_scheduler()
+    stop_contract_sync_scheduler()
     stop_daily_bootstrap_scheduler()
     # 2026-08-11: found missing during a live-WS troubleshooting audit —
     # `stop_market_data_scheduler()` only stops that class's own polling
@@ -521,6 +533,7 @@ def create_app() -> FastAPI:
     app.include_router(metrics.router, prefix="/api/v1")
     app.include_router(system_alerts.router, prefix="/api/v1")
     app.include_router(market_data.router, prefix="/api/v1")
+    app.include_router(system_settings.router, prefix="/api/v1")
     # No /api/v1 prefix, deliberately: SHOONYA_REDIRECT_URL (the fixed URL
     # the user registers on Shoonya's own API key form) is
     # http://127.0.0.1:5000/shoonya/callback — mounting under /api/v1 would

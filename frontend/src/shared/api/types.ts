@@ -12,6 +12,8 @@ export type StrategyType =
   | 'ema_micro_pullback'
   | 'oi_volume_confirmed'
   | 'liquidity_sweep_reversal'
+export type RuntimeMode = 'force_paper'
+export type UnderlyingSymbol = 'NIFTY' | 'BANKNIFTY'
 
 export interface UserOut {
   id: string
@@ -47,6 +49,19 @@ export interface StrategyConfigOut {
   strategy_type: string
   params: Record<string, unknown>
   status: string
+  is_enabled: boolean
+  runtime_mode: string | null
+  underlying_symbol: string | null
+}
+
+export interface ProviderPreferenceOut {
+  active_provider: string | null
+  live_active_leg: string | null
+}
+
+export interface InstrumentFirewallOut {
+  active_live_instruments: string[]
+  recognized_instruments: string[]
 }
 
 export interface InstrumentOut {
