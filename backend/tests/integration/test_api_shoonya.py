@@ -421,3 +421,55 @@ def test_seed_option_anchors_seeds_every_active_expiry_from_the_db(db):
     assert ("NIFTY", date(2026, 8, 18), "NIFTY18AUG26C24400") in fake_adapter.seeded
     seeded_expiries = {call[1] for call in fake_adapter.seeded if call[0] == "NIFTY"}
     assert date(2026, 8, 6) not in seeded_expiries, "an inactive contract must never be seeded"
+
+
+def test_search_scrip_diagnostic_requires_live_session(api_client: TestClient, seeded_admin):
+    """No `set_broker(real_adapter)` call in this test -- `get_broker()`
+    defaults to the mock, matching every other test in this suite unless a
+    test explicitly installs a real ShoonyaBrokerAdapter (see the two
+    request-body tests below).
+    """
+    _login(api_client, seeded_admin)
+    response = api_client.get("/shoonya/search-scrip?exchange=NSE&text=VIX")
+    assert response.status_code == 409
+
+
+def test_subscribe_diagnostic_requires_live_session(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    response = api_client.get("/shoonya/subscribe-diagnostic?symbols=NIFTY18AUG26C24400")
+    assert response.status_code == 409
+
+
+def _install_fake_shoonya_adapter():
+    """Lightweight, network-free `ShoonyaBrokerAdapter` construction --
+    same pattern `tests/unit/test_shoonya_adapter.py`'s own `_adapter()`
+    helper uses, needed here only to pass this endpoint's `isinstance`
+    check; no REST/WS calls are exercised by the tests below.
+    """
+    from pydantic import SecretStr
+
+    from app.config.settings import ShoonyaSettings
+    from app.modules.broker_adapter.base.contracts import AuthResult
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+    class _FakeRestClient:
+        def close(self):
+            pass
+
+    settings = ShoonyaSettings(
+        client_id="TESTCID",
+        secret_code=SecretStr("TESTSECRET"),
+        user_id="FA12345",
+        api_host="https://api.shoonya.test/NorenWClientAPI",
+        ws_host="wss://api.shoonya.test/NorenWSAPI/",
+    )
+    auth_result = AuthResult(session_token="tok", account_id="FA12345")
+    adapter = ShoonyaBrokerAdapter(settings, auth_result, rest_client=_FakeRestClient())
+    composition.set_broker(adapter)
+
+
+def test_subscribe_diagnostic_requires_symbols(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    _install_fake_shoonya_adapter()
+    response = api_client.get("/shoonya/subscribe-diagnostic?symbols=")
+    assert response.status_code == 422

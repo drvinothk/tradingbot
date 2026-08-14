@@ -160,6 +160,129 @@ def ws_tick_diagnostic(
     )
 
 
+@router.get("/search-scrip")
+def search_scrip_diagnostic(
+    exchange: str,
+    text: str,
+    user: User = Depends(require_permission("session.start")),
+) -> dict:
+    """2026-08-14: read-only lookup for discovering a symbol's real Shoonya
+    `tsym`/token before subscribing to it — e.g. India VIX, which (like
+    NIFTY/BANKNIFTY before it — see `_UNDERLYING_INDEX_TSYM`'s own
+    docstring) isn't a bare recognizable name on Shoonya's own search; a
+    naive text search can return several unrelated decoys, so this
+    deliberately returns every raw candidate for a human to pick from,
+    rather than auto-selecting the first match. No side effects — doesn't
+    subscribe, doesn't cache anything.
+    """
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+    broker = get_broker()
+    inner = getattr(broker, "_inner", broker)
+    if not isinstance(inner, ShoonyaBrokerAdapter):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No live Shoonya session — connect via /shoonya/login-url first.",
+        )
+    rows = inner._rest.search_scrip(inner._uid, exchange, text)  # noqa: SLF001
+    return {"count": len(rows), "results": rows}
+
+
+@router.get("/subscribe-diagnostic")
+def subscribe_diagnostic(
+    symbols: str,
+    manual_symbol: str = "",
+    manual_exchange: str = "",
+    manual_token: str = "",
+    duration: float = 20.0,
+    user: User = Depends(require_permission("session.start")),
+) -> dict:
+    """2026-08-14: unlike `/ws-tick-diagnostic` (throwaway callback, never
+    actually invoked once real ingestion already owns the shared
+    connection's fixed construction-time callback -- a known, accepted
+    limitation, not fixed here), this subscribes through the *real*
+    production path -- `market_data.provider_composition
+    .get_market_data_provider()`, the same cached provider `market_data
+    .registry.ensure_ingestion_running` uses -- whose per-symbol callback
+    dict is updatable live with no reconstruction needed, so this doesn't
+    disturb any other symbol's existing routing (verified against
+    `FailoverMarketDataProvider`/`MarketHoursGatedProvider`'s own
+    subscribe_ticks/unsubscribe_ticks, both per-symbol/additive).
+
+    `manual_symbol`/`manual_exchange`/`manual_token` (all three or none)
+    seed the broker's token cache before subscribing -- for a symbol with
+    no `Instrument`/`OptionContract` row and no `KNOWN_UNDERLYINGS` entry
+    (e.g. a VIX row discovered via `/search-scrip`), which has no other way
+    to resolve a token. Already-cached option-contract symbols (anything a
+    real strategy has already ranked via get_option_chain) need no manual
+    token -- `_resolve_token` already has it.
+
+    **Caller must independently confirm no symbol passed here has a
+    currently-OPEN Position** -- subscribe_ticks/unsubscribe_ticks are
+    per-symbol but not per-caller, so sharing a symbol with
+    PositionManager's own live subscription would silently steal that
+    position's real pricing callback for this call's duration and not
+    restore it afterward (unsubscribe_ticks just pops the entry). Not
+    checked here since this endpoint has no session/position context of
+    its own -- it's the caller's responsibility, same as
+    `/ws-tick-diagnostic` already leaves `warm_underlying`/`warm_expiry`
+    correctness to the caller.
+    """
+    import threading
+    import time as time_module
+
+    from app.modules.broker_adapter.base.contracts import Tick
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+    from app.modules.market_data.provider_composition import get_market_data_provider
+
+    broker = get_broker()
+    inner = getattr(broker, "_inner", broker)
+    if not isinstance(inner, ShoonyaBrokerAdapter):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No live Shoonya session — connect via /shoonya/login-url first.",
+        )
+    symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "No symbols given")
+    bounded_duration = min(max(duration, 1.0), 45.0)
+
+    if manual_symbol and manual_exchange and manual_token:
+        inner._remember_token(manual_symbol, manual_exchange, manual_token)  # noqa: SLF001
+
+    received: list[dict] = []
+    lock = threading.Lock()
+
+    def _collect(tick: Tick) -> None:
+        with lock:
+            received.append(
+                {
+                    "contract_symbol": tick.contract_symbol,
+                    "ltp": tick.ltp,
+                    "volume": tick.volume,
+                    "oi": tick.oi,
+                    "ts": tick.ts.isoformat(),
+                }
+            )
+
+    provider = get_market_data_provider()
+    try:
+        provider.subscribe_ticks(symbol_list, on_tick=_collect)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "ticks_received": 0, "sample": []}
+
+    try:
+        time_module.sleep(bounded_duration)
+    finally:
+        try:
+            provider.unsubscribe_ticks(symbol_list)
+        except Exception:
+            logger.exception("Failed to unsubscribe after subscribe-diagnostic")
+
+    with lock:
+        return {"ticks_received": len(received), "sample": received[:20]}
+
+
 @router.get("/login-url")
 def get_login_url(user: User = Depends(require_permission("session.start"))) -> dict:
     settings = get_settings().shoonya
