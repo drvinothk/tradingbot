@@ -380,6 +380,108 @@ def test_close_and_disconnect_duck_type_close_both_legs_and_stop_thread(make_pro
     assert backup.close_calls == 1
 
 
+class _MinimalFakeProvider(BaseMarketDataProvider):
+    """No `close()` at all -- the exact real-world shape of
+    `BrokerPortMarketDataAdapter` (Shoonya), which has never implemented
+    one. `_FakeProvider` above always has, which is exactly why the
+    2026-08-14 bug (`close()` silently never calling `disconnect()`)
+    passed every existing test in this file undetected.
+    """
+
+    def __init__(self) -> None:
+        self.disconnect_calls = 0
+
+    def connect(self) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+    def subscribe_ticks(self, symbols, on_tick, on_depth=None) -> None:
+        pass
+
+    def unsubscribe_ticks(self, symbols) -> None:
+        pass
+
+    def get_latest_tick(self, symbol):
+        return None
+
+    def get_price_history(self, underlying, start, end, timeframe_seconds=60):
+        return []
+
+
+def test_close_tears_down_a_leg_that_has_no_close_method_of_its_own(make_provider):
+    """The exact real-world regression: a leg with no `close()` at all
+    (matching `BrokerPortMarketDataAdapter`) must still have its
+    `disconnect()` called by `FailoverMarketDataProvider.close()` — proving
+    the fix doesn't depend on the leg happening to implement an optional
+    extra method.
+    """
+    primary = _MinimalFakeProvider()
+    backup = _MinimalFakeProvider()
+    provider = FailoverMarketDataProvider(
+        primary=primary,
+        backup=backup,
+        primary_name="shoonya",
+        backup_name="angel_one",
+        failover_threshold_seconds=_THRESHOLD,
+        recovery_stabilization_seconds=_RECOVERY,
+        backup_retry_seconds=_BACKUP_RETRY,
+        poll_interval_seconds=_POLL_INTERVAL,
+    )
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _t: None)
+
+    provider.close()
+
+    assert primary.disconnect_calls == 1
+
+
+def test_stuck_watchdog_join_logs_loudly_instead_of_silently_proceeding(
+    make_provider, monkeypatch, caplog
+):
+    """Defense-in-depth added alongside the 2026-08-14 teardown fixes: if
+    `_stop_watchdog`'s `join(timeout=...)` times out (plausibly because the
+    thread is currently blocked inside `_ensure_backup_subscribed`'s
+    network call to a struggling backup provider — the same kind of
+    connectivity issue that could have triggered this teardown in the
+    first place), the old code proceeded silently as if teardown had fully
+    succeeded. The thread itself can't be force-killed from here (Python
+    has no safe API for that), but the fact that it didn't stop must not
+    be invisible.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _t: None)
+    assert provider._thread is not None  # noqa: SLF001
+    monkeypatch.setattr(provider._thread, "join", lambda timeout=None: None)  # noqa: SLF001
+    monkeypatch.setattr(provider._thread, "is_alive", lambda: True)  # noqa: SLF001
+
+    with caplog.at_level("ERROR", logger="app.market_data.failover"):
+        provider.disconnect()
+
+    assert "did not stop" in caplog.text
+
+
+def test_close_also_calls_disconnect_on_both_legs(make_provider):
+    """Real, live bug fixed 2026-08-14: `close()` used to *only* probe both
+    legs for an optional `close()` method and never called `disconnect()`
+    at all — invisible in this file's own tests because `_FakeProvider`
+    (unlike the real `BrokerPortMarketDataAdapter`, which has never
+    implemented `close()`) happens to implement both. `disconnect()` is the
+    one `BaseMarketDataProvider` method every real provider is guaranteed
+    to have; `close()` must call it unconditionally, not just probe for an
+    optional extra.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    provider.close()
+
+    assert primary.disconnect_calls == 1
+    assert backup.disconnect_calls == 1
+
+
 def test_two_symbols_with_different_callbacks_do_not_cross_talk(make_provider):
     """Regression, 2026-08-13: a single shared on_tick slot (not per-symbol)
     meant a second subscribe_ticks call for a different symbol (e.g.

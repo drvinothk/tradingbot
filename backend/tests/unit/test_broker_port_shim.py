@@ -138,6 +138,50 @@ def test_depth_is_also_routed_per_symbol():
     assert len(option_depths) == 1
 
 
+def test_disconnect_unsubscribes_everything_currently_tracked():
+    """Real, live bug fixed 2026-08-14: `disconnect()` used to be a no-op
+    (`pass`), so a discarded `BrokerPortMarketDataAdapter` instance's
+    underlying WS subscription kept running forever, still receiving and
+    persisting real ticks via its still-registered ingestion callback,
+    invisible to everything now querying the *new* singleton instead --
+    live-diagnosed via a py-spy thread dump the same day as days'-worth of
+    phantom quote_ticks/price_bars freshness. Only authentication is
+    genuinely out of this class's control (see its own docstring); the
+    subscription state it owns must actually be torn down.
+    """
+    broker = _FakeBrokerPort()
+    provider = BrokerPortMarketDataAdapter(broker)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _t: None)
+    provider.subscribe_ticks(["NIFTY18AUG26C24400"], on_tick=lambda _t: None)
+
+    provider.disconnect()
+
+    assert broker.unsubscribe_calls == [["NIFTY", "NIFTY18AUG26C24400"]]
+
+
+def test_disconnect_clears_callbacks_so_a_stray_tick_afterward_is_dropped():
+    broker = _FakeBrokerPort()
+    provider = BrokerPortMarketDataAdapter(broker)
+    ticks: list[Tick] = []
+    provider.subscribe_ticks(["NIFTY"], on_tick=ticks.append)
+
+    provider.disconnect()
+    # A stray tick landing after disconnect (e.g. a race with an in-flight
+    # broker-side message) must not still reach the old callback.
+    broker.on_tick(_tick("NIFTY"))
+
+    assert ticks == []
+
+
+def test_disconnect_with_nothing_subscribed_does_not_call_unsubscribe():
+    broker = _FakeBrokerPort()
+    provider = BrokerPortMarketDataAdapter(broker)
+
+    provider.disconnect()
+
+    assert broker.unsubscribe_calls == []
+
+
 def test_no_depth_callback_passed_through_when_no_caller_wants_depth():
     """subscribe_quotes must not receive a depth dispatcher at all when
     this call's own on_depth is None -- passing one unconditionally would

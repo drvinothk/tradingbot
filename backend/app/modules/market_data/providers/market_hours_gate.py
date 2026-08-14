@@ -106,6 +106,13 @@ class MarketHoursGatedProvider(BaseMarketDataProvider):
         return self._inner.get_price_history(underlying, start, end, timeframe_seconds)
 
     def close(self) -> None:
+        """Same fix as `FailoverMarketDataProvider.close` (2026-08-14) and
+        for the identical reason: `disconnect()` is the one method every
+        provider is guaranteed to implement, so it must be called
+        unconditionally here, not just probed for via an optional `close()`
+        that not every inner provider implements.
+        """
+        self.disconnect()
         close = getattr(self._inner, "close", None)
         if callable(close):
             close()

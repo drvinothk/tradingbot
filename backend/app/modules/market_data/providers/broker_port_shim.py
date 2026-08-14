@@ -1,9 +1,11 @@
 """Wraps any `BrokerPort` (the mock adapter, or a connected `ShoonyaBrokerAdapter`)
 behind `BaseMarketDataProvider` — kept for fallback/testing and for every
 existing test/local-dev run that hasn't opted into Angel One, not the
-production default. `connect`/`disconnect` are no-ops: a `BrokerPort`
-instance authenticates outside this class's control entirely (the mock
-needs no auth; Shoonya's own OAuth flow lives in `api.v1.shoonya`).
+production default. `connect` is a no-op: a `BrokerPort` instance
+authenticates outside this class's control entirely (the mock needs no
+auth; Shoonya's own OAuth flow lives in `api.v1.shoonya`). `disconnect`
+is *not* a no-op — see its own docstring; only authentication is out of
+scope here, not the subscription state this class itself owns.
 
 **Per-symbol callback dispatch, not one shared slot.** `subscribe_ticks`
 used to store `on_tick` in a single `self._on_tick_external` attribute,
@@ -49,7 +51,33 @@ class BrokerPortMarketDataAdapter(BaseMarketDataProvider):
         pass
 
     def disconnect(self) -> None:
-        pass
+        """Unsubscribes everything this instance is currently tracking from
+        the underlying `BrokerPort`, so its raw WS connection stops
+        delivering ticks for this wrapper — authentication itself stays
+        outside this class's control (see class docstring), this only
+        tears down the *subscription* side, which is this wrapper's own
+        responsibility.
+
+        Real, live bug fixed here 2026-08-14: this used to be `pass`.
+        `FailoverMarketDataProvider`/`provider_composition.set_market_data_
+        provider` both correctly call `disconnect()` on a discarded
+        provider before replacing the module-level singleton (e.g. on a
+        Shoonya reconnect) — but with this a no-op, the *actual* teardown
+        never happened. The old instance's raw Shoonya WS subscription kept
+        running indefinitely, still receiving and persisting real ticks via
+        the same registered ingestion callback, while everything else in
+        the system was already querying the *new* singleton instead — a
+        stale, invisible "zombie" data source that made `quote_ticks`/
+        `price_bars` look continuously fresh while `get_latest_tick()` on
+        the current instance saw nothing. Live-diagnosed via a `py-spy`
+        thread dump the same day.
+        """
+        with self._lock:
+            symbols = list(self._on_tick_by_symbol)
+            self._on_tick_by_symbol.clear()
+            self._on_depth_by_symbol.clear()
+        if symbols:
+            self._broker.unsubscribe_quotes(symbols)
 
     def subscribe_ticks(
         self,

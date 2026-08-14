@@ -20,6 +20,7 @@ class _FakeInnerProvider:
         self.unsubscribe_calls: list[list[str]] = []
         self.history_calls: list[str] = []
         self.latest_tick_calls: list[str] = []
+        self.close_calls = 0
 
     def connect(self) -> None:
         self.connect_calls += 1
@@ -40,6 +41,9 @@ class _FakeInnerProvider:
     def get_price_history(self, underlying, start, end, timeframe_seconds=60):
         self.history_calls.append(underlying)
         return ["a-candle"]  # sentinel, just needs to be non-empty/truthy
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 def _gated(inner, *, allow_offhours: bool, blocked: bool, monkeypatch) -> MarketHoursGatedProvider:
@@ -112,6 +116,24 @@ def test_get_latest_tick_is_never_gated(monkeypatch):
     gated = _gated(inner, allow_offhours=False, blocked=True, monkeypatch=monkeypatch)
     gated.get_latest_tick("NIFTY")
     assert inner.latest_tick_calls == ["NIFTY"]
+
+
+def test_close_calls_disconnect_unconditionally(monkeypatch):
+    """Real, live bug fixed 2026-08-14, same shape and same day as
+    `FailoverMarketDataProvider.close`'s identical fix: `close()` used to
+    only probe the inner provider for an optional `close()` method and
+    never called `disconnect()` at all, so an inner provider with no
+    `close()` of its own (the real-world case for `BrokerPortMarketDataAdapter`)
+    never got torn down when the outer `MarketHoursGatedProvider.close()`
+    was called at process shutdown / reconnect.
+    """
+    inner = _FakeInnerProvider()
+    gated = _gated(inner, allow_offhours=False, blocked=True, monkeypatch=monkeypatch)
+
+    gated.close()
+
+    assert inner.disconnect_calls == 1
+    assert inner.close_calls == 1
 
 
 def test_blocked_log_message_reports_the_extended_window_in_replay_mode(monkeypatch, caplog):

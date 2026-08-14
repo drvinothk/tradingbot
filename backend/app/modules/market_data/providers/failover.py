@@ -200,14 +200,26 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         return self._backup.get_price_history(underlying, start, end, timeframe_seconds)
 
     def close(self) -> None:
-        self._stop_watchdog()
+        """Real, live bug fixed here 2026-08-14: this used to skip
+        `disconnect()` entirely and only probe both legs for an *optional*
+        `close()` — which `BrokerPortMarketDataAdapter` (Shoonya) has never
+        implemented, so `getattr(..., "close", None)` silently found
+        nothing and the primary leg's actual WS subscription was never torn
+        down. `disconnect()` is the one `BaseMarketDataProvider` method
+        every provider is guaranteed to implement (an `@abstractmethod`),
+        so it's the correct unconditional teardown call; the optional
+        `close()` probe still runs afterward for provider-specific extra
+        cleanup `disconnect()` doesn't otherwise cover (e.g. Angel One's own
+        REST client) — same two-step shape `AngelOneMarketDataProvider.close`
+        already gets right.
+        """
+        self.disconnect()
         close = getattr(self._primary, "close", None)
         if callable(close):
             close()
-        if self._backup_subscribed:
-            close = getattr(self._backup, "close", None)
-            if callable(close):
-                close()
+        close = getattr(self._backup, "close", None)
+        if callable(close):
+            close()
 
     # -- tick routing -------------------------------------------------------
 
@@ -248,6 +260,28 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self._poll_interval_seconds + 5)
+            if self._thread.is_alive():
+                # The join timed out -- most plausibly the watchdog is
+                # currently blocked inside _ensure_backup_subscribed's
+                # network call to the backup provider (the same
+                # connectivity issue that likely triggered this teardown in
+                # the first place). Proceeding regardless (matching every
+                # other call site's "cleanup is never blocked" discipline)
+                # would previously leave this fact completely invisible --
+                # the caller just moves on as if teardown fully succeeded,
+                # while the old OS thread keeps running indefinitely as a
+                # daemon, discovered only via a live py-spy dump. Logging
+                # loudly here is the whole fix for that half of the
+                # 2026-08-14 incident; the thread itself is still a daemon
+                # so it can't outlive the process, but it can very much
+                # outlive this provider instance being discarded.
+                logger.error(
+                    "Failover watchdog thread did not stop within %.1fs -- likely "
+                    "blocked in a backup-provider network call. Proceeding with "
+                    "teardown anyway; this thread may keep running as an orphan "
+                    "until it unblocks on its own.",
+                    self._poll_interval_seconds + 5,
+                )
             self._thread = None
 
     def _loop(self) -> None:
