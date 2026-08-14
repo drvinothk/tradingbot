@@ -339,6 +339,14 @@ class AppSettings(BaseSettings):
     env: str = Field(default="local", description="local | cloud")
     secret_key: SecretStr = SecretStr("dev-only-change-me")
     session_ttl_minutes: int = 60 * 12
+    # Ops-Hardening Phase 5. Off by default -- never set in the tracked
+    # .env, same "dangerous behavior needs explicit opt-in" discipline as
+    # MARKET_DATA_ALLOW_OFFHOURS_TESTING. get_execution_broker refuses
+    # (ConfigurationError) rather than silently falling back to paper if
+    # session mode calls for live execution but this is False -- the whole
+    # point is a missing/false flag must never be interpreted as "use
+    # paper instead."
+    allow_real_money_dispatch: bool = False
 
 
 class PaperTradingSettings(BaseSettings):

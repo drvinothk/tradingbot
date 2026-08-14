@@ -54,7 +54,15 @@ import logging
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from sqlalchemy.orm import object_session
+
+from app.config.settings import get_settings
+from app.domain.execution.models import Order as OrderRow
+from app.domain.execution.models import OrderMode
+from app.domain.execution.models import Position as PositionRow
 from app.domain.market.mock_universe import build_mock_universe
+from app.domain.session.models import SafeMode
+from app.domain.strategy.models import StrategyConfig, StrategyStatus
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -68,11 +76,12 @@ from app.modules.broker_adapter.base.contracts import (
     PriceCandle,
     Tick,
 )
-from app.modules.broker_adapter.base.errors import BrokerAuthError
+from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 
 if TYPE_CHECKING:
     from app.domain.session.models import TradingSession
+    from app.domain.strategy.models import StrategyRun
 
 logger = logging.getLogger("app.broker_adapter.composition")
 
@@ -244,26 +253,119 @@ def get_broker() -> BrokerPort:
     return _broker
 
 
-def get_execution_broker(trading_session: TradingSession) -> BrokerPort:
+def _position_opened_live(position: PositionRow) -> bool:
+    """True only if the position's own *opening* Order actually recorded
+    `mode=LIVE` — never inferred from current session mode, which can
+    change (kill_switch, degraded_mode) after the position was already
+    opened for real.
+    """
+    db = object_session(position)
+    if db is None:
+        return False
+    opening_order = db.get(OrderRow, position.opening_order_id)
+    return opening_order is not None and opening_order.mode == OrderMode.LIVE
+
+
+def _real_broker_or_raise(reason: str) -> BrokerPort:
+    """The single, uniform gate every real-broker path in `get_execution_broker`
+    routes through -- both checks apply regardless of *why* real execution
+    was requested (a live-tier session mode, or closing a position that was
+    genuinely opened live), so neither path can accidentally skip one.
+    """
+    if not get_settings().app.allow_real_money_dispatch:
+        raise ConfigurationError(
+            f"{reason}, but ALLOW_REAL_MONEY_DISPATCH is not set. Refusing to dispatch "
+            "-- will not silently fall back to paper for a live-intent trade."
+        )
+    if not is_shoonya_configured():
+        raise ConfigurationError(
+            f"{reason}, but no real Shoonya broker is currently connected "
+            "(is_shoonya_configured() is False)."
+        )
+    return get_broker()
+
+
+def get_execution_broker(
+    trading_session: TradingSession,
+    strategy_run: StrategyRun | None = None,
+    *,
+    position: PositionRow | None = None,
+) -> BrokerPort:
     """Broker resolution for anything that places or reads orders/positions
     for a specific session — `dispatch_trade_intent`, `close_position`,
     `PositionManager`, manual square-off/reconcile, and startup recovery.
     Deliberately separate from `get_broker()`, which stays for market-data
-    call sites (instrument sync, option-chain snapshots, ingestion) that
-    legitimately want "whichever real broker is connected" with no session
-    context available.
+    call sites that legitimately want "whichever real broker is connected"
+    with no session context.
 
-    Always returns the persistent mock today, regardless of what
-    `get_broker()` currently resolves to or what `trading_session.mode` is
-    — there is no live-order path anywhere in this codebase yet (Phase 6:
-    guarded-live execution). `trading_session` is accepted now so this
-    function's signature doesn't need to change when Phase 6 adds real
-    per-strategy graduation gating; until then, deliberately not
-    half-building that gate here without Phase 6's surrounding safeguards
-    (one-lot enforcement, sign-off checklist) to back it.
+    **Ops-Hardening Phase 5 routing, in priority order:**
+
+    1. `position` given and it was actually opened LIVE (`Order.mode`, not
+       current session mode) → always resolves the real broker, regardless
+       of `trading_session.mode`. Closing genuinely-live risk is never
+       blocked by `kill_switch`/`degraded_mode`/`reconciliation_lock` —
+       those modes exist to stop *new* risk, not strand *existing* real
+       positions with no path to close them. Still requires
+       `allow_real_money_dispatch` (raises `ConfigurationError`, not a
+       silent paper fallback, if it's off).
+    2. `mode` in `(paper_only, degraded_mode, kill_switch,
+       reconciliation_lock)` → mock, unconditionally, regardless of
+       `strategy_run`.
+    3. `mode == live_enabled`, or `mode == paper_plus_guarded_live` and
+       `strategy_run`'s own `StrategyConfig.status == LIVE` (graduated) →
+       real broker, gated on `allow_real_money_dispatch` (raises
+       `ConfigurationError` rather than falling back to paper if it's off
+       — a missing/false flag must never be silently read as "use paper
+       instead," per explicit design intent).
+    4. Otherwise (`paper_plus_guarded_live` with no `strategy_run`, or a
+       not-yet-graduated one) → mock. Missing strategy-graduation
+       information must never default *up* to real money.
+
+    Real-adapter resolution never constructs a new `ShoonyaBrokerAdapter`
+    here (this module never imports that class at all, by design — see
+    the module's own docstring) — it reuses whatever `get_broker()`
+    currently holds, install by `api.v1.shoonya.oauth_callback` after a
+    real OAuth login, checked via `is_shoonya_configured()` for health.
+    Lazy by construction: a paper-only session never even evaluates
+    `is_shoonya_configured()`, let alone spins up a connection.
     """
-    del trading_session  # unused until Phase 6's graduation gating exists
+    if position is not None and _position_opened_live(position):
+        return _real_broker_or_raise(f"position {position.id} was opened live")
+
+    mode = SafeMode(trading_session.mode)
+    if mode in (
+        SafeMode.PAPER_ONLY,
+        SafeMode.DEGRADED_MODE,
+        SafeMode.KILL_SWITCH,
+        SafeMode.RECONCILIATION_LOCK,
+    ):
+        return _get_or_create_execution_mock()
+
+    strategy_is_live = False
+    if strategy_run is not None:
+        db = object_session(strategy_run)
+        if db is not None:
+            config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+            strategy_is_live = config is not None and config.status == StrategyStatus.LIVE
+
+    if mode == SafeMode.LIVE_ENABLED or (
+        mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
+    ):
+        return _real_broker_or_raise(f"trading_session {trading_session.id} mode={mode.value}")
+
     return _get_or_create_execution_mock()
+
+
+def is_execution_broker_live(broker: BrokerPort) -> bool:
+    """Whether a broker `get_execution_broker` returned is the real
+    adapter, not the persistent execution mock -- callers (`dispatch_trade
+    _intent`, `close_position`) use this to tag `Order.mode` correctly
+    rather than hardcoding `OrderMode.PAPER`. A plain `isinstance` against
+    `MockBrokerAdapter` is enough: the mock is never wrapped in
+    `_AuthAwareBroker` (only `set_broker` wraps real adapters), so this
+    correctly reads real+wrapped as "live" with no unwrapping needed.
+    """
+    return not isinstance(broker, MockBrokerAdapter)
 
 
 def set_broker(broker: BrokerPort | None) -> None:

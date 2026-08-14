@@ -15,6 +15,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderSide,
     OrderType,
 )
+from app.modules.broker_adapter.base.errors import CriticalSafetyException
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 from app.modules.broker_adapter.shoonya.rest_client import ShoonyaApiError
@@ -362,6 +363,7 @@ def test_place_order_is_idempotent_on_key():
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
+        lot_size=25,
         limit_price=120.0,
     )
 
@@ -385,6 +387,7 @@ def test_place_order_follows_up_with_status_when_pending():
         side=OrderSide.BUY,
         order_type=OrderType.MARKET,
         qty=25,
+        lot_size=25,
     )
     result = adapter.place_order(request)
 
@@ -422,6 +425,7 @@ def test_place_order_ack_timeout_finds_the_real_order_via_order_history():
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
+        lot_size=25,
         limit_price=120.0,
     )
 
@@ -452,6 +456,7 @@ def test_place_order_ack_timeout_reraises_when_order_genuinely_not_found():
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
+        lot_size=25,
         limit_price=120.0,
     )
 
@@ -475,6 +480,7 @@ def test_place_order_clean_rejection_does_not_trigger_order_history_fallback():
         side=OrderSide.BUY,
         order_type=OrderType.LIMIT,
         qty=25,
+        lot_size=25,
         limit_price=120.0,
     )
 
@@ -913,3 +919,136 @@ def test_get_price_history_converts_timeframe_seconds_to_whole_minutes():
 
     tpseries_calls = [call[1] for call in rest.calls if call[0] == "get_time_price_series"]
     assert tpseries_calls[0][-1] == 5
+
+
+# -- Ops-Hardening Phase 5: 1-lot hardcap + order tagging --------------------
+
+
+def test_place_order_blocks_qty_above_one_lot():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="hardcap-1",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=50,
+        lot_size=25,
+    )
+
+    with pytest.raises(CriticalSafetyException, match="1-lot hardcap"):
+        adapter.place_order(request)
+
+    assert rest.calls == [], "must never reach the broker at all"
+
+
+def test_place_order_allows_exactly_one_lot():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="hardcap-2",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=25,
+        lot_size=25,
+    )
+
+    adapter.place_order(request)  # must not raise
+
+    assert any(c[0] == "place_order" for c in rest.calls)
+
+
+def test_place_order_blocks_even_when_risk_service_would_have_allowed_it():
+    """Defense-in-depth: the hardcap fires independent of any qty a caller
+    (even one bypassing Risk Service's own per_trade_lot_cap entirely) might
+    pass -- this is the adapter's own floor, not a duplicate of that check.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="hardcap-3",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=100,
+        lot_size=25,
+    )
+
+    with pytest.raises(CriticalSafetyException):
+        adapter.place_order(request)
+
+
+def test_remarks_combines_idempotency_key_and_tag():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="tag-test-1",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=25,
+        lot_size=25,
+        tag="session:abc123",
+    )
+
+    adapter.place_order(request)
+
+    place_order_calls = [c for c in rest.calls if c[0] == "place_order"]
+    payload = place_order_calls[0][1][0]
+    assert payload["remarks"] == "tag-test-1|session:abc123"
+
+
+def test_remarks_is_bare_idempotency_key_when_tag_is_empty():
+    """Byte-for-byte the pre-Phase-5 format for every caller that never
+    sets tag -- no behavior change for anything not opting in.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="tag-test-2",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=25,
+        lot_size=25,
+    )
+
+    adapter.place_order(request)
+
+    place_order_calls = [c for c in rest.calls if c[0] == "place_order"]
+    payload = place_order_calls[0][1][0]
+    assert payload["remarks"] == "tag-test-2"
+
+
+def test_find_order_by_remarks_matches_tagged_remarks_via_prefix():
+    rest = _FakeRestClient()
+    timeout_cause = httpx.ConnectTimeout("connection timed out")
+    try:
+        raise ShoonyaApiError("PlaceOrder", "request failed: timeout") from timeout_cause
+    except ShoonyaApiError as exc:
+        rest.place_order_raises = exc
+    rest.order_book_response = [
+        {
+            "norenordno": "ORD-TAGGED-1",
+            "status": "COMPLETE",
+            "remarks": "key-tagged-1|session:abc123",
+            "fillshares": "25",
+            "avgprc": "120.5",
+        },
+    ]
+    adapter, _ = _adapter(rest)
+    request = OrderRequest(
+        idempotency_key="key-tagged-1",
+        contract_symbol="NIFTY30JUL26C24000",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        qty=25,
+        lot_size=25,
+        limit_price=120.0,
+        tag="session:abc123",
+    )
+
+    result = adapter.place_order(request)
+
+    assert result.broker_order_id == "ORD-TAGGED-1"

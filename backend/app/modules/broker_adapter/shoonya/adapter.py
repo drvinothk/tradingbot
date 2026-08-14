@@ -61,6 +61,7 @@ from app.modules.broker_adapter.base.contracts import (
     PriceCandle,
     Tick,
 )
+from app.modules.broker_adapter.base.errors import CriticalSafetyException
 from app.modules.broker_adapter.shoonya import normalizer
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.rest_client import (
@@ -675,6 +676,21 @@ class ShoonyaBrokerAdapter(BrokerPort):
     # -- BrokerPort: orders ----------------------------------------------------
 
     def place_order(self, request: OrderRequest) -> OrderResult:
+        """Ops-Hardening Phase 5: the 1-lot hardcap below is deliberately
+        redundant with Risk Service's own DB-configurable `per_trade_lot_cap`
+        (`risk_limit_configs`) — defense in depth for the one check that
+        directly bounds real-money blast radius, not trusting a single,
+        operator-editable layer for it. Checked first, before the
+        idempotency-key short-circuit, so a malformed retry can never skip
+        it either.
+        """
+        if request.qty > request.lot_size:
+            raise CriticalSafetyException(
+                f"place_order blocked: qty={request.qty} exceeds the 1-lot hardcap "
+                f"(lot_size={request.lot_size}) for {request.contract_symbol!r} -- "
+                "refusing to place a real order above 1 lot."
+            )
+
         if request.idempotency_key in self._orders_by_idempotency_key:
             return self._orders_by_idempotency_key[request.idempotency_key]
 
@@ -728,6 +744,14 @@ class ShoonyaBrokerAdapter(BrokerPort):
         lookup itself — either way, the caller's only sane fallback is to
         treat this as "couldn't confirm, re-raise the original ambiguity"
         rather than invent a result.
+
+        Ops-Hardening Phase 5: matches `idempotency_key` as a *prefix* of
+        `remarks`, not exact equality — `to_place_order_payload` now appends
+        `|{tag}` after the idempotency_key when a real order carries a
+        session tag (see that function's own docstring), so remarks is no
+        longer always byte-identical to the bare key. `idempotency_key`'s
+        own DB-level `unique=True` constraint (`orders`/`trade_intents`) is
+        what keeps a prefix match from ever finding the wrong row.
         """
         try:
             rows = self._rest.order_book(self._uid)
@@ -737,7 +761,8 @@ class ShoonyaBrokerAdapter(BrokerPort):
             )
             return None
         for row in rows:
-            if str(row.get("remarks", "")) == idempotency_key:
+            remarks = str(row.get("remarks", ""))
+            if remarks == idempotency_key or remarks.startswith(f"{idempotency_key}|"):
                 return normalizer.parse_order_result(row, idempotency_key=idempotency_key)
         return None
 

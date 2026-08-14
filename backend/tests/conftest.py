@@ -149,6 +149,23 @@ def _fake_market_data_provider_preference_lookup(monkeypatch) -> None:
     monkeypatch.setattr(provider_composition, "session_scope", _fake_session_scope)
 
 
+@pytest.fixture(autouse=True)
+def _force_no_real_money_dispatch(monkeypatch) -> None:
+    """Ops-Hardening Phase 5. Forces `Settings.app.allow_real_money_dispatch`
+    to `False` for every test, unconditionally -- regardless of whatever a
+    local, misconfigured `.env` might set. `get_settings()` is `@lru_cache`'d,
+    so this patches the attribute directly on the already-cached instance
+    (same pattern already used for `settings.telegram.bot_token`/`chat_id`
+    in the Phase 2 alerting tests), not the environment variable, which
+    would be too late for an instance that's already constructed. No test
+    anywhere in this suite should ever be able to accidentally clear the
+    real-money gate.
+    """
+    from app.config.settings import get_settings
+
+    monkeypatch.setattr(get_settings().app, "allow_real_money_dispatch", False)
+
+
 @pytest.fixture
 def workspace(db: Session) -> Workspace:
     ws = Workspace(id=uuid.uuid4(), name=f"test-{uuid.uuid4().hex[:8]}")

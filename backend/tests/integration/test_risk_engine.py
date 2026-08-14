@@ -387,9 +387,12 @@ def test_evaluate_trade_intent_max_trades_per_day(
     """2026-08-12: the cap only ever protects real-money exposure now — see
     this test's sibling `test_paper_only_session_has_no_daily_trade_cap`
     below for why `paper_only` is exempt. Set to a live-capable mode here
-    so this test still exercises the cap itself.
+    so this test still exercises the cap itself. `paper_plus_guarded_live`,
+    not `live_enabled`: the cap condition is any `mode != PAPER_ONLY`, and
+    with no strategy_run marked LIVE-graduated, Ops-Hardening Phase 5's
+    get_execution_broker still safely resolves to the paper mock here.
     """
-    trading_session.mode = SafeMode.LIVE_ENABLED
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
     db.flush()
 
@@ -472,8 +475,10 @@ def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
     strategy running in the same session too. Now scoped by
     strategy_config_id (via strategy_run) — a second, unrelated strategy in
     the same session, same day, must not be blocked by the first one's cap.
+    `paper_plus_guarded_live`, not `live_enabled` -- see the identical note
+    in `test_evaluate_trade_intent_max_trades_per_day` above.
     """
-    trading_session.mode = SafeMode.LIVE_ENABLED
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
     db.flush()
 

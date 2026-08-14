@@ -398,7 +398,13 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
     # 2026-08-12: the daily trade cap now only protects real-money exposure
     # (paper_only sessions are uncapped, see risk_engine.service's own
     # docstring) -- set a live-capable mode so this test still exercises it.
-    trading_session.mode = SafeMode.LIVE_ENABLED
+    # paper_plus_guarded_live (not live_enabled): the cap condition is any
+    # `mode != PAPER_ONLY`, and with no strategy_run marked LIVE-graduated,
+    # Ops-Hardening Phase 5's get_execution_broker still safely resolves to
+    # the paper mock for actual dispatch -- live_enabled would instead
+    # require a real Shoonya connection + ALLOW_REAL_MONEY_DISPATCH, neither
+    # of which this test is about.
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
     db.flush()
 

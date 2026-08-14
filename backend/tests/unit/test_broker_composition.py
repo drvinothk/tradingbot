@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, date, datetime
 
 import pytest
 
+from app.config.settings import get_settings
+from app.domain.session.models import SafeMode, TradingSession
 from app.modules.broker_adapter import composition
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import (
@@ -18,7 +21,8 @@ from app.modules.broker_adapter.base.contracts import (
     PriceCandle,
     Tick,
 )
-from app.modules.broker_adapter.base.errors import BrokerAuthError
+from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
+from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 
 
 class _FakeRealBroker(BrokerPort):
@@ -153,3 +157,76 @@ def test_non_auth_calls_are_unaffected_when_connected():
     broker = composition.get_broker()
     assert broker.get_positions() == []
     assert composition.is_shoonya_configured() is True
+
+
+# -- Ops-Hardening Phase 5: get_execution_broker gating ----------------------
+
+
+def _session(mode: SafeMode) -> TradingSession:
+    return TradingSession(id=uuid.uuid4(), mode=mode)
+
+
+def _allow_real_money(monkeypatch, value: bool) -> None:
+    monkeypatch.setattr(get_settings().app, "allow_real_money_dispatch", value)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        SafeMode.PAPER_ONLY,
+        SafeMode.DEGRADED_MODE,
+        SafeMode.KILL_SWITCH,
+        SafeMode.RECONCILIATION_LOCK,
+    ],
+)
+def test_protective_modes_always_return_mock_even_with_flag_on(monkeypatch, mode):
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())  # a real broker IS connected
+
+    broker = composition.get_execution_broker(_session(mode))
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
+def test_live_enabled_without_flag_raises(monkeypatch):
+    _allow_real_money(monkeypatch, False)
+    composition.set_broker(_FakeRealBroker())
+
+    with pytest.raises(ConfigurationError, match="ALLOW_REAL_MONEY_DISPATCH"):
+        composition.get_execution_broker(_session(SafeMode.LIVE_ENABLED))
+
+
+def test_live_enabled_with_flag_but_no_connected_broker_raises(monkeypatch):
+    _allow_real_money(monkeypatch, True)
+    # No set_broker call -- is_shoonya_configured() is False.
+
+    with pytest.raises(ConfigurationError, match="no real Shoonya broker"):
+        composition.get_execution_broker(_session(SafeMode.LIVE_ENABLED))
+
+
+def test_live_enabled_with_flag_and_connected_broker_returns_real(monkeypatch):
+    # set_broker wraps the real adapter in _AuthAwareBroker, so this checks
+    # "not the mock" + is_execution_broker_live, not object identity.
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+
+    broker = composition.get_execution_broker(_session(SafeMode.LIVE_ENABLED))
+
+    assert not isinstance(broker, MockBrokerAdapter)
+    assert composition.is_execution_broker_live(broker) is True
+
+
+def test_guarded_live_with_no_strategy_run_returns_mock_even_with_flag_on(monkeypatch):
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+
+    broker = composition.get_execution_broker(_session(SafeMode.PAPER_PLUS_GUARDED_LIVE))
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
+def test_is_execution_broker_live_distinguishes_mock_from_real():
+    assert (
+        composition.is_execution_broker_live(composition._get_or_create_execution_mock()) is False
+    )
+    assert composition.is_execution_broker_live(_FakeRealBroker()) is True

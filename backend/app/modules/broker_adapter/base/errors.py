@@ -49,3 +49,24 @@ class BrokerRateLimitedError(BrokerConnectivityError):
     budget before anyone noticed — continuing to retry at the normal
     interval after that point risks prolonging the same penalty.
     """
+
+
+class ConfigurationError(Exception):
+    """Ops-Hardening Phase 5. Raised by `broker_adapter.composition
+    .get_execution_broker` when session mode calls for real execution but
+    `Settings.app.allow_real_money_dispatch` is off. Deliberately *not* a
+    `BrokerError` subclass — this means "we correctly refused before ever
+    touching a broker," not "the broker failed," so a caller's `except
+    BrokerError` (retry-next-cycle logic) must never accidentally swallow
+    it. Must propagate and halt the calling cycle, never be caught and
+    downgraded to paper.
+    """
+
+
+class CriticalSafetyException(Exception):
+    """Ops-Hardening Phase 5. Raised by a broker adapter's own
+    `place_order` (e.g. `ShoonyaBrokerAdapter`'s 1-lot hardcap, pre-flight
+    checks) when a hard safety invariant is violated. Deliberately *not* a
+    `BrokerError` subclass, same reasoning as `ConfigurationError` — this
+    is "we refused to send the order," not "the broker rejected it."
+    """

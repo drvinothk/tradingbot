@@ -74,13 +74,18 @@ from app.domain.execution.models import (
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import TradingSession
-from app.domain.strategy.models import SignalSide, TradeIntent
+from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, Tick
 from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSide
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
-from app.modules.broker_adapter.composition import get_broker, get_execution_broker
+from app.modules.broker_adapter.composition import (
+    get_broker,
+    get_execution_broker,
+    is_execution_broker_live,
+)
+from app.modules.broker_adapter.preflight import run_preflight_checks
 from app.modules.market_data.freshness import (
     OPTION_CHAIN_THRESHOLDS,
     TICK_THRESHOLDS,
@@ -165,7 +170,22 @@ def dispatch_trade_intent(
     same `LOCK_EXECUTION_SINGLETON` scope as the insert, so two concurrent
     callers can't both pass it.
     """
-    broker = broker or get_execution_broker(trading_session)
+    # `is_execution_broker_live`'s isinstance check is only meaningful for a
+    # broker `get_execution_broker` itself resolved -- an explicitly-passed
+    # `broker` (the established test-injection pattern throughout this
+    # codebase: fakes/doubles that are never MockBrokerAdapter instances
+    # either) must never be misread as "live" just because it isn't the
+    # mock class. Explicit injection always means paper/no-preflight,
+    # matching every existing test's own assumption that passing `broker=`
+    # bypasses real-vs-mock gating entirely.
+    broker_was_provided = broker is not None
+    strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+    broker = broker or get_execution_broker(trading_session, strategy_run)
+    order_mode = (
+        OrderMode.LIVE
+        if not broker_was_provided and is_execution_broker_live(broker)
+        else OrderMode.PAPER
+    )
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         existing = (
@@ -187,6 +207,14 @@ def dispatch_trade_intent(
         qty = trade_intent.qty_lots * instrument.lot_size
         now = _utcnow()
 
+        if order_mode == OrderMode.LIVE:
+            run_preflight_checks(
+                db,
+                broker,
+                trading_session=trading_session,
+                option_contract=option_contract,
+            )
+
         # trade_intent.entry_price is already the strategy's real,
         # REST-option-chain-derived proposed price (see every strategy's
         # rank_from_latest_snapshot() call) -- pass it through as the fill
@@ -206,6 +234,8 @@ def dispatch_trade_intent(
                 order_type=BrokerOrderType.MARKET,
                 qty=qty,
                 limit_price=limit_price,
+                lot_size=instrument.lot_size,
+                tag=f"session:{trading_session.id}",
             )
         )
 
@@ -216,7 +246,7 @@ def dispatch_trade_intent(
             option_contract_id=option_contract.id,
             trade_intent_id=trade_intent.id,
             idempotency_key=trade_intent.idempotency_key,
-            mode=OrderMode.PAPER,
+            mode=order_mode,
             side=_to_domain_side(side),
             order_type=OrderType.MARKET,
             qty=qty,
@@ -402,7 +432,20 @@ def close_position(
     or the current market price for EOD/manual) — it's what `slippage` is
     measured against, not a duplicate of the actual fill price.
     """
-    broker = broker or get_execution_broker(trading_session)
+    # position-aware resolution: a position genuinely opened live must
+    # always be closeable for real, regardless of current SafeMode
+    # (kill_switch/degraded_mode exist to stop *new* risk, not strand
+    # *existing* real risk) -- see get_execution_broker's own docstring.
+    # broker_was_provided: see the identical guard in dispatch_trade_intent
+    # -- an explicitly-injected broker (the established test-fake pattern)
+    # must never be misread as live just because it isn't MockBrokerAdapter.
+    broker_was_provided = broker is not None
+    broker = broker or get_execution_broker(trading_session, position=position)
+    order_mode = (
+        OrderMode.LIVE
+        if not broker_was_provided and is_execution_broker_live(broker)
+        else OrderMode.PAPER
+    )
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         if position.status != PositionStatus.OPEN:
@@ -411,6 +454,9 @@ def close_position(
         option_contract = db.get(OptionContract, position.option_contract_id)
         if option_contract is None:
             raise ValueError(f"unknown option_contract_id {position.option_contract_id}")
+        instrument = db.get(Instrument, option_contract.instrument_id)
+        if instrument is None:
+            raise ValueError(f"unknown instrument for option_contract {option_contract.id}")
 
         entry_side = SignalSide(position.side)
         exit_side = _opposite(entry_side)
@@ -427,6 +473,14 @@ def close_position(
             # fill basis, same reasoning as the entry side in
             # dispatch_trade_intent, instead of leaving MockBrokerAdapter to
             # fill at its own independent synthetic price.
+            if order_mode == OrderMode.LIVE:
+                run_preflight_checks(
+                    db,
+                    broker,
+                    trading_session=trading_session,
+                    option_contract=option_contract,
+                )
+
             slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
             exit_limit_price = float(
                 _apply_slippage(_dec(intended_price), exit_side, slippage_pct)
@@ -439,6 +493,8 @@ def close_position(
                     order_type=BrokerOrderType.MARKET,
                     qty=position.qty,
                     limit_price=exit_limit_price,
+                    lot_size=instrument.lot_size,
+                    tag=f"session:{trading_session.id}",
                 )
             )
             exit_order = Order(
@@ -448,7 +504,7 @@ def close_position(
                 option_contract_id=option_contract.id,
                 position_id=position.id,
                 idempotency_key=exit_idempotency_key,
-                mode=OrderMode.PAPER,
+                mode=order_mode,
                 side=_to_domain_side(exit_side),
                 order_type=OrderType.MARKET,
                 qty=position.qty,

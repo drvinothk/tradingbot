@@ -351,11 +351,19 @@ def to_place_order_payload(
     (NRML/carry-forward margin product) — matches this system's intraday
     options-scalping use case better than `"I"` (MIS/intraday-only, which
     some brokers force-square-off well before this system's own EOD logic
-    runs) or `"C"` (CNC, cash-and-carry, not valid for F&O). `remarks`
-    carries `idempotency_key` so a duplicate submission is at least
-    traceable broker-side even though the real idempotency guarantee is
-    `place_order`'s own dict lookup in `ShoonyaBrokerAdapter`, not this.
+    runs) or `"C"` (CNC, cash-and-carry, not valid for F&O).
+
+    `remarks` is `f"{idempotency_key}|{tag}"` (or bare `idempotency_key`
+    when `tag` is empty, the existing format, byte-for-byte, for every
+    caller that never sets `tag`) — `idempotency_key` always comes first
+    and is never truncated/altered, since
+    `ShoonyaBrokerAdapter._find_order_by_remarks`'s crash-recovery lookup
+    depends on being able to find it as a substring of whatever's on the
+    broker's own order-book row (see that method's own docstring) — a
+    plain equality check would have broken the moment `tag` started
+    getting appended here.
     """
+    remarks = f"{request.idempotency_key}|{request.tag}" if request.tag else request.idempotency_key
     return {
         "uid": uid,
         "actid": actid,
@@ -368,7 +376,7 @@ def to_place_order_payload(
         "trantype": _SIDE_TO_SHOONYA[request.side],
         "prctyp": _ORDER_TYPE_TO_SHOONYA[request.order_type],
         "ret": "DAY",
-        "remarks": request.idempotency_key,
+        "remarks": remarks,
         "ordersource": "API",
     }
 
