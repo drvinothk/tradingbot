@@ -207,6 +207,33 @@ def test_guarded_live_with_graduated_strategy_but_force_paper_returns_mock(
     assert isinstance(broker, MockBrokerAdapter)
 
 
+def test_live_enabled_session_with_force_paper_strategy_still_returns_mock(
+    db: Session, workspace, trading_session, user, monkeypatch
+):
+    """Regression: the `live_enabled` branch never consults `strategy_is_live`
+    at all (a session-wide override that supersedes individual graduation),
+    so a first-pass implementation that only fed FORCE_PAPER into
+    `strategy_is_live` silently had zero effect once the session itself
+    reached `live_enabled` -- caught on Phase 7's own pre-deploy QC pass,
+    contradicting FORCE_PAPER's own "restricts, never expands" contract.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
+    )
+
+    broker = composition.get_execution_broker(trading_session, run)
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
 # -- Ops-Hardening Phase 7: instrument firewall gating -------------------
 
 

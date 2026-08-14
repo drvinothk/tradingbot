@@ -379,15 +379,34 @@ def get_execution_broker(
         return _get_or_create_execution_mock()
 
     strategy_is_live = False
+    strategy_force_paper = False
     if strategy_run is not None:
         db = object_session(strategy_run)
         if db is not None:
             config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+            strategy_force_paper = (
+                config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
+            )
             strategy_is_live = (
                 config is not None
                 and config.status == StrategyStatus.LIVE
-                and config.runtime_mode != StrategyRuntimeMode.FORCE_PAPER
+                and not strategy_force_paper
             )
+
+    # FORCE_PAPER is a per-strategy restriction, so it must apply
+    # regardless of *which* mode-branch below would otherwise route real --
+    # including `live_enabled`, which (unlike `paper_plus_guarded_live`)
+    # never consults `strategy_is_live` at all and would otherwise silently
+    # ignore this override the moment a human flips the whole session live.
+    # Checked here, before the mode branch, not folded into `strategy_is_live`
+    # alone -- a bug caught on Phase 7's own pre-deploy QC pass: the original
+    # wiring only fed FORCE_PAPER into `strategy_is_live`, which the
+    # `live_enabled` branch below never reads, so the override had zero
+    # effect once a session reached `live_enabled`, contradicting the
+    # "overrides only ever restrict, never expand" design this same field's
+    # own docstring promises.
+    if strategy_run is not None and strategy_force_paper:
+        return _get_or_create_execution_mock()
 
     if mode == SafeMode.LIVE_ENABLED or (
         mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
