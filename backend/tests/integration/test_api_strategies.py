@@ -470,6 +470,68 @@ def test_start_strategy_leaves_no_zombie_run_when_option_chain_fetch_fails(
             cleanup_db.commit()
 
 
+def test_start_strategy_rejects_when_shoonya_not_connected(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    """2026-08-14: same bug class as the restart-triggered ones fixed in
+    _resume_strategy_runners/MarketDataScheduler, human-triggered here
+    instead -- without this check, get_broker() falls back to the mock,
+    record_option_chain_snapshot "succeeds" against fabricated data instead
+    of raising BrokerError, and ensure_ingestion_running starts real
+    ingestion against that same mock-wrapped provider. Rejects before any
+    writes, same "validate first" shape as the zombie-run test above --
+    proves both a clean 409 and zero StrategyRun rows left behind.
+    """
+    monkeypatch.setattr(strategies_module, "is_shoonya_market_data_ready", lambda: False)
+
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-not-connected"}
+    ).json()["id"]
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+    try:
+        with session_factory() as db:
+            db.add(
+                Instrument(
+                    id=instrument_id,
+                    symbol="NIFTY-NOTCONNECTED",
+                    exchange="NFO",
+                    lot_size=25,
+                    tick_size=0.05,
+                )
+            )
+            db.commit()
+
+        start_resp = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/start",
+            json={
+                "trading_session_id": session_id,
+                "instrument_id": str(instrument_id),
+                "expiry_date": date(2026, 8, 6).isoformat(),
+                "execution_mode": "auto",
+            },
+        )
+
+        assert start_resp.status_code == 409
+        assert len(_FakeRunner.instances) == 0
+        with session_factory() as db:
+            runs = (
+                db.query(StrategyRun)
+                .filter(StrategyRun.strategy_config_id == uuid.UUID(strategy_id))
+                .all()
+            )
+            assert runs == []
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
 def test_approve_unknown_trade_approval_is_404(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     response = api_client.post(f"/api/v1/trade-approvals/{uuid.uuid4()}/approve")

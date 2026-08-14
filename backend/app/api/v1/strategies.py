@@ -48,6 +48,7 @@ from app.modules.market_data.freshness import (
     classify_option_chain,
     worse_of,
 )
+from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
 from app.modules.market_data.registry import ensure_ingestion_running
 from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
@@ -347,6 +348,24 @@ def start_strategy(
     instrument = db.get(Instrument, body.instrument_id)
     if instrument is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Instrument not found")
+
+    # 2026-08-14: reject before any writes, same "validate first" discipline
+    # this function already applies to the option-chain snapshot below --
+    # without this, get_broker() a few lines down silently falls back to
+    # the mock (MARKET_DATA_PROVIDER=shoonya, but no human has connected it
+    # yet this process lifetime), so record_option_chain_snapshot "succeeds"
+    # against entirely fabricated data instead of raising BrokerError, and
+    # ensure_ingestion_running further below would start real ingestion
+    # against that same mock-wrapped provider — the same bug class fixed in
+    # _resume_strategy_runners/MarketDataScheduler, just human-triggered
+    # (starting a new strategy before reconnecting) rather than
+    # restart-triggered. Angel One/TrueData/mock configurations are
+    # unaffected -- is_shoonya_market_data_ready() is always True for them.
+    if not is_shoonya_market_data_ready():
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Shoonya is not connected — connect Shoonya before starting a strategy",
+        )
 
     # One immediate option-chain snapshot so the first evaluate() cycle has
     # something to rank against, rather than waiting on whatever polling
