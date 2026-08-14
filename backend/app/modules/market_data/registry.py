@@ -22,10 +22,18 @@ underlyings, all share the one real connection.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+
+from sqlalchemy.orm import Session
+
+from app.core.db.session import session_scope
 from app.modules.market_data.indicators import IndicatorEngine
 from app.modules.market_data.ingestion import MarketDataIngestionService
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
+
+SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 _service: MarketDataIngestionService | None = None
 _subscribed_symbols: set[str] = set()
@@ -88,7 +96,56 @@ def reset() -> None:
     _subscribed_symbols.clear()
 
 
-def reset_for_reconnect() -> None:
+def resume_ingestion_for_active_runs(session_factory: SessionFactory = session_scope) -> None:
+    """Starts ingestion for every underlying a currently-active, non-`STOPPED`
+    `StrategyRun` needs — the same join `app.main._resume_strategy_runners`
+    already runs, duplicated here deliberately rather than imported (`app.
+    main` includes `api.v1.shoonya`'s router, so the reverse import would be
+    circular).
+
+    2026-08-14: added because `reset_for_reconnect`'s own "resubscribe every
+    previously-subscribed symbol" logic resubscribes nothing on a *cold*
+    reconnect (the first one after a process restart) — `_resume_strategy_
+    runners` now defers `ensure_ingestion_running` entirely when Shoonya
+    isn't connected yet (see `provider_composition.is_shoonya_market_data_
+    ready`), so `_subscribed_symbols` is empty by the time a human
+    reconnects, and the old logic alone had nothing to act on. This call is
+    what actually starts ingestion in that case.
+
+    `session_factory` is a real, overridable parameter, not decoration —
+    the default `session_scope` is the production DB, and `reset_for_
+    reconnect`'s own existing tests call the real (non-mocked)
+    implementation directly, so a test that doesn't override this would
+    silently query production. Same reasoning `ensure_ingestion_running`'s
+    docstring already gives for why its own DB-touching callers need to be
+    careful about this.
+    """
+    from app.domain.market.models import Instrument
+    from app.domain.session.models import TradingSession, TradingSessionStatus
+    from app.domain.strategy.models import StrategyRun, StrategyRunStatus
+
+    with session_factory() as db:
+        runs = (
+            db.query(StrategyRun)
+            .join(TradingSession, StrategyRun.trading_session_id == TradingSession.id)
+            .filter(
+                StrategyRun.status != StrategyRunStatus.STOPPED,
+                TradingSession.status == TradingSessionStatus.ACTIVE,
+                StrategyRun.instrument_id.isnot(None),
+            )
+            .all()
+        )
+        instrument_ids = {run.instrument_id for run in runs}
+        symbols = {
+            instrument.symbol
+            for instrument in db.query(Instrument).filter(Instrument.id.in_(instrument_ids))
+        }
+
+    for symbol in sorted(symbols):
+        ensure_ingestion_running(symbol)
+
+
+def reset_for_reconnect(session_factory: SessionFactory = session_scope) -> None:
     """2026-08-12: real gap found while switching `MARKET_DATA_PROVIDER` to
     `shoonya` — `get_market_data_provider()` is a lazy singleton
     (`provider_composition._provider`) resolved once, on first use, then
@@ -116,6 +173,16 @@ def reset_for_reconnect() -> None:
     immediately re-subscribes every one of them against the new provider —
     so already-running strategies don't go dark until something unrelated
     happens to call `ensure_ingestion_running` again.
+
+    2026-08-14: on a *cold* reconnect (the first one after a process
+    restart, per `provider_composition.is_shoonya_market_data_ready`'s own
+    docstring), `_subscribed_symbols` is empty at this point — nothing was
+    ever subscribed against the stale mock-wrapped provider, since
+    `_resume_strategy_runners` now defers instead of subscribing against
+    it. The resubscribe loop above therefore has nothing to do in that
+    case, so `resume_ingestion_for_active_runs` runs after it — querying
+    which underlyings *should* be streaming, independent of what (if
+    anything) was previously subscribed — to actually close the loop.
     """
     global _service
     previously_subscribed = sorted(_subscribed_symbols)
@@ -130,3 +197,5 @@ def reset_for_reconnect() -> None:
 
     for symbol in previously_subscribed:
         ensure_ingestion_running(symbol)
+
+    resume_ingestion_for_active_runs(session_factory)

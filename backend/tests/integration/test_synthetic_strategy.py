@@ -238,6 +238,36 @@ def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(
     assert "skipping cycle" in caplog.text
 
 
+def test_run_cycle_skips_evaluate_when_shoonya_not_yet_connected(
+    db: Session,
+    instrument: Instrument,
+    option_contract: OptionContract,
+    strategy_run,
+    trading_session,
+    strategy_config,
+    monkeypatch,
+):
+    """2026-08-14 regression: `get_broker()` (used for the option-chain
+    refresh) falls back to the mock broker until a human reconnects Shoonya
+    — without this guard, a strategy could evaluate and dispatch a paper
+    trade against a fully fabricated option chain during that window with
+    no error anywhere to notice by. Seeds real market data first so a
+    pass-through (bug) would otherwise produce a real signal, matching
+    test_run_cycle_skips_evaluate_when_option_chain_refresh_fails's own
+    reasoning for why this needs seeded data, not just an empty DB.
+    """
+    _seed_market_data(db, instrument, option_contract)
+    monkeypatch.setattr(runner_module, "is_shoonya_market_data_ready", lambda: False)
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+
+    assert decision is None
+    assert (
+        db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
+    )
+
+
 def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     db: Session, instrument, option_contract, strategy_run, trading_session, strategy_config
 ):

@@ -24,11 +24,12 @@ from __future__ import annotations
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType
 from app.domain.market.mock_universe import build_mock_universe
 from app.domain.market.models import (
     IndicatorSnapshot,
@@ -37,6 +38,8 @@ from app.domain.market.models import (
     PriceBar,
     QuoteTick,
 )
+from app.domain.session.models import FundingMode, SafeMode, TradingSession, TradingSessionStatus
+from app.domain.strategy.models import ExecutionMode, StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.market_data import registry as market_data_registry
 from app.modules.market_data.indicators import IndicatorEngine
@@ -200,7 +203,7 @@ def test_reset_daily_indicators_is_a_harmless_noop_before_any_service_exists():
 
 
 def test_reset_for_reconnect_stops_and_rebuilds_every_previously_subscribed_symbol(
-    monkeypatch,
+    monkeypatch, test_session_factory,
 ):
     """2026-08-12 regression: `get_market_data_provider()` is a lazy
     singleton resolved once, at process startup, always against the
@@ -240,20 +243,156 @@ def test_reset_for_reconnect_stops_and_rebuilds_every_previously_subscribed_symb
     market_data_registry.ensure_ingestion_running("BANKNIFTY", provider=object())
     starts.clear()  # only the re-subscribe after reset matters below
 
-    market_data_registry.reset_for_reconnect()
+    # test_session_factory (not the default session_scope, which is the
+    # production DB) -- see resume_ingestion_for_active_runs's own docstring
+    # for why this parameter exists. Nothing in the test DB matches the
+    # active-run query, so this contributes no extra .start() calls here.
+    market_data_registry.reset_for_reconnect(session_factory=test_session_factory)
 
     assert stops == [["BANKNIFTY", "NIFTY"]], "both symbols stopped on the old service"
     assert set_calls == [None], "provider_composition singleton must be cleared"
     assert starts == [["BANKNIFTY"], ["NIFTY"]], "both symbols re-subscribed on the new service"
 
 
-def test_reset_for_reconnect_is_a_harmless_noop_with_nothing_subscribed(monkeypatch):
+def test_reset_for_reconnect_is_a_harmless_noop_with_nothing_subscribed(
+    monkeypatch, test_session_factory,
+):
     set_calls: list[object | None] = []
     monkeypatch.setattr(
         "app.modules.market_data.provider_composition.set_market_data_provider",
         set_calls.append,
     )
 
-    market_data_registry.reset_for_reconnect()  # must not raise
+    market_data_registry.reset_for_reconnect(session_factory=test_session_factory)  # must not raise
 
     assert set_calls == [None]
+
+
+def _active_run_on_instrument(
+    db: Session, workspace, user, instrument: Instrument
+) -> StrategyRun:
+    broker_account = BrokerAccount(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_type=BrokerType.SHOONYA,
+        label="registry-test-account",
+        credentials_ref="config/credentials/shoonya.env",
+        status=BrokerAccountStatus.ACTIVE,
+    )
+    db.add(broker_account)
+    db.flush()
+
+    trading_session = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        status=TradingSessionStatus.ACTIVE,
+        started_at=datetime.now(UTC),
+        budget_amount=1_000_000,
+        daily_target_profit=1_000_000,
+        daily_loss_cap=1_000_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(trading_session)
+    db.flush()
+
+    strategy_config = StrategyConfig(
+        id=uuid.uuid4(), workspace_id=workspace.id, name=f"registry-test-{uuid.uuid4().hex[:8]}"
+    )
+    db.add(strategy_config)
+    db.flush()
+
+    strategy_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+        instrument_id=instrument.id,
+        expiry_date=EXPIRY,
+    )
+    db.add(strategy_run)
+    db.flush()
+    return strategy_run
+
+
+def test_resume_ingestion_for_active_runs_starts_ingestion_for_active_strategy_runs(
+    db: Session, workspace, user, monkeypatch
+):
+    """`resume_ingestion_for_active_runs` is what actually closes the
+    2026-08-14 cold-reconnect gap — proves it queries active, non-STOPPED
+    runs directly (not via `_subscribed_symbols`, which a cold restart never
+    populated) and starts ingestion for the underlying each one needs.
+    """
+    instrument = Instrument(
+        id=uuid.uuid4(), symbol="NIFTY-REGISTRY", exchange="NFO", lot_size=25, tick_size=0.05
+    )
+    db.add(instrument)
+    db.flush()
+    _active_run_on_instrument(db, workspace, user, instrument)
+
+    @contextmanager
+    def _fake_session_scope():
+        yield db
+
+    starts: list[list[str]] = []
+
+    class _FakeIngestionService:
+        def __init__(self, provider, session_factory=None, indicator_engine=None):
+            pass
+
+        def start(self, symbols):
+            starts.append(list(symbols))
+
+    monkeypatch.setattr(market_data_registry, "MarketDataIngestionService", _FakeIngestionService)
+
+    market_data_registry.resume_ingestion_for_active_runs(session_factory=_fake_session_scope)
+
+    assert starts == [["NIFTY-REGISTRY"]]
+
+
+def test_reset_for_reconnect_starts_ingestion_for_active_runs_on_a_cold_reconnect(
+    db: Session, workspace, user, monkeypatch
+):
+    """The actual bug scenario: a cold restart never subscribed anything
+    (`_resume_strategy_runners` now defers `ensure_ingestion_running` until
+    Shoonya connects, see `app.main`'s own docstring), so the pre-existing
+    "resubscribe every previously-subscribed symbol" logic alone has nothing
+    to act on — `resume_ingestion_for_active_runs` is what makes the first
+    reconnect after any restart actually start ingestion for real.
+    """
+    instrument = Instrument(
+        id=uuid.uuid4(), symbol="BANKNIFTY-REGISTRY", exchange="NFO", lot_size=15, tick_size=0.05
+    )
+    db.add(instrument)
+    db.flush()
+    _active_run_on_instrument(db, workspace, user, instrument)
+
+    @contextmanager
+    def _fake_session_scope():
+        yield db
+
+    starts: list[list[str]] = []
+
+    class _FakeIngestionService:
+        def __init__(self, provider, session_factory=None, indicator_engine=None):
+            pass
+
+        def start(self, symbols):
+            starts.append(list(symbols))
+
+    monkeypatch.setattr(market_data_registry, "MarketDataIngestionService", _FakeIngestionService)
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.set_market_data_provider",
+        lambda provider: None,
+    )
+
+    assert market_data_registry._subscribed_symbols == set()  # nothing subscribed -- cold start
+
+    market_data_registry.reset_for_reconnect(session_factory=_fake_session_scope)
+
+    assert starts == [["BANKNIFTY-REGISTRY"]]

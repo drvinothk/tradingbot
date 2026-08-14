@@ -294,6 +294,18 @@ def _resume_strategy_runners() -> None:
     reasoning as the `PositionManager` resume above. One run's failure
     (a stale `strategy_type`, a deleted `Instrument`) is caught and skipped
     rather than aborting every other run's resume or startup itself.
+
+    2026-08-14: `ensure_ingestion_running` is skipped entirely (not just
+    deferred a cycle) when `market_data.provider_composition.
+    is_shoonya_market_data_ready()` is `False` — this function runs before
+    any human has had a chance to reconnect Shoonya, so calling it
+    unconditionally used to permanently cache the market-data provider
+    singleton wrapping the mock broker, silently writing fabricated prices
+    into `price_bars`/`quote_ticks` under a real-looking "shoonya"
+    configuration until a human happened to reconnect. The `StrategyRunner`
+    thread still starts either way — it just sits idle (no bars, no
+    signal) until `market_data.registry.reset_for_reconnect` starts
+    ingestion for real once Shoonya connects.
     """
     from app.api.v1.strategies import _RUNNERS, _build_strategy
     from app.core.db.session import session_scope
@@ -302,6 +314,7 @@ def _resume_strategy_runners() -> None:
     from app.domain.session.models import TradingSession
     from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
     from app.modules.execution_engine.paper.registry import ensure_position_manager_running
+    from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
     from app.modules.market_data.registry import ensure_ingestion_running
     from app.modules.strategy_engine.runner import StrategyRunner
 
@@ -318,6 +331,13 @@ def _resume_strategy_runners() -> None:
         if not runs:
             logger.info("Strategy-runner recovery check: no stale active runs found.")
             return
+
+        ingestion_ready = is_shoonya_market_data_ready()
+        if not ingestion_ready:
+            logger.warning(
+                "Shoonya not connected yet — deferring market-data ingestion for all "
+                "resumed runs until reconnect (see market_data.registry.reset_for_reconnect)."
+            )
 
         resumed: list[uuid.UUID] = []
         skipped_no_instrument: list[uuid.UUID] = []
@@ -344,7 +364,8 @@ def _resume_strategy_runners() -> None:
                 _RUNNERS[run.id] = runner
 
                 get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
-                ensure_ingestion_running(instrument.symbol)
+                if ingestion_ready:
+                    ensure_ingestion_running(instrument.symbol)
                 ensure_position_manager_running(run.trading_session_id)
 
                 resumed.append(run.id)

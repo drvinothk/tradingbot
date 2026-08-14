@@ -419,6 +419,69 @@ def test_resume_strategy_runners_resumes_scanning_run_with_instrument_and_expiry
     assert resumed.strategy.expiry_date == EXPIRY
 
 
+def test_resume_strategy_runners_defers_ingestion_when_shoonya_not_connected(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    """2026-08-14 regression: calling `ensure_ingestion_running` before a
+    real Shoonya broker is connected permanently caches the market-data
+    provider singleton wrapping the mock (see `provider_composition.
+    is_shoonya_market_data_ready`'s own docstring) — the `StrategyRunner`
+    thread still resumes either way, but ingestion must be deferred, not
+    called, until reconnect.
+    """
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    import app.modules.market_data.provider_composition as provider_composition_module
+    import app.modules.market_data.registry as market_data_registry
+
+    ingestion_calls: list[str] = []
+    monkeypatch.setattr(
+        market_data_registry, "ensure_ingestion_running", ingestion_calls.append
+    )
+    monkeypatch.setattr(provider_composition_module, "is_shoonya_market_data_ready", lambda: False)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert strategy_run.id in _RUNNERS
+    resumed = _RUNNERS[strategy_run.id]
+    assert isinstance(resumed, _FakeStrategyRunner)
+    assert resumed.started is True
+    assert ingestion_calls == []
+
+
+def test_resume_strategy_runners_starts_ingestion_when_shoonya_connected(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    import app.modules.market_data.provider_composition as provider_composition_module
+    import app.modules.market_data.registry as market_data_registry
+
+    ingestion_calls: list[str] = []
+    monkeypatch.setattr(
+        market_data_registry, "ensure_ingestion_running", ingestion_calls.append
+    )
+    monkeypatch.setattr(provider_composition_module, "is_shoonya_market_data_ready", lambda: True)
+
+    from app.main import _resume_strategy_runners
+
+    _resume_strategy_runners()
+
+    assert ingestion_calls == [instrument.symbol]
+
+
 def test_resume_strategy_runners_skips_runs_missing_instrument_id(
     db: Session, workspace, broker_account, user, monkeypatch
 ):

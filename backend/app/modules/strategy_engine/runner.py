@@ -31,6 +31,7 @@ from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
+from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
 from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
     get_recent_completed_bars,
@@ -80,6 +81,14 @@ def run_cycle(
     completes) — that fallback also doubles as this function's empty-bar
     guard, so a cold-start cycle degrades to the old wall-clock behavior
     instead of ever touching `latest_bar.bucket_start` on a `None`.
+
+    2026-08-14: also requires `is_shoonya_market_data_ready()` alongside the
+    window check — `get_broker()` (used for the option-chain refresh right
+    below) falls back to the mock broker until a human reconnects Shoonya,
+    same root cause `market_data.registry.reset_for_reconnect`'s docstring
+    documents for market-data ingestion. Without this, a strategy could
+    evaluate and dispatch paper trades against a fully fabricated option
+    chain during that window with no error anywhere to notice by.
     """
     decision: RiskDecision | None = None
 
@@ -99,7 +108,7 @@ def run_cycle(
         latest_bar = None
         window_ts = now_ist()
 
-    if is_within_global_trading_window(window_ts):
+    if is_within_global_trading_window(window_ts) and is_shoonya_market_data_ready():
         freshness = ensure_fresh_option_chain(
             db,
             get_broker(),

@@ -35,7 +35,7 @@ data for the one actually requested.
 from __future__ import annotations
 
 from app.config.settings import get_settings
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
@@ -150,6 +150,25 @@ def get_market_data_provider() -> BaseMarketDataProvider:
             inner, allow_offhours=settings.market_data.allow_offhours_testing
         )
     return _provider
+
+
+def is_shoonya_market_data_ready() -> bool:
+    """False only when `MARKET_DATA_PROVIDER=shoonya` and no real broker is
+    connected yet — `get_market_data_provider()` would still wrap whatever
+    `get_broker()` currently resolves to, which is the mock until a human
+    completes OAuth (`broker_adapter.composition.get_broker`'s own docstring).
+    `"angel_one"`/`"truedata"` construct independently of `get_broker()`, and
+    `"mock"` returning the mock is correct by definition, so both are always
+    ready regardless of this flag.
+
+    2026-08-14: added after a live incident where `_resume_strategy_runners`
+    (`app.main`) called `ensure_ingestion_running` before any reconnect had
+    happened, permanently caching this module's `_provider` singleton
+    wrapping the mock — see `market_data.registry.reset_for_reconnect`'s own
+    docstring for the full mechanism. Callers use this to defer market-data work
+    entirely rather than let it silently run against fabricated prices.
+    """
+    return get_settings().market_data.provider != "shoonya" or is_shoonya_configured()
 
 
 def set_market_data_provider(provider: BaseMarketDataProvider | None) -> None:

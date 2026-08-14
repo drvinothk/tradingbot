@@ -85,6 +85,44 @@ def test_mock_provider_name_still_resolves(monkeypatch):
     assert provider is not None
 
 
+def test_is_shoonya_market_data_ready_true_for_mock_and_angel_one_regardless_of_broker(
+    monkeypatch,
+):
+    """Neither provider depends on `get_broker()` for market data (`"mock"`
+    returning the mock is correct by definition; `"angel_one"` constructs
+    independently), so this must stay True even when Shoonya isn't
+    connected at all.
+    """
+    monkeypatch.setattr(provider_composition, "is_shoonya_configured", lambda: False)
+
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("mock")
+    )
+    assert provider_composition.is_shoonya_market_data_ready() is True
+
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("angel_one")
+    )
+    assert provider_composition.is_shoonya_market_data_ready() is True
+
+
+def test_is_shoonya_market_data_ready_tracks_broker_connection_for_shoonya(monkeypatch):
+    """2026-08-14 regression: `get_market_data_provider()` wraps whatever
+    `get_broker()` currently resolves to for `"shoonya"` -- False until a
+    real broker is connected, True once it is, so callers can defer
+    market-data work instead of silently running against the mock.
+    """
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("shoonya")
+    )
+
+    monkeypatch.setattr(provider_composition, "is_shoonya_configured", lambda: False)
+    assert provider_composition.is_shoonya_market_data_ready() is False
+
+    monkeypatch.setattr(provider_composition, "is_shoonya_configured", lambda: True)
+    assert provider_composition.is_shoonya_market_data_ready() is True
+
+
 def test_truedata_provider_name_resolves_without_needing_the_real_library(monkeypatch):
     """TrueDataProvider itself is import-safe with zero `truedata-ws`
     dependency (lazy import inside connect(), never called here) -- this
