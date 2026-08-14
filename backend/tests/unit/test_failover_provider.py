@@ -533,3 +533,94 @@ def test_per_symbol_routing_composes_correctly_with_active_leg_routing(make_prov
     assert underlying_ticks[0].contract_symbol == "NIFTY"
     assert len(option_ticks) == 1
     assert option_ticks[0].contract_symbol == "NIFTY18AUG26C24400"
+
+
+# -- Ops-Hardening Phase 4: set_manual_override ------------------------------
+
+
+def test_manual_override_to_backup_subscribes_and_activates_it(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+
+    provider.set_manual_override("angel_one")
+
+    assert provider.active_provider_name == "angel_one"
+    assert provider.manual_override == "angel_one"
+    assert backup.subscribe_calls == [["NIFTY"]]
+
+
+def test_manual_override_to_primary_does_not_touch_backup(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+
+    provider.set_manual_override("shoonya")
+
+    assert provider.active_provider_name == "shoonya"
+    assert backup.subscribe_calls == []
+
+
+def test_manual_override_rejects_an_unrecognized_provider_name(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+
+    with pytest.raises(ValueError):
+        provider.set_manual_override("truedata")
+
+
+def test_manual_override_suspends_automatic_failover(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    provider.set_manual_override("shoonya")
+
+    # Primary goes stale well past the trip threshold -- without an
+    # override this would trip to backup (see _trip_to_backup above).
+    primary.fire_tick(_tick())
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+
+    assert provider.active_provider_name == "shoonya"
+    assert backup.subscribe_calls == []
+
+
+def test_manual_override_backup_subscribe_failure_raises_and_does_not_apply(make_provider):
+    primary = _FakeProvider()
+    backup = _FakeProvider(subscribe_error=RuntimeError("connection refused"))
+    clock = _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+
+    with pytest.raises(RuntimeError):
+        provider.set_manual_override("angel_one")
+
+    assert provider.active_provider_name == "shoonya"
+    assert provider.manual_override is None
+
+
+def test_clearing_override_resumes_automatic_recovery_not_instant_snapback(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    provider.set_manual_override("angel_one")
+
+    # Primary has been healthy the whole time (never actually failed) --
+    # clearing the override must still go through the normal stabilization
+    # window, not snap straight back just because the override is gone.
+    primary.fire_tick(_tick())
+    provider.set_manual_override(None)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"  # not yet -- window hasn't elapsed
+
+    clock.advance(_RECOVERY + 1.0)
+    primary.fire_tick(_tick())
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"  # now recovered for real
+
+
+def test_manual_override_property_defaults_to_none(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+
+    assert provider.manual_override is None

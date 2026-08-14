@@ -98,6 +98,10 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._recovery_started_at: float | None = None
         self._backup_subscribed = False
         self._next_backup_attempt_at: float | None = None
+        # Ops-Hardening Phase 4: a manual override on top of everything
+        # above, not a replacement for it -- see set_manual_override's own
+        # docstring.
+        self._manual_override: str | None = None
 
         self._symbols: set[str] = set()
         # Per-symbol, not a single shared slot -- both the primary and
@@ -120,6 +124,65 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
     def active_provider_name(self) -> str:
         with self._lock:
             return self._active
+
+    @property
+    def manual_override(self) -> str | None:
+        with self._lock:
+            return self._manual_override
+
+    def set_manual_override(self, provider_name: str | None) -> None:
+        """Ops-Hardening Phase 4. A user-driven override on top of this
+        class's own automatic health-based switching (`run_once`'s
+        `_check_primary_health`/`_check_recovery` dispatch) -- not a
+        replacement for it. `provider_name=None` clears the override and
+        resumes normal automatic behavior from whichever leg is currently
+        active (deliberately *not* snapped back to primary on clear -- if
+        the override left backup active, clearing it correctly falls
+        through to `_check_recovery`'s own stabilization-window logic next
+        cycle, the same health-confirmed path an automatic failover's
+        recovery already goes through, rather than yanking back to primary
+        with no health check at all).
+
+        Forcing to the backup leg subscribes it immediately if it isn't
+        already (reusing `_ensure_backup_subscribed`) -- a forced switch
+        must actually be live now, not deferred to whenever the automatic
+        watchdog would have gotten around to it. Raises `RuntimeError` if
+        that subscribe fails, rather than silently marking the backup
+        "active" while it's actually not receiving anything -- unlike the
+        automatic failover path (which just retries next cycle, appropriate
+        for an unattended background loop), this is a synchronous,
+        user-initiated call and the caller (the PATCH endpoint) needs to
+        surface the failure immediately, not have it discovered later as a
+        silent data gap.
+
+        While an override is set, `run_once` skips its own automatic
+        switching entirely (health tracking in `_make_tick_handler` is
+        unaffected either way -- `_last_primary_tick_at` keeps updating
+        regardless of `_active`, so recovery health data isn't stale by the
+        time the override is cleared).
+        """
+        if provider_name is not None and provider_name not in (
+            self._primary_name,
+            self._backup_name,
+        ):
+            raise ValueError(
+                f"manual override {provider_name!r} must be one of "
+                f"{(self._primary_name, self._backup_name)!r}"
+            )
+
+        if provider_name == self._backup_name and not self._ensure_backup_subscribed(
+            self._clock()
+        ):
+            raise RuntimeError(
+                f"Failed to subscribe backup provider {self._backup_name!r} for the "
+                "manual override -- not applied."
+            )
+
+        with self._lock:
+            if provider_name is not None:
+                self._active = provider_name
+            self._manual_override = provider_name
+        logger.warning("Market-data provider manual override set to %r", provider_name)
 
     # -- BaseMarketDataProvider -------------------------------------------
 
@@ -296,6 +359,14 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         now = self._clock()
         with self._lock:
             active = self._active
+            overridden = self._manual_override is not None
+
+        # A manual override suspends this class's own automatic switching
+        # entirely -- see set_manual_override's own docstring for why.
+        # Health tracking (_make_tick_handler updating _last_primary_tick_at)
+        # is unaffected, since it doesn't route through run_once at all.
+        if overridden:
+            return
 
         if active == self._primary_name:
             self._check_primary_health(now)

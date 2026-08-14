@@ -34,7 +34,11 @@ data for the one actually requested.
 
 from __future__ import annotations
 
+import logging
+
 from app.config.settings import get_settings
+from app.core.db.session import session_scope
+from app.domain.ops.models import MarketDataProviderPreference
 from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
@@ -43,6 +47,8 @@ from app.modules.market_data.providers.failover import FailoverMarketDataProvide
 from app.modules.market_data.providers.market_hours_gate import MarketHoursGatedProvider
 from app.modules.market_data.providers.truedata_provider import TrueDataProvider
 from app.modules.market_data.scrip_master import ScripMasterService
+
+logger = logging.getLogger("app.market_data.provider_composition")
 
 _RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
 # Backup legs supported for MARKET_DATA_FAILOVER_BACKUP_PROVIDER today --
@@ -80,6 +86,45 @@ def _build_provider(name: str, settings: object) -> BaseMarketDataProvider:
     if name == "truedata":
         return TrueDataProvider(settings.truedata)  # type: ignore[attr-defined]
     return BrokerPortMarketDataAdapter(get_broker())
+
+
+def _seed_manual_override(failover: FailoverMarketDataProvider) -> None:
+    """Ops-Hardening Phase 4: applies any persisted `MarketDataProviderPreference`
+    as the initial manual override at construction time, so a preference set
+    before a restart/reconnect is honored immediately rather than only ever
+    taking effect via a live PATCH call on an already-running singleton.
+
+    This composition root is a process-wide lazy singleton with no
+    per-request workspace context -- takes the first preference row found,
+    which is correct for this system's actual single-workspace usage (same
+    simplification `market_data.market_hours.TRADABLE_UNDERLYINGS`'s own
+    docstring already makes explicitly for the identical reason).
+
+    Deliberately never raises: a DB hiccup, or a stale preference pointing
+    at a symbol set that isn't subscribed yet, must never prevent
+    market-data ingestion from starting at all -- falls back to no override
+    (normal automatic failover) and logs a warning instead.
+
+    `session_scope` is a module-level import (not local), specifically so
+    tests can monkeypatch `provider_composition.session_scope` to a fake
+    that never touches the real engine -- the module-level `_reset_broker_
+    singleton` fixture in conftest.py does exactly this for the whole test
+    suite, the same "never let a composition-root helper default to the
+    production DB inside a test" discipline this project's own CLAUDE.md
+    already documents hitting as a real incident once before.
+    """
+    try:
+        with session_scope() as db:
+            pref = db.query(MarketDataProviderPreference).first()
+            override = pref.active_provider if pref is not None else None
+        if override is not None:
+            failover.set_manual_override(override)
+    except Exception:  # noqa: BLE001 - best-effort seeding, never blocks startup
+        logger.warning(
+            "Could not apply a persisted market-data provider preference at startup "
+            "-- continuing with normal automatic failover.",
+            exc_info=True,
+        )
 
 
 def get_market_data_provider() -> BaseMarketDataProvider:
@@ -142,6 +187,7 @@ def get_market_data_provider() -> BaseMarketDataProvider:
             ),
             backup_retry_seconds=settings.market_data.failover_backup_retry_seconds,
         )
+        _seed_manual_override(inner)
 
     if provider_name == "mock":
         _provider = inner

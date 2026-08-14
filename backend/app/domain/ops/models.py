@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.db.base import Base, UUIDPkMixin
+from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
 
 
 class AlertSeverity(enum.StrEnum):
@@ -69,3 +69,28 @@ class MetricSeries(Base, UUIDPkMixin):
         ),
         Index("ix_metric_series_trading_session", "trading_session_id"),
     )
+
+
+class MarketDataProviderPreference(Base, UUIDPkMixin, TimestampMixin):
+    """Ops-Hardening Phase 4. One row per workspace — a manual override on
+    top of `FailoverMarketDataProvider`'s own automatic health-based
+    switching (`app.modules.market_data.providers.failover`), not a
+    replacement for it: this records which provider the user wants active
+    *right now* (e.g. "Shoonya's having a bad day, force Angel One"), read
+    at `provider_composition.get_market_data_provider()` construction time
+    to seed the initial override, and applied live via
+    `FailoverMarketDataProvider.set_manual_override` by the PATCH endpoint
+    whenever a live failover-wrapped singleton already exists. `String(30)`,
+    not a native Postgres enum, matching every other enum-shaped column in
+    this codebase (`StrategyStatus`, `ExecutionMode`, etc.) — validated at
+    the API layer against `provider_composition._RECOGNIZED_FAILOVER_
+    BACKUPS`-equivalent values, not a DB constraint.
+    """
+
+    __tablename__ = "market_data_provider_preferences"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"), unique=True)
+    # Nullable, same "None means no override" convention as
+    # StrategyConfig.runtime_mode (Ops-Hardening Phase 1) -- not an empty
+    # string sentinel.
+    active_provider: Mapped[str | None] = mapped_column(String(30), nullable=True)

@@ -115,6 +115,40 @@ def _reset_broker_singleton() -> Generator[None, None, None]:
     provider_composition.reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _fake_market_data_provider_preference_lookup(monkeypatch) -> None:
+    """Ops-Hardening Phase 4: `provider_composition._seed_manual_override`
+    (called from `get_market_data_provider()` whenever failover is enabled)
+    reads `MarketDataProviderPreference` via the real `session_scope` --
+    bound to the actual dev-configured engine, not this suite's own
+    isolated test database (see this file's own module docstring for why
+    those are deliberately never the same connection). Left unpatched,
+    every test that constructs a failover-wrapped provider would make a
+    real read against the live dev DB. Patched to a fake that returns "no
+    preference row" without touching any real connection at all -- same
+    "never let a composition-root helper default to the production DB
+    inside a test" discipline as every other background-write path fixed
+    this same way elsewhere in this codebase.
+    """
+    from contextlib import contextmanager
+
+    from app.modules.market_data import provider_composition
+
+    class _NoRowsQuery:
+        def first(self):
+            return None
+
+    class _FakeSession:
+        def query(self, *args, **kwargs):
+            return _NoRowsQuery()
+
+    @contextmanager
+    def _fake_session_scope():
+        yield _FakeSession()
+
+    monkeypatch.setattr(provider_composition, "session_scope", _fake_session_scope)
+
+
 @pytest.fixture
 def workspace(db: Session) -> Workspace:
     ws = Workspace(id=uuid.uuid4(), name=f"test-{uuid.uuid4().hex[:8]}")
