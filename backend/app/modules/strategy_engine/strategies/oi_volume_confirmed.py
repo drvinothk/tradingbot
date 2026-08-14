@@ -64,7 +64,7 @@ from datetime import date, time
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import IST
+from app.core.clock import to_ist
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
@@ -77,6 +77,7 @@ from app.modules.strategy_engine.common_rules import (
     get_recent_completed_bars,
     pick_by_underlying,
 )
+from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
@@ -228,7 +229,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         if candidate not in self._pending_breakout:
             self._pending_breakout[candidate] = (window_high, window_low, self.bar_count)
 
-        bar_time = latest_bar.bucket_start.astimezone(IST).time()
+        bar_time = to_ist(latest_bar.bucket_start).time()
         if not self._within_trade_windows(bar_time):
             self._log_once(
                 logger, "time_window",
@@ -309,5 +310,6 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
                 "window_low": window_low,
                 "strike_score": top.score,
                 "breakdown": top.breakdown,
+                "env": get_latest_env_metrics(db, self.instrument_id),
             },
         )

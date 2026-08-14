@@ -5,7 +5,7 @@ Revises: 0012
 Create Date: 2026-08-13
 
 Consolidates the EOD force-square-off boundary with the new 09:31-15:09 IST
-trade-firing window (`app.modules.strategy_engine.runner.TRADE_WINDOW_END`)
+trade-firing window (`app.core.clock.TRADE_WINDOW_END`)
 so a position can no longer be opened in the last minutes of the day and
 immediately force-closed. DB-level `server_default` only, matching how
 `0003_sessions_and_audit.py` originally set it — the ORM-side `default=` on

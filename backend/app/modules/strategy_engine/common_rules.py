@@ -319,14 +319,22 @@ class ConfirmationFilterStrategy(Strategy):
         self._logged_keys.add(key)
         logger.info(msg, *args)
 
-    def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
+    def evaluate(
+        self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar | None = None
+    ) -> TradeProposal | None:
         if get_open_position_for_run(db, strategy_run) is not None:
             return None
 
-        latest = get_recent_completed_bars(db, self.instrument_id, self.timeframe, limit=1)
-        if not latest:
-            return None
-        bar = latest[0]
+        if latest_bar is not None:
+            bar = latest_bar
+        else:
+            # No pre-fetched bar supplied (e.g. a test calling evaluate()
+            # directly) -- fetch it ourselves, same as before run_cycle
+            # started pre-fetching this for the trade-window gate.
+            latest = get_recent_completed_bars(db, self.instrument_id, self.timeframe, limit=1)
+            if not latest:
+                return None
+            bar = latest[0]
 
         already_seen = (
             self._last_seen_bucket_start is not None

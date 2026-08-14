@@ -19,7 +19,7 @@ from datetime import date
 
 from sqlalchemy.orm import Session
 
-from app.domain.market.models import Instrument
+from app.domain.market.models import Instrument, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import compute_stop_target
 from app.modules.strategy_engine.interface import Strategy, TradeProposal
@@ -44,7 +44,9 @@ class SyntheticStrategy(Strategy):
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
 
-    def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
+    def evaluate(
+        self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar | None = None
+    ) -> TradeProposal | None:
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
         )

@@ -77,9 +77,14 @@ EXPIRY = date(2026, 7, 30)
 @pytest.fixture(autouse=True)
 def _fixed_trade_window_clock(monkeypatch):
     """This file drives `run_cycle` directly with real signal-dispatch
-    assertions, without regard to wall-clock time -- pin `now_ist()` inside
-    the 09:31-15:09 IST trade-firing window (runner.TRADE_WINDOW_START/END)
-    so those assertions don't depend on what time of day the suite runs.
+    assertions, without regard to wall-clock time. `run_cycle`'s trade-window
+    gate (`core.clock.is_within_global_trading_window`, 09:31-15:09 IST) now
+    keys off the latest seeded `PriceBar.bucket_start` for every strategy
+    here (each fixture below seeds one within that window), not wall-clock
+    `now_ist()` -- this monkeypatch only still matters as a safety net for
+    the no-bar fallback path (`runner.run_cycle` falls back to `now_ist()`
+    when an instrument has no bars at all), which nothing in this file
+    currently exercises.
     """
     monkeypatch.setattr(
         runner_module, "now_ist", lambda: datetime(2026, 1, 1, 11, 0, tzinfo=IST)
@@ -151,8 +156,12 @@ def _seed_orb_breakout(db, instrument: Instrument) -> None:
             bucket_start=or_start + timedelta(minutes=i),
             open=mid, high=mid + 5, low=mid - 5, close=mid, volume=1000,
         ))
+    # +16min (9:31 IST), not +15min (9:30) -- must clear both the opening
+    # range's own end (or_start + or_minutes) and the global trade window's
+    # 09:31 IST start (app.core.clock.is_within_global_trading_window),
+    # which now gates on this bar's own bucket_start, not wall-clock now().
     _seed_bar(
-        db, instrument, or_start + timedelta(minutes=15),
+        db, instrument, or_start + timedelta(minutes=16),
         o=22050, h=22080, l=22045, c=22070,
     )
 
@@ -166,7 +175,10 @@ def _seed_vwap_pullback(db, instrument: Instrument) -> None:
     """
     vwap = 22000.0
     _seed_indicator(db, instrument, "VWAP", vwap)
-    base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+    # IST, not UTC -- 10:00 UTC (15:30 IST) landed the confirmation bar past
+    # the global trade window's 15:09 IST close once run_cycle started
+    # gating on this bar's own bucket_start instead of wall-clock now().
+    base = datetime(2026, 7, 24, 10, 0, tzinfo=IST)
     for i in range(18, 0, -1):
         _seed_bar(
             db, instrument, base - timedelta(minutes=i),
@@ -183,8 +195,9 @@ def _seed_ema_pullback(db, instrument: Instrument) -> None:
     above the setup bar's high -- same shape as
     test_ema_micro_pullback_strategy.py's own _seed_bullish_baseline.
     IST 09:41 -- EMA Micro-pullback's own morning trade window is
-    09:31-11:00 IST, independent of runner.TRADE_WINDOW_START/END (which
-    this file's own _fixed_trade_window_clock fixture pins separately).
+    09:31-11:00 IST, independent of core.clock.TRADE_WINDOW_START/END (the
+    global gate `run_cycle` itself applies, now keyed off this same bar's
+    bucket_start rather than wall-clock).
     """
     ema20 = 21950.0
     base = datetime(2026, 7, 24, 9, 41, tzinfo=IST)
@@ -214,7 +227,7 @@ def _seed_oivol_breakout(db, instrument: Instrument) -> None:
     15-60, and healthy-bodied enough that the aggregate 10-bar body ratio
     clears the default 0.40 filter), then a bar closing above it. IST 09:41
     -- OI/Volume Confirmed's own morning trade window is 09:31-11:00 IST,
-    independent of runner.TRADE_WINDOW_START/END.
+    independent of core.clock.TRADE_WINDOW_START/END.
     """
     base = datetime(2026, 7, 24, 9, 41, tzinfo=IST)
     start = base - timedelta(minutes=10)

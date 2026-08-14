@@ -44,7 +44,7 @@ from datetime import date, datetime, time, timedelta
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import IST
+from app.core.clock import IST, to_ist
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
@@ -56,6 +56,7 @@ from app.modules.strategy_engine.common_rules import (
     get_recent_completed_bars,
     pick_by_underlying,
 )
+from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
@@ -115,7 +116,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
     ) -> TradeProposal | None:
-        bar_ist = latest_bar.bucket_start.astimezone(IST)
+        bar_ist = to_ist(latest_bar.bucket_start)
         or_start = datetime.combine(bar_ist.date(), ORB_SESSION_OPEN_IST, tzinfo=IST)
         or_end = or_start + timedelta(minutes=self.or_minutes)
         if latest_bar.bucket_start < or_end:
@@ -209,5 +210,6 @@ class ORBStrategy(ConfirmationFilterStrategy):
                 "or_low": or_low,
                 "strike_score": top.score,
                 "breakdown": top.breakdown,
+                "env": get_latest_env_metrics(db, self.instrument_id),
             },
         )

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import shutil
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import ntplib
@@ -24,6 +24,38 @@ IST = ZoneInfo("Asia/Kolkata")
 
 def now_ist() -> datetime:
     return datetime.now(IST)
+
+
+def to_ist(dt_utc: datetime) -> datetime:
+    """Converts any timezone-aware datetime to IST. Named for the common
+    case (a UTC-stored column like `PriceBar.bucket_start`), but works for
+    any aware input — `astimezone` doesn't care what zone it's already in.
+    """
+    return dt_utc.astimezone(IST)
+
+
+# The only window new strategy entries may fire in, IST. Deliberately
+# distinct from `market_data.market_hours`'s ~08:30-16:00 data-connectivity
+# window — REST/WS may still connect and flow data outside this range, it
+# just must never result in a new trade. The upper bound matches
+# `TradingSession.cutoff_time`'s default (see `app/domain/session/models.py`)
+# so a position can never be opened in the same instant EOD force-close
+# fires — end is exclusive for that same reason.
+TRADE_WINDOW_START = time(9, 31)
+TRADE_WINDOW_END = time(15, 9)
+
+
+def is_within_global_trading_window(ts_utc: datetime) -> bool:
+    """Gates new strategy entries by the timestamp of the *data* being
+    evaluated (typically a bar's `bucket_start`), not wall-clock `now()` —
+    `strategy_engine.runner.run_cycle` is the caller, passing the latest
+    completed bar it's about to evaluate. Falls back to `now_ist()` when no
+    bar exists yet for an instrument (a strategy that doesn't consume bars,
+    e.g. `SyntheticStrategy`, or an instrument before its first bar
+    completes) — `to_ist` on an already-IST datetime is a no-op, so that
+    fallback works through this same function unchanged.
+    """
+    return TRADE_WINDOW_START <= to_ist(ts_utc).time() < TRADE_WINDOW_END
 
 
 @dataclass(frozen=True)

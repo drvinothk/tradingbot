@@ -45,8 +45,13 @@ EXPIRY = date(2026, 7, 30)
 def _fixed_trade_window_clock(monkeypatch):
     """This file exercises run_cycle/StrategyRunner with real signal-dispatch
     assertions, without regard to wall-clock time -- pin `now_ist()` inside
-    the 09:31-15:09 IST trade-firing window (runner.TRADE_WINDOW_START/END)
-    so those assertions don't depend on what time of day the suite runs.
+    the 09:31-15:09 IST trade-firing window (core.clock.TRADE_WINDOW_START/
+    END) so those assertions don't depend on what time of day the suite
+    runs. `SyntheticStrategy` doesn't consume bars, and this file seeds no
+    `PriceBar` rows, so `run_cycle`'s window gate always takes its no-bar
+    `now_ist()` fallback path -- this monkeypatch is what actually controls
+    it here, unlike in test_phase4_strategies_e2e.py where every strategy
+    has a real seeded bar to gate on instead.
     """
     monkeypatch.setattr(
         runner_module, "now_ist", lambda: datetime(2026, 1, 1, 11, 0, tzinfo=IST)

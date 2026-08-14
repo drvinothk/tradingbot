@@ -27,6 +27,7 @@ and reconciliation checks it already runs there.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -50,6 +51,8 @@ from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.risk_engine.service import evaluate_trade_intent
 from app.modules.strategy_engine.interface import TradeProposal
 
+logger = logging.getLogger("app.strategy_engine.service")
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -63,6 +66,9 @@ def submit_signal(
     proposal: TradeProposal,
 ) -> RiskDecision:
     now = _utcnow()
+
+    if proposal.payload.get("env") is None:
+        logger.info("Signal created without env metrics (stubbed until VIX/PCR pipeline)")
 
     signal = Signal(
         id=uuid.uuid4(),

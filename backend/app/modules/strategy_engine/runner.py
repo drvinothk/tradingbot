@@ -20,39 +20,27 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from datetime import date, time
+from datetime import date
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import now_ist
+from app.core.clock import is_within_global_trading_window, now_ist
 from app.core.db.session import session_scope
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
-from app.modules.strategy_engine.common_rules import get_open_position_for_run
+from app.modules.strategy_engine.common_rules import (
+    get_open_position_for_run,
+    get_recent_completed_bars,
+)
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.service import submit_signal
 
 logger = logging.getLogger("app.strategy_engine.runner")
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
-
-# The only window new entries may fire in, IST. Deliberately distinct from
-# `market_data.market_hours`'s ~08:30-16:00 data-connectivity window --
-# REST/WS may still connect and flow data outside this range, it just must
-# never result in a new trade. The upper bound matches `TradingSession
-# .cutoff_time`'s new default (see `app/domain/session/models.py`) so a
-# position can never be opened in the same instant EOD force-close fires --
-# end is exclusive for that same reason.
-TRADE_WINDOW_START = time(9, 31)
-TRADE_WINDOW_END = time(15, 9)
-
-
-def is_within_trade_window(now: time | None = None) -> bool:
-    t = now if now is not None else now_ist().time()
-    return TRADE_WINDOW_START <= t < TRADE_WINDOW_END
 
 
 def run_cycle(
@@ -78,9 +66,20 @@ def run_cycle(
     cycle," never "trade off data we can't vouch for."
 
     The freshness-check + `evaluate()` + `submit_signal()` block only runs
-    inside `is_within_trade_window()` (09:31-15:09 IST) — outside it, this
-    is a normal "no signal" cycle too, but the status-refresh below still
-    always runs so an already-open position's status stays ground-truth.
+    inside `is_within_global_trading_window()` (09:31-15:09 IST) — outside
+    it, this is a normal "no signal" cycle too, but the status-refresh below
+    still always runs so an already-open position's status stays
+    ground-truth.
+
+    The window gate keys off the latest completed bar's own `bucket_start`,
+    not wall-clock `now()` — fetched once, here, and threaded through to
+    `evaluate()` so a bar-consuming strategy doesn't re-query the identical
+    row a moment later. Falls back to wall-clock `now_ist()` when no bar
+    exists yet for this instrument (a strategy that doesn't consume bars,
+    e.g. `SyntheticStrategy`, or an instrument before its first bar
+    completes) — that fallback also doubles as this function's empty-bar
+    guard, so a cold-start cycle degrades to the old wall-clock behavior
+    instead of ever touching `latest_bar.bucket_start` on a `None`.
     """
     decision: RiskDecision | None = None
 
@@ -92,7 +91,15 @@ def run_cycle(
         # connection — keeps the refresh atomic with the rest of this cycle.
         yield db
 
-    if is_within_trade_window():
+    latest_bars = get_recent_completed_bars(db, strategy.instrument_id, limit=1)
+    if latest_bars:
+        latest_bar = latest_bars[0]
+        window_ts = latest_bar.bucket_start
+    else:
+        latest_bar = None
+        window_ts = now_ist()
+
+    if is_within_global_trading_window(window_ts):
         freshness = ensure_fresh_option_chain(
             db,
             get_broker(),
@@ -110,7 +117,7 @@ def run_cycle(
             )
             proposal = None
         else:
-            proposal = strategy.evaluate(db, strategy_run)
+            proposal = strategy.evaluate(db, strategy_run, latest_bar)
 
         if proposal is not None:
             decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)

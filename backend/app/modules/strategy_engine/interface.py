@@ -22,6 +22,7 @@ from typing import TypedDict
 
 from sqlalchemy.orm import Session
 
+from app.domain.market.models import PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 
 
@@ -57,7 +58,7 @@ class TradePayload(TypedDict, total=False):
     ema20: float
     window_high: float
     window_low: float
-    env: EnvPayload
+    env: EnvPayload | None
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,16 @@ class Strategy(ABC):
     expiry_date: date
 
     @abstractmethod
-    def evaluate(self, db: Session, strategy_run: StrategyRun) -> TradeProposal | None:
+    def evaluate(
+        self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar | None = None
+    ) -> TradeProposal | None:
         """Called once per scan cycle. Returns a proposal to submit, or
         `None` if there's nothing to trade this cycle — "no signal" is a
-        normal, frequent outcome, not an error."""
+        normal, frequent outcome, not an error.
+
+        `latest_bar` is an optional pre-fetched bar from `strategy_engine
+        .runner.run_cycle` (already fetched there for the trade-window
+        gate) — a bar-consuming implementation (`ConfirmationFilterStrategy`)
+        uses it instead of re-querying; `SyntheticStrategy`, which doesn't
+        consume bars at all, ignores it.
+        """
