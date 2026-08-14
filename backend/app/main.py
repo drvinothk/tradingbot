@@ -27,6 +27,10 @@
    `live_enabled` session to `degraded_mode`, not just a log line. Addendum
    hardening batch, promoted from "known open item" to a Phase 6
    prerequisite — see the build plan.
+6. Trade-log export scheduler — starts `TradeLogExportScheduler`
+   (`reporting/export_scheduler.py`, Ops-Hardening Phase 3): once daily at
+   15:35 IST, exports the day's completed trades to a per-workspace Excel
+   workbook under `reports/`, one tab per (underlying, expiry) cycle.
 """
 
 from __future__ import annotations
@@ -436,10 +440,14 @@ async def lifespan(app: FastAPI):
         from app.modules.market_data.market_data_scheduler import (
             ensure_market_data_scheduler_running,
         )
+        from app.modules.reporting.export_scheduler import (
+            ensure_trade_log_export_scheduler_running,
+        )
         from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
 
         ensure_health_check_scheduler_running()
         ensure_market_data_scheduler_running()
+        ensure_trade_log_export_scheduler_running()
     except Exception:
         from app.core.locking import release_advisory_lock
 
@@ -457,12 +465,14 @@ async def lifespan(app: FastAPI):
     from app.modules.market_data.scrip_master_scheduler import (
         stop_scrip_master_refresh_scheduler,
     )
+    from app.modules.reporting.export_scheduler import stop_trade_log_export_scheduler
     from app.modules.scheduler.health_check import stop_health_check_scheduler
 
     stop_all_position_managers()
     stop_health_check_scheduler()
     stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
+    stop_trade_log_export_scheduler()
     # 2026-08-11: found missing during a live-WS troubleshooting audit —
     # `stop_market_data_scheduler()` only stops that class's own polling
     # thread; it never tears down the actual provider connection.

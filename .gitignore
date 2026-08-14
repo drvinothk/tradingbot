@@ -44,6 +44,10 @@ desktop.ini
 # DB backups — may contain real trading data
 ops/backups/
 
+# Daily trade-log Excel exports (Ops-Hardening Phase 3) — may contain real
+# trading data, same reasoning as ops/backups/ above.
+backend/reports/
+
 # Backtest tooling outputs — regenerable (downloaded bhavcopy CSVs / a
 # generated report), not source; see mock_data_tester.py / query_backtest_
 # trades.py on the backup/atr-backtest-session branch.

@@ -18,6 +18,15 @@ dependencies = [
     "websockets>=13.0",
     "httpx>=0.27",
     "smartapi-python>=1.5.5",
+    # Ops-Hardening Phase 3 (trade-log Excel export) — deliberately openpyxl
+    # alone, not pandas: pandas pulls in numpy, whose stub files use Python
+    # 3.12+ syntax that breaks `mypy app tests` under this project's
+    # python_version = "3.11" target (see the `truedata` extra's own comment
+    # below for the full story — pandas has been kept out of the main .venv
+    # for exactly this reason since before this phase). openpyxl has no
+    # numpy/pandas dependency at all, and writing/appending xlsx rows never
+    # needed DataFrame machinery in the first place.
+    "openpyxl>=3.1",
     # Transitive dependency smartapi-python's own installed metadata (1.5.5)
     # doesn't declare — SmartApi/smartConnect.py imports it directly, and
     # SmartApi/__init__.py eagerly imports smartConnect, so even importing
