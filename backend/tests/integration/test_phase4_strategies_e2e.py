@@ -33,9 +33,11 @@ other integration test in this codebase).
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
+from sqlalchemy.orm import Session
 
 import app.modules.strategy_engine.runner as runner_module
 from app.core.clock import IST
@@ -72,6 +74,24 @@ from app.modules.strategy_engine.strategies.orb import ORBStrategy
 from app.modules.strategy_engine.strategies.vwap_pullback import VWAPPullbackStrategy
 
 EXPIRY = date(2026, 7, 30)
+
+
+def _same_session_factory(db: Session):
+    """Ops-Hardening Phase 2: run_cycle's `alert_session_factory` parameter
+    defaults to the real `session_scope` (bound to the production engine,
+    not this test's own isolated one) -- every direct `run_cycle(db, ...)`
+    call in this file must override it with this wrapper so a stalled-feed
+    alert (if the watchdog happens to fire during a test) lands in this
+    test's own rolled-back-at-teardown transaction instead of silently
+    committing to the real dev database. Same trap, same fix shape, as this
+    project's own documented 2026-08-05 PositionManager incident.
+    """
+
+    @contextmanager
+    def _factory():
+        yield db
+
+    return _factory
 
 
 @pytest.fixture(autouse=True)
@@ -419,16 +439,31 @@ def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     for tag, strategy in strategies.items():
         if tag == "sweep":
             continue
-        run_cycle(db, strategy, strategy_runs[tag], session_by_tag[tag], strategy_configs[tag])
+        run_cycle(
+            db,
+            strategy,
+            strategy_runs[tag],
+            session_by_tag[tag],
+            strategy_configs[tag],
+            alert_session_factory=_same_session_factory(db),
+        )
 
     run_cycle(
-        db, strategies["sweep"], strategy_runs["sweep"],
-        session_by_tag["sweep"], strategy_configs["sweep"],
+        db,
+        strategies["sweep"],
+        strategy_runs["sweep"],
+        session_by_tag["sweep"],
+        strategy_configs["sweep"],
+        alert_session_factory=_same_session_factory(db),
     )
     _seed_liquidity_sweep_confirmation(db, instruments["sweep"], sweep_bar)
     run_cycle(
-        db, strategies["sweep"], strategy_runs["sweep"],
-        session_by_tag["sweep"], strategy_configs["sweep"],
+        db,
+        strategies["sweep"],
+        strategy_runs["sweep"],
+        session_by_tag["sweep"],
+        strategy_configs["sweep"],
+        alert_session_factory=_same_session_factory(db),
     )
 
     orb_intent = (

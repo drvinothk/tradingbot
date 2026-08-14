@@ -360,6 +360,26 @@ class PaperTradingSettings(BaseSettings):
     fill_slippage_pct: float = 0.0
 
 
+class TelegramSettings(BaseSettings):
+    """Ops-Hardening Phase 2. Loaded from config/credentials/telegram.env
+    (gitignored, same secret-isolation discipline as shoonya.env/angel_one.env)
+    -- a bot token is a real credential, not app config. Both fields default
+    to empty, which `app.modules.alerting.manager` treats as "Telegram not
+    configured" and falls back to SystemAlert-only, not an error -- this
+    system must work (paper trading, alerts written to the DB) with zero
+    Telegram setup at all.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TELEGRAM_",
+        env_file=CREDENTIALS_DIR / "telegram.env",
+        extra="ignore",
+    )
+
+    bot_token: SecretStr = SecretStr("")
+    chat_id: str = ""
+
+
 class Settings:
     """Aggregate accessor — import `get_settings()`, not the sub-classes directly."""
 
@@ -373,6 +393,7 @@ class Settings:
         self.truedata = TrueDataSettings()
         self.risk_defaults = RiskDefaults()
         self.paper_trading = PaperTradingSettings()
+        self.telegram = TelegramSettings()
 
 
 @lru_cache

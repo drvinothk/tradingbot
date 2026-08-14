@@ -20,17 +20,26 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import is_within_global_trading_window, now_ist
 from app.core.db.session import session_scope
+from app.domain.market.models import PriceBar
+from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
+from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.composition import get_broker
-from app.modules.market_data.freshness import FreshnessState, ensure_fresh_option_chain
+from app.modules.market_data.freshness import (
+    FreshnessState,
+    FreshnessThresholds,
+    classify_age,
+    ensure_fresh_option_chain,
+)
+from app.modules.market_data.market_hours import is_within_market_hours
 from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
 from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
@@ -43,6 +52,112 @@ logger = logging.getLogger("app.strategy_engine.runner")
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
+# Ops-Hardening Phase 2. Patterned after market_data.freshness's own
+# FreshnessThresholds convention (a new instance, not a reuse of
+# TICK_THRESHOLDS -- that one's 60s "stale" boundary is for raw tick
+# freshness, a different granularity than "how long since this run
+# evaluated a bar"). 180s is the actual alert-firing boundary, matching the
+# original spec's own ">3 minutes" condition exactly; 120s is a softer
+# "approaching stale" boundary kept for shape-parity with the freshness
+# module's own three-tier convention, not wired to any distinct behavior
+# yet -- only STALE/DEAD trigger an alert below.
+RUNNER_STALL_THRESHOLDS = FreshnessThresholds(
+    degraded_after_seconds=120.0, stale_after_seconds=180.0
+)
+
+# Per strategy_run, not global -- a systemic outage affecting several
+# concurrent runs still lets each one alert once, just not every cycle.
+RUNNER_STALL_ALERT_THROTTLE_SECONDS = 300.0
+
+_stall_alert_lock = threading.Lock()
+_last_stall_alert_at: dict[uuid.UUID, datetime] = {}
+
+
+def _check_runner_watchdog(
+    strategy_run: StrategyRun,
+    trading_session: TradingSession,
+    latest_bar: PriceBar | None,
+    has_open_position: bool,
+    *,
+    session_factory: SessionFactory = session_scope,
+) -> None:
+    """Alerts (SystemAlert + Telegram, via app.modules.alerting.manager) when
+    a run with an open position hasn't evaluated a fresh bar in
+    RUNNER_STALL_THRESHOLDS.stale_after_seconds -- a real signal this run's
+    own data feed has gone stale while genuine risk is still on the table.
+    Distinct from PositionManager's own stop/target/trail polling, which
+    prices from the live tick feed directly (not bars) and already has its
+    own broker-auth-error handling — this watchdog is specifically about
+    this run's bar-evaluation pipeline, not the position's own P&L pricing.
+
+    Gated on `is_within_market_hours()` (08:30-16:00 IST) rather than the
+    narrower `is_within_global_trading_window()` (09:31-15:09) `run_cycle`'s
+    own evaluate/submit block uses -- deliberate: an open position is
+    actively managed (including EOD square-off) through `cutoff_time`
+    (15:20 by default), well past the entry window's own close, so the
+    watchdog needs to keep watching through that whole span, not just while
+    new entries are allowed.
+
+    Takes `latest_bar` directly (the same `PriceBar | None` `run_cycle`
+    already fetched this cycle) rather than that function's own `window_ts`
+    — `window_ts` falls back to wall-clock `now_ist()` when no bar exists
+    yet, which would read as "perfectly fresh" for the one case (a position
+    somehow open with zero bars ever recorded) that most needs an alert.
+    `latest_bar is None` is therefore treated as maximally stale
+    (`FreshnessState.DEAD`) outright, not silently skipped.
+
+    Uses its own `session_factory` (default `session_scope`) for the alert
+    write, deliberately *not* `run_cycle`'s own `db` -- an alert reporting a
+    stalled feed must durably commit on its own, independent of whatever
+    happens to the rest of that cycle's transaction afterward. `strategy_run`/
+    `trading_session` are read-only here (`.id`/`.workspace_id`, plain
+    already-loaded scalar columns, safe to read regardless of which session
+    is live) — only the alert write itself goes through `session_factory`.
+    Callers needing test isolation inject their own (`StrategyRunner`
+    already threads its own constructor-injected `session_factory` through
+    for exactly this reason — same "never let a background write default to
+    the production DB inside a test" discipline as `ensure_ingestion_running`/
+    `record_option_chain_snapshot`'s own `session_factory` parameters).
+    """
+    if not has_open_position or not is_within_market_hours():
+        return
+
+    now = datetime.now(UTC)
+    state = (
+        FreshnessState.DEAD
+        if latest_bar is None
+        else classify_age(latest_bar.bucket_start, now, RUNNER_STALL_THRESHOLDS)
+    )
+    if state not in (FreshnessState.STALE, FreshnessState.DEAD):
+        return
+
+    with _stall_alert_lock:
+        last_sent = _last_stall_alert_at.get(strategy_run.id)
+        if (
+            last_sent is not None
+            and (now - last_sent).total_seconds() < RUNNER_STALL_ALERT_THROTTLE_SECONDS
+        ):
+            return
+        _last_stall_alert_at[strategy_run.id] = now
+
+    age_desc = (
+        "no bar ever recorded"
+        if latest_bar is None
+        else f"{(now - latest_bar.bucket_start).total_seconds():.0f}s since last evaluated bar"
+    )
+    logger.warning(
+        "run %s: stalled feed watchdog firing -- open position, %s", strategy_run.id, age_desc
+    )
+    with session_factory() as alert_db:
+        send_alert(
+            alert_db,
+            workspace_id=trading_session.workspace_id,
+            severity=AlertSeverity.CRITICAL,
+            category="strategy_run_stalled",
+            message=f"strategy_run {strategy_run.id}: open position but stalled feed ({age_desc})",
+            trading_session_id=trading_session.id,
+        )
+
 
 def run_cycle(
     db: Session,
@@ -50,6 +165,8 @@ def run_cycle(
     strategy_run: StrategyRun,
     trading_session: TradingSession,
     strategy_config: StrategyConfig,
+    *,
+    alert_session_factory: SessionFactory = session_scope,
 ) -> RiskDecision | None:
     """One `evaluate` -> `submit_signal` cycle, plus a ground-truth refresh
     of `strategy_run.status` (IN_POSITION vs SCANNING) computed from whether
@@ -89,6 +206,15 @@ def run_cycle(
     documents for market-data ingestion. Without this, a strategy could
     evaluate and dispatch paper trades against a fully fabricated option
     chain during that window with no error anywhere to notice by.
+
+    Ops-Hardening Phase 2: also calls `_check_runner_watchdog` (this
+    module), which alerts if a run with an open position hasn't evaluated a
+    fresh bar in a while — see that function's own docstring for the full
+    reasoning, including why it uses a wider market-hours window than the
+    trade-entry gate above. `alert_session_factory` is forwarded to it
+    unchanged (default `session_scope`) — deliberately not reusing this
+    function's own `db` parameter, since a stalled-feed alert must commit
+    independently of whatever this cycle's own transaction does afterward.
     """
     decision: RiskDecision | None = None
 
@@ -138,6 +264,14 @@ def run_cycle(
             strategy_run.status = new_status
             db.add(strategy_run)
             db.flush()
+
+        _check_runner_watchdog(
+            strategy_run,
+            trading_session,
+            latest_bar,
+            has_position,
+            session_factory=alert_session_factory,
+        )
 
     return decision
 
@@ -190,7 +324,14 @@ class StrategyRunner:
                             self._strategy_run_id,
                         )
                         return
-                    run_cycle(db, self._strategy, strategy_run, trading_session, strategy_config)
+                    run_cycle(
+                        db,
+                        self._strategy,
+                        strategy_run,
+                        trading_session,
+                        strategy_config,
+                        alert_session_factory=self._session_factory,
+                    )
             except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
                 logger.exception(
                     "strategy cycle failed for run %s", self._strategy_run_id

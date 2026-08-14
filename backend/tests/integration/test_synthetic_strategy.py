@@ -41,6 +41,24 @@ from app.modules.strategy_engine.strategies.synthetic import SyntheticStrategy
 EXPIRY = date(2026, 7, 30)
 
 
+def _same_session_factory(db: Session):
+    """Ops-Hardening Phase 2: run_cycle's new `alert_session_factory`
+    parameter defaults to the real `session_scope` (bound to the production
+    engine, not this test's own isolated one) -- every direct `run_cycle(db,
+    ...)` call in this file must override it with this wrapper so a
+    stalled-feed alert (if the watchdog happens to fire during a test) lands
+    in this test's own rolled-back-at-teardown transaction instead of
+    silently committing to the real dev database. Same trap, same fix shape,
+    as this project's own documented 2026-08-05 PositionManager incident.
+    """
+
+    @contextmanager
+    def _factory():
+        yield db
+
+    return _factory
+
+
 @pytest.fixture(autouse=True)
 def _fixed_trade_window_clock(monkeypatch):
     """This file exercises run_cycle/StrategyRunner with real signal-dispatch
@@ -53,9 +71,7 @@ def _fixed_trade_window_clock(monkeypatch):
     it here, unlike in test_phase4_strategies_e2e.py where every strategy
     has a real seeded bar to gate on instead.
     """
-    monkeypatch.setattr(
-        runner_module, "now_ist", lambda: datetime(2026, 1, 1, 11, 0, tzinfo=IST)
-    )
+    monkeypatch.setattr(runner_module, "now_ist", lambda: datetime(2026, 1, 1, 11, 0, tzinfo=IST))
 
 
 @pytest.fixture
@@ -184,7 +200,14 @@ def test_run_cycle_with_no_market_data_yields_nothing(
     db: Session, instrument: Instrument, strategy_run, trading_session, strategy_config
 ):
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
     assert decision is None
 
 
@@ -212,9 +235,11 @@ def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(
     # ensure_fresh_option_chain actually attempts a refresh (and hits the
     # failing broker below) instead of finding this fresh data and skipping
     # the refresh path entirely.
-    snapshot = db.query(OptionChainSnapshot).filter(
-        OptionChainSnapshot.instrument_id == instrument.id
-    ).one()
+    snapshot = (
+        db.query(OptionChainSnapshot)
+        .filter(OptionChainSnapshot.instrument_id == instrument.id)
+        .one()
+    )
     snapshot.ts = datetime.now(UTC) - timedelta(minutes=20)
     db.add(snapshot)
     db.flush()
@@ -230,7 +255,14 @@ def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(
     try:
         strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
         with caplog.at_level("WARNING", logger="app.strategy_engine.runner"):
-            decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+            decision = run_cycle(
+                db,
+                strategy,
+                strategy_run,
+                trading_session,
+                strategy_config,
+                alert_session_factory=_same_session_factory(db),
+            )
     finally:
         composition.set_broker(None)
 
@@ -260,12 +292,17 @@ def test_run_cycle_skips_evaluate_when_shoonya_not_yet_connected(
     monkeypatch.setattr(runner_module, "is_shoonya_market_data_ready", lambda: False)
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
 
     assert decision is None
-    assert (
-        db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
-    )
+    assert db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
 
 
 def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
@@ -274,7 +311,14 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     _seed_market_data(db, instrument, option_contract)
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
 
     assert decision is not None
     assert decision.decision == "approved"
@@ -288,9 +332,7 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     # off to the real Execution Service, which opens an actual Position
     # (still open; stop/target/trail exit is PositionManager's job, not
     # run_cycle's).
-    position = (
-        db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one_or_none()
-    )
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one_or_none()
     assert position is not None, "run_cycle should dispatch to a real, open Position"
     assert position.status == PositionStatus.OPEN
 
@@ -300,9 +342,7 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
     db.refresh(strategy_run)
     assert strategy_run.status == StrategyRunStatus.IN_POSITION
 
-    events = (
-        db.query(AuditEvent).filter(AuditEvent.trading_session_id == trading_session.id).all()
-    )
+    events = db.query(AuditEvent).filter(AuditEvent.trading_session_id == trading_session.id).all()
     event_types = {e.event_type for e in events}
     assert "signal.generated" in event_types
     assert "risk_decision.approved.dispatched" in event_types
@@ -328,23 +368,32 @@ def test_run_cycle_fires_nothing_outside_the_trade_window(
     called, since a discarded-but-evaluated proposal would burn a
     fire-once strategy's in-memory state for nothing.
     """
-    monkeypatch.setattr(
-        runner_module, "now_ist", lambda: datetime(2026, 1, 1, 9, 0, tzinfo=IST)
-    )
+    monkeypatch.setattr(runner_module, "now_ist", lambda: datetime(2026, 1, 1, 9, 0, tzinfo=IST))
     _seed_market_data(db, instrument, option_contract)
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
-    decision = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
 
     assert decision is None
-    assert (
-        db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
-    )
+    assert db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
 
 
 def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
-    db: Session, workspace, authorized_user, instrument, option_contract,
-    strategy_run, trading_session, strategy_config,
+    db: Session,
+    workspace,
+    authorized_user,
+    instrument,
+    option_contract,
+    strategy_run,
+    trading_session,
+    strategy_config,
 ):
     # 2026-08-12: the daily trade cap now only protects real-money exposure
     # (paper_only sessions are uncapped, see risk_engine.service's own
@@ -365,11 +414,25 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
 
-    first = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    first = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
     assert first is not None
     assert first.decision == "approved"
 
-    second = run_cycle(db, strategy, strategy_run, trading_session, strategy_config)
+    second = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
     assert second is not None
     assert second.decision == "rejected"
     assert "max_trades_per_day_reached" in second.reasons
@@ -676,9 +739,7 @@ def test_runner_executes_on_a_timer_and_stops_cleanly(real_commit_factory):
                     TradingSession.id == ids["trading_session_id"]
                 ).delete()
             if "instrument_id" in ids:
-                cleanup_db.query(Instrument).filter(
-                    Instrument.id == ids["instrument_id"]
-                ).delete()
+                cleanup_db.query(Instrument).filter(Instrument.id == ids["instrument_id"]).delete()
             if "broker_account_id" in ids:
                 cleanup_db.query(BrokerAccountRow).filter(
                     BrokerAccountRow.id == ids["broker_account_id"]
