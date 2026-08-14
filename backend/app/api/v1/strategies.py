@@ -32,6 +32,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -245,6 +246,8 @@ class StrategyConfigOut(BaseModel):
     strategy_type: str
     params: dict
     status: str
+    is_enabled: bool
+    runtime_mode: str | None
 
     model_config = {"from_attributes": True}
 
@@ -308,6 +311,65 @@ def _get_strategy_config_or_404(db: Session, user: User, strategy_id: uuid.UUID)
     )
     if config is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Strategy config not found")
+    return config
+
+
+class UpdateStrategyRequest(BaseModel):
+    is_enabled: bool | None = None
+    runtime_mode: StrategyRuntimeMode | None = None
+
+
+@router.patch("/strategies/{strategy_id}", response_model=StrategyConfigOut)
+def update_strategy(
+    strategy_id: uuid.UUID,
+    body: UpdateStrategyRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.edit")),
+) -> StrategyConfig:
+    """Ops-Hardening Phase 1. Toggles `is_enabled`/`runtime_mode` only —
+    `status` (the graduation ladder) and `strategy_type`/`params` are
+    untouched here, deliberately not folded into one catch-all PATCH.
+
+    `runtime_mode: null` explicitly clears any tactical override, distinct
+    from omitting the field entirely (which leaves it untouched) — the two
+    are distinguished via `model_fields_set` since both parse to the same
+    Python `None` otherwise. `is_enabled` has no such "clear" case (it's a
+    plain, non-nullable bool), so a plain `is not None` check is enough.
+
+    Neither field has any live effect yet — nothing in this codebase reads
+    `is_enabled`/`runtime_mode` at runtime today (that's Phase 4's daily
+    bootstrapper and a later phase's dispatch gating, respectively). This
+    endpoint only ever updates the DB row; a currently-running `StrategyRun`
+    started before this call is completely unaffected by it.
+    """
+    config = _get_strategy_config_or_404(db, user, strategy_id)
+    fields_set = body.model_fields_set
+
+    changes: dict[str, object] = {}
+    if body.is_enabled is not None and body.is_enabled != config.is_enabled:
+        changes["is_enabled"] = body.is_enabled
+        config.is_enabled = body.is_enabled
+
+    if "runtime_mode" in fields_set and body.runtime_mode != config.runtime_mode:
+        changes["runtime_mode"] = body.runtime_mode.value if body.runtime_mode is not None else None
+        config.runtime_mode = body.runtime_mode
+
+    if changes:
+        db.flush()
+        record_event(
+            db,
+            workspace_id=user.workspace_id,
+            actor_type=ActorType.USER,
+            actor_id=user.id,
+            event_category=EventCategory.STRATEGY_STATE_CHANGE,
+            event_type="strategy_config.updated",
+            entity_type="strategy_config",
+            entity_id=config.id,
+            strategy_config_id=config.id,
+            payload=changes,
+        )
+        db.commit()
+        db.refresh(config)
     return config
 
 

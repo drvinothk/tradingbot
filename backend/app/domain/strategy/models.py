@@ -15,6 +15,7 @@ import uuid
 from datetime import date, datetime
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Float,
@@ -37,6 +38,22 @@ class StrategyStatus(enum.StrEnum):
     PAPER = "paper"
     PAPER_PLUS_GUARDED_LIVE = "paper_plus_guarded_live"
     LIVE = "live"
+
+
+class StrategyRuntimeMode(enum.StrEnum):
+    """Ops-Hardening Phase 1 (2026-08-14): a tactical, same-day override
+    layered on top of `StrategyConfig.status`'s own graduation ladder — e.g.
+    forcing a `live`-graduated strategy to trade paper-only for one choppy
+    session without touching its actual graduation status. Deliberately
+    downgrade-only, mirroring the 6-state `SafeMode` matrix's own "overrides
+    only ever restrict, never expand" philosophy
+    (`app.core.modes.state_machine`) — there is no `FORCE_LIVE` value, since
+    raising execution tier must always go through the real graduation ladder
+    (`status`), never a same-day toggle. `StrategyConfig.runtime_mode` is
+    nullable; `None` means "no override, defer to `status`'s own tier."
+    """
+
+    FORCE_PAPER = "force_paper"
 
 
 class SignalSide(enum.StrEnum):
@@ -85,6 +102,15 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     strategy_type: Mapped[str] = mapped_column(String(40), default="synthetic")
     params: Mapped[dict] = mapped_column(JSONB, default=dict)
     status: Mapped[StrategyStatus] = mapped_column(String(30), default=StrategyStatus.RESEARCH)
+    # Ops-Hardening Phase 1: master on/off switch, independent of `status`.
+    # Load-bearing for the Phase 4 daily bootstrapper — a freshly
+    # auto-created `TradingSession` has no existing `StrategyRun` rows to
+    # resume, so `is_enabled` is what tells that bootstrap which configs
+    # should be auto-started each morning at all.
+    is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    runtime_mode: Mapped[StrategyRuntimeMode | None] = mapped_column(
+        String(30), nullable=True, default=None
+    )
 
     __table_args__ = (UniqueConstraint("workspace_id", "name", name="uq_strategy_config_name"),)
 

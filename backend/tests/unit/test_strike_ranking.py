@@ -5,6 +5,7 @@ mirroring test_indicators.py's approach for the indicator engine.
 from __future__ import annotations
 
 import uuid
+from datetime import time
 
 from app.domain.market.models import OptionType
 from app.modules.strategy_engine.strike_ranking.engine import (
@@ -12,6 +13,13 @@ from app.modules.strategy_engine.strike_ranking.engine import (
     StrikeRankingConfig,
     rank_strikes,
 )
+
+# Wide, evenly-spaced strike ladder shared by every DTE-aware test below —
+# atm_index=5 (spot=22000) with enough strikes on both sides that the
+# afternoon deep-ITM offset (default 3) never clips against the edge of the
+# list, which a narrower ladder would silently do and make the test not
+# actually prove what it claims to.
+_DTE_STRIKES = [21500, 21600, 21700, 21800, 21900, 22000, 22100, 22200, 22300, 22400, 22500]
 
 
 def _contract(
@@ -137,3 +145,127 @@ def test_ranked_output_sorted_descending_by_score():
 
     scores = [r.score for r in ranked]
     assert scores == sorted(scores, reverse=True)
+
+
+# -- Ops-Hardening Phase 1: DTE-aware strike windows -------------------------
+
+
+def test_dte_and_current_time_omitted_preserves_plain_atm_window():
+    # Sanity pin: calling exactly as before (no dte/current_time at all)
+    # must be byte-for-byte the old behavior -- this is what makes every
+    # existing caller/test above safe to leave untouched.
+    contracts = [_contract(s, option_type=OptionType.CE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(atm_range=1, max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config)
+
+    assert {r.strike for r in ranked} == {21900, 22000, 22100}
+
+
+def test_supplying_only_one_of_dte_or_current_time_falls_back_to_plain_window():
+    # A partial/mistaken call must not half-apply DTE logic -- it silently
+    # degrades to the well-tested plain-window path instead.
+    contracts = [_contract(s, option_type=OptionType.CE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(atm_range=1, max_spread_pct=1.0)
+
+    ranked_dte_only = rank_strikes(22000.0, contracts, config, dte=1)
+    ranked_time_only = rank_strikes(22000.0, contracts, config, current_time=time(10, 0))
+
+    assert {r.strike for r in ranked_dte_only} == {21900, 22000, 22100}
+    assert {r.strike for r in ranked_time_only} == {21900, 22000, 22100}
+
+
+def test_non_expiry_day_window_is_symmetric_atm_plus_minus_one():
+    contracts = [_contract(s, option_type=OptionType.CE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=1, current_time=time(10, 0))
+
+    assert {r.strike for r in ranked} == {21900, 22000, 22100}
+
+
+def test_expiry_morning_window_is_itm_only_for_calls():
+    # Calls: ITM is the lower-strike side. "ATM to 1-ITM" must exclude the
+    # OTM strike one above ATM (22100), even though it's the same distance
+    # the non-expiry-day window would have included.
+    contracts = [_contract(s, option_type=OptionType.CE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(10, 0))
+
+    assert {r.strike for r in ranked} == {21900, 22000}
+
+
+def test_expiry_morning_window_is_itm_only_for_puts():
+    # Puts: ITM is the higher-strike side -- the mirror image of the call
+    # case above, proving the window is genuinely per-option-type, not a
+    # single shared price band.
+    contracts = [_contract(s, option_type=OptionType.PE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(10, 0))
+
+    assert {r.strike for r in ranked} == {22000, 22100}
+
+
+def test_expiry_morning_premium_floor_hard_filters_below_threshold():
+    cheap = _contract(21900, ltp=30.0, option_type=OptionType.CE)  # in-window, below floor
+    rich = _contract(22000, ltp=80.0, option_type=OptionType.CE)  # in-window, above floor
+    config = StrikeRankingConfig(max_spread_pct=1.0, expiry_morning_premium_floor=50.0)
+
+    ranked = rank_strikes(22000.0, [cheap, rich], config, dte=0, current_time=time(10, 0))
+
+    assert [r.strike for r in ranked] == [22000]
+
+
+def test_expiry_morning_premium_floor_can_empty_result_without_crashing():
+    # The regression this directly guards against: if every in-window
+    # candidate is below the floor, rank_strikes must return [] cleanly,
+    # not raise or return None -- exactly what every real call site
+    # (pick_top_by_type / `if not ranked`) already expects.
+    contracts = [
+        _contract(21900, ltp=10.0, option_type=OptionType.CE),
+        _contract(22000, ltp=20.0, option_type=OptionType.CE),
+    ]
+    config = StrikeRankingConfig(max_spread_pct=1.0, expiry_morning_premium_floor=50.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(10, 0))
+
+    assert ranked == []
+
+
+def test_expiry_afternoon_window_anchors_on_deep_itm_excluding_atm():
+    # Calls: deep ITM is well below spot. Default offset=3 from atm_index=5
+    # (see _DTE_STRIKES) anchors on 21700, well clear of the ATM strike
+    # (22000) itself -- "avoid theta decay traps" means genuinely away from
+    # the money, not just one strike over like the morning window.
+    contracts = [_contract(s, option_type=OptionType.CE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(14, 0))
+
+    ranked_strikes = {r.strike for r in ranked}
+    assert ranked_strikes == {21600, 21700, 21800}
+    assert 22000 not in ranked_strikes
+
+
+def test_expiry_afternoon_window_mirrors_for_puts():
+    contracts = [_contract(s, option_type=OptionType.PE) for s in _DTE_STRIKES]
+    config = StrikeRankingConfig(max_spread_pct=1.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(14, 0))
+
+    ranked_strikes = {r.strike for r in ranked}
+    assert ranked_strikes == {22200, 22300, 22400}
+    assert 22000 not in ranked_strikes
+
+
+def test_expiry_afternoon_has_no_premium_floor_by_default():
+    # The floor is scoped to the morning rule only, per the original spec --
+    # a cheap deep-ITM contract in the afternoon window must still survive.
+    contracts = [_contract(21700, ltp=5.0, option_type=OptionType.CE)]
+    config = StrikeRankingConfig(max_spread_pct=1.0, expiry_morning_premium_floor=50.0)
+
+    ranked = rank_strikes(22000.0, contracts, config, dte=0, current_time=time(14, 0))
+
+    assert [r.strike for r in ranked] == [21700]

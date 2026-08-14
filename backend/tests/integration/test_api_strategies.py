@@ -751,3 +751,102 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
             ).delete()
             cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
             cleanup_db.commit()
+
+
+# -- Ops-Hardening Phase 1: PATCH /strategies/{id} ---------------------------
+
+
+def test_update_strategy_requires_login(api_client: TestClient):
+    response = api_client.patch(
+        f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False}
+    )
+    assert response.status_code == 401
+
+
+def test_update_strategy_unknown_id_is_404(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    response = api_client.patch(
+        f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False}
+    )
+    assert response.status_code == 404
+
+
+def test_new_strategy_defaults_to_enabled_with_no_runtime_override(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    created = api_client.post("/api/v1/strategies", json={"name": "orb-patch-default"}).json()
+
+    assert created["is_enabled"] is True
+    assert created["runtime_mode"] is None
+
+
+def test_patch_toggles_is_enabled(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-enable"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"is_enabled": False}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["is_enabled"] is False
+    assert body["runtime_mode"] is None
+
+    refetched = api_client.get("/api/v1/strategies").json()
+    updated = next(row for row in refetched if row["id"] == strategy_id)
+    assert updated["is_enabled"] is False
+
+
+def test_patch_sets_and_clears_runtime_mode(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-runtime-mode"}
+    ).json()["id"]
+
+    set_resp = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_paper"}
+    )
+    assert set_resp.status_code == 200
+    assert set_resp.json()["runtime_mode"] == "force_paper"
+    assert set_resp.json()["is_enabled"] is True  # untouched by this call
+
+    # Explicit null clears the override -- distinct from simply omitting
+    # the field, which the next test covers.
+    clear_resp = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None}
+    )
+    assert clear_resp.status_code == 200
+    assert clear_resp.json()["runtime_mode"] is None
+
+
+def test_patch_omitting_a_field_leaves_it_untouched(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-partial"}
+    ).json()["id"]
+    api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_paper"})
+
+    # Omitting runtime_mode entirely (not passing it as null) while only
+    # updating is_enabled must not clear the override set above.
+    response = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"is_enabled": False})
+
+    assert response.status_code == 200
+    assert response.json()["is_enabled"] is False
+    assert response.json()["runtime_mode"] == "force_paper"
+
+
+def test_patch_rejects_unknown_runtime_mode_value(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-invalid"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_live"}
+    )
+
+    assert response.status_code == 422
