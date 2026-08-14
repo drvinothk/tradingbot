@@ -32,7 +32,10 @@ from app.modules.market_data.market_hours import (
     MarketPhase,
     current_phase,
 )
-from app.modules.market_data.provider_composition import get_market_data_provider
+from app.modules.market_data.provider_composition import (
+    get_market_data_provider,
+    is_shoonya_market_data_ready,
+)
 
 logger = logging.getLogger("app.market_data.scheduler")
 
@@ -97,7 +100,7 @@ class MarketDataScheduler:
             # actually torn down, not just reused.
             provider.disconnect()
             provider.connect()
-            self._subscribe_known_underlyings()
+            self._subscribe_known_underlyings_if_ready()
             self._reset_daily_indicators()
         elif to_phase is MarketPhase.ACTIVE_MARKET and from_phase is None:
             # Process started (or restarted) mid-day, already past
@@ -106,9 +109,34 @@ class MarketDataScheduler:
             # daily pre_market -> active_market transition (from_phase is
             # already PRE_MARKET) stays a genuine no-op, unchanged.
             provider.connect()
-            self._subscribe_known_underlyings()
+            self._subscribe_known_underlyings_if_ready()
         elif to_phase is MarketPhase.CLOSED:
             provider.disconnect()
+
+    def _subscribe_known_underlyings_if_ready(self) -> None:
+        """2026-08-14: real live incident -- this used to call `ensure_
+        ingestion_running` unconditionally, same bug class as `app.main
+        ._resume_strategy_runners` (see that function's own docstring for
+        the full mechanism). This scheduler runs on its own timer,
+        independent of `_resume_strategy_runners` and reconnect -- a
+        restart during market hours reaches `ACTIVE_MARKET`/`from_phase is
+        None` within one tick, `ensure_ingestion_running` starts a real
+        background thread writing fabricated prices to `price_bars`/
+        `quote_ticks`, and this kept happening every tick until a human
+        reconnected, even *after* `_resume_strategy_runners`'s own guard
+        was fixed -- confirmed live: two garbage bars land in the minute
+        between a restart and reconnect. `market_data.registry
+        .reset_for_reconnect`'s `resume_ingestion_for_active_runs` call
+        still closes the loop once a human reconnects, same as before.
+        """
+        if not is_shoonya_market_data_ready():
+            logger.warning(
+                "Shoonya not connected yet — deferring market-data subscription for "
+                "known underlyings until reconnect (see market_data.registry"
+                ".reset_for_reconnect)."
+            )
+            return
+        self._subscribe_known_underlyings()
 
     def _subscribe_known_underlyings(self) -> None:
         # Local import matches this codebase's existing convention for this
