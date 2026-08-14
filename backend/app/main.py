@@ -53,6 +53,26 @@ from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.locking import LOCK_PROCESS_SINGLETON, try_advisory_lock
 from app.domain.session.models import TradingSessionStatus
 
+# 2026-08-14: this app has never had a logging configuration anywhere (no
+# `basicConfig`/`setLevel` — several modules' own comments already flagged
+# this as a known gap, e.g. `broker_adapter/shoonya/ws_client.py`,
+# `market_data/providers/angel_ws_client.py`). With no handler attached to
+# the root logger, Python falls back to its "handler of last resort" —
+# stderr, WARNING+ only — so every `.info()` call across the whole app
+# (module-level loggers all propagate to root) has been silently invisible
+# in journald this entire time. Concretely cost real diagnostic time today:
+# `FailoverMarketDataProvider._check_recovery`'s "primary is back online —
+# starting stabilization window" info log was firing roughly once a minute
+# for 45+ minutes straight during a live Shoonya WS incident, and with only
+# its paired "dropped during anti-flap window" warning visible, the
+# connection looked totally silent when it was actually receiving a sparse
+# trickle of ticks — a materially different, and more useful, picture.
+# uvicorn configures its own named loggers (`uvicorn`/`uvicorn.error`/
+# `uvicorn.access`) before importing this module but never touches the root
+# logger itself, so `basicConfig` here is untouched by that and applies
+# cleanly to every `app.*` logger in the codebase.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
 logger = logging.getLogger("app.startup")
 
 
