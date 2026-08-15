@@ -61,9 +61,9 @@ _RATE_LIMIT_BACKOFF_SECONDS = 300.0
 # it's worth a warning -- time-based, not a consecutive-empty-cycle count,
 # deliberately: a cycle count is only meaningful relative to one particular
 # `rest_poll_interval_seconds`, and this codebase already expects that to
-# vary (a slower/faster broker, a future TrueData provider, a caller like
-# `live_rest_paper_trader.py` driving its own 60s-aligned cadence instead of
-# this class's own free-running loop). A fixed wall-clock threshold means
+# vary (a slower/faster broker, a future TrueData provider, a hypothetical
+# future caller driving its own wall-clock-aligned cadence instead of this
+# class's own free-running loop). A fixed wall-clock threshold means
 # "no real data in over 90s" reads the same regardless of what's polling or
 # how often. 90s is a little over 3x the default 25s poll interval -- long
 # enough that one or two genuinely-empty cycles (e.g. the first minute after
