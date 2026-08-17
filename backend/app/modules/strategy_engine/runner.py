@@ -24,14 +24,17 @@ from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import is_within_global_trading_window, now_ist
+from app.core.clock import is_past_eod_scanning_stop, is_within_global_trading_window, now_ist
 from app.core.db.session import session_scope
-from app.domain.market.models import PriceBar
+from app.core.sleep_inhibitor import get_sleep_inhibitor
+from app.domain.audit.models import ActorType, EventCategory
+from app.domain.market.models import Instrument, PriceBar
 from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.alerting.manager import send_alert
+from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data.freshness import (
     FreshnessState,
@@ -41,6 +44,7 @@ from app.modules.market_data.freshness import (
 )
 from app.modules.market_data.market_hours import is_within_market_hours
 from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
+from app.modules.market_data.registry import unsubscribe_symbol
 from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
     get_recent_completed_bars,
@@ -159,6 +163,93 @@ def _check_runner_watchdog(
         )
 
 
+def _maybe_stop_for_eod(
+    db: Session,
+    strategy_run: StrategyRun,
+    trading_session: TradingSession,
+    instrument_id: uuid.UUID,
+) -> None:
+    """EOD-stop for scanning-only runs, 2026-08-17: a run with zero open
+    positions has nothing left to protect once no new entry can fire
+    anyway (`TRADE_WINDOW_END`, 15:09 IST) — left scanning past
+    `EOD_SCANNING_STOP_TIME` (15:10 IST) it just burns a background thread
+    and a market-data subscription for the rest of the day. Confirmed live
+    twice: a zombie `SCANNING` run surviving a full session, and five more
+    the same way days later.
+
+    Only called from `run_cycle` when this cycle's own `has_position` is
+    already known `False` — never re-derives it. A run *with* an open
+    position is untouched here; `PositionManager`'s own stop/target/trail/
+    EOD-square-off keeps managing it through `TradingSession.cutoff_time`
+    (15:20 by default) regardless of this function.
+
+    Reuses the existing `STOPPED` status (identical to a manual
+    `stop_strategy` call) rather than a new terminal status — `STOPPED` is
+    already the app-wide "terminal, excluded from `/strategies/running`,
+    excluded from resume-on-restart" signal everywhere else, so this needs
+    zero new consumer-side plumbing. Audited as a `SYSTEM` actor (no
+    `actor_id`), distinct `event_type` (`strategy_run.eod_stopped`) from a
+    human's `strategy_run.stopped` so the audit trail can still tell the
+    two apart.
+
+    Market-data unsubscription is reference-counted, not unconditional:
+    `market_data.registry` subscribes by *underlying* symbol, one shared
+    stream across every concurrent strategy run on that underlying (see
+    that module's own docstring — "one shared thing, not one per caller").
+    Unsubscribing unconditionally here would silently kill ticks for
+    another still-active run on the same underlying (including one still
+    IN_POSITION, whose `PositionManager` pricing depends on that live
+    feed). Only unsubscribes when this is genuinely the last non-`STOPPED`
+    run left on that instrument.
+    """
+    # now_ist(), not a raw datetime.now(UTC) -- this module-level name is
+    # what test fixtures already monkeypatch to freeze wall-clock time for
+    # run_cycle's own trade-window fallback (see e.g.
+    # test_phase4_strategies_e2e.py's _fixed_trade_window_clock); using it
+    # here too means this gate respects the exact same freeze instead of
+    # silently reading real wall-clock time regardless of what a test
+    # pretends the current moment is.
+    if not is_past_eod_scanning_stop(now_ist()):
+        return
+
+    strategy_run.status = StrategyRunStatus.STOPPED
+    strategy_run.stopped_at = datetime.now(UTC)
+    db.add(strategy_run)
+    db.flush()
+
+    get_sleep_inhibitor().release(f"strategy_run:{strategy_run.id}")
+
+    record_event(
+        db,
+        workspace_id=trading_session.workspace_id,
+        actor_type=ActorType.SYSTEM,
+        actor_id=None,
+        event_category=EventCategory.STRATEGY_STATE_CHANGE,
+        event_type="strategy_run.eod_stopped",
+        entity_type="strategy_run",
+        entity_id=strategy_run.id,
+        trading_session_id=trading_session.id,
+        strategy_config_id=strategy_run.strategy_config_id,
+        payload={"reason": "zero open positions at EOD scanning cutoff (15:10 IST)"},
+    )
+
+    other_active_run = (
+        db.query(StrategyRun.id)
+        .filter(
+            StrategyRun.instrument_id == instrument_id,
+            StrategyRun.status != StrategyRunStatus.STOPPED,
+            StrategyRun.id != strategy_run.id,
+        )
+        .first()
+    )
+    if other_active_run is None:
+        instrument = db.get(Instrument, instrument_id)
+        if instrument is not None:
+            unsubscribe_symbol(instrument.symbol)
+
+    logger.info("run %s: EOD scanning stop applied (zero open positions)", strategy_run.id)
+
+
 def run_cycle(
     db: Session,
     strategy: Strategy,
@@ -215,6 +306,11 @@ def run_cycle(
     unchanged (default `session_scope`) — deliberately not reusing this
     function's own `db` parameter, since a stalled-feed alert must commit
     independently of whatever this cycle's own transaction does afterward.
+
+    2026-08-17: also calls `_maybe_stop_for_eod` whenever this cycle finds
+    zero open positions — self-stops a still-SCANNING run past 15:10 IST
+    (see that function's own docstring). A run with an open position is
+    left alone here; `PositionManager` keeps managing it independently.
     """
     decision: RiskDecision | None = None
 
@@ -273,6 +369,9 @@ def run_cycle(
             session_factory=alert_session_factory,
         )
 
+        if not has_position:
+            _maybe_stop_for_eod(db, strategy_run, trading_session, strategy.instrument_id)
+
     return decision
 
 
@@ -283,6 +382,7 @@ class StrategyRunner:
         strategy_run_id: uuid.UUID,
         interval_seconds: float = 30.0,
         session_factory: SessionFactory = session_scope,
+        on_self_stop: Callable[[], object] | None = None,
     ) -> None:
         self._strategy = strategy
         self._strategy_run_id = strategy_run_id
@@ -290,6 +390,14 @@ class StrategyRunner:
         self._session_factory = session_factory
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        # Called (at most once, from the loop's own thread) when this
+        # runner notices its own strategy_run has gone STOPPED without a
+        # `stop()` call from outside -- today, only `_maybe_stop_for_eod`
+        # (this module) does that. `stop_strategy` (api.v1.strategies) still
+        # pops `_RUNNERS` itself before calling `stop()`, so this firing
+        # too on a manual stop is a harmless no-op double-pop, not a
+        # required path for that case.
+        self._on_self_stop = on_self_stop
 
     @property
     def instrument_id(self) -> uuid.UUID:
@@ -315,6 +423,8 @@ class StrategyRunner:
                 with self._session_factory() as db:
                     strategy_run = db.get(StrategyRun, self._strategy_run_id)
                     if strategy_run is None or strategy_run.status == StrategyRunStatus.STOPPED:
+                        if self._on_self_stop is not None:
+                            self._on_self_stop()
                         return
                     trading_session = db.get(TradingSession, strategy_run.trading_session_id)
                     strategy_config = db.get(StrategyConfig, strategy_run.strategy_config_id)
@@ -333,7 +443,5 @@ class StrategyRunner:
                         alert_session_factory=self._session_factory,
                     )
             except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception(
-                    "strategy cycle failed for run %s", self._strategy_run_id
-                )
+                logger.exception("strategy cycle failed for run %s", self._strategy_run_id)
             self._stop_event.wait(self._interval_seconds)

@@ -87,6 +87,61 @@ export function SessionsPage() {
     onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Recover failed'),
   })
 
+  const bulkModeMutation = useMutation({
+    mutationFn: (mode: 'force_paper' | null) =>
+      api.post('/strategies/bulk-runtime-mode', { mode }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['strategies'] }),
+    onError: (err) =>
+      setActionError(err instanceof ApiError ? err.message : 'Bulk strategy mode update failed'),
+  })
+
+  function confirmBulkApply(target: 'live' | 'paper') {
+    const label = target === 'live' ? 'Live' : 'Paper'
+    if (window.confirm(`Master mode is now ${label}. Also set every strategy's Mode to ${label}?`)) {
+      bulkModeMutation.mutate(target === 'live' ? null : 'force_paper')
+    }
+  }
+
+  // Master switch -> Live is the first-ever action in this app that can put
+  // a session into live_enabled (see set_master_trading_mode's own
+  // docstring) -- a plain OK/Cancel click is too easy to fat-finger for
+  // that, so this requires typing LIVE rather than just confirming.
+  // Master switch -> Paper is always the safety-decreasing direction, so a
+  // normal confirm is enough there.
+  const goLiveMutation = useMutation({
+    mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/go-live`),
+    onSuccess: () => {
+      invalidateSessions()
+      confirmBulkApply('live')
+    },
+    onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Go live failed'),
+  })
+
+  const goPaperMutation = useMutation({
+    mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/go-paper`),
+    onSuccess: () => {
+      invalidateSessions()
+      confirmBulkApply('paper')
+    },
+    onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Go paper failed'),
+  })
+
+  function handleGoLive(sessionId: string) {
+    const typed = window.prompt(
+      'This switches the session to LIVE -- strategies whose own Mode is "Live" ' +
+        '(not "Paper") can then place real orders. Type LIVE to confirm.',
+    )
+    if (typed === 'LIVE') {
+      goLiveMutation.mutate(sessionId)
+    }
+  }
+
+  function handleGoPaper(sessionId: string) {
+    if (window.confirm('Switch this session’s master mode to Paper?')) {
+      goPaperMutation.mutate(sessionId)
+    }
+  }
+
   function handleCreate(event: FormEvent) {
     event.preventDefault()
     setFormError(null)
@@ -217,6 +272,33 @@ export function SessionsPage() {
                         >
                           Kill switch
                         </button>
+                      )}
+                      {/* Master switch. Hidden entirely for the three
+                          emergency modes (kill_switch/degraded_mode/
+                          reconciliation_lock) -- those need their own
+                          dedicated recovery flow, not this shortcut; see
+                          set_master_trading_mode's own docstring. */}
+                      {['paper_only', 'paper_plus_guarded_live', 'live_enabled'].includes(
+                        session.mode,
+                      ) && (
+                        <>
+                          {session.mode !== 'live_enabled' && (
+                            <button
+                              disabled={goLiveMutation.isPending}
+                              onClick={() => handleGoLive(session.id)}
+                            >
+                              Go Live
+                            </button>
+                          )}
+                          {session.mode !== 'paper_only' && (
+                            <button
+                              disabled={goPaperMutation.isPending}
+                              onClick={() => handleGoPaper(session.id)}
+                            >
+                              Go Paper
+                            </button>
+                          )}
+                        </>
                       )}
                       <button
                         disabled={endMutation.isPending}

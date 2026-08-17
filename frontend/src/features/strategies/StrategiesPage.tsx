@@ -8,6 +8,7 @@ import type {
   InstrumentOut,
   RuntimeMode,
   SessionOut,
+  SetStrategyPowerOut,
   StrategyConfigOut,
   StrategyRunOut,
   StrategyType,
@@ -135,7 +136,7 @@ export function StrategiesPage() {
             <th>Type</th>
             <th>Status</th>
             <th>Power</th>
-            <th>Safety</th>
+            <th>Mode</th>
             <th>Instrument</th>
             <th>Start</th>
             <th></th>
@@ -194,6 +195,24 @@ function StrategyPatchControls({
     onSuccess,
   })
 
+  // Dual-Trigger Model: the Power checkbox goes through its own dedicated
+  // route (not the generic PATCH above) since it has a real side effect --
+  // it starts/stops the actual run, not just the is_enabled flag -- and
+  // must never look like a silent no-op when it can't (trade window
+  // closed, no active session today, a broker error). `detail` holds the
+  // last response's explanation, shown inline right under the checkbox.
+  const [powerDetail, setPowerDetail] = useState<string | null>(null)
+  const powerMutation = useMutation({
+    mutationFn: (is_enabled: boolean) =>
+      api.post<SetStrategyPowerOut>(`/strategies/${strategy.id}/power`, { is_enabled }),
+    onSuccess: (result) => {
+      setPowerDetail(result.run_started || result.run_stopped ? null : result.detail)
+      onSuccess()
+    },
+    onError: (err) =>
+      setPowerDetail(err instanceof ApiError ? err.message : 'Power toggle failed'),
+  })
+
   return (
     <>
       <td>
@@ -201,13 +220,23 @@ function StrategyPatchControls({
           <input
             type="checkbox"
             checked={strategy.is_enabled}
-            disabled={patchMutation.isPending}
-            onChange={(e) => patchMutation.mutate({ is_enabled: e.target.checked })}
+            disabled={powerMutation.isPending}
+            onChange={(e) => powerMutation.mutate(e.target.checked)}
           />
           {strategy.is_enabled ? 'On' : 'Off'}
         </label>
+        {powerDetail && (
+          <p style={{ fontSize: '0.8rem', opacity: 0.75, margin: '0.2rem 0 0' }}>{powerDetail}</p>
+        )}
       </td>
       <td>
+        {/* Mode master-switch feature: "Live" = clear the runtime_mode
+            override (null, i.e. "not force_paper") -- whether a strategy
+            in that state actually trades live still depends on the
+            session-level master switch (Sessions page) and every other
+            gate in get_execution_broker (instrument firewall,
+            ALLOW_REAL_MONEY_DISPATCH). This dropdown only ever controls
+            this one strategy's own opt-in/opt-out. */}
         <select
           value={strategy.runtime_mode ?? ''}
           disabled={patchMutation.isPending}
@@ -217,8 +246,8 @@ function StrategyPatchControls({
             })
           }
         >
-          <option value="">Default</option>
-          <option value="force_paper">Force paper</option>
+          <option value="">Live</option>
+          <option value="force_paper">Paper</option>
         </select>
       </td>
       <td>

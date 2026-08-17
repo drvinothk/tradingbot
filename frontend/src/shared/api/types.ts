@@ -54,6 +54,14 @@ export interface StrategyConfigOut {
   underlying_symbol: string | null
 }
 
+export interface SetStrategyPowerOut {
+  is_enabled: boolean
+  run_started: boolean
+  run_stopped: boolean
+  run_id: string | null
+  detail: string
+}
+
 export interface ProviderPreferenceOut {
   active_provider: string | null
   live_active_leg: string | null

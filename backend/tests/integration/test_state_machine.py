@@ -16,6 +16,7 @@ from app.core.modes import (
     ModeTransitionError,
     enter_kill_switch,
     recover_from_degraded,
+    set_master_trading_mode,
     transition_mode,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
@@ -143,4 +144,147 @@ def test_every_transition_is_captured_in_the_audit_chain(db, trading_session, au
         db, trading_session, TransitionTriggerType.MANUAL, actor_user=authorized_user, reason="t"
     )
     ok, broken_id = verify_chain(db)
-    assert ok, f"audit chain broken at {broken_id}"
+    assert ok, f"broken chain at {broken_id}"
+
+
+# -- set_master_trading_mode ("master switch") ---------------------------
+
+
+def test_master_switch_live_from_paper_only_walks_both_hops(db, trading_session, authorized_user):
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+
+
+def test_master_switch_live_from_guarded_live_is_a_single_hop(db, trading_session, authorized_user):
+    transition_mode(
+        db,
+        trading_session,
+        SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        TransitionTriggerType.MANUAL,
+        actor_user=authorized_user,
+    )
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+
+
+def test_master_switch_live_is_a_noop_when_already_live(db, trading_session, authorized_user):
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    # Must not raise "session is already in live_enabled" the way a raw
+    # transition_mode(..., LIVE_ENABLED) call would -- repeat clicks from
+    # the UI must be safe.
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+
+
+def test_master_switch_paper_from_live_enabled_walks_both_hops(
+    db, trading_session, authorized_user
+):
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    set_master_trading_mode(
+        db, trading_session, "paper", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+
+def test_master_switch_paper_is_a_noop_when_already_paper_only(
+    db, trading_session, authorized_user
+):
+    set_master_trading_mode(
+        db, trading_session, "paper", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+
+def test_master_switch_refuses_from_every_emergency_mode(db, trading_session, authorized_user):
+    for emergency_mode in (
+        SafeMode.KILL_SWITCH,
+        SafeMode.DEGRADED_MODE,
+        SafeMode.RECONCILIATION_LOCK,
+    ):
+        trading_session.mode = emergency_mode
+        db.flush()
+        for target in ("live", "paper"):
+            with pytest.raises(ModeTransitionError, match="dedicated recovery flow"):
+                set_master_trading_mode(
+                    db,
+                    trading_session,
+                    target,
+                    TransitionTriggerType.MANUAL,
+                    actor_user=authorized_user,
+                )
+        # And the refusal must not have silently moved the session anyway.
+        assert trading_session.mode == emergency_mode
+
+
+def test_master_switch_live_requires_livetrade_permission(db, trading_session, user):
+    # `user` fixture has no roles/permissions assigned.
+    with pytest.raises(ModeTransitionError, match="livetrade.execute"):
+        set_master_trading_mode(
+            db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=user
+        )
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+
+def test_master_switch_paper_requires_session_stop_permission(
+    db, trading_session, authorized_user, workspace
+):
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+
+    # A user with livetrade.execute but not session.stop cannot step down --
+    # build one directly rather than stripping authorized_user's roles
+    # mid-test. Reuses the "livetrade.execute" Permission row authorized_user
+    # already created (Permission.code is unique, so a second row with the
+    # same code would violate that constraint).
+    from app.core.security.passwords import hash_password
+    from app.domain.identity.models import Permission, Role, RolePermission, User, UserRole
+
+    limited_user = User(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("correct horse battery staple"),
+        display_name="Limited Test User",
+        is_active=True,
+    )
+    db.add(limited_user)
+    db.flush()
+
+    role = Role(id=uuid.uuid4(), name=f"live-only-{uuid.uuid4().hex[:8]}")
+    db.add(role)
+    db.flush()
+
+    livetrade_permission = db.query(Permission).filter(Permission.code == "livetrade.execute").one()
+    db.add(RolePermission(role_id=role.id, permission_id=livetrade_permission.id))
+    db.add(UserRole(user_id=limited_user.id, role_id=role.id, workspace_id=workspace.id))
+    db.flush()
+
+    with pytest.raises(ModeTransitionError, match="session.stop"):
+        set_master_trading_mode(
+            db, trading_session, "paper", TransitionTriggerType.MANUAL, actor_user=limited_user
+        )
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+
+
+def test_master_switch_transitions_are_captured_in_the_audit_chain(
+    db, trading_session, authorized_user
+):
+    set_master_trading_mode(
+        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    set_master_trading_mode(
+        db, trading_session, "paper", TransitionTriggerType.MANUAL, actor_user=authorized_user
+    )
+    ok, broken_id = verify_chain(db)
+    assert ok, f"broken chain at {broken_id}"

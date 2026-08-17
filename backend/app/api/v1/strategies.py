@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.clock import now_ist, to_ist
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
@@ -24,7 +25,7 @@ from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, QuoteTick
-from app.domain.session.models import TradingSession
+from app.domain.session.models import TradingSession, TradingSessionStatus
 from app.domain.strategy.models import (
     ApprovalStatus,
     ExecutionMode,
@@ -51,6 +52,7 @@ from app.modules.market_data.freshness import (
 )
 from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
 from app.modules.market_data.registry import ensure_ingestion_running
+from app.modules.strategy_engine.auto_spawner import SpawnStatus, spawn_one_now
 from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.runner import StrategyRunner
@@ -225,9 +227,7 @@ def _build_strategy(
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS},
         )
-    raise HTTPException(
-        status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{strategy_type}'"
-    )
+    raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{strategy_type}'")
 
 
 KNOWN_STRATEGY_TYPES = {
@@ -238,6 +238,100 @@ KNOWN_STRATEGY_TYPES = {
     "oi_volume_confirmed",
     "liquidity_sweep_reversal",
 }
+
+
+def _start_runner_thread(
+    run: StrategyRun,
+    strategy_config: StrategyConfig,
+    trading_session: TradingSession,
+    instrument: Instrument,
+    expiry_date: date,
+    interval_seconds: float,
+) -> None:
+    """The post-commit half of starting a strategy run -- sleep inhibitor,
+    market-data ingestion, the actual runner thread, PositionManager.
+    Shared by `start_strategy` (human-supplied instrument/expiry/session)
+    and `set_strategy_power`'s auto-resolved "Power toggle -> ON" path, so
+    the two can never drift out of sync on what "actually running"
+    requires. `run` must already be committed -- both callers commit their
+    own row-creation transaction before calling this.
+    """
+    # Sleep inhibitor: "actively scanning" half of the two overlapping
+    # lifecycles core/sleep_inhibitor.py's own docstring describes (the
+    # other half is an open position, acquired/released around
+    # _open_position_from_fill/close_position). Reference-counted, so a
+    # session with several concurrent runs stays awake until every one of
+    # them has stopped.
+    get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
+
+    # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
+    # nothing ever actually started one outside tests — real strategies
+    # (unlike the synthetic stub) need genuinely live price_bars/
+    # indicator_snapshots for their underlying. One shared service for the
+    # whole process (see market_data.registry's own docstring for why: a
+    # broker connection is a single shared stream, not one per instrument),
+    # idempotent per symbol so several concurrent runs on the same or
+    # different underlyings all share it.
+    ensure_ingestion_running(instrument.symbol)
+
+    strategy = _build_strategy(strategy_config, instrument.id, expiry_date)
+    runner = StrategyRunner(
+        strategy,
+        run.id,
+        interval_seconds=interval_seconds,
+        on_self_stop=lambda: _RUNNERS.pop(run.id, None),
+    )
+    runner.start()
+    _RUNNERS[run.id] = runner
+
+    # PositionManager is per trading_session, not per strategy_run — a
+    # session that already has one running (e.g. a second strategy started
+    # against it) is left alone; ensure_position_manager_running no-ops in
+    # that case. It's deliberately not stopped by _stop_active_run below: an
+    # already-open position from this run must keep being managed to its
+    # stop/target even after the strategy that opened it stops scanning.
+    ensure_position_manager_running(trading_session.id)
+
+
+def _stop_active_run(
+    db: Session,
+    run: StrategyRun,
+    strategy_config: StrategyConfig,
+    *,
+    actor_type: ActorType,
+    actor_id: uuid.UUID | None,
+) -> None:
+    """Shared by `stop_strategy` (human clicks Stop) and
+    `set_strategy_power`'s "Power toggle -> OFF" path. Caller commits
+    afterward.
+    """
+    runner = _RUNNERS.pop(run.id, None)
+    if runner is not None:
+        runner.stop()
+
+    # Releases this run's half of the sleep inhibitor's reference count —
+    # see the matching acquire in _start_runner_thread. Safe even if this
+    # run never acquired it (e.g. a process restart between start and
+    # stop): SleepInhibitor.release on an absent reason is a no-op.
+    get_sleep_inhibitor().release(f"strategy_run:{run.id}")
+
+    run.status = StrategyRunStatus.STOPPED
+    run.stopped_at = _utcnow()
+    db.add(run)
+    db.flush()
+
+    record_event(
+        db,
+        workspace_id=strategy_config.workspace_id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        event_category=EventCategory.STRATEGY_STATE_CHANGE,
+        event_type="strategy_run.stopped",
+        entity_type="strategy_run",
+        entity_id=run.id,
+        trading_session_id=run.trading_session_id,
+        strategy_config_id=strategy_config.id,
+    )
 
 
 class StrategyConfigOut(BaseModel):
@@ -311,6 +405,12 @@ def create_strategy(
         strategy_type=body.strategy_type,
         params=body.params,
         underlying_symbol=body.underlying_symbol,
+        # Master-switch feature: default every new strategy to Paper
+        # (force_paper), not the column's own NULL default -- "Live" must
+        # always be something a human opts into via the Mode dropdown,
+        # never an inherited default. See the matching backfill migration
+        # 0019 for the same fix applied to strategies that already existed.
+        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
     )
     db.add(config)
     db.commit()
@@ -397,6 +497,62 @@ def update_strategy(
         db.commit()
         db.refresh(config)
     return config
+
+
+class BulkRuntimeModeRequest(BaseModel):
+    mode: StrategyRuntimeMode | None
+
+
+class BulkRuntimeModeOut(BaseModel):
+    updated_count: int
+    strategy_ids: list[uuid.UUID]
+
+
+@router.post("/strategies/bulk-runtime-mode", response_model=BulkRuntimeModeOut)
+def bulk_set_runtime_mode(
+    body: BulkRuntimeModeRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.edit")),
+) -> BulkRuntimeModeOut:
+    """The "master switch" confirm dialog's bulk-apply action -- sets every
+    workspace strategy's `runtime_mode` to `body.mode` in one pass
+    (`body.mode=None` means "Live"/no override, `force_paper` means
+    "Paper", the same two values `update_strategy` already accepts one
+    strategy at a time). Deliberately a separate endpoint rather than the
+    frontend looping `PATCH /strategies/{id}` per row: one DB transaction
+    (all-or-nothing) and the audit trail records this as one deliberate
+    bulk action, not N indistinguishable individual edits.
+    """
+    configs = (
+        db.query(StrategyConfig).filter(StrategyConfig.workspace_id == user.workspace_id).all()
+    )
+    changed = [config for config in configs if config.runtime_mode != body.mode]
+    for config in changed:
+        config.runtime_mode = body.mode
+
+    if changed:
+        db.flush()
+        for config in changed:
+            record_event(
+                db,
+                workspace_id=user.workspace_id,
+                actor_type=ActorType.USER,
+                actor_id=user.id,
+                event_category=EventCategory.STRATEGY_STATE_CHANGE,
+                event_type="strategy_config.updated",
+                entity_type="strategy_config",
+                entity_id=config.id,
+                strategy_config_id=config.id,
+                payload={
+                    "runtime_mode": body.mode.value if body.mode is not None else None,
+                    "bulk": True,
+                },
+            )
+        db.commit()
+
+    return BulkRuntimeModeOut(
+        updated_count=len(changed), strategy_ids=[config.id for config in changed]
+    )
 
 
 class StartStrategyRequest(BaseModel):
@@ -545,36 +701,9 @@ def start_strategy(
         db.commit()
         db.refresh(run)
 
-    # Sleep inhibitor: "actively scanning" half of the two overlapping
-    # lifecycles core/sleep_inhibitor.py's own docstring describes (the
-    # other half is an open position, acquired/released around
-    # _open_position_from_fill/close_position). Reference-counted, so a
-    # session with several concurrent runs stays awake until every one of
-    # them has stopped.
-    get_sleep_inhibitor().acquire(f"strategy_run:{run.id}")
-
-    # MarketDataIngestionService/IndicatorEngine were built in Phase 1 but
-    # nothing ever actually started one outside tests — real strategies
-    # (unlike the synthetic stub) need genuinely live price_bars/
-    # indicator_snapshots for their underlying. One shared service for the
-    # whole process (see market_data.registry's own docstring for why: a
-    # broker connection is a single shared stream, not one per instrument),
-    # idempotent per symbol so several concurrent runs on the same or
-    # different underlyings all share it.
-    ensure_ingestion_running(instrument.symbol)
-
-    strategy = _build_strategy(strategy_config, body.instrument_id, body.expiry_date)
-    runner = StrategyRunner(strategy, run.id, interval_seconds=body.interval_seconds)
-    runner.start()
-    _RUNNERS[run.id] = runner
-
-    # PositionManager is per trading_session, not per strategy_run — a
-    # session that already has one running (e.g. a second strategy started
-    # against it) is left alone; ensure_position_manager_running no-ops in
-    # that case. It's deliberately not stopped by stop_strategy below: an
-    # already-open position from this run must keep being managed to its
-    # stop/target even after the strategy that opened it stops scanning.
-    ensure_position_manager_running(trading_session.id)
+    _start_runner_thread(
+        run, strategy_config, trading_session, instrument, body.expiry_date, body.interval_seconds
+    )
 
     return {"strategy_run_id": run.id, "status": run.status, "execution_mode": run.execution_mode}
 
@@ -599,35 +728,136 @@ def stop_strategy(
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No active run for this strategy")
 
-    runner = _RUNNERS.pop(run.id, None)
-    if runner is not None:
-        runner.stop()
-
-    # Releases this run's half of the sleep inhibitor's reference count —
-    # see the matching acquire in start_strategy. Safe even if this run
-    # never acquired it (e.g. a process restart between start and stop):
-    # SleepInhibitor.release on an absent reason is a no-op.
-    get_sleep_inhibitor().release(f"strategy_run:{run.id}")
-
-    run.status = StrategyRunStatus.STOPPED
-    run.stopped_at = _utcnow()
-    db.add(run)
-    db.flush()
-
-    record_event(
-        db,
-        workspace_id=user.workspace_id,
-        actor_type=ActorType.USER,
-        actor_id=user.id,
-        event_category=EventCategory.STRATEGY_STATE_CHANGE,
-        event_type="strategy_run.stopped",
-        entity_type="strategy_run",
-        entity_id=run.id,
-        trading_session_id=run.trading_session_id,
-        strategy_config_id=strategy_config.id,
-    )
+    _stop_active_run(db, run, strategy_config, actor_type=ActorType.USER, actor_id=user.id)
     db.commit()
     return {"ok": True}
+
+
+def _todays_active_session(db: Session, workspace_id: uuid.UUID) -> TradingSession | None:
+    today_ist = now_ist().date()
+    sessions = (
+        db.query(TradingSession)
+        .filter(
+            TradingSession.workspace_id == workspace_id,
+            TradingSession.status == TradingSessionStatus.ACTIVE,
+        )
+        .all()
+    )
+    return next((s for s in sessions if to_ist(s.started_at).date() == today_ist), None)
+
+
+class SetStrategyPowerRequest(BaseModel):
+    is_enabled: bool
+
+
+class SetStrategyPowerOut(BaseModel):
+    is_enabled: bool
+    run_started: bool
+    run_stopped: bool
+    run_id: uuid.UUID | None
+    detail: str
+
+
+@router.post("/strategies/{strategy_id}/power", response_model=SetStrategyPowerOut)
+def set_strategy_power(
+    strategy_id: uuid.UUID,
+    body: SetStrategyPowerRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.edit")),
+) -> SetStrategyPowerOut:
+    """The "Power" toggle's dedicated route (Dual-Trigger Model, 2026-08-17)
+    -- unlike `PATCH /strategies/{id}`, which only ever persists the
+    `is_enabled` flag for tomorrow's cron to pick up, this makes the toggle
+    immediately actionable: `true` auto-resolves today's session/instrument/
+    expiry (reusing `strategy_engine.auto_spawner.spawn_one_now`, the same
+    logic the cron/login paths use, just with `ignore_stopped_today=True` --
+    a deliberate toggle-on is allowed to re-arm something stopped earlier
+    today, unlike the ambient paths) and starts its runner thread right
+    away; `false` stops whatever run is currently active for this config,
+    same as `stop_strategy`.
+
+    Always returns 200 with an explicit `run_started`/`run_stopped`/`detail`
+    outcome, never a silent no-op -- a click that doesn't actually start
+    anything (trade window closed, no active session today, a broker error)
+    must never look identical to one that did. `is_enabled` itself is
+    persisted regardless of the spawn outcome: that flag is the user's
+    standing intent, not contingent on today's specific spawn attempt
+    succeeding, so a real skip today still leaves it correctly enabled for
+    tomorrow's bootstrap.
+    """
+    strategy_config = _get_strategy_config_or_404(db, user, strategy_id)
+
+    if strategy_config.is_enabled != body.is_enabled:
+        strategy_config.is_enabled = body.is_enabled
+        db.flush()
+        record_event(
+            db,
+            workspace_id=user.workspace_id,
+            actor_type=ActorType.USER,
+            actor_id=user.id,
+            event_category=EventCategory.STRATEGY_STATE_CHANGE,
+            event_type="strategy_config.updated",
+            entity_type="strategy_config",
+            entity_id=strategy_config.id,
+            strategy_config_id=strategy_config.id,
+            payload={"is_enabled": body.is_enabled},
+        )
+
+    run_started = False
+    run_stopped = False
+    run_id: uuid.UUID | None = None
+    detail = "No change."
+
+    if body.is_enabled:
+        trading_session = _todays_active_session(db, user.workspace_id)
+        if trading_session is None:
+            detail = "No active trading session found for today -- start one first."
+            db.commit()
+        else:
+            outcome = spawn_one_now(db, trading_session, strategy_config, actor_id=user.id)
+            detail = outcome.detail
+            if outcome.status == SpawnStatus.SPAWNED and outcome.run is not None:
+                db.commit()
+                db.refresh(outcome.run)
+                instrument = db.get(Instrument, outcome.run.instrument_id)
+                if instrument is not None and outcome.run.expiry_date is not None:
+                    _start_runner_thread(
+                        outcome.run,
+                        strategy_config,
+                        trading_session,
+                        instrument,
+                        outcome.run.expiry_date,
+                        outcome.run.interval_seconds or 30.0,
+                    )
+                    run_started = True
+                    run_id = outcome.run.id
+            else:
+                db.commit()
+    else:
+        run = (
+            db.query(StrategyRun)
+            .filter(
+                StrategyRun.strategy_config_id == strategy_config.id,
+                StrategyRun.status != StrategyRunStatus.STOPPED,
+            )
+            .order_by(StrategyRun.started_at.desc())
+            .first()
+        )
+        if run is not None:
+            _stop_active_run(db, run, strategy_config, actor_type=ActorType.USER, actor_id=user.id)
+            run_stopped = True
+            detail = "Strategy stopped."
+        else:
+            detail = "No active run to stop."
+        db.commit()
+
+    return SetStrategyPowerOut(
+        is_enabled=body.is_enabled,
+        run_started=run_started,
+        run_stopped=run_stopped,
+        run_id=run_id,
+        detail=detail,
+    )
 
 
 class RunningPositionOut(BaseModel):

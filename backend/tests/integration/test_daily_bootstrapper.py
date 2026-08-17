@@ -419,6 +419,14 @@ def test_auto_spawner_runs_against_todays_freshly_created_session(
         auto_spawner_module, "record_option_chain_snapshot", lambda *a, **kw: None
     )
     monkeypatch.setattr(auto_spawner_module, "get_broker", lambda: object())
+    # auto_spawner has its own `now_ist` module binding, separate from
+    # bootstrapper_module's (each did its own `from app.core.clock import
+    # now_ist`) -- the _fixed_today fixture above only covers the latter,
+    # so _spawn_one's own TRADE_WINDOW_END (15:09 IST) check needs its own
+    # freeze too, or this test is only deterministic before 15:09 real time.
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 11, 0, tzinfo=IST)
+    )
 
     _yesterday_session(
         db,

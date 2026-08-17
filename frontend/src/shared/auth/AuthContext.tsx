@@ -30,6 +30,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   async function login(email: string, password: string) {
     const loggedInUser = await api.post<UserOut>('/auth/login', { email, password })
     queryClient.setQueryData(['auth', 'me'], loggedInUser)
+
+    // Dual-Trigger Model: the login-triggered half of the daily bootstrap,
+    // alongside the existing 09:00 IST scheduler -- fire-and-forget, since
+    // this is an ambient sync the user isn't watching for and must never
+    // block or fail the actual login on.
+    void api.post('/sessions/bootstrap-now').catch(() => {})
   }
 
   async function logout() {

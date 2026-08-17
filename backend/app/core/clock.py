@@ -58,6 +58,20 @@ def is_within_global_trading_window(ts_utc: datetime) -> bool:
     return TRADE_WINDOW_START <= to_ist(ts_utc).time() < TRADE_WINDOW_END
 
 
+# One minute past TRADE_WINDOW_END: a strategy run still SCANNING (zero open
+# positions) this late has nothing left to protect, since no new entry can
+# fire past TRADE_WINDOW_END anyway — see strategy_engine.runner's
+# _maybe_stop_for_eod for the actual stop logic. Deliberately wall-clock
+# `now()`-based, not bar-timestamp-based like TRADE_WINDOW_END/START above —
+# "should this background thread tear itself down now" needs real current
+# time, not a bar that may lag it.
+EOD_SCANNING_STOP_TIME = time(15, 10)
+
+
+def is_past_eod_scanning_stop(ts_utc: datetime) -> bool:
+    return to_ist(ts_utc).time() >= EOD_SCANNING_STOP_TIME
+
+
 @dataclass(frozen=True)
 class ClockCheckResult:
     ok: bool

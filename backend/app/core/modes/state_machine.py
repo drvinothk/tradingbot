@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy.orm import Session
 
@@ -199,3 +200,66 @@ def recover_from_degraded(
         actor_user=actor_user,
         reason=reason,
     )
+
+
+_MASTER_MODE_LADDER: dict[Literal["paper", "live"], list[SafeMode]] = {
+    "live": [SafeMode.PAPER_ONLY, SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED],
+    "paper": [SafeMode.LIVE_ENABLED, SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.PAPER_ONLY],
+}
+
+
+def set_master_trading_mode(
+    db: Session,
+    trading_session: TradingSession,
+    target: Literal["paper", "live"],
+    trigger_type: TransitionTriggerType,
+    *,
+    actor_user: User | None = None,
+    reason: str = "",
+) -> TradingSession:
+    """The friendly, two-value "master switch" (Paper/Live) a human actually
+    wants, layered over the real 6-state SafeMode ladder -- there is no
+    direct `paper_only <-> live_enabled` edge in `transitions.py`, so both
+    directions walk through `paper_plus_guarded_live` as an intermediate
+    hop, one `transition_mode` call per hop.
+
+    That intermediate hop is safe to pass through unattended: it is
+    strictly more restrictive than `live_enabled` (it additionally requires
+    per-strategy graduation, `StrategyConfig.status == LIVE`, which nothing
+    in this codebase can currently set -- see that field's own docstring),
+    so a session sitting there for the instant between hops behaves
+    identically to `paper_only` for every strategy that exists today, in
+    either direction.
+
+    Deliberately refuses -- rather than walking through -- when the session
+    is currently in one of the three emergency states (`kill_switch`,
+    `degraded_mode`, `reconciliation_lock`). Those have their own
+    dedicated, higher-bar recovery endpoints
+    (`recover_from_kill_switch`/`recover_from_degraded`) and must never be
+    bypassed by a mode convenience wrapper. A session already at the target
+    mode is a no-op, not an error -- unlike `transition_mode` itself, which
+    treats "already there" as illegal, this wrapper is meant to be safe to
+    click repeatedly from a UI.
+    """
+    from_mode = SafeMode(trading_session.mode)
+    emergency_modes = (SafeMode.KILL_SWITCH, SafeMode.DEGRADED_MODE, SafeMode.RECONCILIATION_LOCK)
+    if from_mode in emergency_modes:
+        raise ModeTransitionError(
+            f"session is in {from_mode.value} -- use its dedicated recovery flow, "
+            "not the master switch"
+        )
+
+    ladder = _MASTER_MODE_LADDER[target]
+    if from_mode not in ladder:
+        raise ModeTransitionError(
+            f"session mode {from_mode.value} is not on the master-mode ladder"
+        )
+
+    hops = ladder[ladder.index(from_mode) + 1 :]
+
+    result = trading_session
+    for hop in hops:
+        result = transition_mode(
+            db, result, hop, trigger_type, actor_user=actor_user, reason=reason
+        )
+    return result

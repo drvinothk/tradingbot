@@ -77,8 +77,10 @@ def seeded_admin(engine):
             "session.start",
             "session.stop",
             "strategy.view",
+            "strategy.edit",
             "papertrade.execute",
             "risk.override",
+            "livetrade.execute",
         ):
             permission = Permission(id=uuid.uuid4(), code=code, description="")
             db.add(permission)
@@ -133,9 +135,7 @@ def seeded_admin(engine):
         # row (login, kill-switch) — miss this and cleanup fails on the same
         # FK-violation-cascades-into-the-next-test's-unique-constraint
         # pattern as the Permission rows below.
-        cleanup_db.query(AuditEvent).filter(
-            AuditEvent.workspace_id == ids["workspace_id"]
-        ).delete()
+        cleanup_db.query(AuditEvent).filter(AuditEvent.workspace_id == ids["workspace_id"]).delete()
         cleanup_db.query(SessionModeTransition).delete()
         cleanup_db.query(TradingSession).filter(
             TradingSession.workspace_id == ids["workspace_id"]
@@ -146,9 +146,7 @@ def seeded_admin(engine):
         ).delete()
         cleanup_db.query(UserRole).filter(UserRole.user_id == ids["user_id"]).delete()
         cleanup_db.query(User).filter(User.id == ids["user_id"]).delete()
-        cleanup_db.query(RolePermission).filter(
-            RolePermission.role_id == ids["role_id"]
-        ).delete()
+        cleanup_db.query(RolePermission).filter(RolePermission.role_id == ids["role_id"]).delete()
         cleanup_db.query(Permission).filter(Permission.id.in_(ids["permission_ids"])).delete(
             synchronize_session=False
         )
@@ -195,9 +193,7 @@ def test_create_session_rejects_unknown_broker_account(api_client: TestClient, s
         "/api/v1/auth/login",
         json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
     )
-    response = api_client.post(
-        "/api/v1/sessions", json={"broker_account_id": str(uuid.uuid4())}
-    )
+    response = api_client.post("/api/v1/sessions", json={"broker_account_id": str(uuid.uuid4())})
     # Must be a clean 404, not an unhandled 500 from a foreign-key violation.
     assert response.status_code == 404
 
@@ -632,3 +628,95 @@ def test_daily_plan_rejects_non_positive_budget(api_client: TestClient, seeded_a
         },
     )
     assert response.status_code == 422
+
+
+# -- Mode master switch (go-live/go-paper) --------------------------------
+
+
+def _login_and_create_session(api_client: TestClient, seeded_admin) -> str:
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    create_resp = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    )
+    session_id: str = create_resp.json()["id"]
+    return session_id
+
+
+def test_go_live_walks_a_fresh_session_to_live_enabled(api_client: TestClient, seeded_admin):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    assert response.status_code == 200
+    assert response.json()["mode"] == "live_enabled"
+
+
+def test_go_live_then_go_paper_restores_paper_only(api_client: TestClient, seeded_admin):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/go-paper")
+    assert response.status_code == 200
+    assert response.json()["mode"] == "paper_only"
+
+
+def test_go_live_is_idempotent_when_already_live(api_client: TestClient, seeded_admin):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    assert response.status_code == 200
+    assert response.json()["mode"] == "live_enabled"
+
+
+def test_go_live_rejects_from_kill_switch(api_client: TestClient, seeded_admin):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"})
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    assert response.status_code == 409
+
+    # Must not have silently changed the session's mode on the way to
+    # rejecting -- the whole point is that kill_switch needs its own
+    # dedicated recovery endpoint, not a bypass through this one.
+    get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
+    assert get_resp.json()["mode"] == "kill_switch"
+
+
+# -- POST /sessions/bootstrap-now (Dual-Trigger Model, 2026-08-17) --------
+
+
+def test_bootstrap_now_requires_login(api_client: TestClient):
+    response = api_client.post("/api/v1/sessions/bootstrap-now")
+    assert response.status_code == 401
+
+
+def test_bootstrap_now_calls_run_daily_bootstrap(api_client: TestClient, seeded_admin, monkeypatch):
+    """Deliberately doesn't exercise `run_daily_bootstrap` for real here --
+    that function's own default `session_factory` is the *production*
+    `session_scope`, not this test's isolated engine (the endpoint does a
+    local import specifically so a real call can never accidentally touch
+    prod from an automated test run -- same discipline
+    test_daily_bootstrapper.py's own `_no_real_resume` fixture already
+    applies to `_resume_strategy_runners`). `run_daily_bootstrap`'s actual
+    behavior is covered thoroughly and safely there, with its
+    `session_factory` explicitly overridden; this test only proves the
+    endpoint's own wiring -- auth gate passed, the function got called.
+    """
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    calls: list[None] = []
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: calls.append(None))
+
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    response = api_client.post("/api/v1/sessions/bootstrap-now")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert len(calls) == 1

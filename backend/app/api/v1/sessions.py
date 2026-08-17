@@ -16,7 +16,12 @@ from app.config.settings import get_settings
 from app.core.clock import now_ist
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
-from app.core.modes import ModeTransitionError, enter_kill_switch, transition_mode
+from app.core.modes import (
+    ModeTransitionError,
+    enter_kill_switch,
+    set_master_trading_mode,
+    transition_mode,
+)
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
@@ -176,6 +181,41 @@ def create_session(
         db.commit()
         db.refresh(trading_session)
         return trading_session
+
+
+@router.post("/bootstrap-now")
+def bootstrap_now(
+    user: User = Depends(require_permission("session.start")),
+) -> dict:
+    """Dual-Trigger Model (2026-08-17): the login-triggered half of the
+    daily bootstrap, alongside the existing 09:00 IST
+    `DailyBootstrapScheduler`. Calls `run_daily_bootstrap()` directly --
+    deliberately *not* through that scheduler's own `run_once()` gate,
+    which only fires once per calendar day and would otherwise lock out
+    this endpoint for the rest of the day after its first call. That's
+    safe now specifically because `strategy_engine.auto_spawner._spawn_one`
+    became date-aware in the same change that added this endpoint: it
+    already refuses to resurrect a strategy that ran-and-stopped earlier
+    today, so calling the full bootstrap as many times as a human logs in
+    is idempotent at the granularity that actually matters (per strategy,
+    per day), not just once globally.
+
+    No workspace scoping -- `run_daily_bootstrap` itself iterates every
+    workspace unconditionally, same as the scheduler's own call already
+    does; this endpoint is just an on-demand trigger for that same
+    ambient, system-wide sweep, not a per-workspace action.
+
+    Local import, not module-level: `app.main` imports `api.v1.sessions`
+    (this module) at its own top level, before `_resume_strategy_runners`
+    is even defined further down that same file -- `session.bootstrapper`
+    imports that name at *its* module level, so a module-level import of
+    it here would be a real circular import at app startup, not just a
+    style choice.
+    """
+    from app.modules.session.bootstrapper import run_daily_bootstrap
+
+    run_daily_bootstrap()
+    return {"ok": True}
 
 
 @router.post("/{session_id}/daily-plan", response_model=SessionOut)
@@ -374,6 +414,72 @@ def trigger_kill_switch(
     try:
         enter_kill_switch(
             db, trading_session, TransitionTriggerType.MANUAL, actor_user=user, reason=body.reason
+        )
+    except ModeTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
+
+
+@router.post("/{session_id}/go-live", response_model=SessionOut)
+def go_live(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("livetrade.execute")),
+) -> TradingSession:
+    """The "master switch" -> Live. Walks `paper_only -> paper_plus_guarded_live
+    -> live_enabled` (skipping whichever hop is already satisfied) via
+    `set_master_trading_mode`, so this is the first place in the app that can
+    ever actually put a session into `live_enabled` -- see that helper's own
+    docstring for why the intermediate hop is safe to pass through
+    unattended, and why kill_switch/degraded_mode/reconciliation_lock refuse
+    rather than get walked through. A strategy only actually dispatches a
+    real order after this if its own `runtime_mode` isn't `force_paper` (see
+    `StrategiesPage`'s "Mode" column) and every other gate in
+    `get_execution_broker` (instrument firewall, `ALLOW_REAL_MONEY_DISPATCH`)
+    also passes -- this endpoint only ever controls the session-mode gate.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    try:
+        set_master_trading_mode(
+            db,
+            trading_session,
+            "live",
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="master switch -> live",
+        )
+    except ModeTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
+
+
+@router.post("/{session_id}/go-paper", response_model=SessionOut)
+def go_paper(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.stop")),
+) -> TradingSession:
+    """The "master switch" -> Paper -- always the safety-decreasing
+    direction, gated on `session.stop` (the same permission bar as every
+    other stop-like action in this file), not `livetrade.execute`. Walks
+    `live_enabled -> paper_plus_guarded_live -> paper_only` via
+    `set_master_trading_mode`. Master=Paper always wins: once this
+    completes, `get_execution_broker` returns the mock for every strategy
+    on this session regardless of any individual strategy's `runtime_mode`.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    try:
+        set_master_trading_mode(
+            db,
+            trading_session,
+            "paper",
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="master switch -> paper",
         )
     except ModeTransitionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc

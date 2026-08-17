@@ -388,15 +388,26 @@ def _resume_strategy_runners() -> None:
                 instrument = db.get(Instrument, run.instrument_id)
                 if strategy_config is None or instrument is None:
                     logger.warning(
-                        "strategy_run %s references a missing config/instrument — "
-                        "skipping resume",
+                        "strategy_run %s references a missing config/instrument — skipping resume",
                         run.id,
                     )
                     continue
 
                 strategy = _build_strategy(strategy_config, run.instrument_id, run.expiry_date)
                 interval = run.interval_seconds if run.interval_seconds is not None else 30.0
-                runner = StrategyRunner(strategy, run.id, interval_seconds=interval)
+
+                def _forget_runner(run_id: uuid.UUID = run.id) -> None:
+                    # Default-arg binds run_id at definition time, not call
+                    # time -- avoids the classic late-binding closure-in-a-
+                    # loop bug (`run` is reassigned every iteration).
+                    _RUNNERS.pop(run_id, None)
+
+                runner = StrategyRunner(
+                    strategy,
+                    run.id,
+                    interval_seconds=interval,
+                    on_self_stop=_forget_runner,
+                )
                 runner.start()
                 _RUNNERS[run.id] = runner
 

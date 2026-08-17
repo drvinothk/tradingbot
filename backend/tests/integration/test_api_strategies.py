@@ -21,6 +21,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 import app.api.v1.strategies as strategies_module
+import app.modules.strategy_engine.auto_spawner as auto_spawner_module
+from app.core.clock import IST
 from app.core.db.session import get_db
 from app.core.security.passwords import hash_password
 from app.domain.execution.models import Position, PositionStatus
@@ -209,9 +211,9 @@ def seeded_admin(engine):
         cleanup_db.query(OrderEvent).filter(OrderEvent.order_id.in_(order_ids)).delete(
             synchronize_session=False
         )
-        cleanup_db.query(TradeOutcome).filter(
-            TradeOutcome.position_id.in_(position_ids)
-        ).delete(synchronize_session=False)
+        cleanup_db.query(TradeOutcome).filter(TradeOutcome.position_id.in_(position_ids)).delete(
+            synchronize_session=False
+        )
         cleanup_db.query(StopPlan).filter(StopPlan.position_id.in_(position_ids)).delete(
             synchronize_session=False
         )
@@ -232,9 +234,9 @@ def seeded_admin(engine):
         cleanup_db.query(Order).filter(Order.position_id.in_(position_ids)).delete(
             synchronize_session=False
         )
-        cleanup_db.query(Position).filter(
-            Position.trade_intent_id.in_(trade_intent_ids)
-        ).delete(synchronize_session=False)
+        cleanup_db.query(Position).filter(Position.trade_intent_id.in_(trade_intent_ids)).delete(
+            synchronize_session=False
+        )
         # Entry orders (trade_intent_id set) are now unreferenced.
         cleanup_db.query(Order).filter(Order.trade_intent_id.in_(trade_intent_ids)).delete(
             synchronize_session=False
@@ -265,9 +267,7 @@ def seeded_admin(engine):
             ReconciliationRun.workspace_id == ids["workspace_id"]
         ).delete()
 
-        cleanup_db.query(AuditEvent).filter(
-            AuditEvent.workspace_id == ids["workspace_id"]
-        ).delete()
+        cleanup_db.query(AuditEvent).filter(AuditEvent.workspace_id == ids["workspace_id"]).delete()
         cleanup_db.query(StrategyRun).filter(
             StrategyRun.strategy_config_id.in_(
                 cleanup_db.query(StrategyConfig.id).filter(
@@ -287,9 +287,7 @@ def seeded_admin(engine):
         ).delete()
         cleanup_db.query(UserRole).filter(UserRole.user_id == ids["user_id"]).delete()
         cleanup_db.query(User).filter(User.id == ids["user_id"]).delete()
-        cleanup_db.query(RolePermission).filter(
-            RolePermission.role_id == ids["role_id"]
-        ).delete()
+        cleanup_db.query(RolePermission).filter(RolePermission.role_id == ids["role_id"]).delete()
         cleanup_db.query(Permission).filter(Permission.id.in_(ids["permission_ids"])).delete(
             synchronize_session=False
         )
@@ -310,9 +308,7 @@ def test_create_strategy_requires_login(api_client: TestClient):
     assert response.status_code == 401
 
 
-def test_list_strategies_returns_workspace_scoped_configs(
-    api_client: TestClient, seeded_admin
-):
+def test_list_strategies_returns_workspace_scoped_configs(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     api_client.post("/api/v1/strategies", json={"name": "orb-list-test", "strategy_type": "orb"})
 
@@ -395,9 +391,9 @@ def test_start_strategy_creates_run_and_stop_ends_it(
             # column's own docstring) — must clear referencing rows first,
             # same FK-safe-order requirement as every other direct-DB test
             # cleanup in this codebase.
-            cleanup_db.query(StrategyRun).filter(
-                StrategyRun.instrument_id == instrument_id
-            ).update({StrategyRun.instrument_id: None})
+            cleanup_db.query(StrategyRun).filter(StrategyRun.instrument_id == instrument_id).update(
+                {StrategyRun.instrument_id: None}
+            )
             cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
             cleanup_db.commit()
 
@@ -486,9 +482,9 @@ def test_start_strategy_rejects_when_shoonya_not_connected(
     monkeypatch.setattr(strategies_module, "is_shoonya_market_data_ready", lambda: False)
 
     _login(api_client, seeded_admin)
-    strategy_id = api_client.post(
-        "/api/v1/strategies", json={"name": "orb-not-connected"}
-    ).json()["id"]
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-not-connected"}).json()[
+        "id"
+    ]
     session_id = api_client.post(
         "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
     ).json()["id"]
@@ -696,15 +692,13 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
                             )
                         )
                     ]
-                    cleanup_db.query(OrderEvent).filter(
-                        OrderEvent.order_id.in_(order_ids)
-                    ).delete(synchronize_session=False)
+                    cleanup_db.query(OrderEvent).filter(OrderEvent.order_id.in_(order_ids)).delete(
+                        synchronize_session=False
+                    )
                     cleanup_db.query(TradeOutcome).filter(
                         TradeOutcome.position_id == position.id
                     ).delete()
-                    cleanup_db.query(StopPlan).filter(
-                        StopPlan.position_id == position.id
-                    ).delete()
+                    cleanup_db.query(StopPlan).filter(StopPlan.position_id == position.id).delete()
                     cleanup_db.query(TrailPlan).filter(
                         TrailPlan.position_id == position.id
                     ).delete()
@@ -758,44 +752,45 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
 
 
 def test_update_strategy_requires_login(api_client: TestClient):
-    response = api_client.patch(
-        f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False}
-    )
+    response = api_client.patch(f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False})
     assert response.status_code == 401
 
 
 def test_update_strategy_unknown_id_is_404(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
-    response = api_client.patch(
-        f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False}
-    )
+    response = api_client.patch(f"/api/v1/strategies/{uuid.uuid4()}", json={"is_enabled": False})
     assert response.status_code == 404
 
 
-def test_new_strategy_defaults_to_enabled_with_no_runtime_override(
-    api_client: TestClient, seeded_admin
-):
+def test_new_strategy_defaults_to_enabled_and_force_paper(api_client: TestClient, seeded_admin):
+    """Mode master-switch feature: new strategies default to `force_paper`
+    (Mode dropdown = "Paper"), not the runtime_mode column's own NULL
+    default -- `NULL` means "not force_paper," which is live-eligible the
+    moment a session reaches `live_enabled`. "Live" must always be an
+    explicit, per-strategy human choice, never an inherited default. See
+    `create_strategy`'s own comment and migration 0019's docstring (the
+    matching backfill for strategies that already existed before this
+    change) for the full reasoning.
+    """
     _login(api_client, seeded_admin)
     created = api_client.post("/api/v1/strategies", json={"name": "orb-patch-default"}).json()
 
     assert created["is_enabled"] is True
-    assert created["runtime_mode"] is None
+    assert created["runtime_mode"] == "force_paper"
 
 
 def test_patch_toggles_is_enabled(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
-    strategy_id = api_client.post(
-        "/api/v1/strategies", json={"name": "orb-patch-enable"}
-    ).json()["id"]
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-patch-enable"}).json()[
+        "id"
+    ]
 
-    response = api_client.patch(
-        f"/api/v1/strategies/{strategy_id}", json={"is_enabled": False}
-    )
+    response = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"is_enabled": False})
 
     assert response.status_code == 200
     body = response.json()
     assert body["is_enabled"] is False
-    assert body["runtime_mode"] is None
+    assert body["runtime_mode"] == "force_paper"  # new-strategy default, untouched by this call
 
     refetched = api_client.get("/api/v1/strategies").json()
     updated = next(row for row in refetched if row["id"] == strategy_id)
@@ -817,18 +812,16 @@ def test_patch_sets_and_clears_runtime_mode(api_client: TestClient, seeded_admin
 
     # Explicit null clears the override -- distinct from simply omitting
     # the field, which the next test covers.
-    clear_resp = api_client.patch(
-        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None}
-    )
+    clear_resp = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None})
     assert clear_resp.status_code == 200
     assert clear_resp.json()["runtime_mode"] is None
 
 
 def test_patch_omitting_a_field_leaves_it_untouched(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
-    strategy_id = api_client.post(
-        "/api/v1/strategies", json={"name": "orb-patch-partial"}
-    ).json()["id"]
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-patch-partial"}).json()[
+        "id"
+    ]
     api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_paper"})
 
     # Omitting runtime_mode entirely (not passing it as null) while only
@@ -842,15 +835,69 @@ def test_patch_omitting_a_field_leaves_it_untouched(api_client: TestClient, seed
 
 def test_patch_rejects_unknown_runtime_mode_value(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
-    strategy_id = api_client.post(
-        "/api/v1/strategies", json={"name": "orb-patch-invalid"}
-    ).json()["id"]
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-patch-invalid"}).json()[
+        "id"
+    ]
 
     response = api_client.patch(
         f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_live"}
     )
 
     assert response.status_code == 422
+
+
+def test_bulk_runtime_mode_sets_every_workspace_strategy_to_live(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    id_a = api_client.post("/api/v1/strategies", json={"name": "bulk-a"}).json()["id"]
+    id_b = api_client.post("/api/v1/strategies", json={"name": "bulk-b"}).json()["id"]
+
+    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": None})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["updated_count"] == 2
+    assert set(body["strategy_ids"]) == {id_a, id_b}
+
+    refetched = {row["id"]: row for row in api_client.get("/api/v1/strategies").json()}
+    assert refetched[id_a]["runtime_mode"] is None
+    assert refetched[id_b]["runtime_mode"] is None
+
+
+def test_bulk_runtime_mode_sets_every_workspace_strategy_to_paper(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "bulk-paper"}).json()["id"]
+    # New strategies already default to force_paper -- clear it first so this
+    # test actually exercises a real change, not a no-op.
+    api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None})
+
+    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": "force_paper"})
+    assert response.status_code == 200
+    assert response.json()["updated_count"] == 1
+    assert response.json()["strategy_ids"] == [strategy_id]
+
+    refetched = api_client.get("/api/v1/strategies").json()
+    assert (
+        next(row for row in refetched if row["id"] == strategy_id)["runtime_mode"] == "force_paper"
+    )
+
+
+def test_bulk_runtime_mode_is_a_noop_when_already_at_target(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    # New strategies already default to force_paper.
+    api_client.post("/api/v1/strategies", json={"name": "bulk-already-paper"})
+
+    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": "force_paper"})
+    assert response.status_code == 200
+    assert response.json()["updated_count"] == 0
+    assert response.json()["strategy_ids"] == []
+
+
+def test_bulk_runtime_mode_requires_login(api_client: TestClient):
+    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": None})
+    assert response.status_code == 401
 
 
 @contextmanager
@@ -866,9 +913,7 @@ def _seeded_instrument(engine, symbol: str):
     session_factory = sessionmaker(bind=engine, future=True)
     with session_factory() as db:
         db.add(
-            Instrument(
-                id=instrument_id, symbol=symbol, exchange="NFO", lot_size=25, tick_size=0.05
-            )
+            Instrument(id=instrument_id, symbol=symbol, exchange="NFO", lot_size=25, tick_size=0.05)
         )
         db.commit()
     try:
@@ -936,3 +981,197 @@ def test_patch_rejects_unknown_underlying_symbol(api_client: TestClient, seeded_
     )
 
     assert response.status_code == 400
+
+
+# -- POST /strategies/{id}/power (Dual-Trigger Model, 2026-08-17) ---------
+
+POWER_TEST_TODAY = date(2026, 8, 18)  # a real Tuesday, matches test_auto_spawner.py's own TODAY
+
+
+@contextmanager
+def _seeded_instrument_with_contract(engine, symbol: str, expiry: date):
+    """Same shape as `_seeded_instrument` above, plus one active
+    OptionContract -- the power route's "on" path auto-resolves the
+    nearest listed expiry via `resolve_nearest_expiry`, so it needs a real
+    contract to find, unlike the plain create/patch tests above.
+    """
+    instrument_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        db.add(
+            Instrument(id=instrument_id, symbol=symbol, exchange="NFO", lot_size=25, tick_size=0.05)
+        )
+        db.add(
+            OptionContract(
+                id=uuid.uuid4(),
+                instrument_id=instrument_id,
+                expiry_date=expiry,
+                strike=24000,
+                option_type=OptionType.CE,
+                symbol=f"{symbol}-{expiry.isoformat()}-C24000",
+                is_active=True,
+            )
+        )
+        db.commit()
+    try:
+        yield instrument_id
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(StrategyRun).filter(StrategyRun.instrument_id == instrument_id).update(
+                {StrategyRun.instrument_id: None}
+            )
+            cleanup_db.query(OptionContract).filter(
+                OptionContract.instrument_id == instrument_id
+            ).delete()
+            cleanup_db.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            cleanup_db.commit()
+
+
+def _freeze_auto_spawner_clock(monkeypatch, *, hour: int = 11, minute: int = 0):
+    monkeypatch.setattr(
+        auto_spawner_module,
+        "now_ist",
+        lambda: datetime(
+            POWER_TEST_TODAY.year,
+            POWER_TEST_TODAY.month,
+            POWER_TEST_TODAY.day,
+            hour,
+            minute,
+            tzinfo=IST,
+        ),
+    )
+    # is_shoonya_market_data_ready() is True by default for mock/angel_one
+    # providers (matches production), so _spawn_one would otherwise attempt
+    # a real record_option_chain_snapshot/get_broker call here -- forcing
+    # the "not ready" branch exercises the exact same idle-spawn path
+    # test_auto_spawner.py's own test_shoonya_not_ready_still_spawns_idle...
+    # already covers directly, without needing to also fake the snapshot.
+    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: False)
+
+
+def test_power_on_starts_a_run_immediately(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    _freeze_auto_spawner_clock(monkeypatch)
+    with _seeded_instrument_with_contract(engine, "NIFTY-POWER-1", date(2026, 8, 20)):
+        _login(api_client, seeded_admin)
+        strategy_id = api_client.post(
+            "/api/v1/strategies",
+            json={"name": "orb-power-on", "underlying_symbol": "NIFTY-POWER-1"},
+        ).json()["id"]
+        api_client.post(
+            "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+        )
+
+        response = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": True}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_enabled"] is True
+        assert body["run_started"] is True
+        assert body["run_id"] is not None
+        assert len(_FakeRunner.instances) == 1
+        assert _FakeRunner.instances[0].started is True
+
+
+def test_power_on_reports_trade_window_closed_without_starting(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    _freeze_auto_spawner_clock(monkeypatch, hour=15, minute=30)
+    with _seeded_instrument_with_contract(engine, "NIFTY-POWER-2", date(2026, 8, 20)):
+        _login(api_client, seeded_admin)
+        strategy_id = api_client.post(
+            "/api/v1/strategies",
+            json={"name": "orb-power-window-closed", "underlying_symbol": "NIFTY-POWER-2"},
+        ).json()["id"]
+        api_client.post(
+            "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+        )
+
+        response = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": True}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        # is_enabled is still persisted -- the user's standing intent isn't
+        # contingent on today's specific spawn attempt succeeding.
+        assert body["is_enabled"] is True
+        assert body["run_started"] is False
+        assert "15:09" in body["detail"] or "window" in body["detail"].lower()
+        assert len(_FakeRunner.instances) == 0
+
+
+def test_power_on_reports_no_active_session_today(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    _freeze_auto_spawner_clock(monkeypatch)
+    with _seeded_instrument_with_contract(engine, "NIFTY-POWER-3", date(2026, 8, 20)):
+        _login(api_client, seeded_admin)
+        strategy_id = api_client.post(
+            "/api/v1/strategies",
+            json={"name": "orb-power-no-session", "underlying_symbol": "NIFTY-POWER-3"},
+        ).json()["id"]
+        # Deliberately no POST /sessions call.
+
+        response = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": True}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_enabled"] is True
+        assert body["run_started"] is False
+        assert "session" in body["detail"].lower()
+
+
+def test_power_off_stops_the_active_run(
+    api_client: TestClient, seeded_admin, fake_runner, engine, monkeypatch
+):
+    _freeze_auto_spawner_clock(monkeypatch)
+    with _seeded_instrument_with_contract(engine, "NIFTY-POWER-4", date(2026, 8, 20)):
+        _login(api_client, seeded_admin)
+        strategy_id = api_client.post(
+            "/api/v1/strategies",
+            json={"name": "orb-power-off", "underlying_symbol": "NIFTY-POWER-4"},
+        ).json()["id"]
+        api_client.post(
+            "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+        )
+        api_client.post(f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": True})
+
+        response = api_client.post(
+            f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": False}
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_enabled"] is False
+        assert body["run_stopped"] is True
+        assert _FakeRunner.instances[0].stopped is True
+
+
+def test_power_off_with_nothing_running_is_a_clean_noop(
+    api_client: TestClient, seeded_admin, fake_runner
+):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-power-off-noop"}).json()[
+        "id"
+    ]
+
+    response = api_client.post(
+        f"/api/v1/strategies/{strategy_id}/power", json={"is_enabled": False}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_stopped"] is False
+
+
+def test_power_requires_login(api_client: TestClient):
+    response = api_client.post(
+        f"/api/v1/strategies/{uuid.uuid4()}/power", json={"is_enabled": True}
+    )
+    assert response.status_code == 401

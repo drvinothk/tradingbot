@@ -14,6 +14,8 @@ import pytest
 from sqlalchemy.orm import Session
 
 import app.modules.strategy_engine.auto_spawner as auto_spawner_module
+from app.core.clock import IST
+from app.domain.audit.models import AuditEvent
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import SystemAlert
@@ -21,8 +23,11 @@ from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.broker_adapter.base.errors import BrokerConnectivityError
 from app.modules.strategy_engine.auto_spawner import (
+    SpawnStatus,
+    _spawn_one,
     resolve_nearest_expiry,
     spawn_enabled_strategies,
+    spawn_one_now,
 )
 
 TODAY = date(2026, 8, 18)  # a real Tuesday -- see test_market_utils.py
@@ -47,6 +52,14 @@ def _fake_snapshot_and_broker(monkeypatch):
     monkeypatch.setattr(auto_spawner_module, "record_option_chain_snapshot", _fake_record)
     monkeypatch.setattr(auto_spawner_module, "get_broker", lambda: object())
     monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: True)
+    # Dual-Trigger Model (2026-08-17): _spawn_one now refuses to spawn past
+    # TRADE_WINDOW_END (15:09 IST) -- fixed to 11:00 IST on TODAY so this
+    # file's tests stay deterministic regardless of when the suite actually
+    # runs, same reasoning test_phase4_strategies_e2e.py's own
+    # _fixed_trade_window_clock fixture already established.
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 11, 0, tzinfo=IST)
+    )
     return calls
 
 
@@ -108,11 +121,7 @@ def _contract(db: Session, instrument: Instrument, expiry: date, strike: float, 
 
 
 def _alerts_for(db: Session, trading_session: TradingSession) -> list[SystemAlert]:
-    return (
-        db.query(SystemAlert)
-        .filter(SystemAlert.trading_session_id == trading_session.id)
-        .all()
-    )
+    return db.query(SystemAlert).filter(SystemAlert.trading_session_id == trading_session.id).all()
 
 
 def _enabled_config(db: Session, workspace, *, name="orb-nifty", underlying_symbol="NIFTY"):
@@ -325,3 +334,175 @@ def test_one_bad_config_does_not_block_others(
 
     assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == bad.id).count() == 0
     assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == good.id).count() == 1
+
+
+# -- Dual-Trigger Model (2026-08-17): date-aware checks, 15:09 gate --------
+
+
+def _stopped_run_today(db, config, trading_session, instrument, user):
+    """A run that already happened today and was stopped -- either by a
+    human or by the EOD-stop logic -- at the same frozen `now_ist()` this
+    file's autouse fixture uses (2026-08-18 11:00 IST == 05:30 UTC).
+    """
+    started_at = datetime(2026, 8, 18, 5, 30, tzinfo=UTC)
+    run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=config.id,
+        trading_session_id=trading_session.id,
+        execution_mode="auto",
+        status=StrategyRunStatus.STOPPED,
+        started_at=started_at,
+        stopped_at=started_at,
+        started_by_user_id=user.id,
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 8, 20),
+        interval_seconds=30.0,
+    )
+    db.add(run)
+    db.flush()
+    return run
+
+
+def test_ambient_path_does_not_resurrect_a_run_stopped_earlier_today(
+    db, workspace, trading_session, nifty, user, _fake_snapshot_and_broker
+):
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+    _stopped_run_today(db, config, trading_session, nifty, user)
+
+    spawn_enabled_strategies(db, trading_session, TODAY)
+
+    # Still just the one (stopped) row -- nothing new spawned.
+    assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).count() == 1
+
+
+def test_spawn_one_now_ignores_a_run_stopped_earlier_today(
+    db, workspace, trading_session, nifty, user, _fake_snapshot_and_broker
+):
+    """The mid-day Power-toggle-ON path is the one caller that must be able
+    to re-arm a strategy already stopped earlier the same day -- the exact
+    opposite of the ambient path's own contract, tested just above.
+    """
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+    _stopped_run_today(db, config, trading_session, nifty, user)
+
+    outcome = spawn_one_now(db, trading_session, config, actor_id=user.id)
+
+    assert outcome.status == SpawnStatus.SPAWNED
+    assert outcome.run is not None
+    active = (
+        db.query(StrategyRun)
+        .filter(
+            StrategyRun.strategy_config_id == config.id,
+            StrategyRun.status != StrategyRunStatus.STOPPED,
+        )
+        .one()
+    )
+    assert active.id == outcome.run.id
+
+
+def test_spawn_one_now_still_refuses_a_currently_active_run(
+    db, workspace, trading_session, nifty, user, _fake_snapshot_and_broker
+):
+    """ignore_stopped_today must not be mistaken for "ignore everything" --
+    a genuinely active run (not stopped, regardless of date) always blocks,
+    for both callers.
+    """
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+    spawn_enabled_strategies(db, trading_session, TODAY)
+    assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).count() == 1
+
+    outcome = spawn_one_now(db, trading_session, config, actor_id=user.id)
+
+    assert outcome.status == SpawnStatus.ALREADY_ACTIVE
+    assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).count() == 1
+
+
+def test_trade_window_closed_blocks_the_ambient_path(
+    db, workspace, trading_session, nifty, user, monkeypatch, _fake_snapshot_and_broker
+):
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 15, 30, tzinfo=IST)
+    )
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    outcome = _spawn_one(db, trading_session, config, TODAY, {}, set())
+
+    assert outcome.status == SpawnStatus.TRADE_WINDOW_CLOSED
+    assert db.query(StrategyRun).count() == 0
+
+
+def test_trade_window_closed_blocks_the_explicit_toggle_too(
+    db, workspace, trading_session, nifty, user, monkeypatch, _fake_snapshot_and_broker
+):
+    """No exception for a deliberate human click -- past 15:09 nothing can
+    ever trade today regardless of who or what asked for the spawn.
+    """
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 15, 30, tzinfo=IST)
+    )
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    outcome = spawn_one_now(db, trading_session, config, actor_id=user.id)
+
+    assert outcome.status == SpawnStatus.TRADE_WINDOW_CLOSED
+    assert db.query(StrategyRun).count() == 0
+
+
+def test_ambient_spawn_is_audited_as_system_with_no_actor(
+    db, workspace, trading_session, nifty, _fake_snapshot_and_broker
+):
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    spawn_enabled_strategies(db, trading_session, TODAY)
+
+    event = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "strategy_run.auto_spawned")
+        .filter(AuditEvent.strategy_config_id == config.id)
+        .one()
+    )
+    assert event.actor_type == "system"
+    assert event.actor_id is None
+
+
+def test_spawn_one_now_is_audited_as_the_clicking_user(
+    db, workspace, trading_session, nifty, user, _fake_snapshot_and_broker
+):
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    spawn_one_now(db, trading_session, config, actor_id=user.id)
+
+    event = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "strategy_run.auto_spawned")
+        .filter(AuditEvent.strategy_config_id == config.id)
+        .one()
+    )
+    assert event.actor_type == "user"
+    assert event.actor_id == user.id
+
+
+def test_a_second_spawn_attempt_after_success_is_a_noop(
+    db, workspace, trading_session, nifty, _fake_snapshot_and_broker
+):
+    """Not a real concurrency test (pytest is single-threaded here), but
+    pins the decision logic two near-simultaneous callers actually rely on:
+    once the first call's insert has landed, a second call for the same
+    config must see ALREADY_ACTIVE, never create a sibling run.
+    """
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    first = _spawn_one(db, trading_session, config, TODAY, {}, set())
+    second = _spawn_one(db, trading_session, config, TODAY, {}, set())
+
+    assert first.status == SpawnStatus.SPAWNED
+    assert second.status == SpawnStatus.ALREADY_ACTIVE
+    assert db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).count() == 1
