@@ -23,6 +23,23 @@ broken until directly diagnosed). Fixed by keying the callback by symbol
 instead: the two real callers subscribe disjoint symbol sets (underlyings
 vs option contracts), so this was never actually a multiple-subscribers-
 per-symbol problem, just the wrong sharing granularity.
+
+**2026-08-17: the "disjoint symbol sets" premise above was wrong for one
+case.** `PositionManager._ensure_symbol_subscribed` also subscribes the
+*underlying* itself (a no-op callback, purely to warm `get_latest_tick()`
+for its own live-price read on that position) — the exact same symbol
+`MarketDataIngestionService` already registered its real persistence
+callback for. Per-symbol keying alone doesn't stop a second caller from
+clobbering the first caller's callback on a symbol they both legitimately
+subscribe to. Live-confirmed the same way as 2026-08-13: `quote_ticks` for
+NIFTY stopped incrementing at the exact moment a position opened, while raw
+WS frames kept arriving uninterrupted (a temporary diagnostic proved this
+was a client-side registration bug, not a broker-side drop). Fixed by
+making registration first-registrant-wins (`dict.setdefault` instead of
+unconditional assignment) — safe because every real caller here always
+subscribes a given symbol with the same callback on every call, so keeping
+whichever callback arrived first never discards a caller's own intended
+callback, only a different caller's redundant later subscribe.
 """
 
 from __future__ import annotations
@@ -87,9 +104,9 @@ class BrokerPortMarketDataAdapter(BaseMarketDataProvider):
     ) -> None:
         with self._lock:
             for symbol in symbols:
-                self._on_tick_by_symbol[symbol] = on_tick
+                self._on_tick_by_symbol.setdefault(symbol, on_tick)
                 if on_depth is not None:
-                    self._on_depth_by_symbol[symbol] = on_depth
+                    self._on_depth_by_symbol.setdefault(symbol, on_depth)
         # Only pass a real depth dispatcher through when at least this call
         # actually wants depth -- passing self._handle_depth unconditionally
         # would signal "subscribe depth" to the broker even for a caller

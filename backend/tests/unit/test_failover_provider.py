@@ -506,6 +506,37 @@ def test_two_symbols_with_different_callbacks_do_not_cross_talk(make_provider):
     assert option_ticks[0].contract_symbol == "NIFTY18AUG26C24400"
 
 
+def test_resubscribing_the_same_symbol_with_a_different_callback_does_not_clobber_it(
+    make_provider,
+):
+    """Real, live bug fixed 2026-08-17: the 2026-08-13 fix above assumed
+    ingestion and PositionManager subscribe *disjoint* symbol sets
+    (underlyings vs option contracts) -- true for options, false for the
+    underlying itself. PositionManager._ensure_symbol_subscribed also
+    subscribes the underlying (a no-op callback, purely to warm
+    get_latest_tick() for its own live-price read on an open position),
+    colliding on the exact symbol MarketDataIngestionService already
+    registered its real persistence callback for. Live-confirmed: NIFTY's
+    quote_ticks stopped incrementing at the exact moment a position opened
+    and PositionManager's own underlying re-subscribe fired, while real WS
+    frames kept arriving on the wire uninterrupted -- a client-side
+    registration bug, not a broker-side drop. First-registrant-wins
+    (setdefault) fixes this.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    underlying_ticks: list[Tick] = []
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=underlying_ticks.append)
+    # PositionManager's own later re-subscribe of the *same* underlying,
+    # for its own live-price read -- must not steal NIFTY's callback slot.
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _tick: None)
+
+    primary.fire_tick(_tick("NIFTY"))
+
+    assert len(underlying_ticks) == 1
+
+
 def test_per_symbol_routing_composes_correctly_with_active_leg_routing(make_provider):
     """Two symbols, two callbacks, subscribed before a failover trip -- once
     tripped to backup, ticks for each symbol from backup must still reach

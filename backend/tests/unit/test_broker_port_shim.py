@@ -86,6 +86,35 @@ def test_a_second_subscribers_no_op_callback_does_not_silence_the_first():
     assert len(nifty_ticks) == 1
 
 
+def test_resubscribing_the_same_symbol_with_a_different_callback_does_not_clobber_it():
+    """Real, live bug fixed 2026-08-17: the 2026-08-13 fix above assumed
+    ingestion and PositionManager subscribe *disjoint* symbol sets
+    (underlyings vs option contracts) -- true for options, false for the
+    underlying itself. PositionManager._ensure_symbol_subscribed also
+    subscribes the underlying (a no-op callback, purely to warm
+    get_latest_tick() for its own live-price read on an open position),
+    colliding on the exact symbol MarketDataIngestionService already
+    registered its real persistence callback for. Live-confirmed: NIFTY's
+    quote_ticks stopped incrementing at the exact moment a position opened
+    and PositionManager's own underlying re-subscribe fired, while real WS
+    frames kept arriving on the wire uninterrupted. First-registrant-wins
+    (setdefault) fixes this: a later subscribe for an already-registered
+    symbol must not replace the first caller's callback.
+    """
+    broker = _FakeBrokerPort()
+    provider = BrokerPortMarketDataAdapter(broker)
+    nifty_ticks: list[Tick] = []
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=nifty_ticks.append)
+    # PositionManager's own later re-subscribe of the *same* underlying,
+    # for its own live-price read -- must not steal NIFTY's callback slot.
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _tick: None)
+
+    broker.fire_tick(_tick("NIFTY"))
+
+    assert len(nifty_ticks) == 1
+
+
 def test_get_latest_tick_updates_regardless_of_which_symbols_callback():
     broker = _FakeBrokerPort()
     provider = BrokerPortMarketDataAdapter(broker)

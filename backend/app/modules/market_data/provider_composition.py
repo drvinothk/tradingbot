@@ -52,10 +52,15 @@ logger = logging.getLogger("app.market_data.provider_composition")
 
 _RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
 # Backup legs supported for MARKET_DATA_FAILOVER_BACKUP_PROVIDER today --
-# narrower than _RECOGNIZED_PROVIDERS on purpose: TrueData is a deliberately
-# deferred scope call (not yet live-tested as a failover backup at all), and
-# "mock"/self-as-backup are never valid regardless of provider.
-_RECOGNIZED_FAILOVER_BACKUPS = ("angel_one",)
+# narrower than _RECOGNIZED_PROVIDERS on purpose: "mock"/self-as-backup are
+# never valid regardless of provider. "shoonya" added 2026-08-17 for the
+# TrueData-primary/Shoonya-backup configuration -- `_build_provider` already
+# handled "shoonya" (it's the same `BrokerPortMarketDataAdapter(get_broker())`
+# every other Shoonya-market-data path already uses), this was purely the
+# allowlist gate. "truedata" itself is deliberately still excluded as a
+# *backup* value -- nothing in this codebase configures it that way yet, and
+# adding it speculatively would just be one more untested combination.
+_RECOGNIZED_FAILOVER_BACKUPS = ("angel_one", "shoonya")
 
 _provider: BaseMarketDataProvider | None = None
 _scrip_master: ScripMasterService | None = None

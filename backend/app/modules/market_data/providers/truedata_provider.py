@@ -79,6 +79,38 @@ and read the current package directly):**
   2026-08-11 fallback-strategy note in `docs/architecture/build-plan.md`
   regarding Shoonya's own option-chain zero-price gap.
 
+**2026-08-17: live-verified against a real trial account for the first
+time** (see the memory note this session wrote,
+`project_truedata_live_tick_verification_2026_08_17`, for the full
+account) — confirmed via a standalone isolated script, not through this
+module directly, but two facts from that session feed directly into this
+module's own correctness:
+- **Real host/port confirmed**: `push.truedata.in:8086` — the *production*
+  host, on the *sandbox* port. `TrueDataSettings.live_port`'s own
+  pre-existing default (8084, from the official PDF's "Production" entry)
+  needs overriding to 8086 for this trial account via
+  `config/credentials/truedata.env`, not a code change.
+  `wstest.truedata.in` (the "Sandbox > Test" link in TrueData's own
+  onboarding email) is a red herring — it's a Cloudflare-fronted web page,
+  not a data host; `TD_live` against it hangs forever with zero error.
+- **Real index-tick symbol strings confirmed, and they do NOT match this
+  codebase's own internal underlying symbols.** `TRADABLE_UNDERLYINGS`
+  (`market_hours.py`) is `("NIFTY", "BANKNIFTY")` — but TrueData's real
+  symbols are `"NIFTY 50"` and `"NIFTY BANK"`. Before this fix, this
+  module passed the internal symbol straight through to
+  `start_live_data`/`stop_live_data` with no translation, which would have
+  silently subscribed to nothing against a real account. `_TO_TRUEDATA_
+  SYMBOL` below (translated out on subscribe/unsubscribe/history, and
+  back on every tick received via `_to_truedata_symbol`'s use as the
+  `live_data` lookup key while `Tick.contract_symbol` stays the internal
+  name) fixes this — the same
+  "bridge this codebase's own symbol convention to the broker's real one"
+  shape `AngelOneMarketDataProvider`'s `ScripMasterService` already uses,
+  just a static 2-entry map here since only these two underlyings are ever
+  subscribed via this interface (option-chain/OI/VIX are a separate,
+  deliberately out-of-scope pipeline as of this note — see that memory
+  entry for what's deferred and why).
+
 **NOT confirmed — still inferred/unverified, flagged exactly like every
 other unverified assumption in this codebase:**
 - Real connection/login behavior against an actual account — `TD_live.
@@ -132,6 +164,22 @@ _HISTORICAL_BAR_SIZE_BY_TIMEFRAME: dict[int, str] = {
     1800: "30min",
     3600: "60min",
 }
+
+# Confirmed live 2026-08-17 (see module docstring) -- this codebase's own
+# internal underlying symbols (`market_hours.TRADABLE_UNDERLYINGS`) don't
+# match TrueData's real index-tick symbol strings. Every subscribe/
+# unsubscribe/history call translates out through this map; every tick
+# received back is translated back to the internal symbol before being
+# handed to a caller, so `price_bars`/indicator persistence keeps using the
+# one convention the rest of this codebase already relies on.
+_TO_TRUEDATA_SYMBOL: dict[str, str] = {
+    "NIFTY": "NIFTY 50",
+    "BANKNIFTY": "NIFTY BANK",
+}
+
+
+def _to_truedata_symbol(symbol: str) -> str:
+    return _TO_TRUEDATA_SYMBOL.get(symbol, symbol)
 
 
 def _row_to_candle(row: Any) -> PriceCandle:
@@ -242,7 +290,7 @@ class TrueDataProvider(BaseMarketDataProvider):
             self._subscribed_symbols.update(new_symbols)
 
         assert self._td_live is not None
-        self._td_live.start_live_data(new_symbols)
+        self._td_live.start_live_data([_to_truedata_symbol(s) for s in new_symbols])
 
     def unsubscribe_ticks(self, symbols: list[str]) -> None:
         if self._td_live is None:
@@ -255,7 +303,7 @@ class TrueDataProvider(BaseMarketDataProvider):
                 self._subscribed_symbols.discard(symbol)
                 self._latest_ticks.pop(symbol, None)
                 self._last_pushed_ts.pop(symbol, None)
-        self._td_live.stop_live_data(to_remove)
+        self._td_live.stop_live_data([_to_truedata_symbol(s) for s in to_remove])
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
         with self._lock:
@@ -276,7 +324,7 @@ class TrueDataProvider(BaseMarketDataProvider):
             symbols = list(self._subscribed_symbols)
 
         for symbol in symbols:
-            feed = self._td_live.live_data.get(symbol)
+            feed = self._td_live.live_data.get(_to_truedata_symbol(symbol))
             if feed is None or feed.timestamp is None:
                 continue
 
@@ -343,7 +391,7 @@ class TrueDataProvider(BaseMarketDataProvider):
             )
 
         df = self._td_hist.get_historic_data(
-            underlying,
+            _to_truedata_symbol(underlying),
             start_time=start.astimezone(IST).replace(tzinfo=None),
             end_time=end.astimezone(IST).replace(tzinfo=None),
             bar_size=bar_size,

@@ -114,6 +114,30 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         # quote_ticks/price_bars persistence for everything, system-wide,
         # the moment any position opened -- live-confirmed 2026-08-13, same
         # root cause and fix as broker_port_shim.py/angel_one.py.
+        #
+        # **2026-08-17: real gap in that fix, found and fixed.** The
+        # 2026-08-13 writeup assumed "the two real callers subscribe
+        # disjoint symbol sets" (ingestion on underlyings, PositionManager
+        # on option contracts) -- true for options, false for the
+        # underlying itself: PositionManager._ensure_symbol_subscribed also
+        # subscribes the *underlying* (for its own live-price read on that
+        # position, via a no-op callback), which collides on the exact same
+        # symbol MarketDataIngestionService already registered its real
+        # persistence callback for. Per-symbol keying alone doesn't stop a
+        # second *caller* from clobbering the first caller's callback on a
+        # symbol they both legitimately subscribe to. Live-confirmed via a
+        # temporary raw-frame diagnostic (now removed): quote_ticks for
+        # NIFTY stopped incrementing at the exact millisecond
+        # PositionManager's own "SUBSCRIBE sent: keys='NSE|26000'" fired,
+        # while the real WS frames kept arriving on the wire uninterrupted
+        # (proving this was a client-side callback-registration bug, not a
+        # broker-side subscription drop). Fixed by making registration
+        # first-registrant-wins (`setdefault` instead of unconditional
+        # assignment) -- safe because every real caller in this codebase
+        # always subscribes a given symbol with the exact same callback on
+        # every call, so "keep whichever callback got here first" never
+        # actually discards a caller's *own* intended callback, only a
+        # different caller's redundant later subscribe.
         self._on_tick_by_symbol: dict[str, TickCallback] = {}
         self._on_depth_by_symbol: dict[str, DepthCallback] = {}
 
@@ -220,9 +244,15 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._symbols |= set(symbols)
         with self._lock:
             for symbol in symbols:
-                self._on_tick_by_symbol[symbol] = on_tick
+                # First registrant wins -- see 2026-08-17 incident note in
+                # this class's own docstring. PositionManager subscribing
+                # the *underlying* (for its own live-price read, via a
+                # no-op callback) after MarketDataIngestionService already
+                # registered the real persistence callback for that same
+                # symbol must not clobber it.
+                self._on_tick_by_symbol.setdefault(symbol, on_tick)
                 if on_depth is not None:
-                    self._on_depth_by_symbol[symbol] = on_depth
+                    self._on_depth_by_symbol.setdefault(symbol, on_depth)
             if self._subscribed_at is None:
                 self._subscribed_at = self._clock()
         self._primary.subscribe_ticks(

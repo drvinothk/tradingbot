@@ -143,17 +143,23 @@ class AngelOneMarketDataProvider(BaseMarketDataProvider):
         underlying callback, breaking `quote_ticks`/`price_bars` persistence
         for everything, system-wide, the moment any position opened --
         live-confirmed 2026-08-13 (see broker_port_shim.py's identical fix,
-        same root cause, for the full incident writeup). Safe to key by
-        symbol instead since the two real callers subscribe disjoint symbol
-        sets and each always resubscribes with its own same callback.
+        same root cause, for the full incident writeup).
+
+        **2026-08-17**: per-symbol keying alone wasn't the full fix --
+        `PositionManager` also subscribes the *underlying* itself (not just
+        option contracts), colliding on the same symbol/caller pair
+        ingestion already owns. Registration is now first-registrant-wins
+        (`setdefault`) rather than unconditional assignment, matching
+        `broker_port_shim.py`'s identical fix -- see that module's
+        docstring for the full incident writeup.
         """
         if self._feed_token is None:
             self.connect()
         with self._lock:
             for symbol in symbols:
-                self._on_tick_by_symbol[symbol] = on_tick
+                self._on_tick_by_symbol.setdefault(symbol, on_tick)
                 if on_depth is not None:
-                    self._on_depth_by_symbol[symbol] = on_depth
+                    self._on_depth_by_symbol.setdefault(symbol, on_depth)
 
         if self._ws is None:
             self._ws = AngelWSClient(

@@ -106,13 +106,32 @@ class _FakeTDHist:
         return self.result if self.result is not None else _FakeHistDataFrame()
 
 
-def test_subscribe_ticks_calls_start_live_data_with_the_symbols():
+def test_subscribe_ticks_calls_start_live_data_with_the_truedata_symbols():
+    """Confirmed live 2026-08-17 (see module docstring): TrueData's real
+    index-tick symbols are "NIFTY 50"/"NIFTY BANK", not this codebase's own
+    internal "NIFTY"/"BANKNIFTY" -- the SDK call must see the translated
+    name, while every other method (get_latest_tick included) keeps using
+    the internal one.
+    """
     td_live = _FakeTDLive()
     provider = TrueDataProvider(SETTINGS, td_live_client=td_live)
 
     provider.subscribe_ticks(["NIFTY", "BANKNIFTY"], on_tick=lambda _t: None)
 
-    assert td_live.start_live_data_calls == [["NIFTY", "BANKNIFTY"]]
+    assert td_live.start_live_data_calls == [["NIFTY 50", "NIFTY BANK"]]
+
+
+def test_subscribe_ticks_passes_through_an_unmapped_symbol_unchanged():
+    """Only the two known underlyings have a real TrueData translation
+    (see module docstring) -- anything else passes through as-is rather
+    than raising, matching `_to_truedata_symbol`'s own `dict.get` fallback.
+    """
+    td_live = _FakeTDLive()
+    provider = TrueDataProvider(SETTINGS, td_live_client=td_live)
+
+    provider.subscribe_ticks(["SOMEOTHERSYMBOL"], on_tick=lambda _t: None)
+
+    assert td_live.start_live_data_calls == [["SOMEOTHERSYMBOL"]]
 
 
 def test_subscribe_ticks_is_idempotent_per_symbol():
@@ -124,7 +143,7 @@ def test_subscribe_ticks_is_idempotent_per_symbol():
 
     # Second call must only request the genuinely new symbol.
     assert len(td_live.start_live_data_calls) == 2
-    assert td_live.start_live_data_calls[1] == ["BANKNIFTY"]
+    assert td_live.start_live_data_calls[1] == ["NIFTY BANK"]
 
 
 def test_unsubscribe_ticks_clears_the_symbol_and_calls_stop_live_data():
@@ -134,7 +153,7 @@ def test_unsubscribe_ticks_clears_the_symbol_and_calls_stop_live_data():
 
     provider.unsubscribe_ticks(["NIFTY"])
 
-    assert td_live.stop_live_data_calls == [["NIFTY"]]
+    assert td_live.stop_live_data_calls == [["NIFTY 50"]]
     assert provider.get_latest_tick("NIFTY") is None
 
 
@@ -142,6 +161,10 @@ def test_update_signal_pushes_a_fresh_tick_when_live_data_changes():
     """Neither `trade_callback` nor `bidask_callback` carry a resolvable
     symbol in this version of the library (see module docstring) — any
     fire re-scans `td_live.live_data` for subscribed symbols instead.
+    `live_data` is keyed by TrueData's own real symbol ("NIFTY 50"), but
+    the resulting `Tick.contract_symbol`/`get_latest_tick` key stays this
+    codebase's internal "NIFTY" (see the 2026-08-17 symbol-mapping note in
+    the module docstring).
     """
     td_live = _FakeTDLive()
     provider = TrueDataProvider(SETTINGS, td_live_client=td_live)
@@ -149,8 +172,8 @@ def test_update_signal_pushes_a_fresh_tick_when_live_data_changes():
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: received.append(t.ltp))
 
     ts = datetime(2026, 8, 11, 9, 20, 0)
-    td_live.live_data["NIFTY"] = _fake_feed(
-        "NIFTY",
+    td_live.live_data["NIFTY 50"] = _fake_feed(
+        "NIFTY 50",
         ltp=24500.0,
         timestamp=ts,
         ttq=10,
@@ -180,7 +203,7 @@ def test_update_signal_is_a_noop_when_timestamp_is_unchanged():
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: received.append(t.ltp))
 
     ts = datetime(2026, 8, 11, 9, 20, 0)
-    td_live.live_data["NIFTY"] = _fake_feed("NIFTY", ltp=24500.0, timestamp=ts)
+    td_live.live_data["NIFTY 50"] = _fake_feed("NIFTY 50", ltp=24500.0, timestamp=ts)
     provider._handle_any_update(None)  # noqa: SLF001
     provider._handle_any_update(None)  # noqa: SLF001
 
@@ -193,11 +216,12 @@ def test_update_signal_ignores_a_symbol_never_subscribed():
     provider = TrueDataProvider(SETTINGS, td_live_client=td_live)
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda _t: None)
 
-    # BANKNIFTY shows up in live_data (e.g. some other caller subscribed
-    # it against the same shared td_live) but this provider instance never
-    # subscribed it -- must not leak into get_latest_tick.
-    td_live.live_data["BANKNIFTY"] = _fake_feed(
-        "BANKNIFTY", ltp=51000.0, timestamp=datetime(2026, 8, 11, 9, 20, 0)
+    # BANKNIFTY (as "NIFTY BANK") shows up in live_data (e.g. some other
+    # caller subscribed it against the same shared td_live) but this
+    # provider instance never subscribed it -- must not leak into
+    # get_latest_tick.
+    td_live.live_data["NIFTY BANK"] = _fake_feed(
+        "NIFTY BANK", ltp=51000.0, timestamp=datetime(2026, 8, 11, 9, 20, 0)
     )
     provider._handle_any_update(None)  # noqa: SLF001
 
@@ -229,7 +253,7 @@ def test_get_price_history_maps_dataframe_rows_correctly():
     assert candles[0].close == 100.5
     assert candles[0].volume == 10
     symbol, start_time, end_time, bar_size = td_hist.historic_calls[0]
-    assert symbol == "NIFTY"
+    assert symbol == "NIFTY 50"
     # Confirmed real value (see module docstring): the library's own
     # `historical_decorator` normalizes spacing/pluralization anyway, but
     # this module sends the plain form directly.
@@ -273,8 +297,8 @@ def test_disconnect_clears_all_local_state():
     td_live = _FakeTDLive()
     provider = TrueDataProvider(SETTINGS, td_live_client=td_live)
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda _t: None)
-    td_live.live_data["NIFTY"] = _fake_feed(
-        "NIFTY", ltp=100.0, timestamp=datetime(2026, 8, 11, 9, 20, 0)
+    td_live.live_data["NIFTY 50"] = _fake_feed(
+        "NIFTY 50", ltp=100.0, timestamp=datetime(2026, 8, 11, 9, 20, 0)
     )
     provider._handle_any_update(None)  # noqa: SLF001
     assert provider.get_latest_tick("NIFTY") is not None

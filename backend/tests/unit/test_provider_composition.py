@@ -173,17 +173,39 @@ def test_failover_backup_same_as_primary_raises(monkeypatch):
 
 
 def test_failover_unrecognized_backup_raises(monkeypatch):
-    # "shoonya" is a real, recognized *provider* -- just not (yet) a
-    # supported failover *backup*, so this proves the two checks are
+    # "truedata" is a real, recognized *provider* -- just not (yet) a
+    # supported failover *backup* (see _RECOGNIZED_FAILOVER_BACKUPS's own
+    # comment on why that's deliberate), so this proves the two checks are
     # actually separate, not just re-checking _RECOGNIZED_PROVIDERS.
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("angel_one", "truedata"),
+    )
+
+    with pytest.raises(ValueError, match="truedata"):
+        provider_composition.get_market_data_provider()
+
+
+def test_failover_shoonya_backup_is_recognized(monkeypatch):
+    """2026-08-17: TrueData-primary/Shoonya-backup is now a real, supported
+    configuration -- `_build_provider("shoonya", ...)` already resolved to
+    `BrokerPortMarketDataAdapter(get_broker())` before this, this test
+    proves the allowlist gate itself no longer blocks it.
+    """
+    from app.modules.market_data.providers.failover import FailoverMarketDataProvider
+
     monkeypatch.setattr(
         provider_composition,
         "get_settings",
         lambda: _settings_with_failover("truedata", "shoonya"),
     )
 
-    with pytest.raises(ValueError, match="shoonya"):
-        provider_composition.get_market_data_provider()
+    provider = provider_composition.get_market_data_provider()
+
+    inner = provider._inner  # noqa: SLF001 - intentionally reaching in to assert composition
+    assert isinstance(inner, FailoverMarketDataProvider)
+    assert inner.active_provider_name == "truedata"
 
 
 def test_failover_enabled_with_mock_provider_is_noop(monkeypatch):

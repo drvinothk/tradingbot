@@ -54,5 +54,10 @@ backend/reports/
 backend/mock_data/
 backend/trade_breakdown.txt
 
+# Fetched TrueData historical data (scripts/fetch_truedata_historical.py) —
+# regenerable real market data, not source, same reasoning as mock_data/
+# above. Also potentially sizable (per-contract 1-min CSVs).
+backend/data/
+
 # Claude
 .claude/settings.local.json

@@ -465,6 +465,40 @@ def test_two_symbols_subscribed_separately_with_different_callbacks_do_not_cross
     assert option_ticks[0].contract_symbol == "NIFTY30JUL2624000CE"
 
 
+def test_resubscribing_the_same_symbol_with_a_different_callback_does_not_clobber_it(
+    provider: AngelOneMarketDataProvider,
+):
+    """Real, live bug fixed 2026-08-17: the 2026-08-13 fix above assumed
+    ingestion and PositionManager subscribe *disjoint* symbol sets
+    (underlyings vs option contracts) -- true for options, false for the
+    underlying itself. PositionManager._ensure_symbol_subscribed also
+    subscribes the underlying (a no-op callback, purely to warm
+    get_latest_tick() for its own live-price read on an open position),
+    colliding on the exact symbol MarketDataIngestionService already
+    registered its real persistence callback for -- live-confirmed on the
+    Shoonya-backed provider the same way (see broker_port_shim.py's own
+    fix), and this provider shares the identical subscribe_ticks shape.
+    First-registrant-wins (setdefault) fixes this.
+    """
+    from app.modules.market_data.providers.angel_ws_client import RawAngelTick
+
+    underlying_ticks: list = []
+    provider.subscribe_ticks(["NIFTY"], on_tick=underlying_ticks.append)
+    # PositionManager's own later re-subscribe of the *same* underlying,
+    # for its own live-price read -- must not steal NIFTY's callback slot.
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda _tick: None)
+    ws = _FakeWSClient.instances[0]
+
+    ws.on_tick(
+        RawAngelTick(
+            token="26000", ltp=24300.0, bid=24299.5, ask=24300.5, volume=0, oi=None,
+            ts=datetime.now(UTC),
+        )
+    )
+
+    assert len(underlying_ticks) == 1
+
+
 def test_subscribe_ticks_skips_unmapped_symbols_without_raising(
     provider: AngelOneMarketDataProvider,
 ):
