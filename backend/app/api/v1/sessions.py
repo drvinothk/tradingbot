@@ -19,6 +19,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes import (
     ModeTransitionError,
     enter_kill_switch,
+    recover_from_degraded,
     set_master_trading_mode,
     transition_mode,
 )
@@ -395,6 +396,47 @@ def recover_from_kill_switch(
             TransitionTriggerType.MANUAL,
             actor_user=user,
             reason="manual recovery from kill_switch",
+        )
+    except ModeTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.commit()
+    db.refresh(trading_session)
+    return trading_session
+
+
+@router.post("/{session_id}/recover-from-degraded", response_model=SessionOut)
+def recover_from_degraded_mode(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("livetrade.execute")),
+) -> TradingSession:
+    """2026-08-18 addition, closing the same class of gap
+    `recover_from_kill_switch` closed for that mode: `degraded_mode` is
+    entered automatically by two independent health checks
+    (`scheduler.health_check`'s NTP/disk trip, or a broker-auth failure
+    `PositionManager` detects mid-session) but had no recovery path
+    anywhere in the app -- no endpoint, no button. A session that trips
+    into `degraded_mode` from `live_enabled`/`paper_plus_guarded_live` was
+    stuck there permanently until this existed.
+
+    `recover_from_degraded`'s own target is dynamic (`trading_session
+    .prior_mode`, falling back to `paper_only` if unset) and it already
+    enforces the real bar itself -- resuming to `paper_only` can be
+    automatic, but resuming to anything above it always requires a manual
+    trigger, a real actor, and `livetrade.execute`, raising
+    `ModeTransitionError` otherwise. This endpoint's own declared
+    permission matches that same bar (rather than something looser like
+    `session.stop`) so a user without it gets a clean 403 up front instead
+    of reaching the function and hitting a 409 from `ModeTransitionError`.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    try:
+        recover_from_degraded(
+            db,
+            trading_session,
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="manual recovery from degraded_mode",
         )
     except ModeTransitionError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc

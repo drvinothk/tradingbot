@@ -87,6 +87,13 @@ export function SessionsPage() {
     onError: (err) => setActionError(err instanceof ApiError ? err.message : 'Recover failed'),
   })
 
+  const recoverFromDegradedMutation = useMutation({
+    mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/recover-from-degraded`),
+    onSuccess: invalidateSessions,
+    onError: (err) =>
+      setActionError(err instanceof ApiError ? err.message : 'Recover from degraded failed'),
+  })
+
   const bulkModeMutation = useMutation({
     mutationFn: (mode: 'force_paper' | null) =>
       api.post('/strategies/bulk-runtime-mode', { mode }),
@@ -271,6 +278,20 @@ export function SessionsPage() {
                           onClick={() => killSwitchMutation.mutate(session.id)}
                         >
                           Kill switch
+                        </button>
+                      )}
+                      {/* degraded_mode: entered automatically by a health-
+                          check trip (NTP/disk) or a mid-session broker-auth
+                          failure -- offer both a way back (Recover, to
+                          whatever mode it dropped from) and a way to
+                          escalate instead (Kill switch, already rendered
+                          above since degraded_mode isn't 'kill_switch'). */}
+                      {session.mode === 'degraded_mode' && (
+                        <button
+                          disabled={recoverFromDegradedMutation.isPending}
+                          onClick={() => recoverFromDegradedMutation.mutate(session.id)}
+                        >
+                          Recover
                         </button>
                       )}
                       {/* Master switch. Hidden entirely for the three

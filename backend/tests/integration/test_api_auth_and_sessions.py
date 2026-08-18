@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db.session import get_db
+from app.core.modes import transition_mode
 from app.core.security.passwords import hash_password
 from app.domain.identity.models import (
     BrokerAccount,
@@ -34,6 +35,7 @@ from app.domain.identity.models import (
     UserRole,
     Workspace,
 )
+from app.domain.session.models import SafeMode, TradingSession, TransitionTriggerType
 from app.main import app
 
 ADMIN_PASSWORD = "correct horse battery staple 123!"
@@ -720,3 +722,124 @@ def test_bootstrap_now_calls_run_daily_bootstrap(api_client: TestClient, seeded_
     assert response.status_code == 200
     assert response.json() == {"ok": True}
     assert len(calls) == 1
+
+
+# -- POST /sessions/{id}/recover-from-degraded (2026-08-18) ---------------
+
+
+def _drop_session_into_degraded(engine, session_id: str) -> None:
+    """Simulates what scheduler.health_check/PositionManager actually do --
+    a SYSTEM-triggered transition into degraded_mode -- since there is
+    (deliberately) no API endpoint that lets a human enter this mode
+    directly.
+    """
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        trading_session = db.get(TradingSession, uuid.UUID(session_id))
+        assert trading_session is not None
+        transition_mode(
+            db,
+            trading_session,
+            SafeMode.DEGRADED_MODE,
+            TransitionTriggerType.SYSTEM,
+            reason="simulated health-check trip",
+        )
+        db.commit()
+
+
+def test_recover_from_degraded_restores_prior_mode(api_client: TestClient, seeded_admin, engine):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    _drop_session_into_degraded(engine, session_id)
+
+    response = api_client.post(f"/api/v1/sessions/{session_id}/recover-from-degraded")
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "live_enabled"
+
+
+def test_recover_from_degraded_requires_login(api_client: TestClient):
+    response = api_client.post(f"/api/v1/sessions/{uuid.uuid4()}/recover-from-degraded")
+    assert response.status_code == 401
+
+
+def test_recover_from_degraded_rejects_without_livetrade_execute_permission(
+    api_client: TestClient, seeded_admin, engine
+):
+    """The endpoint's own declared permission (livetrade.execute) matches
+    the bar recover_from_degraded itself enforces for resuming above
+    paper_only -- a user missing it must get a clean 403 up front, never
+    even reaching the function (which would otherwise raise
+    ModeTransitionError -> 409 instead). No existing test in this file
+    exercises a permission-denied case via a real HTTP round trip, so this
+    builds its own limited user rather than reusing seeded_admin (which
+    intentionally holds every permission).
+    """
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    _drop_session_into_degraded(engine, session_id)
+    api_client.post("/api/v1/auth/logout")
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    limited_user_id = uuid.uuid4()
+    limited_role_id = uuid.uuid4()
+    limited_email = f"limited-{uuid.uuid4().hex[:8]}@example.com"
+    try:
+        with session_factory() as db:
+            limited_user = User(
+                id=limited_user_id,
+                workspace_id=seeded_admin["workspace_id"],
+                email=limited_email,
+                password_hash=hash_password(ADMIN_PASSWORD),
+                display_name="Limited Test User",
+                is_active=True,
+            )
+            db.add(limited_user)
+            db.flush()
+
+            role = Role(id=limited_role_id, name=f"limited-role-{uuid.uuid4().hex[:8]}")
+            db.add(role)
+            db.flush()
+
+            # session.stop only -- deliberately not livetrade.execute.
+            session_stop_permission = (
+                db.query(Permission).filter(Permission.code == "session.stop").one()
+            )
+            db.add(RolePermission(role_id=role.id, permission_id=session_stop_permission.id))
+            db.add(
+                UserRole(
+                    user_id=limited_user.id,
+                    role_id=role.id,
+                    workspace_id=seeded_admin["workspace_id"],
+                )
+            )
+            db.commit()
+
+        api_client.post(
+            "/api/v1/auth/login", json={"email": limited_email, "password": ADMIN_PASSWORD}
+        )
+        response = api_client.post(f"/api/v1/sessions/{session_id}/recover-from-degraded")
+
+        assert response.status_code == 403
+
+        # Must not have silently recovered the session on the way to
+        # rejecting.
+        api_client.post("/api/v1/auth/logout")
+        api_client.post(
+            "/api/v1/auth/login",
+            json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+        )
+        get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
+        assert get_resp.json()["mode"] == "degraded_mode"
+    finally:
+        with session_factory() as cleanup_db:
+            from app.domain.identity.models import LoginSession
+
+            cleanup_db.query(LoginSession).filter(LoginSession.user_id == limited_user_id).delete()
+            cleanup_db.query(UserRole).filter(UserRole.user_id == limited_user_id).delete()
+            cleanup_db.query(RolePermission).filter(
+                RolePermission.role_id == limited_role_id
+            ).delete()
+            cleanup_db.query(Role).filter(Role.id == limited_role_id).delete()
+            cleanup_db.query(User).filter(User.id == limited_user_id).delete()
+            cleanup_db.commit()
