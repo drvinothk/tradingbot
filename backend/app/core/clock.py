@@ -86,28 +86,54 @@ class DiskCheckResult:
     total_gb: float
 
 
+# OCI's link-local instance-metadata service, which also answers NTP --
+# reachable from inside any OCI VCN regardless of the public internet egress
+# rules that block generic outbound UDP/123 (live-confirmed 2026-08-18: this
+# box's own systemd-timesyncd already syncs against it successfully, while
+# `pool.ntp.org` gets no response at all -- same "cloud egress restricts
+# public endpoints" pattern already documented for Angel One's REST gateway
+# from this same box). Not OCI-specific by name in a way that breaks
+# portability: it's only ever tried as a fallback, after the public pool.
+_OCI_METADATA_NTP = "169.254.169.254"
+
+
 def check_ntp_drift(
     server: str = "pool.ntp.org",
     max_drift_seconds: float = 2.0,
     timeout: float = 5.0,
+    fallback_server: str | None = _OCI_METADATA_NTP,
 ) -> ClockCheckResult:
     """Compares local system time against an NTP server. `ok=False` on
     exceeding max_drift_seconds OR on failure to reach the server at all —
     a network hiccup and a genuinely drifted clock are both reasons this
     check shouldn't be trusted, and callers should treat them the same way
     (log + retry next cycle), not distinguish them.
+
+    `fallback_server`: tried only if `server` raises (never if it merely
+    reports excessive drift -- a real drift reading from the primary is
+    still a real answer, not a reason to go shopping for a different
+    server that might report something more convenient). Defaults to OCI's
+    metadata service since that's this project's actual deployment target;
+    pass `None` to disable the fallback entirely (e.g. in a test asserting
+    the primary-only behavior).
     """
-    try:
-        client = ntplib.NTPClient()
-        response = client.request(server, version=3, timeout=timeout)
-    except Exception as exc:  # noqa: BLE001 - any network/library failure is "not ok"
-        return ClockCheckResult(ok=False, drift_seconds=None, error=str(exc))
+    error: str | None = None
+    for candidate in (server, fallback_server):
+        if candidate is None:
+            continue
+        try:
+            client = ntplib.NTPClient()
+            response = client.request(candidate, version=3, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - any network/library failure is "not ok"
+            error = str(exc)
+            continue
 
-    ntp_time = datetime.fromtimestamp(response.tx_time, tz=UTC)
-    local_time = datetime.now(UTC)
-    drift = (local_time - ntp_time).total_seconds()
+        ntp_time = datetime.fromtimestamp(response.tx_time, tz=UTC)
+        local_time = datetime.now(UTC)
+        drift = (local_time - ntp_time).total_seconds()
+        return ClockCheckResult(ok=abs(drift) <= max_drift_seconds, drift_seconds=drift)
 
-    return ClockCheckResult(ok=abs(drift) <= max_drift_seconds, drift_seconds=drift)
+    return ClockCheckResult(ok=False, drift_seconds=None, error=error)
 
 
 def check_disk_space(path: str = "/", min_free_gb: float = 2.0) -> DiskCheckResult:
