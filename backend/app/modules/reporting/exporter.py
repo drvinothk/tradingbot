@@ -15,12 +15,15 @@ not one shared file — matches `HealthCheckScheduler`'s own precedent of
 never assuming single-tenant, and never mixes different workspaces'
 financial data in one file.
 
-**One tab per (underlying, expiry_date)**, not a single global "today's
-cycle" tab — each trade already carries its own cycle via its own
-contract's `expiry_date` (`OptionContract`, reached through
-`Position.option_contract_id`), so there's nothing to "determine": a day
-where, say, this week's and next week's contracts both traded correctly
-lands in two different tabs.
+**One tab per strategy** (`StrategyConfig.name`) — **2026-08-19, changed
+from the original one-tab-per-(underlying, expiry_date)** — a strategy's
+full trade history (across every underlying/expiry cycle it ever ran on,
+and across both paper and live trades — see the new "Paper/Live" column)
+in one place, since evaluating a strategy's own performance (and comparing
+its paper vs. live behavior) is the actual question this report exists to
+answer, not "what traded on a given expiry." `Underlying`/`Expiry` moved
+from being implied by the sheet name to explicit row columns, since a
+strategy's own tab can now span more than one of either.
 
 **Idempotent appends** — every row carries its source `TradeOutcome.id` as
 its last column; before appending, a tab's existing IDs are read and
@@ -50,10 +53,15 @@ from sqlalchemy.orm import Session
 from app.config.settings import BACKEND_ROOT_DIR
 from app.core.clock import IST, now_ist, to_ist
 from app.core.db.session import session_scope
-from app.domain.execution.models import Position, TradeOutcome
+from app.domain.execution.models import Order, Position, TradeOutcome
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
-from app.modules.strategy_engine.env_metrics import get_env_metrics
+from app.modules.strategy_engine.env_metrics import (
+    compute_pcr,
+    get_chain_data_as_of,
+    get_contract_oi,
+    get_vix_as_of,
+)
 
 logger = logging.getLogger("app.reporting.exporter")
 
@@ -63,7 +71,10 @@ REPORTS_DIR = BACKEND_ROOT_DIR / "reports"
 
 _HEADERS = [
     "Strategy",
+    "Underlying",
+    "Expiry",
     "Execution Mode",
+    "Paper/Live",
     "Contract Symbol",
     "Option Type",
     "Strike",
@@ -77,6 +88,7 @@ _HEADERS = [
     "Realized PnL",
     "Slippage",
     "VIX (at entry)",
+    "OI (at entry)",
     "PCR - OI (at entry)",
     "PCR - Volume (at entry)",
     "Trade ID (internal)",
@@ -90,6 +102,10 @@ class TradeLogRow:
     workspace_id: uuid.UUID
     strategy_name: str
     execution_mode: str
+    # "paper" / "live" -- Order.mode on the position's own opening order,
+    # not this system's SafeMode/session-level concept. Distinct from
+    # execution_mode (auto/manual approval), which is orthogonal to this.
+    trade_mode: str
     underlying_symbol: str
     contract_symbol: str
     option_type: str
@@ -104,12 +120,15 @@ class TradeLogRow:
     exit_reason: str
     realized_pnl: float
     slippage: float
-    # VIX/PCR environment metrics as of this trade's entry time, not
+    # VIX/PCR/OI environment metrics as of this trade's entry time, not
     # "current" -- see strategy_engine.env_metrics.get_env_metrics's own
     # docstring for the as_of_utc reconstruction this is built from. `None`
-    # for any/all three when nothing was known yet at that moment (e.g. a
-    # trade that predates the VIX/PCR pipeline entirely).
+    # for any/all when nothing was known yet at that moment (e.g. a trade
+    # that predates the VIX/PCR pipeline entirely). `oi` is the specific
+    # traded contract's own raw open interest (env_metrics.get_contract_oi),
+    # distinct from pcr_oi/pcr_vol, which are chain-wide aggregates.
     vix: float | None
+    oi: int | None
     pcr_oi: float | None
     pcr_vol: float | None
 
@@ -140,6 +159,7 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
             TradeIntent,
             StrategyRun,
             StrategyConfig,
+            Order,
         )
         .join(Position, TradeOutcome.position_id == Position.id)
         .join(OptionContract, Position.option_contract_id == OptionContract.id)
@@ -147,22 +167,24 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
         .join(TradeIntent, TradeOutcome.trade_intent_id == TradeIntent.id)
         .join(StrategyRun, TradeIntent.strategy_run_id == StrategyRun.id)
         .join(StrategyConfig, StrategyRun.strategy_config_id == StrategyConfig.id)
+        .join(Order, Position.opening_order_id == Order.id)
         .filter(TradeOutcome.closed_at >= start_utc, TradeOutcome.closed_at < end_utc)
         .order_by(TradeOutcome.closed_at)
         .all()
     )
 
     rows = []
-    for outcome, position, contract, instrument, intent, run, config in query_rows:
+    for outcome, position, contract, instrument, intent, run, config, opening_order in query_rows:
         # As of this trade's own entry time, not "current" -- see
-        # env_metrics.get_env_metrics's own docstring for the
-        # as_of_utc reconstruction. One extra query pair per row (VIX
-        # tick + option-chain snapshot); fine at this system's real
-        # trade volumes, and this only ever runs once daily, off the
-        # hot path.
-        env = get_env_metrics(
-            db, instrument.id, contract.expiry_date, as_of_utc=position.opened_at
-        )
+        # get_chain_data_as_of/get_vix_as_of's own docstrings for the
+        # as_of_utc reconstruction. Two extra queries per row (VIX tick +
+        # option-chain snapshot); fine at this system's real trade volumes,
+        # and this only ever runs once daily, off the hot path.
+        as_of = position.opened_at
+        vix = get_vix_as_of(db, as_of_utc=as_of)
+        chain_data = get_chain_data_as_of(db, instrument.id, contract.expiry_date, as_of_utc=as_of)
+        pcr_oi, pcr_vol = compute_pcr(chain_data) if chain_data is not None else (None, None)
+        oi = get_contract_oi(chain_data, contract.symbol) if chain_data is not None else None
         rows.append(
             # `.value`, not a bare attribute -- these columns are all plain
             # String(N) (no native SQLAlchemy Enum type), so a value freshly
@@ -177,6 +199,7 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
                 workspace_id=intent.workspace_id,
                 strategy_name=config.name,
                 execution_mode=str(run.execution_mode),
+                trade_mode=str(opening_order.mode),
                 underlying_symbol=instrument.symbol,
                 contract_symbol=contract.symbol,
                 option_type=str(contract.option_type),
@@ -191,9 +214,10 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
                 exit_reason=str(outcome.exit_reason),
                 realized_pnl=float(outcome.realized_pnl),
                 slippage=float(outcome.slippage),
-                vix=env.get("vix") if env is not None else None,
-                pcr_oi=env.get("pcr_oi") if env is not None else None,
-                pcr_vol=env.get("pcr_vol") if env is not None else None,
+                vix=vix,
+                oi=oi,
+                pcr_oi=pcr_oi,
+                pcr_vol=pcr_vol,
             )
         )
     return rows
@@ -206,13 +230,16 @@ def _sanitize_sheet_name(name: str) -> str:
 
 
 def _sheet_name_for(row: TradeLogRow) -> str:
-    return _sanitize_sheet_name(f"{row.underlying_symbol} {row.expiry_date.isoformat()}")
+    return _sanitize_sheet_name(row.strategy_name)
 
 
 def _row_values(row: TradeLogRow) -> list:
     return [
         row.strategy_name,
+        row.underlying_symbol,
+        row.expiry_date.isoformat(),
         row.execution_mode,
+        row.trade_mode,
         row.contract_symbol,
         row.option_type,
         row.strike,
@@ -226,6 +253,7 @@ def _row_values(row: TradeLogRow) -> list:
         row.realized_pnl,
         row.slippage,
         row.vix,
+        row.oi,
         row.pcr_oi,
         row.pcr_vol,
         str(row.trade_outcome_id),
@@ -254,16 +282,19 @@ def _write_csv_fallback(
 ) -> Path:
     """The file-lock guard's actual safety net — same row shape as the
     Excel append, just to a fresh, never-locked file, so a `.xlsx` left open
-    on the desktop at 15:35 never costs the day's records.
+    on the desktop at 15:35 never costs the day's records. No separate
+    prepended Underlying/Expiry columns (unlike before 2026-08-19's
+    per-strategy-tab change) -- both are now real `_HEADERS` columns
+    themselves, since a flat CSV has no sheet to imply them from either way.
     """
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = now_ist().strftime("%H%M%S")
     path = REPORTS_DIR / f"trade_log_{workspace_id}_{target_date.isoformat()}_fallback_{stamp}.csv"
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Underlying", "Expiry", *_HEADERS])
+        writer.writerow(_HEADERS)
         for row in rows:
-            writer.writerow([row.underlying_symbol, row.expiry_date.isoformat(), *_row_values(row)])
+            writer.writerow(_row_values(row))
     return path
 
 

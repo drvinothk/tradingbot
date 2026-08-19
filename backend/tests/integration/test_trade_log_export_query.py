@@ -117,6 +117,7 @@ def _seed_completed_trade(
     strategy_name: str,
     closed_at: datetime,
     realized_pnl: float = 500.0,
+    order_mode: OrderMode = OrderMode.PAPER,
 ) -> TradeOutcome:
     """Builds a full Signal -> TradeIntent -> Order(open) -> Position ->
     Order(close) -> TradeOutcome chain, bypassing the real execution engine
@@ -185,7 +186,7 @@ def _seed_completed_trade(
         option_contract_id=option_contract.id,
         trade_intent_id=intent.id,
         idempotency_key=f"test-open-{uuid.uuid4()}",
-        mode=OrderMode.PAPER,
+        mode=order_mode,
         side=OrderSide.BUY,
         order_type=OrderType.MARKET,
         qty=25,
@@ -314,6 +315,7 @@ def test_row_carries_strategy_execution_mode_and_cycle_fields(
     row = rows[0]
     assert row.strategy_name == "vwap_pullback"
     assert row.execution_mode == "auto"
+    assert row.trade_mode == "paper"
     assert row.underlying_symbol == "NIFTY"
     assert row.expiry_date == EXPIRY
     assert row.workspace_id == workspace.id
@@ -362,7 +364,12 @@ def test_row_carries_env_metrics_as_of_the_trades_own_entry_time(
                 expiry_date=EXPIRY,
                 ts=entry_time - timedelta(seconds=30),
                 chain_data=[
-                    {"option_type": "CE", "oi": 1000, "volume": 100},
+                    {
+                        "contract_symbol": "NIFTY18AUG26C24000",
+                        "option_type": "CE",
+                        "oi": 1000,
+                        "volume": 100,
+                    },
                     {"option_type": "PE", "oi": 500, "volume": 50},
                 ],
             ),
@@ -372,7 +379,12 @@ def test_row_carries_env_metrics_as_of_the_trades_own_entry_time(
                 expiry_date=EXPIRY,
                 ts=entry_time + timedelta(minutes=10),  # after entry -- must not be picked up
                 chain_data=[
-                    {"option_type": "CE", "oi": 1000, "volume": 100},
+                    {
+                        "contract_symbol": "NIFTY18AUG26C24000",
+                        "option_type": "CE",
+                        "oi": 9999,  # after entry -- must not be picked up
+                        "volume": 100,
+                    },
                     {"option_type": "PE", "oi": 1000, "volume": 100},
                 ],
             ),
@@ -395,6 +407,7 @@ def test_row_carries_env_metrics_as_of_the_trades_own_entry_time(
     assert len(rows) == 1
     row = rows[0]
     assert row.vix == 13.0
+    assert row.oi == 1000  # the traded contract's own OI as of entry, not the later 9999
     assert row.pcr_oi == 0.5
     assert row.pcr_vol == 0.5
 
@@ -416,8 +429,41 @@ def test_row_env_metrics_are_none_when_nothing_was_known_yet(
 
     assert len(rows) == 1
     assert rows[0].vix is None
+    assert rows[0].oi is None
     assert rows[0].pcr_oi is None
     assert rows[0].pcr_vol is None
+
+
+def test_row_carries_the_opening_orders_own_paper_or_live_mode(
+    db: Session, workspace, user, trading_session, option_contract
+):
+    """Order.mode on the position's opening order -- distinct from
+    execution_mode (auto/manual approval), which is orthogonal to this."""
+    _seed_completed_trade(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb-paper",
+        closed_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+        order_mode=OrderMode.PAPER,
+    )
+    _seed_completed_trade(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb-live",
+        closed_at=datetime(2026, 8, 18, 7, 0, tzinfo=UTC),
+        order_mode=OrderMode.LIVE,
+    )
+
+    rows = fetch_completed_trades_for_day(db, date(2026, 8, 18))
+
+    by_strategy = {r.strategy_name: r.trade_mode for r in rows}
+    assert by_strategy == {"orb-paper": "paper", "orb-live": "live"}
 
 
 def test_export_completed_trades_for_day_writes_a_workbook(
@@ -450,8 +496,8 @@ def test_export_completed_trades_for_day_writes_a_workbook(
     path = tmp_path / f"trade_log_{workspace.id}.xlsx"
     assert path.exists()
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["NIFTY 2026-08-18"]
-    assert wb["NIFTY 2026-08-18"].cell(row=2, column=1).value == "orb"
+    assert wb.sheetnames == ["orb"]
+    assert wb["orb"].cell(row=2, column=1).value == "orb"
 
 
 def test_export_completed_trades_for_day_no_trades_touches_no_file(

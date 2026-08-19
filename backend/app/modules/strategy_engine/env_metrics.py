@@ -74,7 +74,11 @@ def compute_pcr(chain_data: list[dict]) -> tuple[float | None, float | None]:
     return pcr_oi, pcr_vol
 
 
-def _vix_as_of(db: Session, as_of_utc: datetime | None) -> float | None:
+def get_vix_as_of(db: Session, as_of_utc: datetime | None = None) -> float | None:
+    """Public building block, also used directly by `reporting.exporter`
+    (which needs VIX alone, without paying for a chain-snapshot query it
+    doesn't need for that column) -- `get_env_metrics` below composes from
+    this rather than duplicating it."""
     vix_instrument = db.query(Instrument).filter(Instrument.symbol == VIX_SYMBOL).one_or_none()
     if vix_instrument is None:
         return None
@@ -85,9 +89,13 @@ def _vix_as_of(db: Session, as_of_utc: datetime | None) -> float | None:
     return float(tick.ltp) if tick is not None else None
 
 
-def _chain_data_as_of(
-    db: Session, instrument_id: uuid.UUID, expiry_date: date, as_of_utc: datetime | None
+def get_chain_data_as_of(
+    db: Session, instrument_id: uuid.UUID, expiry_date: date, as_of_utc: datetime | None = None
 ) -> list[dict] | None:
+    """Public building block -- `get_env_metrics` composes from this for
+    the PCR side; `reporting.exporter` also calls it directly to derive a
+    specific traded contract's own raw OI (`get_contract_oi`) from the
+    exact same snapshot, without a second, duplicate query."""
     query = db.query(OptionChainSnapshot).filter(
         OptionChainSnapshot.instrument_id == instrument_id,
         OptionChainSnapshot.expiry_date == expiry_date,
@@ -102,6 +110,21 @@ def _chain_data_as_of(
     # record_option_chain_snapshot always actually writes a list of
     # per-strike dicts -- confirmed by reading that function directly.
     return snapshot.chain_data  # type: ignore[return-value]
+
+
+def get_contract_oi(chain_data: list[dict], contract_symbol: str) -> int | None:
+    """Raw open interest for one specific contract within a chain-snapshot's
+    entry list -- distinct from `compute_pcr`'s chain-wide aggregate.
+    `reporting.exporter`'s own per-trade "OI (at entry)" column reads this,
+    not the PCR ratio. `None` if the contract isn't in that snapshot (a
+    strike outside the snapshot's own ranked/captured range) or its `oi`
+    field itself was `None`.
+    """
+    for entry in chain_data:
+        if entry.get("contract_symbol") == contract_symbol:
+            oi = entry.get("oi")
+            return int(oi) if oi is not None else None
+    return None
 
 
 def get_env_metrics(
@@ -128,8 +151,8 @@ def get_env_metrics(
     versa) still reports whatever is actually known rather than waiting
     for every field to be ready at once.
     """
-    vix = _vix_as_of(db, as_of_utc)
-    chain_data = _chain_data_as_of(db, instrument_id, expiry_date, as_of_utc)
+    vix = get_vix_as_of(db, as_of_utc)
+    chain_data = get_chain_data_as_of(db, instrument_id, expiry_date, as_of_utc)
     pcr_oi, pcr_vol = compute_pcr(chain_data) if chain_data is not None else (None, None)
 
     if vix is None and pcr_oi is None and pcr_vol is None:

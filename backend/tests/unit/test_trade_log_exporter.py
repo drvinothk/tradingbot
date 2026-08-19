@@ -4,6 +4,9 @@ append, file-lock fallback), driven with synthetic `TradeLogRow`s against a
 `tmp_path`-backed `REPORTS_DIR` rather than the DB -- `fetch_completed_trades_
 for_day`'s own DB-query correctness is covered separately in
 tests/integration/test_trade_log_export_query.py.
+
+**2026-08-19**: sheets route by strategy name now, not (underlying,
+expiry_date) -- see exporter.py's own module docstring for why.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ import pytest
 
 from app.modules.reporting import exporter
 from app.modules.reporting.exporter import (
+    _HEADERS,
     TradeLogRow,
     _day_bounds_utc,
     _sanitize_sheet_name,
@@ -36,9 +40,11 @@ def _row(
     underlying: str = "NIFTY",
     expiry: date = date(2026, 8, 18),
     strategy: str = "orb",
+    trade_mode: str = "paper",
     trade_id: uuid.UUID | None = None,
     pnl: float = 500.0,
     vix: float | None = 13.5,
+    oi: int | None = 125000,
     pcr_oi: float | None = 0.9,
     pcr_vol: float | None = 1.1,
 ) -> TradeLogRow:
@@ -47,6 +53,7 @@ def _row(
         workspace_id=workspace_id or uuid.uuid4(),
         strategy_name=strategy,
         execution_mode="auto",
+        trade_mode=trade_mode,
         underlying_symbol=underlying,
         contract_symbol=f"{underlying}{expiry.strftime('%d%b%y').upper()}C24000",
         option_type="CE",
@@ -62,6 +69,7 @@ def _row(
         realized_pnl=pnl,
         slippage=1.5,
         vix=vix,
+        oi=oi,
         pcr_oi=pcr_oi,
         pcr_vol=pcr_vol,
     )
@@ -107,18 +115,26 @@ def test_creates_workbook_with_correct_sheet_and_headers(tmp_path):
 
     assert path == tmp_path / f"trade_log_{workspace_id}.xlsx"
     wb = openpyxl.load_workbook(path)
-    assert wb.sheetnames == ["NIFTY 2026-08-18"]
-    ws = wb["NIFTY 2026-08-18"]
+    assert wb.sheetnames == ["orb"]  # sheet routes by strategy, not underlying/expiry
+    ws = wb["orb"]
     assert ws.cell(row=1, column=1).value == "Strategy"
     assert ws.cell(row=2, column=1).value == "orb"
-    assert ws.cell(row=1, column=15).value == "VIX (at entry)"
-    assert ws.cell(row=2, column=15).value == row.vix
-    assert ws.cell(row=1, column=16).value == "PCR - OI (at entry)"
-    assert ws.cell(row=2, column=16).value == row.pcr_oi
-    assert ws.cell(row=1, column=17).value == "PCR - Volume (at entry)"
-    assert ws.cell(row=2, column=17).value == row.pcr_vol
-    assert ws.cell(row=1, column=18).value == "Trade ID (internal)"
-    assert ws.cell(row=2, column=18).value == str(row.trade_outcome_id)
+    assert ws.cell(row=1, column=2).value == "Underlying"
+    assert ws.cell(row=2, column=2).value == "NIFTY"
+    assert ws.cell(row=1, column=3).value == "Expiry"
+    assert ws.cell(row=2, column=3).value == "2026-08-18"
+    assert ws.cell(row=1, column=5).value == "Paper/Live"
+    assert ws.cell(row=2, column=5).value == "paper"
+    assert ws.cell(row=1, column=18).value == "VIX (at entry)"
+    assert ws.cell(row=2, column=18).value == row.vix
+    assert ws.cell(row=1, column=19).value == "OI (at entry)"
+    assert ws.cell(row=2, column=19).value == row.oi
+    assert ws.cell(row=1, column=20).value == "PCR - OI (at entry)"
+    assert ws.cell(row=2, column=20).value == row.pcr_oi
+    assert ws.cell(row=1, column=21).value == "PCR - Volume (at entry)"
+    assert ws.cell(row=2, column=21).value == row.pcr_vol
+    assert ws.cell(row=1, column=22).value == "Trade ID (internal)"
+    assert ws.cell(row=2, column=22).value == str(row.trade_outcome_id)
 
 
 def test_none_env_metrics_write_as_blank_cells(tmp_path):
@@ -126,37 +142,58 @@ def test_none_env_metrics_write_as_blank_cells(tmp_path):
     ever landed a value) must not crash the export -- None values render as
     blank cells, not a formatting error."""
     workspace_id = uuid.uuid4()
-    row = _row(workspace_id=workspace_id, vix=None, pcr_oi=None, pcr_vol=None)
+    row = _row(workspace_id=workspace_id, vix=None, oi=None, pcr_oi=None, pcr_vol=None)
 
     path = export_trade_log_for_workspace(workspace_id, [row], date(2026, 8, 18))
 
-    ws = openpyxl.load_workbook(path)["NIFTY 2026-08-18"]
-    assert ws.cell(row=2, column=15).value is None
-    assert ws.cell(row=2, column=16).value is None
-    assert ws.cell(row=2, column=17).value is None
+    ws = openpyxl.load_workbook(path)["orb"]
+    assert ws.cell(row=2, column=18).value is None
+    assert ws.cell(row=2, column=19).value is None
+    assert ws.cell(row=2, column=20).value is None
+    assert ws.cell(row=2, column=21).value is None
 
 
-def test_routes_different_cycles_to_different_sheets(tmp_path):
+def test_routes_by_strategy_not_underlying_or_expiry(tmp_path):
+    """A strategy's trades across different underlyings/expiries/cycles all
+    land in its own single tab -- the actual point of the 2026-08-19 change
+    (evaluate a strategy's own performance in one place)."""
     workspace_id = uuid.uuid4()
-    this_week = _row(workspace_id=workspace_id, underlying="NIFTY", expiry=date(2026, 8, 18))
-    next_week = _row(workspace_id=workspace_id, underlying="NIFTY", expiry=date(2026, 8, 25))
+    this_week = _row(workspace_id=workspace_id, strategy="orb", expiry=date(2026, 8, 18))
+    next_week = _row(workspace_id=workspace_id, strategy="orb", expiry=date(2026, 8, 25))
     other_underlying = _row(
-        workspace_id=workspace_id, underlying="BANKNIFTY", expiry=date(2026, 8, 25)
+        workspace_id=workspace_id, strategy="orb", underlying="BANKNIFTY", expiry=date(2026, 8, 25)
     )
+    other_strategy = _row(workspace_id=workspace_id, strategy="vwap_pullback")
 
     path = export_trade_log_for_workspace(
-        workspace_id, [this_week, next_week, other_underlying], date(2026, 8, 18)
+        workspace_id,
+        [this_week, next_week, other_underlying, other_strategy],
+        date(2026, 8, 18),
     )
 
     wb = openpyxl.load_workbook(path)
-    assert set(wb.sheetnames) == {
-        "NIFTY 2026-08-18",
-        "NIFTY 2026-08-25",
-        "BANKNIFTY 2026-08-25",
-    }
-    assert wb["NIFTY 2026-08-18"].max_row == 2  # header + 1 row
-    assert wb["NIFTY 2026-08-25"].max_row == 2
-    assert wb["BANKNIFTY 2026-08-25"].max_row == 2
+    assert set(wb.sheetnames) == {"orb", "vwap_pullback"}
+    assert wb["orb"].max_row == 4  # header + 3 distinct trades, one tab regardless of cycle
+    assert wb["vwap_pullback"].max_row == 2  # header + 1 row
+
+
+def test_paper_and_live_trades_share_the_same_strategy_tab(tmp_path):
+    """Per explicit design decision: one tab per strategy with a Paper/Live
+    column, not separate paper/live tabs -- lets a strategy's paper vs live
+    behavior be compared side by side."""
+    workspace_id = uuid.uuid4()
+    paper_trade = _row(workspace_id=workspace_id, strategy="orb", trade_mode="paper")
+    live_trade = _row(workspace_id=workspace_id, strategy="orb", trade_mode="live")
+
+    path = export_trade_log_for_workspace(
+        workspace_id, [paper_trade, live_trade], date(2026, 8, 18)
+    )
+
+    wb = openpyxl.load_workbook(path)
+    assert wb.sheetnames == ["orb"]
+    ws = wb["orb"]
+    assert ws.cell(row=2, column=5).value == "paper"
+    assert ws.cell(row=3, column=5).value == "live"
 
 
 def test_reexporting_the_same_trades_does_not_duplicate_rows(tmp_path):
@@ -167,7 +204,7 @@ def test_reexporting_the_same_trades_does_not_duplicate_rows(tmp_path):
     path = export_trade_log_for_workspace(workspace_id, [row], date(2026, 8, 18))
 
     wb = openpyxl.load_workbook(path)
-    assert wb["NIFTY 2026-08-18"].max_row == 2  # still just header + 1 row
+    assert wb["orb"].max_row == 2  # still just header + 1 row
 
 
 def test_new_trades_append_alongside_already_exported_ones(tmp_path):
@@ -179,7 +216,7 @@ def test_new_trades_append_alongside_already_exported_ones(tmp_path):
     path = export_trade_log_for_workspace(workspace_id, [first, second], date(2026, 8, 18))
 
     wb = openpyxl.load_workbook(path)
-    assert wb["NIFTY 2026-08-18"].max_row == 3  # header + 2 distinct trades
+    assert wb["orb"].max_row == 3  # header + 2 distinct trades
 
 
 def test_separate_workspaces_get_separate_files(tmp_path):
@@ -211,6 +248,7 @@ def test_permission_error_falls_back_to_csv(tmp_path, monkeypatch):
 
     with result_path.open(newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
-    assert rows[0][0] == "Underlying"
-    assert rows[1][0] == "NIFTY"
-    assert rows[1][2] == "orb"  # Strategy column, shifted by the two prepended columns
+    assert rows[0] == _HEADERS
+    assert rows[1][0] == "orb"  # Strategy
+    assert rows[1][1] == "NIFTY"  # Underlying
+    assert rows[1][4] == "paper"  # Paper/Live
