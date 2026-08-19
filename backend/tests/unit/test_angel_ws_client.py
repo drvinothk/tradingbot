@@ -42,7 +42,16 @@ class _FakeSmartWebSocketV2:
         self.subscribe_calls: list[tuple] = []
         self.unsubscribe_calls: list[tuple] = []
         self._closed = threading.Event()
+        # Mirrors the real SDK's own wsapp attribute (set by real connect()/
+        # AngelWSClient._connect_via_proxy) closely enough for the text-ping
+        # heartbeat to find and call .send() on -- aliased to self rather
+        # than a separate object since the fake has no real WebSocketApp.
+        self.wsapp = self
+        self.send_calls: list[str] = []
         _FakeSmartWebSocketV2.instances.append(self)
+
+    def send(self, data: str, opcode: int | None = None) -> None:
+        self.send_calls.append(data)
 
     def subscribe(self, correlation_id, mode, token_list):
         self.subscribe_calls.append((correlation_id, mode, token_list))
@@ -499,5 +508,62 @@ def test_connect_and_run_patches_the_real_import_targets_on_close():
     time.sleep(0.05)
 
     assert getattr(_FakeSmartWebSocketV2._on_close, "_arity_patched", False) is True
+
+    client.stop()
+
+
+# -- literal text-frame "ping" heartbeat (2026-08-19) -----------------------
+
+
+@pytest.fixture
+def _fast_heartbeat(monkeypatch):
+    monkeypatch.setattr(ws_module, "_TEXT_PING_INTERVAL_SECONDS", 0.05)
+
+
+def test_text_ping_heartbeat_sends_the_literal_string_on_interval(_fast_heartbeat):
+    """Angel's docs require a WS text frame with the literal body "ping"
+    every 30s -- distinct from, and not satisfied by, the SDK's own
+    protocol-level ping_interval mechanism. See module docstring."""
+    client = AngelWSClient(
+        auth_token="jwt1", api_key="key1", client_code="C123", feed_token="feed1",
+        on_tick=lambda t: None,
+    )
+    client.start()
+    time.sleep(0.2)
+
+    fake = _FakeSmartWebSocketV2.instances[0]
+    assert fake.send_calls
+    assert all(call == "ping" for call in fake.send_calls)
+
+    client.stop()
+
+
+def test_text_ping_heartbeat_stops_after_close_does_not_leak_into_next_connection(
+    _fast_heartbeat,
+):
+    """A fresh reconnect gets its own heartbeat targeting the new instance
+    -- the old one must stop, not keep firing (and definitely must not
+    call .send() on a stale/closed instance)."""
+    client = AngelWSClient(
+        auth_token="jwt1", api_key="key1", client_code="C123", feed_token="feed1",
+        on_tick=lambda t: None,
+    )
+    client.start()
+    time.sleep(0.15)
+    assert len(_FakeSmartWebSocketV2.instances) == 1
+    first = _FakeSmartWebSocketV2.instances[0]
+    assert first.send_calls  # heartbeat fired at least once on the first instance
+
+    first.close_connection()
+    time.sleep(1.3)  # past the first reconnect backoff delay (1s)
+
+    assert len(_FakeSmartWebSocketV2.instances) == 2
+    first_send_count_at_reconnect = len(first.send_calls)
+    time.sleep(0.2)
+    # The old, closed instance's heartbeat thread must not still be sending.
+    assert len(first.send_calls) == first_send_count_at_reconnect
+
+    second = _FakeSmartWebSocketV2.instances[1]
+    assert second.send_calls  # the new connection gets its own fresh heartbeat
 
     client.stop()

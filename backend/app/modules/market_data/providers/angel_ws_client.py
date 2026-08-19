@@ -13,6 +13,34 @@ installed package, `smartapi-python==1.5.5`,
 `SmartApi/smartWebSocketV2.py`) does that work; this module only translates
 its already-parsed dict into `RawAngelTick`.
 
+**2026-08-19 — literal text-frame "ping" heartbeat added, distinct from the
+SDK's own protocol-level ping.** Angel's own docs are explicit: "Heartbeat
+request (text): ping ... Heartbeat response (text): pong" — a WebSocket
+**text frame** carrying the literal string, not a protocol-level Ping
+control frame (opcode 0x9). The installed SDK never sends this — `connect()`
+only sets `ping_interval=HEART_BEAT_INTERVAL` on `websocket-client`'s
+`run_forever`, which sends protocol-level pings with an **empty** payload
+(confirmed directly from `websocket-client==1.9.0`'s own source — not the
+"random 4-byte binary payload" a since-corrected external claim attributed
+to a different, commonly-confused package, `websockets`, which this
+codebase does not use). `_on_message`/`HEART_BEAT_MESSAGE` exist in the SDK
+source but are genuinely dead code here — `connect()` wires `on_data`, not
+`on_message`, so that text-ping logic never runs regardless. Real forum
+reports describe exactly this failure mode (connects, then goes silent)
+tied to a client only ever sending protocol-level pings. **Does not fully
+explain every past symptom on its own** — a fully successful, sustained,
+384-tick 2026-08-11 session used this exact same protocol-ping-only path,
+which a strict "no text ping => no data" theory doesn't cleanly predict —
+but it's cheap, safe, additive (the existing protocol ping is untouched),
+and directly matches the documented requirement, so it ships as a
+supplementary heartbeat rather than a replacement. `AngelWSClient` now
+starts a dedicated thread once `on_open` fires that sends a literal
+`wsapp.send("ping")` text frame every `_TEXT_PING_INTERVAL_SECONDS` (25s,
+a safety margin under the documented 30s), stopped on close/reconnect/
+shutdown. A send failure (socket already closing) is expected during a
+real disconnect race and is swallowed at debug — the main `_run` loop's
+own `on_close`/`on_error` handling already owns that transition.
+
 **2026-08-19 — real `_on_close` arity bug confirmed and fixed.** Verified
 directly against both installed package sources: `websocket-client==1.9.0`'s
 `WebSocketApp._callback` invokes `on_close` as
@@ -131,6 +159,14 @@ _RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 15, 30)
 # module's own audit note above), so this fires only after 3 fresh-login
 # attempts have already run and still failed.
 _TOKEN_REFRESH_AFTER_CONSECUTIVE_FAILURES = 3
+
+# 2026-08-19: Angel's docs require a literal WS text frame "ping" every
+# 30s (see module docstring) -- 25s leaves a safety margin, same "respond
+# before the real deadline" shape as this codebase's other timing
+# constants (e.g. EOD-stop firing a minute after cutoff, not exactly at
+# it). Module-level so tests can shrink it, same pattern as
+# _RECONNECT_BACKOFF_SECONDS.
+_TEXT_PING_INTERVAL_SECONDS = 25.0
 
 # SmartWebSocketV2 class constants, mirrored here so callers don't need to
 # import the SDK just to reference a mode/exchange-type code.
@@ -318,6 +354,12 @@ class AngelWSClient:
         self._connected = threading.Event()
         self._sws: object | None = None
 
+        # Text-ping heartbeat (see module docstring) -- fresh per
+        # connection attempt, started from _handle_open once the socket is
+        # genuinely live, stopped on close/reconnect/shutdown.
+        self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_thread: threading.Thread | None = None
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -450,6 +492,11 @@ class AngelWSClient:
             else:
                 sws.connect()  # blocks; on_open fires (and resubscribes) once handshake completes
         finally:
+            # Safety net alongside _handle_close (which may not fire on
+            # every exit path, e.g. an exception raised before a real close
+            # frame arrives) -- a heartbeat thread must never outlive the
+            # connection it was sending on.
+            self._stop_text_ping_heartbeat()
             with self._lock:
                 if self._sws is sws:
                     self._sws = None
@@ -514,7 +561,45 @@ class AngelWSClient:
             entries = [(token, exchange_type) for (exchange_type, token) in self._subscriptions]
         if sws is not None:
             self._send_subscribe(sws, entries)
+            self._start_text_ping_heartbeat(sws)
         self._connected.set()
+
+    def _start_text_ping_heartbeat(self, sws: object) -> None:
+        stop_event = threading.Event()
+        with self._lock:
+            self._heartbeat_stop = stop_event
+            self._heartbeat_thread = threading.Thread(
+                target=self._text_ping_loop, args=(sws, stop_event), daemon=True
+            )
+            self._heartbeat_thread.start()
+
+    def _stop_text_ping_heartbeat(self) -> None:
+        with self._lock:
+            stop_event = self._heartbeat_stop
+            self._heartbeat_stop = None
+        if stop_event is not None:
+            stop_event.set()
+
+    def _text_ping_loop(self, sws: object, stop_event: threading.Event) -> None:
+        """See module docstring ("literal text-frame 'ping' heartbeat") for
+        why this exists alongside, not instead of, the SDK's own protocol-
+        level ping. `_TEXT_PING_INTERVAL_SECONDS` is read from the module
+        namespace on every wait, not captured at thread-start, so tests can
+        shrink it via `monkeypatch.setattr` (same pattern `_run` already
+        uses for `_RECONNECT_BACKOFF_SECONDS`).
+        """
+        while not stop_event.wait(_TEXT_PING_INTERVAL_SECONDS):
+            wsapp = getattr(sws, "wsapp", None)
+            if wsapp is None:
+                continue
+            try:
+                wsapp.send("ping")
+            except Exception:
+                logger.debug(
+                    "Angel One WS text-ping heartbeat send failed "
+                    "(socket likely already closing) -- stopping this heartbeat thread"
+                )
+                return
 
     def _handle_data(self, wsapp: object, data: dict) -> None:
         """**2026-08-10 audit finding**: this had zero exception handling —
@@ -567,6 +652,7 @@ class AngelWSClient:
     def _handle_close(self, wsapp: object) -> None:
         del wsapp
         logger.warning("Angel One WebSocket closed")
+        self._stop_text_ping_heartbeat()
 
     def _handle_error(self, error_type: str, message: str) -> None:
         logger.warning("Angel One WebSocket error: %s - %s", error_type, message)
