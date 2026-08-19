@@ -227,6 +227,6 @@ def test_guarded_live_with_no_strategy_run_returns_mock_even_with_flag_on(monkey
 
 def test_is_execution_broker_live_distinguishes_mock_from_real():
     assert (
-        composition.is_execution_broker_live(composition._get_or_create_execution_mock()) is False
+        composition.is_execution_broker_live(composition.get_execution_mock()) is False
     )
     assert composition.is_execution_broker_live(_FakeRealBroker()) is True

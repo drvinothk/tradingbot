@@ -117,6 +117,55 @@ def test_order_book_returns_list_response_directly():
     assert len(result) == 2
 
 
+def test_position_book_no_data_returns_empty_list_not_an_error():
+    """Real, live bug fixed 2026-08-18: Shoonya's list-returning endpoints
+    (PositionBook/OrderBook/SingleOrdHist) signal "genuinely nothing to
+    return" as a stat:Not_Ok error (live-observed emsg:
+    'Error Occurred : 5 "no data"') instead of an empty JSON list --
+    contradicting this module's own prior "a list response is never itself
+    an error" assumption. Live-confirmed on a real account with zero open
+    positions, crash-looping PositionManager every ~3s until this fix.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"stat": "Not_Ok", "emsg": 'Error Occurred : 5 "no data"'}
+        )
+
+    client = _client(handler)
+    assert client.position_book("FA1", "FA1") == []
+
+
+def test_order_book_no_data_returns_empty_list_not_an_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "No Data"})
+
+    client = _client(handler)
+    assert client.order_book("FA1") == []
+
+
+def test_single_order_history_no_data_returns_empty_list_not_an_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "No Data"})
+
+    client = _client(handler)
+    assert client.single_order_history("FA1", "999") == []
+
+
+def test_position_book_genuine_error_still_raises():
+    """The "no data" translation must stay narrowly scoped -- a real
+    failure (e.g. a dead session) on the same endpoint must not be
+    silently swallowed as "no open positions."
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "Invalid Session Key"})
+
+    client = _client(handler)
+    with pytest.raises(ShoonyaApiError, match="Invalid Session Key"):
+        client.position_book("FA1", "FA1")
+
+
 def test_place_order_sends_payload_and_parses_ack():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"stat": "Ok", "norenordno": "999"})

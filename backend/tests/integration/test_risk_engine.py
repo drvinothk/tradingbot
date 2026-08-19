@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.strategies import _get_pending_approval_or_404
 from app.domain.audit.models import AuditEvent
+from app.domain.execution.models import Order, OrderMode
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.identity.models import Workspace as WorkspaceRow
 from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
@@ -29,6 +30,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -351,9 +353,90 @@ def test_evaluate_trade_intent_same_strike_locked(
     assert "same_strike_locked" in decision.reasons
 
 
-def test_evaluate_trade_intent_max_concurrent_positions(
-    db: Session, broker, trading_session, strategy_run, instrument
+def test_same_strike_lock_does_not_cross_strategies(
+    db: Session, broker, workspace, user, trading_session, strategy_run, option_contract,
 ):
+    """2026-08-19 regression: `_same_strike_locked` used to be session-wide
+    — any other strategy's pending/open trade_intent on the exact same
+    contract locked a new one out, live-confirmed against two real paper
+    strategies independently proposing the same strike the same day. Now
+    scoped per (strategy_config_id, option_contract_id) -- a different
+    strategy must be free to trade the identical contract.
+    """
+    _dispatch(db, trading_session, strategy_run, option_contract, broker)
+
+    other_config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="other-strategy")
+    db.add(other_config)
+    db.flush()
+    other_run = StrategyRun(
+        id=uuid.uuid4(), strategy_config_id=other_config.id,
+        trading_session_id=trading_session.id, execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(other_run)
+    db.flush()
+
+    second = _make_trade_intent(db, trading_session, other_run, option_contract)
+    decision = evaluate_trade_intent(db, second, trading_session, other_run)
+
+    assert "same_strike_locked" not in decision.reasons
+
+
+def test_same_strike_locked_blocks_a_pending_approval_duplicate(
+    db: Session, trading_session, strategy_config, user: User, option_contract
+):
+    """2026-08-19: `_same_strike_locked` checks both PENDING_APPROVAL and
+    DISPATCHED, but every existing test only ever exercised the DISPATCHED
+    case (via `_dispatch`). Proves the other half of "block same strategy
+    same order if already pending or open" -- a strategy whose first
+    trade_intent on a contract is still awaiting manual approval must not
+    be able to propose a second one on the identical contract.
+    """
+    approval_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(approval_run)
+    db.flush()
+
+    first = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    first_decision = evaluate_trade_intent(db, first, trading_session, approval_run)
+    assert first_decision.decision == "approved"
+    assert first.status == TradeIntentStatus.PENDING_APPROVAL
+
+    second = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    decision = evaluate_trade_intent(db, second, trading_session, approval_run)
+
+    assert decision.decision == "rejected"
+    assert "same_strike_locked" in decision.reasons
+
+
+def test_evaluate_trade_intent_max_concurrent_positions(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, instrument, monkeypatch,
+):
+    """2026-08-19: max_concurrent_positions is now live-only (a busy paper
+    session must never count toward it — see `_open_trade_intents_query`'s
+    own docstring), so this needs a genuinely live-routed strategy and its
+    open positions actually marked live, same setup pattern as `test_
+    evaluate_trade_intent_max_trades_per_day`.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     contracts = []
     for i in range(3):
         c = OptionContract(
@@ -370,9 +453,19 @@ def test_evaluate_trade_intent_max_concurrent_positions(
 
     # Default max_concurrent_positions is 2 (RiskDefaults) — first two open
     # cleanly, the third (a different strike, so not same-strike-locked)
-    # should trip the concurrency cap instead.
-    _dispatch(db, trading_session, strategy_run, contracts[0], broker)
-    _dispatch(db, trading_session, strategy_run, contracts[1], broker)
+    # should trip the concurrency cap instead. Both dispatches happen
+    # *before* either is marked live: `dispatch_trade_intent` runs its own
+    # event-triggered reconciliation internally against `broker` (the mock),
+    # so marking the first live before the second dispatch would make that
+    # second dispatch's own reconciliation see a real mismatch (the mock
+    # still has the first position, but it's no longer counted as a local
+    # paper position) — a test-harness artifact of `_mark_last_order_live`
+    # being a raw DB flag flip, not an actual different-broker dispatch, not
+    # a real bug in the 2026-08-19 mode-scoped reconciliation fix.
+    first = _dispatch(db, trading_session, strategy_run, contracts[0], broker)
+    second = _dispatch(db, trading_session, strategy_run, contracts[1], broker)
+    _mark_last_order_live(db, first)
+    _mark_last_order_live(db, second)
 
     third = _make_trade_intent(db, trading_session, strategy_run, contracts[2])
     decision = evaluate_trade_intent(db, third, trading_session, strategy_run)
@@ -381,20 +474,93 @@ def test_evaluate_trade_intent_max_concurrent_positions(
     assert "max_concurrent_positions_reached" in decision.reasons
 
 
+def test_max_concurrent_positions_does_not_block_a_paper_routed_strategy(
+    db: Session, broker, workspace, trading_session, strategy_run, strategy_config, instrument,
+):
+    """The symmetric case: a force_paper strategy holding many open paper
+    positions (well past the default cap of 2) must never get
+    max_concurrent_positions_reached — the cap only counts live-routed
+    trade_intents (see `_open_trade_intents_query`'s own docstring)."""
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+
+    contracts = []
+    for i in range(4):
+        c = OptionContract(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            expiry_date=date(2026, 7, 30),
+            strike=23000 + i * 50,
+            option_type=OptionType.CE,
+            symbol=f"NIFTY26JUL{23000 + i * 50}CE",
+        )
+        db.add(c)
+        db.flush()
+        contracts.append(c)
+
+    for c in contracts[:3]:
+        _dispatch(db, trading_session, strategy_run, c, broker)
+
+    fourth = _make_trade_intent(db, trading_session, strategy_run, contracts[3])
+    decision = evaluate_trade_intent(db, fourth, trading_session, strategy_run)
+
+    assert "max_concurrent_positions_reached" not in decision.reasons
+
+
+def _mark_last_order_live(db: Session, trade_intent: TradeIntent) -> None:
+    """Test helper: `_dispatch` always passes an explicit `broker=`, so the
+    resulting `Order.mode` is always `PAPER` regardless of session/strategy
+    state (`dispatch_trade_intent`'s own `broker_was_provided` guard — see
+    its docstring). The `max_trades_per_day` cap now counts only genuinely
+    `LIVE` orders (2026-08-19 fix), so tests that need to simulate "this
+    strategy's earlier dispatch actually went out live" flip it directly
+    here rather than threading real broker-resolution plumbing through
+    every risk-engine test in this file.
+    """
+    order = db.query(Order).filter(Order.trade_intent_id == trade_intent.id).one()
+    order.mode = OrderMode.LIVE
+    db.add(order)
+    db.flush()
+
+
 def test_evaluate_trade_intent_max_trades_per_day(
-    db: Session, broker, workspace, authorized_user, trading_session, strategy_run, instrument
+    db: Session,
+    broker,
+    workspace,
+    authorized_user,
+    trading_session,
+    strategy_run,
+    strategy_config,
+    instrument,
+    monkeypatch,
 ):
     """2026-08-12: the cap only ever protects real-money exposure now — see
     this test's sibling `test_paper_only_session_has_no_daily_trade_cap`
-    below for why `paper_only` is exempt. Set to a live-capable mode here
-    so this test still exercises the cap itself. `paper_plus_guarded_live`,
-    not `live_enabled`: the cap condition is any `mode != PAPER_ONLY`, and
-    with no strategy_run marked LIVE-graduated, Ops-Hardening Phase 5's
-    get_execution_broker still safely resolves to the paper mock here.
+    below for why `paper_only` is exempt. 2026-08-19: the cap must also
+    apply only when *this strategy* is actually routed live, and only count
+    its own genuinely-live dispatches — see `test_force_paper_strategy_
+    exempt_from_daily_trade_cap_even_when_session_is_live` and
+    `test_daily_trade_cap_ignores_a_strategys_earlier_paper_era_dispatches`
+    below for those two directions. This test exercises the cap still
+    working at all: strategy graduated to LIVE, session guarded-live, and
+    its one dispatch actually marked live. `get_execution_broker` is
+    monkeypatched to the mock -- graduating the strategy to LIVE also makes
+    `_check_margin` (this morning's own fix) try to resolve a real broker,
+    which would otherwise raise `ConfigurationError` with no
+    `ALLOW_REAL_MONEY_DISPATCH` in test settings; this test is about the
+    daily cap, not margin, same reasoning `test_evaluate_trade_intent_force
+    _paper_strategy_ignores_real_margin_shortfall` already established.
     """
     trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
     db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
 
     create_new_risk_limit_config_version(
         db,
@@ -415,7 +581,8 @@ def test_evaluate_trade_intent_max_trades_per_day(
     db.add_all([c1, c2])
     db.flush()
 
-    _dispatch(db, trading_session, strategy_run, c1, broker)
+    first = _dispatch(db, trading_session, strategy_run, c1, broker)
+    _mark_last_order_live(db, first)
 
     second = _make_trade_intent(db, trading_session, strategy_run, c2)
     decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
@@ -467,7 +634,7 @@ def test_paper_only_session_has_no_daily_trade_cap(
 
 def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
     db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
-    strategy_config, instrument, user,
+    strategy_config, instrument, user, monkeypatch,
 ):
     """2026-08-12: the cap used to count DISPATCHED trade_intents across the
     whole session regardless of which strategy dispatched them, so one
@@ -475,19 +642,31 @@ def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
     strategy running in the same session too. Now scoped by
     strategy_config_id (via strategy_run) — a second, unrelated strategy in
     the same session, same day, must not be blocked by the first one's cap.
-    `paper_plus_guarded_live`, not `live_enabled` -- see the identical note
-    in `test_evaluate_trade_intent_max_trades_per_day` above.
+    Both strategies graduated to LIVE and their dispatches marked live
+    (2026-08-19 fix) so this test actually exercises per-strategy scoping
+    of a real cap, not just two strategies the cap skips entirely.
+    `get_execution_broker` monkeypatched to the mock -- same reasoning as
+    `test_evaluate_trade_intent_max_trades_per_day` above.
     """
     trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
     db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
 
     create_new_risk_limit_config_version(
         db, workspace.id, actor_user=authorized_user,
         max_trades_per_day=1, max_concurrent_positions=5,
     )
 
-    other_config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="other-strategy")
+    other_config = StrategyConfig(
+        id=uuid.uuid4(), workspace_id=workspace.id, name="other-strategy",
+        status=StrategyStatus.LIVE,
+    )
     db.add(other_config)
     db.flush()
     other_run = StrategyRun(
@@ -511,7 +690,8 @@ def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
     db.flush()
 
     # Strategy #1 dispatches its one allowed trade, hitting its own cap.
-    _dispatch(db, trading_session, strategy_run, c1, broker)
+    first = _dispatch(db, trading_session, strategy_run, c1, broker)
+    _mark_last_order_live(db, first)
 
     # Strategy #2 (different strategy_config, same session, same day) has
     # dispatched nothing yet -- must still be approved.
@@ -522,18 +702,164 @@ def test_max_trades_per_day_is_scoped_per_strategy_not_per_session(
     assert "max_trades_per_day_reached" not in decision.reasons
 
 
-def test_evaluate_trade_intent_consecutive_loss_pause(
-    db: Session, trading_session, strategy_run, option_contract
+def test_force_paper_strategy_exempt_from_daily_trade_cap_even_when_session_is_live(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract,
 ):
+    """2026-08-19 regression (direction 1, over-restrictive): a `force_paper`
+    strategy must never be capped by `max_trades_per_day` just because the
+    *session* reached a live-capable mode -- those trades never touched
+    real money regardless of session mode, so the cap (whose whole purpose
+    is capping real-money exposure) has nothing to protect here. Live
+    incident: exactly this happened to a real force_paper strategy the same
+    day this was fixed.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+
+    create_new_risk_limit_config_version(
+        db, workspace.id, actor_user=authorized_user,
+        max_trades_per_day=1, max_concurrent_positions=5,
+    )
+
+    # Dispatch (as paper, since force_paper) well past the cap -- must never
+    # matter, since is_strategy_routed_live is False for this strategy the
+    # whole time. Strikes start at 22100, clear of the option_contract
+    # fixture's own 22000 (uq_option_contract_identity).
+    for i in range(3):
+        strike = 22100 + i * 50
+        contract = OptionContract(
+            id=uuid.uuid4(), instrument_id=option_contract.instrument_id,
+            expiry_date=date(2026, 7, 30), strike=strike,
+            option_type=OptionType.CE, symbol=f"NIFTY26JUL2{strike}CE-FP",
+        )
+        db.add(contract)
+        db.flush()
+        _dispatch(db, trading_session, strategy_run, contract, broker)
+
+    final_contract = OptionContract(
+        id=uuid.uuid4(), instrument_id=option_contract.instrument_id,
+        expiry_date=date(2026, 7, 30), strike=22999,
+        option_type=OptionType.CE, symbol="NIFTY26JUL22999CE-FP",
+    )
+    db.add(final_contract)
+    db.flush()
+    fourth = _make_trade_intent(db, trading_session, strategy_run, final_contract)
+    decision = evaluate_trade_intent(db, fourth, trading_session, strategy_run)
+
+    assert "max_trades_per_day_reached" not in decision.reasons
+
+
+def test_daily_trade_cap_ignores_a_strategys_earlier_paper_era_dispatches(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
+):
+    """2026-08-19 regression (direction 2, under-restrictive protection): a
+    strategy that dispatched several genuinely-paper trades earlier today
+    (session was still `paper_only`, or the strategy itself was still
+    `force_paper`) must not have those count against its cap once it
+    becomes genuinely live -- the cap exists to protect real capital, and a
+    strategy's first-ever live signal being blocked by trades that never
+    touched real money is the cap doing the opposite of its job. Live
+    incident: exactly this blocked a real strategy's first live signal the
+    same day this was fixed, immediately after its force_paper override was
+    removed.
+    """
+    # Earlier in the day: session paper_only, strategy trades freely as
+    # paper (uncapped, same as test_paper_only_session_has_no_daily_trade_cap).
+    create_new_risk_limit_config_version(
+        db, workspace.id, actor_user=authorized_user,
+        max_trades_per_day=1, max_concurrent_positions=5,
+    )
+    for _ in range(3):
+        contract = OptionContract(
+            id=uuid.uuid4(), instrument_id=option_contract.instrument_id,
+            expiry_date=date(2026, 7, 30), strike=23000 + _ * 50,
+            option_type=OptionType.CE, symbol=f"NIFTY26JUL2{23000 + _ * 50}CE-PE",
+        )
+        db.add(contract)
+        db.flush()
+        _dispatch(db, trading_session, strategy_run, contract, broker)
+
+    # Later: strategy graduates to live, session goes live_enabled -- its
+    # very first genuinely-live signal must still be evaluated on its own
+    # (zero prior *live* dispatches), not blocked by the 3 paper ones above.
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
+    live_contract = OptionContract(
+        id=uuid.uuid4(), instrument_id=option_contract.instrument_id,
+        expiry_date=date(2026, 7, 30), strike=23999,
+        option_type=OptionType.CE, symbol="NIFTY26JUL23999CE-LIVE",
+    )
+    db.add(live_contract)
+    db.flush()
+    live_intent = _make_trade_intent(db, trading_session, strategy_run, live_contract)
+    decision = evaluate_trade_intent(db, live_intent, trading_session, strategy_run)
+
+    assert "max_trades_per_day_reached" not in decision.reasons
+
+
+def test_evaluate_trade_intent_consecutive_loss_pause(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
+):
+    """2026-08-19: gated on is_strategy_routed_live -- see this check's own
+    comment in evaluate_trade_intent. Needs a genuinely live-routed
+    strategy, same setup as the other rescoped checks in this file.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
     trading_session.consecutive_losses = 2  # RiskDefaults threshold is 2
+    db.add(strategy_config)
     db.add(trading_session)
     db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
 
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
     decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
 
     assert decision.decision == "rejected"
     assert "consecutive_loss_pause_active" in decision.reasons
+
+
+def test_consecutive_loss_pause_does_not_block_a_paper_routed_strategy(
+    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
+    option_contract, monkeypatch,
+):
+    """The symmetric case: the live side having hit its consecutive-loss
+    threshold must not stop a force_paper strategy from continuing.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.runtime_mode = "force_paper"
+    trading_session.consecutive_losses = 2
+    db.add(strategy_config)
+    db.add(trading_session)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: MockBrokerAdapter(),
+    )
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "consecutive_loss_pause_active" not in decision.reasons
 
 
 def test_evaluate_trade_intent_per_trade_lot_cap_exceeded(
@@ -550,17 +876,46 @@ def test_evaluate_trade_intent_per_trade_lot_cap_exceeded(
 
 
 def test_evaluate_trade_intent_budget_exceeded(
-    db: Session, trading_session, strategy_run, option_contract
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
 ):
+    """2026-08-19: gated on is_strategy_routed_live -- a paper intent's own
+    capital_required must never be checked against the real budget at all.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     trading_session.budget_amount = 1000  # 1 lot @ premium 80 * lot_size 25 = 2000 > 1000
     db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
     db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
 
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
     decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
 
     assert decision.decision == "rejected"
     assert "budget_exceeded" in decision.reasons
+
+
+def test_budget_exceeded_does_not_block_a_paper_routed_strategy(
+    db: Session, trading_session, strategy_run, strategy_config, option_contract,
+):
+    """A force_paper strategy's own capital_required must never be checked
+    against `budget_amount`, even when the budget is set impossibly low.
+    """
+    trading_session.budget_amount = 1  # would reject any real trade
+    db.add(trading_session)
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "budget_exceeded" not in decision.reasons
 
 
 def test_evaluate_trade_intent_margin_check_failed(
@@ -579,7 +934,7 @@ def test_evaluate_trade_intent_margin_check_failed(
 
     monkeypatch.setattr(
         "app.modules.risk_engine.service.get_execution_broker",
-        lambda trading_session: _LowMarginBroker(),
+        lambda trading_session, strategy_run=None: _LowMarginBroker(),
     )
 
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
@@ -587,6 +942,49 @@ def test_evaluate_trade_intent_margin_check_failed(
 
     assert decision.decision == "rejected"
     assert "margin_check_failed" in decision.reasons
+
+
+def test_evaluate_trade_intent_force_paper_strategy_ignores_real_margin_shortfall(
+    db: Session, trading_session, strategy_run, strategy_config, option_contract, monkeypatch
+):
+    """Live bug fixed 2026-08-18: `_check_margin` used to call
+    `get_execution_broker(trading_session)` without `strategy_run`, so a
+    `force_paper` strategy's margin was checked against whatever
+    `get_execution_broker` would resolve with no strategy context at all —
+    the real broker, once the session itself reached `live_enabled`, per
+    that function's own routing table. A strategy explicitly held back to
+    paper should never be blocked by the real account's real cash shortfall
+    — `get_execution_broker` already knows this (its `FORCE_PAPER` branch),
+    `_check_margin` just wasn't telling it which strategy was asking.
+    """
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+
+    class _LowMarginBroker(MockBrokerAdapter):
+        def get_margin(self):
+            return MarginInfo(
+                available_margin=1.0, used_margin=0.0, total_margin=1.0, ts=datetime.now(UTC)
+            )
+
+    def _fake_get_execution_broker(trading_session, strategy_run=None):
+        # A force_paper strategy must never even reach the low-margin real
+        # broker stand-in — if it does, this test should fail loudly rather
+        # than passing for the wrong reason.
+        if strategy_run is not None:
+            config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+            if config is not None and config.runtime_mode == "force_paper":
+                return MockBrokerAdapter()
+        return _LowMarginBroker()
+
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker", _fake_get_execution_broker
+    )
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "margin_check_failed" not in decision.reasons
 
 
 def test_evaluate_trade_intent_tick_size_violation(
@@ -821,14 +1219,14 @@ def test_expire_stale_pending_approvals_leaves_fresh_ones_alone(
 
 
 def test_record_trade_outcome_effects_updates_running_totals(db: Session, trading_session):
-    record_trade_outcome_effects(db, trading_session, realized_pnl=150.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=150.0, is_live=True)
 
     assert float(trading_session.cumulative_realized_pnl) == pytest.approx(150.0)
     assert trading_session.consecutive_losses == 0
 
 
 def test_record_trade_outcome_effects_increments_consecutive_losses(db: Session, trading_session):
-    record_trade_outcome_effects(db, trading_session, realized_pnl=-50.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=-50.0, is_live=True)
 
     assert trading_session.consecutive_losses == 1
 
@@ -837,7 +1235,7 @@ def test_record_trade_outcome_effects_breaching_loss_cap_triggers_kill_switch(
     db: Session, trading_session
 ):
     # daily_loss_cap is 1000 on the fixture session.
-    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0, is_live=True)
 
     assert trading_session.mode == SafeMode.KILL_SWITCH
     alerts = db.query(SystemAlert).filter(
@@ -851,17 +1249,51 @@ def test_record_trade_outcome_effects_hitting_target_sets_entries_paused(
     db: Session, trading_session
 ):
     # daily_target_profit is 2000 on the fixture session.
-    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0)
+    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0, is_live=True)
 
     assert trading_session.entries_paused_reason == "daily_target_reached"
     # Not a mode transition — reaching a target is a goal, not a fault.
     assert trading_session.mode == SafeMode.PAPER_ONLY
 
 
+def test_record_trade_outcome_effects_is_a_noop_for_paper(db: Session, trading_session):
+    """2026-08-19 regression: the most severe gap from that day's audit —
+    this function used to run unconditionally for every closed position,
+    paper or live. A losing streak of pure paper trades could trip a real
+    kill_switch or pause live entries via daily_target_profit, over a
+    "loss"/"profit" that never touched real money. `is_live=False` must
+    return before touching anything, not just before the loss-cap/target
+    triggers -- proven here with a paper loss well past daily_loss_cap.
+    """
+    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0, is_live=False)
+
+    assert float(trading_session.cumulative_realized_pnl) == 0.0
+    assert trading_session.consecutive_losses == 0
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+    assert trading_session.entries_paused_reason is None
+
+
 def test_entries_paused_blocks_further_trade_intents(
-    db: Session, trading_session, strategy_run, option_contract, instrument
+    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
+    option_contract, instrument, broker, monkeypatch,
 ):
-    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0)
+    """`entries_paused_reason` here is `DAILY_TARGET_REACHED` — P&L-driven,
+    live-only after 2026-08-19 (see `record_trade_outcome_effects`'s own
+    docstring) — so this must exercise a genuinely live-routed strategy_run
+    to still prove the block, same setup pattern as `test_evaluate_trade_
+    intent_max_trades_per_day`.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
+    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0, is_live=True)
     assert trading_session.entries_paused_reason == "daily_target_reached"
 
     other_contract = OptionContract(
@@ -876,6 +1308,43 @@ def test_entries_paused_blocks_further_trade_intents(
 
     assert decision.decision == "rejected"
     assert any(r.startswith("entries_paused") for r in decision.reasons)
+
+
+def test_daily_target_entries_paused_does_not_block_a_paper_routed_strategy(
+    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
+    option_contract, instrument, monkeypatch,
+):
+    """2026-08-19 regression: the live side hitting its daily profit target
+    must not stop a `force_paper` strategy from continuing to test, on a
+    session that's otherwise live-capable (a mixed day) -- entries_paused_
+    reason=DAILY_TARGET_REACHED is P&L-driven, so it's gated the same way
+    as max_concurrent_positions/budget_exceeded/consecutive_loss_pause.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+
+    # Simulate the live side having already hit its target (session-level
+    # state -- doesn't matter which strategy's live close produced it).
+    trading_session.entries_paused_reason = "daily_target_reached"
+    db.add(trading_session)
+    db.flush()
+
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: MockBrokerAdapter(),
+    )
+
+    decision = evaluate_trade_intent(
+        db,
+        _make_trade_intent(db, trading_session, strategy_run, option_contract),
+        trading_session,
+        strategy_run,
+    )
+
+    assert not any(r.startswith("entries_paused") for r in decision.reasons)
 
 
 # -- audit trail integrity ----------------------------------------------------

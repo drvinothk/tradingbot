@@ -7,7 +7,7 @@ tests/unit/test_trade_log_exporter.py against synthetic rows.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -24,7 +24,13 @@ from app.domain.execution.models import (
     TradeOutcome,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import (
+    Instrument,
+    OptionChainSnapshot,
+    OptionContract,
+    OptionType,
+    QuoteTick,
+)
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -314,6 +320,104 @@ def test_row_carries_strategy_execution_mode_and_cycle_fields(
     assert row.realized_pnl == 750.0
     assert row.entry_price == 80.0
     assert row.exit_price == 100.0
+
+
+def test_row_carries_env_metrics_as_of_the_trades_own_entry_time(
+    db: Session, workspace, user, trading_session, instrument, option_contract
+):
+    """2026-08-19: VIX/PCR must be reconstructed as of `position.opened_at`
+    (the trade's own entry time), not whatever is current when the export
+    runs -- a later VIX tick / option-chain snapshot must not leak in.
+    """
+    entry_time = datetime(2026, 8, 18, 6, 0, tzinfo=UTC)
+    vix_instrument = Instrument(
+        id=uuid.uuid4(), symbol="INDIA VIX", exchange="NSE", lot_size=1, tick_size=0.05
+    )
+    db.add(vix_instrument)
+    db.flush()
+
+    db.add_all(
+        [
+            QuoteTick(
+                id=uuid.uuid4(),
+                instrument_id=vix_instrument.id,
+                ltp=13.0,
+                bid=13.0,
+                ask=13.0,
+                volume=0,
+                ts=entry_time - timedelta(minutes=1),
+            ),
+            QuoteTick(
+                id=uuid.uuid4(),
+                instrument_id=vix_instrument.id,
+                ltp=20.0,  # after entry -- must not be picked up
+                bid=20.0,
+                ask=20.0,
+                volume=0,
+                ts=entry_time + timedelta(minutes=10),
+            ),
+            OptionChainSnapshot(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                expiry_date=EXPIRY,
+                ts=entry_time - timedelta(seconds=30),
+                chain_data=[
+                    {"option_type": "CE", "oi": 1000, "volume": 100},
+                    {"option_type": "PE", "oi": 500, "volume": 50},
+                ],
+            ),
+            OptionChainSnapshot(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                expiry_date=EXPIRY,
+                ts=entry_time + timedelta(minutes=10),  # after entry -- must not be picked up
+                chain_data=[
+                    {"option_type": "CE", "oi": 1000, "volume": 100},
+                    {"option_type": "PE", "oi": 1000, "volume": 100},
+                ],
+            ),
+        ]
+    )
+    db.flush()
+
+    _seed_completed_trade(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb",
+        closed_at=entry_time,
+    )
+
+    rows = fetch_completed_trades_for_day(db, date(2026, 8, 18))
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.vix == 13.0
+    assert row.pcr_oi == 0.5
+    assert row.pcr_vol == 0.5
+
+
+def test_row_env_metrics_are_none_when_nothing_was_known_yet(
+    db: Session, workspace, user, trading_session, option_contract
+):
+    _seed_completed_trade(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb",
+        closed_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+    )
+
+    rows = fetch_completed_trades_for_day(db, date(2026, 8, 18))
+
+    assert len(rows) == 1
+    assert rows[0].vix is None
+    assert rows[0].pcr_oi is None
+    assert rows[0].pcr_vol is None
 
 
 def test_export_completed_trades_for_day_writes_a_workbook(

@@ -429,17 +429,37 @@ def parse_position(raw: dict) -> Position:
 
 
 def parse_margin(raw: dict) -> MarginInfo:
-    """`Limits` response. `cash`/`marginused` are the Noren-OMS field names
-    observed across community forks researched for this — not live-verified
-    against a real Shoonya account, same caveat as the rest of this module.
-    Defaults to 0.0 rather than raising on a missing field (unlike
-    `parse_tick`'s required `lp`): a margin figure that's merely
-    conservative-wrong (reads as less available than reality) is a safer
-    failure mode here than a hard crash on every pre-trade check once this
-    is wired into Risk Service.
+    """`Limits` response. **Live-corrected 2026-08-18**: a real captured
+    response (`{'cash': '253.58', 'payin': '26000.00', 'payout': '0.00',
+    'blk_amt': '0.00', 'mr_der_a': '18377.51', ...}`) confirmed two things
+    the prior, research-only version got wrong. First, `marginused` — the
+    field this function used to read as `used` — does not exist anywhere in
+    a real response; it silently defaulted to 0.0 every time, which
+    happened to be harmless only because `used` was never the actual
+    problem. Second, and the real bug: `cash` alone is *not* total
+    available funds — a same-day deposit lands in `payin`, not `cash`,
+    until settlement (a well-documented Noren-OMS-family convention, not
+    unique to Shoonya) — so a user who deposits real money mid-session saw
+    it silently ignored, reproducing the exact `margin_check_failed`
+    rejection depositing was meant to fix. `total` now folds in `payin`/
+    `payout`; `used` reads `blk_amt` (amount currently blocked/reserved —
+    the only field in the real response that plausibly maps to "unavailable
+    right now", `blk_amt=0.00` in the captured no-open-position case, so
+    this couldn't be cross-checked against a nonzero real value yet).
+    `mr_der_a` ("margin required — derivatives, actual"?) looks like it may
+    also be a used-margin candidate but its exact semantics are still
+    unconfirmed — revisit if `blk_amt` and `mr_der_a` ever diverge in a way
+    that makes one of them clearly wrong. Defaults to 0.0 rather than
+    raising on a missing field (unlike `parse_tick`'s required `lp`): a
+    margin figure that's merely conservative-wrong (reads as less available
+    than reality) is a safer failure mode here than a hard crash on every
+    pre-trade check once this is wired into Risk Service.
     """
-    total = _float(raw, "cash", default=0.0)
-    used = _float(raw, "marginused", default=0.0)
+    cash = _float(raw, "cash", default=0.0)
+    payin = _float(raw, "payin", default=0.0)
+    payout = _float(raw, "payout", default=0.0)
+    used = _float(raw, "blk_amt", default=0.0)
+    total = cash + payin - payout
     return MarginInfo(
         available_margin=total - used, used_margin=used, total_margin=total, ts=_utcnow()
     )

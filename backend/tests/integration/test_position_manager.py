@@ -38,6 +38,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -649,6 +650,156 @@ def test_run_once_force_closes_past_cutoff_time(
 
     db.refresh(position)
     assert position.status == PositionStatus.CLOSED
+
+
+def _mixed_strategy_positions(
+    db: Session, workspace, user, trading_session: TradingSession, option_contract: OptionContract
+) -> tuple[Position, Position, MockBrokerAdapter, MockBrokerAdapter, StrategyRun]:
+    """Two open positions in the same session -- one from a `force_paper`
+    strategy, one from a genuinely-live strategy -- each opened via its
+    *own* distinguishable `MockBrokerAdapter` instance, so a test can prove
+    which broker a later close/square-off call actually landed on.
+    """
+    paper_config = StrategyConfig(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        name="pm-paper-strat",
+        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
+    )
+    live_config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="pm-live-strat")
+    db.add_all([paper_config, live_config])
+    db.flush()
+
+    paper_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=paper_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    live_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=live_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add_all([paper_run, live_run])
+    db.flush()
+
+    paper_broker = MockBrokerAdapter()
+    live_broker = MockBrokerAdapter()
+
+    position_paper = _dispatch_position(
+        db, trading_session, paper_run, option_contract, paper_broker,
+        stop_price=1.0, target_price=100_000.0,
+    )
+    position_live = _dispatch_position(
+        db, trading_session, live_run, option_contract, live_broker,
+        stop_price=1.0, target_price=100_000.0,
+    )
+    return position_paper, position_live, paper_broker, live_broker, paper_run
+
+
+def _fake_get_execution_broker_by_strategy(paper_run_id, paper_broker, live_broker):
+    def _fake(trading_session, strategy_run=None, *, position=None):
+        if strategy_run is not None and strategy_run.id == paper_run_id:
+            return paper_broker
+        return live_broker
+
+    return _fake
+
+
+def test_run_cycle_resolves_broker_per_position_when_strategies_differ(
+    db: Session, workspace, user, trading_session, option_contract, monkeypatch
+):
+    """2026-08-19 regression: the actual live incident. Two open positions
+    in the same cycle -- one opened by a force_paper strategy, one by a
+    genuinely graduated-live strategy -- on a session that has reached
+    live_enabled. PositionManager must resolve each position's own broker
+    via its own strategy, not reuse a single broker for the whole cycle
+    (the real bug: a force_paper position's close attempt routed to the
+    real broker just because the *session* was live_enabled, saved only by
+    an unrelated broker-side order-type rejection).
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    position_paper, position_live, paper_broker, live_broker, paper_run = (
+        _mixed_strategy_positions(db, workspace, user, trading_session, option_contract)
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        _fake_get_execution_broker_by_strategy(paper_run.id, paper_broker, live_broker),
+    )
+
+    # Both brokers report a price below stop -- both positions should close
+    # this cycle, each via its own broker.
+    paper_broker._prices[option_contract.symbol] = 0.5  # noqa: SLF001
+    live_broker._prices[option_contract.symbol] = 0.5  # noqa: SLF001
+
+    manager = PositionManager(
+        trading_session.id,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position_paper)
+    db.refresh(position_live)
+    assert position_paper.status == PositionStatus.CLOSED
+    assert position_live.status == PositionStatus.CLOSED
+
+    # The critical assertion: each position's close order landed on *its
+    # own* strategy's broker, never the other's.
+    assert f"exit:{position_paper.id}" in paper_broker._orders  # noqa: SLF001
+    assert f"exit:{position_paper.id}" not in live_broker._orders  # noqa: SLF001
+    assert f"exit:{position_live.id}" in live_broker._orders  # noqa: SLF001
+    assert f"exit:{position_live.id}" not in paper_broker._orders  # noqa: SLF001
+
+
+def test_eod_square_off_resolves_broker_per_position_when_strategies_differ(
+    db: Session, workspace, user, trading_session, option_contract, monkeypatch
+):
+    """Same 2026-08-19 fix, the EOD-square-off path -- `_square_off_all_open_
+    positions` used to apply one caller-supplied broker to every position
+    being force-closed, the identical bug shape as the main stop/target/
+    trail loop, just reached at cutoff_time instead.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    trading_session.cutoff_time = dt_time(0, 0)  # always "past cutoff" in IST
+    db.add(trading_session)
+    db.flush()
+
+    position_paper, position_live, paper_broker, live_broker, paper_run = (
+        _mixed_strategy_positions(db, workspace, user, trading_session, option_contract)
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        _fake_get_execution_broker_by_strategy(paper_run.id, paper_broker, live_broker),
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position_paper)
+    db.refresh(position_live)
+    assert position_paper.status == PositionStatus.CLOSED
+    assert position_live.status == PositionStatus.CLOSED
+
+    assert f"exit:{position_paper.id}" in paper_broker._orders  # noqa: SLF001
+    assert f"exit:{position_paper.id}" not in live_broker._orders  # noqa: SLF001
+    assert f"exit:{position_live.id}" in live_broker._orders  # noqa: SLF001
+    assert f"exit:{position_live.id}" not in paper_broker._orders  # noqa: SLF001
 
 
 def test_run_once_runs_reconciliation_every_n_cycles(

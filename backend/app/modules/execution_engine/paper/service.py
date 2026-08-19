@@ -219,19 +219,36 @@ def dispatch_trade_intent(
         # REST-option-chain-derived proposed price (see every strategy's
         # rank_from_latest_snapshot() call) -- pass it through as the fill
         # basis instead of leaving MockBrokerAdapter to fill at its own
-        # independent synthetic price. order_type stays MARKET (existing
-        # contract/tests expect it); limit_price here is paper-mode fill
-        # plumbing only -- a real broker adapter must not send this
-        # unchanged on an actual MARKET order.
-        slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
-        limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, slippage_pct))
+        # independent synthetic price.
+        #
+        # order_type: **live-corrected 2026-08-19** -- a real Shoonya
+        # PlaceOrder call rejects order_type=MARKET outright
+        # ("ALGO_CHK: MKT Order type not allowed for API order",
+        # live-confirmed). PAPER keeps MARKET unchanged (existing
+        # contract/tests expect it; the mock doesn't care). LIVE now sends
+        # a real LIMIT order, priced with its own dedicated buffer
+        # (`AppSettings.live_limit_order_buffer_pct`) rather than paper's
+        # `fill_slippage_pct` (which defaults to 0.0 and exists for a
+        # different purpose -- realistic paper fill simulation, not "will
+        # a real limit order actually execute despite LTP moving between
+        # decision and placement").
+        if order_mode == OrderMode.LIVE:
+            buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+            limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, buffer_pct))
+            broker_order_type = BrokerOrderType.LIMIT
+            domain_order_type = OrderType.LIMIT
+        else:
+            slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
+            limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, slippage_pct))
+            broker_order_type = BrokerOrderType.MARKET
+            domain_order_type = OrderType.MARKET
 
         order_result = broker.place_order(
             OrderRequest(
                 idempotency_key=trade_intent.idempotency_key,
                 contract_symbol=option_contract.symbol,
                 side=_to_broker_side(side),
-                order_type=BrokerOrderType.MARKET,
+                order_type=broker_order_type,
                 qty=qty,
                 limit_price=limit_price,
                 lot_size=instrument.lot_size,
@@ -248,7 +265,7 @@ def dispatch_trade_intent(
             idempotency_key=trade_intent.idempotency_key,
             mode=order_mode,
             side=_to_domain_side(side),
-            order_type=OrderType.MARKET,
+            order_type=domain_order_type,
             qty=qty,
             status=_map_status(order_result.status),
             filled_qty=order_result.filled_qty,
@@ -416,6 +433,40 @@ def _open_position_from_fill(
     return position
 
 
+def resolve_broker_for_position(
+    db: Session, trading_session: TradingSession, position: Position
+) -> BrokerPort:
+    """Resolves the correct broker for one specific position's own
+    strategy — must be called per-position, never once for a whole batch
+    of positions, since different open positions in the same session can
+    belong to differently-configured strategies (one `force_paper`, one
+    genuinely graduated live) whose orders must never share a single
+    broker resolution.
+
+    **Live bug fixed 2026-08-19**: `PositionManager._run_cycle` used to
+    resolve one broker via `get_execution_broker(trading_session)` (no
+    `strategy_run`) for the *entire* cycle and reuse it to evaluate/close
+    every open position regardless of which strategy opened it —
+    `close_position`'s own fallback resolution below had the identical
+    gap. Once a session reaches `live_enabled`, every open position's
+    close attempt routed to the *real* Shoonya broker, including positions
+    opened by a strategy explicitly marked `force_paper`. Confirmed live:
+    a genuine `force_paper` strategy's paper position retried a real
+    `PlaceOrder` call against the live account every ~4s, saved only by an
+    unrelated Shoonya-side rejection (`ALGO_CHK: MKT Order type not
+    allowed for API order`), not by anything in this codebase.
+    `eod_square_off._square_off_all_open_positions` (shared by EOD and
+    margin-breach square-off) had the same shape — a single broker applied
+    to every position being force-closed — and is fixed the same way, via
+    this same helper.
+    """
+    strategy_run: StrategyRun | None = None
+    trade_intent = db.get(TradeIntent, position.trade_intent_id)
+    if trade_intent is not None:
+        strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+    return get_execution_broker(trading_session, strategy_run, position=position)
+
+
 def close_position(
     db: Session,
     trading_session: TradingSession,
@@ -440,7 +491,7 @@ def close_position(
     # -- an explicitly-injected broker (the established test-fake pattern)
     # must never be misread as live just because it isn't MockBrokerAdapter.
     broker_was_provided = broker is not None
-    broker = broker or get_execution_broker(trading_session, position=position)
+    broker = broker or resolve_broker_for_position(db, trading_session, position)
     order_mode = (
         OrderMode.LIVE
         if not broker_was_provided and is_execution_broker_live(broker)
@@ -481,16 +532,32 @@ def close_position(
                     option_contract=option_contract,
                 )
 
-            slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
-            exit_limit_price = float(
-                _apply_slippage(_dec(intended_price), exit_side, slippage_pct)
-            )
+            # order_type: same 2026-08-19 live-correction as
+            # dispatch_trade_intent's own entry order -- see that
+            # function's docstring for the real Shoonya rejection this
+            # fixes and why the buffer setting is a separate one from
+            # paper's fill_slippage_pct.
+            if order_mode == OrderMode.LIVE:
+                buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+                exit_limit_price = float(
+                    _apply_slippage(_dec(intended_price), exit_side, buffer_pct)
+                )
+                exit_broker_order_type = BrokerOrderType.LIMIT
+                exit_domain_order_type = OrderType.LIMIT
+            else:
+                slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
+                exit_limit_price = float(
+                    _apply_slippage(_dec(intended_price), exit_side, slippage_pct)
+                )
+                exit_broker_order_type = BrokerOrderType.MARKET
+                exit_domain_order_type = OrderType.MARKET
+
             order_result = broker.place_order(
                 OrderRequest(
                     idempotency_key=exit_idempotency_key,
                     contract_symbol=option_contract.symbol,
                     side=_to_broker_side(exit_side),
-                    order_type=BrokerOrderType.MARKET,
+                    order_type=exit_broker_order_type,
                     qty=position.qty,
                     limit_price=exit_limit_price,
                     lot_size=instrument.lot_size,
@@ -506,7 +573,7 @@ def close_position(
                 idempotency_key=exit_idempotency_key,
                 mode=order_mode,
                 side=_to_domain_side(exit_side),
-                order_type=OrderType.MARKET,
+                order_type=exit_domain_order_type,
                 qty=position.qty,
                 status=_map_status(order_result.status),
                 filled_qty=order_result.filled_qty,
@@ -649,7 +716,9 @@ def close_position(
         # call site instead of relying on remembering it.
         from app.modules.risk_engine.service import record_trade_outcome_effects
 
-        record_trade_outcome_effects(db, trading_session, float(realized_pnl))
+        record_trade_outcome_effects(
+            db, trading_session, float(realized_pnl), is_live=(order_mode == OrderMode.LIVE)
+        )
 
         db.flush()
         run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)

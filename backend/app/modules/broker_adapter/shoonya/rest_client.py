@@ -18,15 +18,12 @@ account confirms which one actually matters.
 from __future__ import annotations
 
 import json
-import logging
 import urllib.parse
 
 import httpx
 
 from app.core.rate_limiter import RateLimitExceeded, TokenBucket, make_broker_call_limiter
 from app.modules.broker_adapter.base.errors import BrokerAuthError, BrokerConnectivityError
-
-logger = logging.getLogger("app.broker_adapter.shoonya")
 
 # Substrings observed (via research, not a live session — same caveat as
 # the rest of this package) in Shoonya's `emsg` for a token that died
@@ -35,6 +32,17 @@ logger = logging.getLogger("app.broker_adapter.shoonya")
 # broker-agnostic callers like `PositionManager` already know to react to),
 # not a generic `ShoonyaApiError` indistinguishable from any other failure.
 _SESSION_EXPIRED_MARKERS = ("session expired", "invalid session", "invalid token")
+
+# 2026-08-18, live-confirmed: Shoonya's list-returning endpoints
+# (PositionBook/OrderBook/SingleOrdHist) signal "genuinely nothing to
+# return" as a `stat:Not_Ok` error response (e.g. `emsg='Error Occurred :
+# 5 "no data"'`) rather than an empty JSON list — contradicting this
+# module's own prior documented assumption ("a list response ... is never
+# itself an error"). Live-observed on `PositionBook` for a real account
+# with zero open positions; every empty-list-returning method below checks
+# for this pattern specifically before treating a Not_Ok response as a
+# real failure.
+_NO_DATA_MARKERS = ("no data",)
 
 
 class ShoonyaApiError(BrokerConnectivityError):
@@ -58,6 +66,10 @@ class ShoonyaSessionExpiredError(ShoonyaApiError, BrokerAuthError):
     `ShoonyaApiError` (existing Shoonya-specific catch sites keep working)
     and `BrokerAuthError` (broker-agnostic callers react to it too).
     """
+
+
+def _is_no_data_error(exc: ShoonyaApiError) -> bool:
+    return any(marker in exc.message.lower() for marker in _NO_DATA_MARKERS)
 
 
 class ShoonyaRestClient:
@@ -247,15 +259,30 @@ class ShoonyaRestClient:
         return result
 
     def order_book(self, uid: str) -> list[dict]:
-        result = self._post("OrderBook", {"uid": uid})
+        try:
+            result = self._post("OrderBook", {"uid": uid})
+        except ShoonyaApiError as exc:
+            if _is_no_data_error(exc):
+                return []
+            raise
         return list(result) if isinstance(result, list) else []
 
     def single_order_history(self, uid: str, broker_order_id: str) -> list[dict]:
-        result = self._post("SingleOrdHist", {"uid": uid, "norenordno": broker_order_id})
+        try:
+            result = self._post("SingleOrdHist", {"uid": uid, "norenordno": broker_order_id})
+        except ShoonyaApiError as exc:
+            if _is_no_data_error(exc):
+                return []
+            raise
         return list(result) if isinstance(result, list) else []
 
     def position_book(self, uid: str, actid: str) -> list[dict]:
-        result = self._post("PositionBook", {"uid": uid, "actid": actid})
+        try:
+            result = self._post("PositionBook", {"uid": uid, "actid": actid})
+        except ShoonyaApiError as exc:
+            if _is_no_data_error(exc):
+                return []
+            raise
         return list(result) if isinstance(result, list) else []
 
     def get_limits(self, uid: str, actid: str) -> dict:

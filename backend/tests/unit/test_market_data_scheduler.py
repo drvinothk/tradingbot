@@ -17,7 +17,11 @@ from app.modules.market_data.market_data_scheduler import (
     PRE_MARKET_HEALTH_CHECK_SECONDS,
     MarketDataScheduler,
 )
-from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, MarketPhase
+from app.modules.market_data.market_hours import (
+    ENV_METRIC_SYMBOLS,
+    TRADABLE_UNDERLYINGS,
+    MarketPhase,
+)
 
 
 class _FakeProvider:
@@ -37,6 +41,7 @@ def _scheduler_with_phase_sequence(
     provider: _FakeProvider,
     subscribe_calls: list[str] | None = None,
     reset_calls: list[None] | None = None,
+    resubscribe_calls: list[None] | None = None,
 ):
     it = iter(phases)
     monkeypatch.setattr(scheduler_module, "current_phase", lambda: next(it))
@@ -49,6 +54,10 @@ def _scheduler_with_phase_sequence(
     monkeypatch.setattr(
         registry_module, "reset_daily_indicators", lambda: resets.append(None)
     )
+    resubscribes = resubscribe_calls if resubscribe_calls is not None else []
+    monkeypatch.setattr(
+        registry_module, "reset_subscriptions_for_new_day", lambda: resubscribes.append(None)
+    )
     return MarketDataScheduler(tick_seconds=1.0)
 
 
@@ -58,13 +67,69 @@ def test_transition_into_pre_market_disconnects_connects_subscribes_and_resets_v
     provider = _FakeProvider()
     subscribe_calls: list[str] = []
     reset_calls: list[None] = []
+    resubscribe_calls: list[None] = []
     sched = _scheduler_with_phase_sequence(
-        monkeypatch, [MarketPhase.PRE_MARKET], provider, subscribe_calls, reset_calls
+        monkeypatch,
+        [MarketPhase.PRE_MARKET],
+        provider,
+        subscribe_calls,
+        reset_calls,
+        resubscribe_calls,
     )
     sched.run_once()
     assert provider.calls == ["disconnect", "connect"]
-    assert subscribe_calls == list(TRADABLE_UNDERLYINGS)
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + list(ENV_METRIC_SYMBOLS)
     assert len(reset_calls) == 1
+    assert len(resubscribe_calls) == 1
+
+
+def test_pre_market_resets_subscription_bookkeeping_before_disconnecting(monkeypatch):
+    """2026-08-19 regression: the daily PRE_MARKET transition disconnects
+    and reconnects the provider -- a genuinely new WS session -- but must
+    invalidate registry._subscribed_symbols' "already subscribed"
+    bookkeeping *before* that, or a symbol subscribed yesterday reads as
+    "already handled" against today's brand-new connection and never gets
+    a real subscribe request sent on it. Ordering is asserted via the same
+    shared call-order list `_FakeProvider.calls` already records
+    disconnect/connect into, not just that both eventually fire.
+    """
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr(
+        registry_module,
+        "reset_subscriptions_for_new_day",
+        lambda: provider.calls.append("resubscribe"),
+    )
+
+    sched.run_once()
+
+    assert provider.calls == ["resubscribe", "disconnect", "connect"]
+
+
+def test_fresh_startup_into_active_market_does_not_reset_subscription_bookkeeping(monkeypatch):
+    """A mid-day process (re)start already has fresh, empty registry state
+    (the module was just reloaded) -- no stale bookkeeping to invalidate,
+    and this transition is only ever reached with from_phase=None, never
+    from a live PRE_MARKET->ACTIVE_MARKET day-to-day flow, so it must not
+    call the daily resubscribe reset.
+    """
+    provider = _FakeProvider()
+    resubscribe_calls: list[None] = []
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch, [MarketPhase.ACTIVE_MARKET], provider, resubscribe_calls=resubscribe_calls
+    )
+    sched.run_once()
+    assert resubscribe_calls == []
+
+
+def test_transition_into_closed_does_not_reset_subscription_bookkeeping(monkeypatch):
+    provider = _FakeProvider()
+    resubscribe_calls: list[None] = []
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch, [MarketPhase.CLOSED], provider, resubscribe_calls=resubscribe_calls
+    )
+    sched.run_once()
+    assert resubscribe_calls == []
 
 
 def test_fresh_startup_into_active_market_does_not_reset_vwap(monkeypatch):
@@ -102,7 +167,7 @@ def test_fresh_startup_into_active_market_connects_and_subscribes(monkeypatch):
     )
     sched.run_once()
     assert provider.calls == ["connect"]
-    assert subscribe_calls == list(TRADABLE_UNDERLYINGS)
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + list(ENV_METRIC_SYMBOLS)
 
 
 def test_fresh_startup_into_active_market_defers_subscription_when_shoonya_not_connected(

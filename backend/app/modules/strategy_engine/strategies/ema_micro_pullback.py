@@ -267,6 +267,6 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
                 "ema20": ema20,
                 "strike_score": top.score,
                 "breakdown": top.breakdown,
-                "env": get_latest_env_metrics(db, self.instrument_id),
+                "env": get_latest_env_metrics(db, self.instrument_id, self.expiry_date),
             },
         )

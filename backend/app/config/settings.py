@@ -347,6 +347,17 @@ class AppSettings(BaseSettings):
     # point is a missing/false flag must never be interpreted as "use
     # paper instead."
     allow_real_money_dispatch: bool = False
+    # 2026-08-19: a genuinely live dispatch now sends order_type=LIMIT (not
+    # MARKET -- Shoonya rejects MKT via API, live-confirmed:
+    # "ALGO_CHK: MKT Order type not allowed for API order"), so it needs a
+    # real, non-zero price buffer to tolerate LTP movement between decision
+    # and placement and still fill. Deliberately separate from
+    # PaperTradingSettings.fill_slippage_pct (which defaults to 0.0 and
+    # exists for a different purpose -- realistic paper *fill simulation*,
+    # not "will a real limit order actually execute"). 0.5% is a starting
+    # point, not a researched figure -- tune via APP_LIVE_LIMIT_ORDER_
+    # BUFFER_PCT once live fills are observed.
+    live_limit_order_buffer_pct: float = 0.005
 
 
 class PaperTradingSettings(BaseSettings):

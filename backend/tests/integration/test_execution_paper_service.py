@@ -18,7 +18,9 @@ from sqlalchemy.orm import Session
 from app.domain.execution.models import (
     ExitReason,
     Order,
+    OrderMode,
     OrderStatus,
+    OrderType,
     Position,
     PositionStatus,
     StopPlan,
@@ -36,6 +38,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -328,6 +331,70 @@ def test_dispatch_is_idempotent_on_trade_intent_key(
     assert db.query(Position).filter(Position.trade_intent_id == trade_intent.id).count() == 1
 
 
+def test_dispatch_sends_market_order_for_a_paper_dispatch(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-08-19 regression: paper stays exactly as it always was — an
+    explicit-broker dispatch (this suite's normal paper pattern) must never
+    be re-priced by the new live-only limit-order buffer.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+
+    order = dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+
+    assert order.order_type == OrderType.MARKET
+    assert _price(order.avg_fill_price) == pytest.approx(80.0)
+
+
+def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
+    db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
+    option_contract, monkeypatch,
+):
+    """2026-08-19 fix: a real Shoonya PlaceOrder rejects order_type=MARKET
+    outright ("ALGO_CHK: MKT Order type not allowed for API order",
+    live-confirmed) -- a genuinely live-routed dispatch must send LIMIT with
+    a real, non-zero price buffer (APP_LIVE_LIMIT_ORDER_BUFFER_PCT, default
+    0.5%) so it still fills despite LTP moving between decision and
+    placement. Same live-routing/_FakeLiveBroker/preflight-neutralizing
+    pattern as `test_close_position_updates_session_pnl_and_can_trigger_kill_switch`.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+
+    class _FakeLiveBroker:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    fake_live_broker = _FakeLiveBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda trading_session, strategy_run=None, **kwargs: fake_live_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+    order = dispatch_trade_intent(db, trading_session, trade_intent)
+
+    assert order.mode == OrderMode.LIVE
+    assert order.order_type == OrderType.LIMIT
+    # BUY side, 0.5% default buffer -- priced *above* entry_price so a real
+    # limit order still tolerates adverse LTP movement and fills.
+    assert _price(order.avg_fill_price) == pytest.approx(80.0 * 1.005, rel=1e-3)
+
+
 # -- close_position -----------------------------------------------------------
 
 
@@ -427,10 +494,24 @@ def test_close_position_leaves_position_open_when_exit_order_is_rejected(
 
 
 def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
-    db: Session, broker, trading_session, strategy_run, option_contract
+    db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
+    option_contract, monkeypatch,
 ):
+    """2026-08-19: `record_trade_outcome_effects` only applies session P&L
+    effects for a genuinely *live* close now (the most severe gap from
+    that day's audit — paper losses used to trip a real kill_switch). The
+    entry stays an explicit-broker paper dispatch (irrelevant to this
+    test); the close is what needs to resolve live, so it's called without
+    an explicit broker, through a graduated strategy on a guarded-live
+    session, with `get_execution_broker`/preflight neutralized the same
+    way `test_evaluate_trade_intent_margin_check_failed`-style tests
+    already do elsewhere in this suite.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     trading_session.daily_loss_cap = 1.0  # trivially small so any loss breaches it
     db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
     db.flush()
 
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
@@ -441,9 +522,29 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     # this is otherwise a no-op price move).
     broker._prices[option_contract.symbol] = _price(order.avg_fill_price) - 5.0  # noqa: SLF001
 
-    outcome = close_position(
-        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    # is_execution_broker_live is a plain `not isinstance(_, MockBrokerAdapter)`
+    # check -- returning the `broker` fixture itself would still read as
+    # paper. A thin delegate that isn't a MockBrokerAdapter subclass reads
+    # as live while all real behavior (get_quote/place_order/...) still
+    # goes through the same seeded mock underneath.
+    class _FakeLiveBroker:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    fake_live_broker = _FakeLiveBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda trading_session, strategy_run=None, **kwargs: fake_live_broker,
     )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+
+    outcome = close_position(db, trading_session, position, ExitReason.STOP, intended_price=72.0)
 
     assert outcome is not None
     assert outcome.realized_pnl < 0
@@ -454,6 +555,44 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     assert float(trading_session.cumulative_realized_pnl) == pytest.approx(outcome.realized_pnl)
     assert trading_session.consecutive_losses == 1
     assert trading_session.mode == SafeMode.KILL_SWITCH
+
+    # 2026-08-19: the exit order for a genuinely live close must also be a
+    # buffered LIMIT order, same fix and reasoning as the entry side.
+    exit_order = db.query(Order).filter(Order.position_id == position.id).one()
+    assert exit_order.order_type == OrderType.LIMIT
+    assert exit_order.mode == OrderMode.LIVE
+
+
+def test_close_position_does_not_update_session_pnl_for_a_paper_close(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-08-19 regression: the actual bug this fixed. A paper close
+    (this test's normal, explicit-broker setup, unchanged) must never touch
+    `cumulative_realized_pnl`/`consecutive_losses` or trip `kill_switch` —
+    proven here with a loss well past a trivially small daily_loss_cap.
+    """
+    trading_session.daily_loss_cap = 1.0
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    broker._prices[option_contract.symbol] = _price(order.avg_fill_price) - 5.0  # noqa: SLF001
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+
+    assert outcome is not None
+    assert outcome.realized_pnl < 0
+    assert float(trading_session.cumulative_realized_pnl) == 0.0
+    assert trading_session.consecutive_losses == 0
+    assert trading_session.mode == SafeMode.PAPER_ONLY
+
+    exit_order = db.query(Order).filter(Order.position_id == position.id).one()
+    assert exit_order.order_type == OrderType.MARKET
+    assert exit_order.mode == OrderMode.PAPER
 
 
 # -- evaluate_open_position: stop/target/trail --------------------------------

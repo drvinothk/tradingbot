@@ -28,6 +28,7 @@ import logging
 import threading
 
 from app.modules.market_data.market_hours import (
+    ENV_METRIC_SYMBOLS,
     TRADABLE_UNDERLYINGS,
     MarketPhase,
     current_phase,
@@ -95,6 +96,15 @@ class MarketDataScheduler:
         )
         provider = get_market_data_provider()
         if to_phase is MarketPhase.PRE_MARKET:
+            # 2026-08-19: invalidate registry._subscribed_symbols' "already
+            # subscribed" bookkeeping *before* tearing down the connection
+            # it was tracking -- otherwise a symbol subscribed yesterday
+            # reads as "already handled" against today's brand-new
+            # connection below, and the real subscribe request never gets
+            # re-sent. See `market_data.registry
+            # .reset_subscriptions_for_new_day`'s own docstring for the
+            # live incident this fixes.
+            self._reset_subscriptions_for_new_day()
             # Fresh session for the day -- disconnect first so any state
             # left over from yesterday (a stale token, an open WS) is
             # actually torn down, not just reused.
@@ -112,6 +122,13 @@ class MarketDataScheduler:
             self._subscribe_known_underlyings_if_ready()
         elif to_phase is MarketPhase.CLOSED:
             provider.disconnect()
+
+    def _reset_subscriptions_for_new_day(self) -> None:
+        # Local import, same convention as _subscribe_known_underlyings/
+        # _reset_daily_indicators below.
+        from app.modules.market_data.registry import reset_subscriptions_for_new_day
+
+        reset_subscriptions_for_new_day()
 
     def _subscribe_known_underlyings_if_ready(self) -> None:
         """2026-08-14: real live incident -- this used to call `ensure_
@@ -149,6 +166,13 @@ class MarketDataScheduler:
         from app.modules.market_data.registry import ensure_ingestion_running
 
         for symbol in TRADABLE_UNDERLYINGS:
+            ensure_ingestion_running(symbol)
+        # VIX/PCR environment-metrics feed (2026-08-19) -- same
+        # provider-agnostic subscription path as the tradable underlyings
+        # above, just a separate loop so this symbol never touches
+        # TRADABLE_UNDERLYINGS itself (see ENV_METRIC_SYMBOLS's own
+        # docstring for why that separation matters).
+        for symbol in ENV_METRIC_SYMBOLS:
             ensure_ingestion_running(symbol)
 
     def _reset_daily_indicators(self) -> None:

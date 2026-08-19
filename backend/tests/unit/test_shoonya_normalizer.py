@@ -245,3 +245,48 @@ def test_parse_tpseries_row_real_volume_on_a_derivative_token():
     }
     candle = normalizer.parse_tpseries_row(row)
     assert candle.volume == 8970
+
+
+def test_parse_margin_includes_payin():
+    """Live bug fixed 2026-08-18: a real captured `Limits` response for an
+    account that had just deposited real cash. `cash` alone
+    (253.58) undercounted real available funds by the full deposit — `payin`
+    (26000.00) must be added in, since a same-day deposit lands there, not
+    in `cash`, until settlement. `marginused` (the field this parser used to
+    read for `used`) doesn't exist in this real response at all.
+    """
+    raw = {
+        "cash": "253.58",
+        "payin": "26000.00",
+        "payout": "0.00",
+        "brkcollamt": "0.00",
+        "unclearedcash": "0.00",
+        "aux_daycash": "0.00",
+        "aux_brkcollamt": "0.00",
+        "aux_unclearedcash": "0.00",
+        "daycash": "0.00",
+        "turnoverlmt": "999999999999.00",
+        "pendordvallmt": "999999999999.00",
+        "remarks_amt": "0.00",
+        "blk_amt": "0.00",
+        "mr_der_a": "18377.51",
+    }
+    margin = normalizer.parse_margin(raw)
+    assert margin.total_margin == pytest.approx(26253.58)
+    assert margin.used_margin == pytest.approx(0.0)
+    assert margin.available_margin == pytest.approx(26253.58)
+
+
+def test_parse_margin_subtracts_blocked_amount():
+    raw = {"cash": "10000.00", "payin": "0.00", "payout": "0.00", "blk_amt": "1500.00"}
+    margin = normalizer.parse_margin(raw)
+    assert margin.total_margin == pytest.approx(10000.0)
+    assert margin.used_margin == pytest.approx(1500.0)
+    assert margin.available_margin == pytest.approx(8500.0)
+
+
+def test_parse_margin_defaults_missing_fields_to_zero():
+    margin = normalizer.parse_margin({})
+    assert margin.total_margin == 0.0
+    assert margin.used_margin == 0.0
+    assert margin.available_margin == 0.0

@@ -53,6 +53,7 @@ from app.core.db.session import session_scope
 from app.domain.execution.models import Position, TradeOutcome
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
+from app.modules.strategy_engine.env_metrics import get_env_metrics
 
 logger = logging.getLogger("app.reporting.exporter")
 
@@ -75,6 +76,9 @@ _HEADERS = [
     "Exit Reason",
     "Realized PnL",
     "Slippage",
+    "VIX (at entry)",
+    "PCR - OI (at entry)",
+    "PCR - Volume (at entry)",
     "Trade ID (internal)",
 ]
 _TRADE_ID_COLUMN_INDEX = len(_HEADERS)  # 1-indexed, last column
@@ -100,6 +104,14 @@ class TradeLogRow:
     exit_reason: str
     realized_pnl: float
     slippage: float
+    # VIX/PCR environment metrics as of this trade's entry time, not
+    # "current" -- see strategy_engine.env_metrics.get_env_metrics's own
+    # docstring for the as_of_utc reconstruction this is built from. `None`
+    # for any/all three when nothing was known yet at that moment (e.g. a
+    # trade that predates the VIX/PCR pipeline entirely).
+    vix: float | None
+    pcr_oi: float | None
+    pcr_vol: float | None
 
 
 def _day_bounds_utc(target_date: date) -> tuple[datetime, datetime]:
@@ -140,36 +152,51 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
         .all()
     )
 
-    return [
-        # `.value`, not a bare attribute -- these columns are all plain
-        # String(N) (no native SQLAlchemy Enum type), so a value freshly
-        # read back via this query's own SELECT comes back as a plain `str`,
-        # not the declared StrEnum subtype (confirmed empirically: a bare
-        # `.value` access AttributeErrors on the read-back object even
-        # though the same field accepts an enum member fine on construction).
-        # `str(...)` handles both shapes uniformly rather than assuming one.
-        TradeLogRow(
-            trade_outcome_id=outcome.id,
-            workspace_id=intent.workspace_id,
-            strategy_name=config.name,
-            execution_mode=str(run.execution_mode),
-            underlying_symbol=instrument.symbol,
-            contract_symbol=contract.symbol,
-            option_type=str(contract.option_type),
-            strike=float(contract.strike),
-            expiry_date=contract.expiry_date,
-            side=str(position.side),
-            qty=position.qty,
-            entry_price=float(outcome.entry_price),
-            entry_time_utc=position.opened_at,
-            exit_price=float(outcome.exit_price),
-            exit_time_utc=outcome.closed_at,
-            exit_reason=str(outcome.exit_reason),
-            realized_pnl=float(outcome.realized_pnl),
-            slippage=float(outcome.slippage),
+    rows = []
+    for outcome, position, contract, instrument, intent, run, config in query_rows:
+        # As of this trade's own entry time, not "current" -- see
+        # env_metrics.get_env_metrics's own docstring for the
+        # as_of_utc reconstruction. One extra query pair per row (VIX
+        # tick + option-chain snapshot); fine at this system's real
+        # trade volumes, and this only ever runs once daily, off the
+        # hot path.
+        env = get_env_metrics(
+            db, instrument.id, contract.expiry_date, as_of_utc=position.opened_at
         )
-        for outcome, position, contract, instrument, intent, run, config in query_rows
-    ]
+        rows.append(
+            # `.value`, not a bare attribute -- these columns are all plain
+            # String(N) (no native SQLAlchemy Enum type), so a value freshly
+            # read back via this query's own SELECT comes back as a plain
+            # `str`, not the declared StrEnum subtype (confirmed
+            # empirically: a bare `.value` access AttributeErrors on the
+            # read-back object even though the same field accepts an enum
+            # member fine on construction). `str(...)` handles both shapes
+            # uniformly rather than assuming one.
+            TradeLogRow(
+                trade_outcome_id=outcome.id,
+                workspace_id=intent.workspace_id,
+                strategy_name=config.name,
+                execution_mode=str(run.execution_mode),
+                underlying_symbol=instrument.symbol,
+                contract_symbol=contract.symbol,
+                option_type=str(contract.option_type),
+                strike=float(contract.strike),
+                expiry_date=contract.expiry_date,
+                side=str(position.side),
+                qty=position.qty,
+                entry_price=float(outcome.entry_price),
+                entry_time_utc=position.opened_at,
+                exit_price=float(outcome.exit_price),
+                exit_time_utc=outcome.closed_at,
+                exit_reason=str(outcome.exit_reason),
+                realized_pnl=float(outcome.realized_pnl),
+                slippage=float(outcome.slippage),
+                vix=env.get("vix") if env is not None else None,
+                pcr_oi=env.get("pcr_oi") if env is not None else None,
+                pcr_vol=env.get("pcr_vol") if env is not None else None,
+            )
+        )
+    return rows
 
 
 def _sanitize_sheet_name(name: str) -> str:
@@ -198,6 +225,9 @@ def _row_values(row: TradeLogRow) -> list:
         row.exit_reason,
         row.realized_pnl,
         row.slippage,
+        row.vix,
+        row.pcr_oi,
+        row.pcr_vol,
         str(row.trade_outcome_id),
     ]
 

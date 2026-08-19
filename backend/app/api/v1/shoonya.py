@@ -106,6 +106,53 @@ def ws_diagnostic(user: User = Depends(require_permission("session.start"))) -> 
     return inner.diagnose_ws_auth()
 
 
+@router.get("/export-ws-session-for-diagnostic")
+def export_ws_session_for_diagnostic(
+    user: User = Depends(require_permission("session.start")),
+) -> dict:
+    """2026-08-19 TEMP diagnostic — lets a standalone, out-of-process WS
+    quality-monitoring script (run in isolation, deliberately outside this
+    app's own request/response cycle so it can watch for hours without
+    tying up an HTTP connection) reuse this app's already-live Shoonya
+    session instead of logging in separately. A second, independent login
+    risked silently invalidating this app's own live session mid-paper-
+    trading if Shoonya's session model only permits one active token per
+    account (never confirmed either way, not worth risking to find out).
+
+    Writes `{uid, actid, access_token, ws_host, api_host}` to a local file
+    only this box's own user can read (`chmod 600`) -- deliberately never
+    returned in the HTTP response body, so the access token never lands in
+    a browser network tab, an nginx access log, or anywhere else an HTTP
+    response might be captured. Strip this endpoint once the diagnostic run
+    is done.
+    """
+    import json
+    import os
+
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+    broker = get_broker()
+    inner = getattr(broker, "_inner", broker)
+    if not isinstance(inner, ShoonyaBrokerAdapter):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "No live Shoonya session — connect via /shoonya/login-url first.",
+        )
+    payload = {
+        "uid": inner._uid,  # noqa: SLF001 - deliberate diagnostic-only reach into adapter internals
+        "actid": inner._actid,  # noqa: SLF001
+        "access_token": inner._auth_result.session_token,  # noqa: SLF001
+        "ws_host": inner._settings.ws_host,  # noqa: SLF001
+        "api_host": inner._settings.api_host,  # noqa: SLF001
+    }
+    path = os.path.join(os.path.dirname(__file__), "..", "..", "..", ".ws_diagnostic_session.json")
+    path = os.path.abspath(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(payload, f)
+    return {"exported": True}
+
+
 @router.get("/ws-tick-diagnostic")
 def ws_tick_diagnostic(
     symbols: str,

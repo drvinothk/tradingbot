@@ -40,6 +40,19 @@ logger = logging.getLogger("app.market_data")
 # leave price_bars empty for minutes before anyone notices.
 _WS_HEALTH_GRACE_SECONDS = 15.0
 
+# Per-symbol override for the above -- VIX/PCR environment-metrics feed
+# (2026-08-19). India VIX is a computed index, not a continuously-traded
+# instrument: `scripts/shoonya_ws_quality_diagnostic.py`'s own live-observed
+# data found gaps as low as ~2 ticks/60s during genuinely healthy streaming
+# (vs. NIFTY/BANKNIFTY's 350+/min) -- the flat 15s default would keep VIX
+# perpetually flagged unhealthy and permanently on REST fallback (itself
+# untested for an index symbol, unlike the option-underlying candles this
+# fallback path was actually built for). 60s matches that diagnostic's own
+# empirically-derived threshold.
+_WS_HEALTH_GRACE_SECONDS_BY_SYMBOL: dict[str, float] = {
+    "INDIA VIX": 60.0,
+}
+
 # REST-poll cadence — deliberately shorter than the 60s bar timeframe so a
 # just-closed candle is picked up within roughly half a bar, not up to a
 # full minute late, while staying far under Shoonya's 10/sec GetQuotes-class
@@ -113,6 +126,7 @@ class MarketDataIngestionService:
         indicator_engine: IndicatorEngine | None = None,
         *,
         ws_health_grace_seconds: float = _WS_HEALTH_GRACE_SECONDS,
+        ws_health_grace_seconds_by_symbol: dict[str, float] | None = None,
         rest_poll_interval_seconds: float = _REST_POLL_INTERVAL_SECONDS,
         rate_limit_backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
     ) -> None:
@@ -126,6 +140,11 @@ class MarketDataIngestionService:
         # missing from it after the grace window means WS genuinely
         # delivered nothing, not just a slow first tick.
         self._ws_health_grace_seconds = ws_health_grace_seconds
+        self._ws_health_grace_seconds_by_symbol = (
+            ws_health_grace_seconds_by_symbol
+            if ws_health_grace_seconds_by_symbol is not None
+            else _WS_HEALTH_GRACE_SECONDS_BY_SYMBOL
+        )
         self._rest_poll_interval_seconds = rest_poll_interval_seconds
         self._rate_limit_backoff_seconds = rate_limit_backoff_seconds
         self._last_tick_at: dict[str, datetime] = {}
@@ -140,6 +159,9 @@ class MarketDataIngestionService:
         # (startup, or every poll so far has come back empty) -- handled as
         # "unknown, don't warn yet" in _poll_once, not treated as a stall.
         self._last_valid_data_time: dict[str, datetime] = {}
+
+    def _grace_seconds_for(self, symbol: str) -> float:
+        return self._ws_health_grace_seconds_by_symbol.get(symbol, self._ws_health_grace_seconds)
 
     def _build_symbol_map(self, contract_symbols: list[str]) -> dict[str, _SymbolRef]:
         symbol_map: dict[str, _SymbolRef] = {}
@@ -178,9 +200,8 @@ class MarketDataIngestionService:
                 continue
             if symbol in self._fallback_symbols or symbol in self._last_tick_at:
                 continue
-            timer = threading.Timer(
-                self._ws_health_grace_seconds, self._check_ws_health, args=(symbol,)
-            )
+            grace_seconds = self._grace_seconds_for(symbol)
+            timer = threading.Timer(grace_seconds, self._check_ws_health, args=(symbol,))
             timer.daemon = True
             timer.start()
 
@@ -191,7 +212,7 @@ class MarketDataIngestionService:
             "No WS tick received for %r within %.0fs of subscribing — "
             "falling back to REST polling for price_bars",
             symbol,
-            self._ws_health_grace_seconds,
+            self._grace_seconds_for(symbol),
         )
         self._start_rest_fallback(symbol)
 
@@ -389,6 +410,45 @@ class MarketDataIngestionService:
                 volume=candle.volume,
             )
         )
+
+    @property
+    def fallback_symbols(self) -> frozenset[str]:
+        """Read-only view of which symbols are currently REST-polling
+        instead of WS — used by `market_data.registry
+        .reset_subscriptions_for_new_day` to know which symbols must NOT
+        be touched by a daily resubscribe (see `forget_symbol`'s own
+        docstring for why).
+        """
+        return frozenset(self._fallback_symbols)
+
+    def forget_symbol(self, symbol: str) -> None:
+        """Clears WS-health tracking (`_last_tick_at`) for one symbol so
+        the next `start()` call re-arms its watchdog timer, as if this
+        symbol had never been subscribed before. Deliberately leaves
+        `_fallback_symbols`/`_poll_threads` untouched — a symbol already on
+        REST fallback must stay there (see `_start_rest_fallback`'s own
+        "one-way ... for the life of this instance" contract); calling
+        `start()` again for it would re-send a WS subscribe that could race
+        a REST-polled insert for the same `price_bars` bucket, exactly what
+        that fallback's own unsubscribe-on-switch was built to prevent.
+
+        **Live bug fixed 2026-08-19**: `MarketDataScheduler`'s daily
+        PRE_MARKET transition disconnects and reconnects the market-data
+        provider — a genuinely new WS session server-side — but nothing
+        told this service its `_last_tick_at`/`registry._subscribed_symbols`
+        bookkeeping was now stale. `registry.ensure_ingestion_running` saw
+        every underlying as "already subscribed" from the *previous* day's
+        now-dead connection and never re-sent the real subscribe request on
+        the new one; even a fixed `_subscribed_symbols` alone wouldn't have
+        been enough, since `start()`'s own watchdog-scheduling loop also
+        skips arming a fresh timer for any symbol still in `_last_tick_at`
+        (`if symbol in self._fallback_symbols or symbol in
+        self._last_tick_at: continue`) — silently disarming the one safety
+        net (`_check_ws_health`) that should have caught this. Confirmed
+        live: zero `quote_ticks` for a full trading day despite strategies
+        scanning normally and TrueData reporting a clean reconnect.
+        """
+        self._last_tick_at.pop(symbol, None)
 
     def stop(self, contract_symbols: list[str]) -> None:
         fallback_here = [s for s in contract_symbols if s in self._fallback_symbols]

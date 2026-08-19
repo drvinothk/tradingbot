@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import app.modules.strategy_engine.runner as runner_module
 from app.core.clock import IST
 from app.domain.audit.models import AuditEvent
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionChainSnapshot, OptionContract, OptionType
 from app.domain.market.models import QuoteTick as QuoteTickRow
@@ -30,10 +30,12 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
 from app.modules.audit_service.service import verify_chain
+from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.risk_engine.service import create_new_risk_limit_config_version
 from app.modules.strategy_engine.runner import StrategyRunner, run_cycle
 from app.modules.strategy_engine.strategies.synthetic import SyntheticStrategy
@@ -394,16 +396,26 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
     strategy_run,
     trading_session,
     strategy_config,
+    monkeypatch,
 ):
     # 2026-08-12: the daily trade cap now only protects real-money exposure
     # (paper_only sessions are uncapped, see risk_engine.service's own
     # docstring) -- set a live-capable mode so this test still exercises it.
-    # paper_plus_guarded_live (not live_enabled): the cap condition is any
-    # `mode != PAPER_ONLY`, and with no strategy_run marked LIVE-graduated,
-    # Ops-Hardening Phase 5's get_execution_broker still safely resolves to
-    # the paper mock for actual dispatch -- live_enabled would instead
-    # require a real Shoonya connection + ALLOW_REAL_MONEY_DISPATCH, neither
-    # of which this test is about.
+    #
+    # 2026-08-19: that alone isn't enough anymore -- the cap now also only
+    # applies to a strategy actually routed live (`is_strategy_routed_live`),
+    # not merely "session mode != paper_only", AND only counts genuinely
+    # `LIVE`-mode orders (see risk_engine.service's own updated docstring
+    # for the two real incidents that fixed this). The first cycle below
+    # dispatches normally as paper (strategy not yet graduated -- avoids
+    # needing a real Shoonya connection/preflight for the dispatch itself),
+    # then its resulting Order is flipped to `LIVE` directly (simulating
+    # "this dispatch actually went out live") before graduating the
+    # strategy and running the second cycle -- the one this test is
+    # actually about. `get_execution_broker` is monkeypatched only for
+    # `risk_engine.service` (the margin pre-check `evaluate_trade_intent`
+    # also runs), not `execution_engine.paper.service`, since the second
+    # intent is rejected before dispatch is ever attempted.
     trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
     db.flush()
@@ -430,6 +442,21 @@ def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
     )
     assert first is not None
     assert first.decision == "approved"
+
+    # Simulate "that dispatch actually went out live" without needing a
+    # real Shoonya connection for it -- see this test's own docstring above.
+    first_order = (
+        db.query(Order).filter(Order.trade_intent_id == first.trade_intent_id).one()
+    )
+    first_order.mode = OrderMode.LIVE
+    db.add(first_order)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: MockBrokerAdapter(),
+    )
 
     second = run_cycle(
         db,

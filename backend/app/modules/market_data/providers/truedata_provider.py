@@ -175,6 +175,12 @@ _HISTORICAL_BAR_SIZE_BY_TIMEFRAME: dict[int, str] = {
 _TO_TRUEDATA_SYMBOL: dict[str, str] = {
     "NIFTY": "NIFTY 50",
     "BANKNIFTY": "NIFTY BANK",
+    # Confirmed live 2026-08-17 (project_truedata_live_tick_verification):
+    # TrueData's own real India VIX symbol is exactly this string -- an
+    # identity mapping, unlike NIFTY/BANKNIFTY above, but listed explicitly
+    # rather than left to the identity fallback in _to_truedata_symbol so
+    # this is a documented, deliberate confirmation, not a coincidence.
+    "INDIA VIX": "INDIA VIX",
 }
 
 

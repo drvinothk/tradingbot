@@ -41,7 +41,7 @@ from app.config.settings import get_settings
 from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
 from app.domain.ops.models import AlertSeverity, SystemAlert
@@ -64,7 +64,7 @@ from app.domain.strategy.models import (
 )
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
-from app.modules.broker_adapter.composition import get_execution_broker
+from app.modules.broker_adapter.composition import get_execution_broker, is_strategy_routed_live
 from app.modules.market_data.freshness import PRICE_DRIFT_TOLERANCE_PCT, check_price_drift
 
 logger = logging.getLogger("app.risk_engine")
@@ -276,28 +276,44 @@ def _open_trade_intents_query(db: Session, trading_session_id: uuid.UUID):
     brief in-transaction window between Risk marking DISPATCHED and the
     caller invoking Execution) — the real proxy for "currently open
     position" that replaces Phase 2's SyntheticTradeOutcome stand-in.
+
+    **Live-only, 2026-08-19**: `max_concurrent_positions` exists to protect
+    real capital, so a busy paper session must never count toward it — same
+    "session-wide check must be live-scoped" bug shape as `max_trades_per_
+    day`/`budget_exceeded`/`same_strike_locked`, all fixed the same day.
+    `Order.id.is_(None)` (via the outer join) keeps counting a trade_intent
+    still in that brief pre-dispatch window — it might yet turn out live —
+    excluded only once its own `Order` confirms `PAPER`.
     """
     return (
         db.query(TradeIntent)
         .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
+        .outerjoin(Order, Order.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.status == TradeIntentStatus.DISPATCHED,
             sa_or(Position.id.is_(None), Position.status == PositionStatus.OPEN),
+            sa_or(Order.mode == OrderMode.LIVE, Order.id.is_(None)),
         )
     )
 
 
 def _open_committed_capital(db: Session, trading_session_id: uuid.UUID) -> Decimal:
+    """**Live-only, 2026-08-19**: same reasoning as `_open_trade_intents_
+    query` above — `budget_amount` protects real capital, so existing paper
+    commitments must never count toward it.
+    """
     rows = (
         db.query(RiskDecision.capital_required)
         .join(TradeIntent, RiskDecision.trade_intent_id == TradeIntent.id)
         .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
+        .outerjoin(Order, Order.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.status == TradeIntentStatus.DISPATCHED,
             RiskDecision.decision == RiskDecisionOutcome.APPROVED,
             sa_or(Position.id.is_(None), Position.status == PositionStatus.OPEN),
+            sa_or(Order.mode == OrderMode.LIVE, Order.id.is_(None)),
         )
         .all()
     )
@@ -305,14 +321,48 @@ def _open_committed_capital(db: Session, trading_session_id: uuid.UUID) -> Decim
 
 
 def _same_strike_locked(
-    db: Session, trading_session_id: uuid.UUID, option_contract_id: uuid.UUID
+    db: Session,
+    trading_session_id: uuid.UUID,
+    strategy_config_id: uuid.UUID,
+    option_contract_id: uuid.UUID,
 ) -> bool:
+    """**Rescoped to per-strategy, 2026-08-19**: used to be session-wide —
+    any other strategy's pending/open trade_intent on the exact same
+    contract would lock a new one out, live-confirmed against two paper
+    strategies (Test 4, Test) independently proposing the same strike the
+    same day this was rescoped. Explicit product decision: different
+    strategies are allowed to independently trade the identical contract —
+    each position already has its own dedicated `StopPlan`/`TrailPlan`/
+    `TradeOutcome` row (never shared across positions), so per-strategy
+    SL/TSL/target tracking was already structurally guaranteed before this
+    change; `reconciliation.service._local_net_qty_by_symbol` already nets
+    by symbol across every open local position regardless of strategy, so
+    two strategies sharing a contract (same mode) net correctly against the
+    broker's own combined position with no false mismatch. **2026-08-19,
+    same day, later**: netting across strategies was fine, but netting
+    across *modes* wasn't — a session holding both a paper and a live
+    position (now structurally possible) got compared against only one
+    broker at a time, misreading the other mode's positions as phantom
+    mismatches. Fixed via mode-scoped netting + `run_full_reconciliation`
+    (see that module). One narrow, accepted limitation remains: if the
+    *same* contract is ever held by both a paper and a live strategy at
+    once, `BrokerSyncState`'s stored snapshot row (keyed only by session +
+    contract, no mode dimension) reflects whichever pass ran last — alerts
+    and escalation still fire correctly for both, only the persisted
+    display/audit snapshot loses per-mode granularity for that one
+    contract. Still scoped to *this* strategy, though: a single strategy
+    must not be able to double-enter its own already-open/pending position
+    on a contract (a duplicate/glitchy signal guard), in either paper or
+    live mode.
+    """
     locked = (
         db.query(TradeIntent.id)
+        .join(StrategyRun, StrategyRun.id == TradeIntent.strategy_run_id)
         .outerjoin(Position, Position.trade_intent_id == TradeIntent.id)
         .filter(
             TradeIntent.trading_session_id == trading_session_id,
             TradeIntent.option_contract_id == option_contract_id,
+            StrategyRun.strategy_config_id == strategy_config_id,
             TradeIntent.status.in_(
                 [TradeIntentStatus.PENDING_APPROVAL, TradeIntentStatus.DISPATCHED]
             ),
@@ -331,7 +381,9 @@ def _is_alert_worthy(reasons: list[str]) -> bool:
     )
 
 
-def _check_margin(capital_required: Decimal, trading_session: TradingSession) -> bool:
+def _check_margin(
+    capital_required: Decimal, trading_session: TradingSession, strategy_run: StrategyRun
+) -> bool:
     """Real broker-backed margin check (Phase 5+) via `BrokerPort.get_margin`
     — replaces the old fixed-placeholder stub. Uses `get_execution_broker`,
     same as every other execution-facing call site, so this always checks
@@ -339,6 +391,20 @@ def _check_margin(capital_required: Decimal, trading_session: TradingSession) ->
     returns a generous synthetic figure, so paper mode stays capital-
     unconstrained same as before) and against the real Shoonya adapter once
     Phase 6 makes it the execution broker.
+
+    **Live-corrected 2026-08-18**: `strategy_run` must be passed through to
+    `get_execution_broker`, not omitted — omitting it was a real bug. Per
+    that function's own docstring, its `FORCE_PAPER` override (a per-
+    strategy "stay on paper even though the session itself is live"
+    restriction) only ever applies when `strategy_run` is given; without
+    it, a `force_paper` strategy running inside a `live_enabled` session
+    had its pre-trade margin checked against the *real* Shoonya account
+    regardless — the account's real (often insufficient) cash could reject
+    a trade that was never going to touch real money in the first place.
+    Passing `strategy_run` routes a paper-mode strategy to
+    `MockBrokerAdapter` here exactly as it already does for the actual
+    order dispatch, so "paper trading ignores margin" is a natural
+    consequence of correct broker resolution, not a separate bypass.
 
     Fails closed (rejects) on a `BrokerError` rather than treating it as
     `margin_ok=True` — `MockBrokerAdapter` never raises `BrokerError`
@@ -349,7 +415,7 @@ def _check_margin(capital_required: Decimal, trading_session: TradingSession) ->
     """
     if capital_required <= 0:
         return False
-    broker = get_execution_broker(trading_session)
+    broker = get_execution_broker(trading_session, strategy_run)
     try:
         margin = broker.get_margin()
     except BrokerError:
@@ -394,15 +460,36 @@ def evaluate_trade_intent(
         ):
             reasons.append(f"mode_blocks_new_entries:{current_mode.value}")
 
-        if trading_session.entries_paused_reason is not None:
+        # DAILY_TARGET_REACHED is P&L-driven (live-only after
+        # record_trade_outcome_effects's own 2026-08-19 fix below), so it
+        # must not block a paper-routed intent just because the live side
+        # hit its target -- same "session-wide check must be live-scoped"
+        # shape as everything else fixed today. Any other reason (today
+        # just the not-yet-wired-up ADMIN_PAUSE) is a deliberate
+        # operational control and stays universal, same as
+        # kill_switch/degraded_mode/reconciliation_lock above.
+        if trading_session.entries_paused_reason is not None and (
+            trading_session.entries_paused_reason != EntriesPausedReason.DAILY_TARGET_REACHED
+            or is_strategy_routed_live(trading_session, strategy_run)
+        ):
             reasons.append(f"entries_paused:{trading_session.entries_paused_reason}")
 
-        if _same_strike_locked(db, trading_session.id, trade_intent.option_contract_id):
+        if _same_strike_locked(
+            db, trading_session.id, strategy_run.strategy_config_id, trade_intent.option_contract_id
+        ):
             reasons.append("same_strike_locked")
 
-        open_count = _open_trade_intents_query(db, trading_session.id).count()
-        if open_count >= risk_config.max_concurrent_positions:
-            reasons.append("max_concurrent_positions_reached")
+        # 2026-08-19: gated on is_strategy_routed_live, same reasoning as
+        # max_trades_per_day/budget_exceeded below -- max_concurrent_
+        # positions protects real capital, so a busy paper session must
+        # never count toward it, and a paper-routed intent must never be
+        # blocked by pre-existing *live* congestion either (paper isn't
+        # sharing real capacity). _open_trade_intents_query is itself
+        # live-only now too (see its own docstring).
+        if is_strategy_routed_live(trading_session, strategy_run):
+            open_count = _open_trade_intents_query(db, trading_session.id).count()
+            if open_count >= risk_config.max_concurrent_positions:
+                reasons.append("max_concurrent_positions_reached")
 
         # 2026-08-12: real gap found and fixed — max_trades_per_day used to
         # count DISPATCHED trade_intents across the *whole session*, with no
@@ -414,28 +501,57 @@ def evaluate_trade_intent(
         # every signal from a completely different set of strategies for the
         # rest of the day, on a PAPER_ONLY session, with paper capital never
         # actually at risk. `paper_only` now has no cap at all; every
-        # live-capable mode (`paper_plus_guarded_live`, `live_enabled` — the
-        # only two modes where a dispatched trade_intent could plausibly
-        # reach a real broker once Phase 6 exists) keeps the cap, scoped per
-        # `strategy_config_id` rather than per session, so one strategy
-        # hitting its daily cap doesn't block every other strategy running
-        # in the same session, and a restart of the same strategy (a new
-        # `strategy_run` row, same `strategy_config_id`) doesn't reset it.
-        if current_mode != SafeMode.PAPER_ONLY:
+        # live-capable mode keeps the cap, scoped per `strategy_config_id`
+        # rather than per session, so one strategy hitting its daily cap
+        # doesn't block every other strategy running in the same session,
+        # and a restart of the same strategy (a new `strategy_run` row, same
+        # `strategy_config_id`) doesn't reset it.
+        #
+        # 2026-08-19: that first fix wasn't enough — `current_mode !=
+        # PAPER_ONLY` is still session-wide, not per-strategy, the same bug
+        # shape found twice already today (the margin pre-check, then
+        # PositionManager's own broker resolution). Two real, opposite
+        # incidents same day: a `force_paper` strategy got capped by trades
+        # that were never real money (over-restrictive — this session's own
+        # `paper_plus_guarded_live`/`live_enabled` transition capped a
+        # strategy explicitly held back to paper), and a strategy that
+        # dispatched several genuinely-paper trades earlier (session was
+        # still `paper_only`, or the strategy itself was still
+        # `force_paper` at the time) then had its very first *live* signal
+        # blocked, because those earlier paper dispatches had already used
+        # up the day's count (under-restrictive protection — the cap exists
+        # to protect real capital, and here it did the opposite: hid behind
+        # a count made entirely of trades that never touched real money).
+        # `is_strategy_routed_live` (the same predicate `get_execution_
+        # broker` itself routes on) fixes the first; requiring the counted
+        # `Order.mode == LIVE` (not just any DISPATCHED trade_intent) fixes
+        # the second — a strategy's earlier paper-era dispatches (however
+        # many) never contribute to its live-era cap.
+        if is_strategy_routed_live(trading_session, strategy_run):
             dispatched_today = (
                 db.query(TradeIntent)
                 .join(StrategyRun, StrategyRun.id == TradeIntent.strategy_run_id)
+                .join(Order, Order.trade_intent_id == TradeIntent.id)
                 .filter(
                     TradeIntent.trading_session_id == trading_session.id,
                     StrategyRun.strategy_config_id == strategy_run.strategy_config_id,
                     TradeIntent.status == TradeIntentStatus.DISPATCHED,
+                    Order.mode == OrderMode.LIVE,
                 )
                 .count()
             )
             if dispatched_today >= risk_config.max_trades_per_day:
                 reasons.append("max_trades_per_day_reached")
 
-        if trading_session.consecutive_losses >= risk_config.consecutive_loss_pause_threshold:
+        # 2026-08-19: gated on is_strategy_routed_live -- consecutive_losses
+        # is now only ever incremented by genuinely-live closes (see
+        # record_trade_outcome_effects's own fix), so this stays 0 on a
+        # pure-paper day regardless; the explicit gate matters on a *mixed*
+        # day, where a live-side losing streak must not stop a paper
+        # strategy from continuing to test.
+        if is_strategy_routed_live(trading_session, strategy_run) and (
+            trading_session.consecutive_losses >= risk_config.consecutive_loss_pause_threshold
+        ):
             reasons.append("consecutive_loss_pause_active")
 
         if trade_intent.qty_lots > risk_config.per_trade_lot_cap:
@@ -485,14 +601,20 @@ def evaluate_trade_intent(
         ):
             reasons.append("price_drift_exceeded")
 
-        margin_ok = _check_margin(_dec(analytics.capital_required), trading_session)
+        margin_ok = _check_margin(_dec(analytics.capital_required), trading_session, strategy_run)
         if not margin_ok:
             reasons.append("margin_check_failed")
 
-        open_committed = _open_committed_capital(db, trading_session.id)
-        projected_committed = open_committed + _dec(analytics.capital_required)
-        if projected_committed > _dec(trading_session.budget_amount):
-            reasons.append("budget_exceeded")
+        # 2026-08-19: gated on is_strategy_routed_live -- a paper intent's
+        # own capital_required must never be checked against the real
+        # budget at all (not just "existing paper commitments excluded" —
+        # _open_committed_capital already handles that side, see its own
+        # docstring), same reasoning as max_concurrent_positions above.
+        if is_strategy_routed_live(trading_session, strategy_run):
+            open_committed = _open_committed_capital(db, trading_session.id)
+            projected_committed = open_committed + _dec(analytics.capital_required)
+            if projected_committed > _dec(trading_session.budget_amount):
+                reasons.append("budget_exceeded")
 
         outcome = RiskDecisionOutcome.REJECTED if reasons else RiskDecisionOutcome.APPROVED
 
@@ -600,6 +722,8 @@ def record_trade_outcome_effects(
     db: Session,
     trading_session: TradingSession,
     realized_pnl: float,
+    *,
+    is_live: bool,
 ) -> None:
     """Called by `execution_engine.paper.service.close_position` right after
     it writes a real `TradeOutcome` row — this function owns only the
@@ -612,6 +736,20 @@ def record_trade_outcome_effects(
     straight to kill_switch (no soft step-down), a target-profit hit sets
     `entries_paused_reason` without touching the safety-mode state machine.
 
+    **`is_live` required, 2026-08-19**: this used to run unconditionally
+    for every closed position, paper or live, with no distinction — the
+    most severe bug found in that day's audit. `cumulative_realized_pnl`/
+    `consecutive_losses` drive a *real* `kill_switch` and `entries_paused_
+    reason`; a losing streak of pure paper trades could trip both, halting
+    the entire session (paper and live) over a "loss" that never touched
+    real money, and paper profit accumulating toward `daily_target_profit`
+    could pause live entries the same way. `is_live=False` now returns
+    immediately, before the lock and before any write — paper P&L is
+    already fully captured per-trade in `TradeOutcome` (symbol, strategy,
+    entry/exit, realized_pnl, timestamps), which is what every "evaluate
+    the strategies" query in this project has always actually used; no
+    separate paper-side running total was needed.
+
     Runs under `LOCK_RISK_EVALUATION_QUEUE` (not `LOCK_EXECUTION_SINGLETON`,
     which the caller already holds) — deliberately a *different* lock than
     the caller's, since these running totals are read by
@@ -619,6 +757,8 @@ def record_trade_outcome_effects(
     serialized against concurrent risk evaluations, not against concurrent
     dispatches.
     """
+    if not is_live:
+        return
     with advisory_lock(db, LOCK_RISK_EVALUATION_QUEUE):
         new_cumulative = _dec(trading_session.cumulative_realized_pnl) + _dec(realized_pnl)
         trading_session.cumulative_realized_pnl = float(new_cumulative)

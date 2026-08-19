@@ -38,7 +38,7 @@ from app.domain.session.models import (
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_execution_broker
-from app.modules.reconciliation.service import run_reconciliation
+from app.modules.reconciliation.service import run_full_reconciliation
 from app.modules.scheduler.eod_square_off import run_eod_square_off
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -559,13 +559,25 @@ def manual_reconcile(
     runs one periodically on its own poll cadence; this makes it
     exercisable on demand (e.g. right after suspecting/injecting a
     mismatch), same reasoning as `manual_square_off` above.
+
+    Runs both the paper and (if connected) live passes via
+    `run_full_reconciliation` — a session can hold positions in both modes
+    at once, see that function's own docstring. The response aggregates
+    across whichever runs actually executed: `mismatches_found` sums them,
+    `action_taken` reports the most severe
+    (`reconciliation_lock_entered` > `alert_raised` > `none`).
     """
     trading_session = _get_session_or_404(db, user, session_id)
-    run = run_reconciliation(
-        db, get_execution_broker(trading_session), trading_session, ReconciliationTrigger.EVENT
-    )
+    runs = run_full_reconciliation(db, trading_session, ReconciliationTrigger.EVENT)
     db.commit()
-    return {"mismatches_found": run.mismatches_found, "action_taken": run.action_taken}
+    action_priority = {"reconciliation_lock_entered": 2, "alert_raised": 1, "none": 0}
+    action_taken = max(
+        (run.action_taken for run in runs), key=lambda a: action_priority.get(a, 0), default="none"
+    )
+    return {
+        "mismatches_found": sum(run.mismatches_found for run in runs),
+        "action_taken": action_taken,
+    }
 
 
 class ReconciliationRunOut(BaseModel):

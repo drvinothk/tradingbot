@@ -72,6 +72,38 @@ def unsubscribe_symbol(symbol: str) -> None:
     _subscribed_symbols.discard(symbol)
 
 
+def reset_subscriptions_for_new_day() -> None:
+    """Invalidates `_subscribed_symbols`' idempotency bookkeeping for
+    every symbol still relying on WS, without touching `_service`/its
+    `IndicatorEngine` (EMA continuity across days is intentional — see
+    `reset_daily_indicators`) or any symbol already on REST fallback
+    (`MarketDataIngestionService.fallback_symbols` — see
+    `forget_symbol`'s own docstring for why those must be left alone).
+
+    **Live bug fixed 2026-08-19**: called from `MarketDataScheduler`'s
+    daily PRE_MARKET transition, right before it disconnects and
+    reconnects the market-data provider. That reconnect is a genuinely new
+    WS session server-side, but without this, `_subscribed_symbols` still
+    remembered every underlying as "already subscribed" from the *previous*
+    day's now-dead connection (this module is a process-lifetime singleton,
+    never rebuilt between days — see the module's own docstring), so
+    `ensure_ingestion_running` never re-sent the real subscribe request on
+    the new connection. Confirmed live: zero `quote_ticks` for NIFTY/
+    BANKNIFTY for a full trading day despite five strategies scanning
+    normally and TrueData reporting a clean reconnect — only a full process
+    restart (which rebuilds this module's state from scratch) unblocked it.
+    A cold `_service is None` (nothing was ever subscribed this process
+    lifetime) is a harmless no-op, same "safe to call early" contract every
+    other function in this module already has.
+    """
+    if _service is None:
+        return
+    on_ws = _subscribed_symbols - _service.fallback_symbols
+    for symbol in on_ws:
+        _service.forget_symbol(symbol)
+    _subscribed_symbols.intersection_update(_service.fallback_symbols)
+
+
 def reset_daily_indicators() -> None:
     """Called from `MarketDataScheduler`'s daily PRE_MARKET transition so
     VWAP (session-cumulative) actually resets each trading day instead of

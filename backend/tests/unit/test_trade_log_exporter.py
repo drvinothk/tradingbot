@@ -38,6 +38,9 @@ def _row(
     strategy: str = "orb",
     trade_id: uuid.UUID | None = None,
     pnl: float = 500.0,
+    vix: float | None = 13.5,
+    pcr_oi: float | None = 0.9,
+    pcr_vol: float | None = 1.1,
 ) -> TradeLogRow:
     return TradeLogRow(
         trade_outcome_id=trade_id or uuid.uuid4(),
@@ -58,6 +61,9 @@ def _row(
         exit_reason="target",
         realized_pnl=pnl,
         slippage=1.5,
+        vix=vix,
+        pcr_oi=pcr_oi,
+        pcr_vol=pcr_vol,
     )
 
 
@@ -105,7 +111,29 @@ def test_creates_workbook_with_correct_sheet_and_headers(tmp_path):
     ws = wb["NIFTY 2026-08-18"]
     assert ws.cell(row=1, column=1).value == "Strategy"
     assert ws.cell(row=2, column=1).value == "orb"
-    assert ws.cell(row=2, column=15).value == str(row.trade_outcome_id)
+    assert ws.cell(row=1, column=15).value == "VIX (at entry)"
+    assert ws.cell(row=2, column=15).value == row.vix
+    assert ws.cell(row=1, column=16).value == "PCR - OI (at entry)"
+    assert ws.cell(row=2, column=16).value == row.pcr_oi
+    assert ws.cell(row=1, column=17).value == "PCR - Volume (at entry)"
+    assert ws.cell(row=2, column=17).value == row.pcr_vol
+    assert ws.cell(row=1, column=18).value == "Trade ID (internal)"
+    assert ws.cell(row=2, column=18).value == str(row.trade_outcome_id)
+
+
+def test_none_env_metrics_write_as_blank_cells(tmp_path):
+    """A trade that predates the VIX/PCR pipeline (or fired before either
+    ever landed a value) must not crash the export -- None values render as
+    blank cells, not a formatting error."""
+    workspace_id = uuid.uuid4()
+    row = _row(workspace_id=workspace_id, vix=None, pcr_oi=None, pcr_vol=None)
+
+    path = export_trade_log_for_workspace(workspace_id, [row], date(2026, 8, 18))
+
+    ws = openpyxl.load_workbook(path)["NIFTY 2026-08-18"]
+    assert ws.cell(row=2, column=15).value is None
+    assert ws.cell(row=2, column=16).value is None
+    assert ws.cell(row=2, column=17).value is None
 
 
 def test_routes_different_cycles_to_different_sheets(tmp_path):

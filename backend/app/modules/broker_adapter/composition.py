@@ -234,7 +234,7 @@ def _next_weekly_expiry() -> date:
     return today + timedelta(days=(3 - today.weekday()) % 7)
 
 
-def _get_or_create_execution_mock() -> MockBrokerAdapter:
+def get_execution_mock() -> MockBrokerAdapter:
     """The one persistent `MockBrokerAdapter` instance execution ever uses,
     never replaced by `set_broker()`. Kept separate from `_broker` so that
     `get_broker()`'s default (before anything is connected) and
@@ -242,6 +242,11 @@ def _get_or_create_execution_mock() -> MockBrokerAdapter:
     `PositionManager`'s quote reads and reconciliation's position reads
     never diverge from what `dispatch_trade_intent`/`close_position` wrote,
     for the common case today where nothing real is connected yet.
+
+    **Public since 2026-08-19** (previously `_get_or_create_execution_mock`)
+    — `reconciliation.run_full_reconciliation` needs the same "no session
+    context, just give me the one persistent paper broker" access
+    `get_broker()` already documents for the real side.
     """
     global _execution_mock
     if _execution_mock is None:
@@ -252,7 +257,7 @@ def _get_or_create_execution_mock() -> MockBrokerAdapter:
 def get_broker() -> BrokerPort:
     global _broker
     if _broker is None:
-        _broker = _get_or_create_execution_mock()
+        _broker = get_execution_mock()
     return _broker
 
 
@@ -304,6 +309,69 @@ def _real_broker_or_raise(reason: str) -> BrokerPort:
             "(is_shoonya_configured() is False)."
         )
     return get_broker()
+
+
+def is_strategy_routed_live(
+    trading_session: TradingSession, strategy_run: StrategyRun | None
+) -> bool:
+    """Whether a *new* dispatch for `strategy_run` under the session's
+    current mode would resolve to the real broker — the same mode/strategy-
+    config decision `get_execution_broker` makes (its own steps 2-4),
+    factored out so a pre-trade check can ask "is this strategy actually
+    trading real money right now" without resolving a broker at all.
+    Deliberately excludes `get_execution_broker`'s step 1 (the
+    position-aware live override) — not meaningful before a position
+    exists — and the `allow_real_money_dispatch`/instrument-firewall
+    checks, which raise rather than silently downgrade; appropriate for an
+    actual dispatch attempt, not for this narrower yes/no question.
+
+    **Live bug fixed 2026-08-19**: `risk_engine.service.evaluate_trade_intent`
+    used to gate its `max_trades_per_day` cap on `trading_session.mode !=
+    PAPER_ONLY` alone — session-wide, ignoring which strategy was actually
+    being evaluated. Two real, opposite-direction incidents same day: a
+    `force_paper` strategy got capped by trades that were never real money
+    (over-restrictive), and a strategy that dispatched several trades while
+    genuinely paper (session still `paper_only`, or the strategy itself
+    still `force_paper`) then got its very first *live* signal blocked
+    because those earlier paper dispatches had already used up its daily
+    count (under-restrictive protection — the cap's whole purpose is
+    capping real-money exposure, and here it was doing the opposite: it hid
+    behind an already-exhausted count made of trades that never touched
+    real money). This function is the shared "is this strategy live right
+    now" predicate `evaluate_trade_intent` uses to fix both — see its own
+    call site for how the count itself is also scoped to genuinely-live
+    dispatches only.
+    """
+    mode = SafeMode(trading_session.mode)
+    if mode in (
+        SafeMode.PAPER_ONLY,
+        SafeMode.DEGRADED_MODE,
+        SafeMode.KILL_SWITCH,
+        SafeMode.RECONCILIATION_LOCK,
+    ):
+        return False
+
+    strategy_is_live = False
+    strategy_force_paper = False
+    if strategy_run is not None:
+        db = object_session(strategy_run)
+        if db is not None:
+            config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+            strategy_force_paper = (
+                config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
+            )
+            strategy_is_live = (
+                config is not None
+                and config.status == StrategyStatus.LIVE
+                and not strategy_force_paper
+            )
+
+    if strategy_run is not None and strategy_force_paper:
+        return False
+
+    return mode == SafeMode.LIVE_ENABLED or (
+        mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
+    )
 
 
 def get_execution_broker(
@@ -369,63 +437,23 @@ def get_execution_broker(
     if position is not None and _position_opened_live(position):
         return _real_broker_or_raise(f"position {position.id} was opened live")
 
-    mode = SafeMode(trading_session.mode)
-    if mode in (
-        SafeMode.PAPER_ONLY,
-        SafeMode.DEGRADED_MODE,
-        SafeMode.KILL_SWITCH,
-        SafeMode.RECONCILIATION_LOCK,
-    ):
-        return _get_or_create_execution_mock()
+    if not is_strategy_routed_live(trading_session, strategy_run):
+        return get_execution_mock()
 
-    strategy_is_live = False
-    strategy_force_paper = False
     if strategy_run is not None:
         db = object_session(strategy_run)
-        if db is not None:
-            config = db.get(StrategyConfig, strategy_run.strategy_config_id)
-            strategy_force_paper = (
-                config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
-            )
-            strategy_is_live = (
-                config is not None
-                and config.status == StrategyStatus.LIVE
-                and not strategy_force_paper
-            )
-
-    # FORCE_PAPER is a per-strategy restriction, so it must apply
-    # regardless of *which* mode-branch below would otherwise route real --
-    # including `live_enabled`, which (unlike `paper_plus_guarded_live`)
-    # never consults `strategy_is_live` at all and would otherwise silently
-    # ignore this override the moment a human flips the whole session live.
-    # Checked here, before the mode branch, not folded into `strategy_is_live`
-    # alone -- a bug caught on Phase 7's own pre-deploy QC pass: the original
-    # wiring only fed FORCE_PAPER into `strategy_is_live`, which the
-    # `live_enabled` branch below never reads, so the override had zero
-    # effect once a session reached `live_enabled`, contradicting the
-    # "overrides only ever restrict, never expand" design this same field's
-    # own docstring promises.
-    if strategy_run is not None and strategy_force_paper:
-        return _get_or_create_execution_mock()
-
-    if mode == SafeMode.LIVE_ENABLED or (
-        mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
-    ):
-        if strategy_run is not None:
-            db = object_session(strategy_run)
-            if db is not None and strategy_run.instrument_id is not None:
-                instrument = db.get(Instrument, strategy_run.instrument_id)
-                if instrument is not None and not _instrument_firewall_allows(
-                    db, trading_session.workspace_id, instrument.symbol
-                ):
-                    raise ConfigurationError(
-                        f"trading_session {trading_session.id}: instrument "
-                        f"{instrument.symbol!r} is not on the active_live_instruments "
-                        "firewall -- refusing real dispatch."
-                    )
-        return _real_broker_or_raise(f"trading_session {trading_session.id} mode={mode.value}")
-
-    return _get_or_create_execution_mock()
+        if db is not None and strategy_run.instrument_id is not None:
+            instrument = db.get(Instrument, strategy_run.instrument_id)
+            if instrument is not None and not _instrument_firewall_allows(
+                db, trading_session.workspace_id, instrument.symbol
+            ):
+                raise ConfigurationError(
+                    f"trading_session {trading_session.id}: instrument "
+                    f"{instrument.symbol!r} is not on the active_live_instruments "
+                    "firewall -- refusing real dispatch."
+                )
+    mode = SafeMode(trading_session.mode)
+    return _real_broker_or_raise(f"trading_session {trading_session.id} mode={mode.value}")
 
 
 def is_execution_broker_live(broker: BrokerPort) -> bool:

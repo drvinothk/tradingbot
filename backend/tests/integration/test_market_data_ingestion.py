@@ -360,6 +360,52 @@ def test_ws_health_watchdog_falls_back_to_rest_polling_when_no_tick_arrives(
     service.stop([underlying_symbol])
 
 
+def test_ws_health_watchdog_uses_a_wider_per_symbol_grace_override(
+    seeded_universe, test_session_factory
+):
+    """2026-08-19: India VIX updates far less often than NIFTY/BANKNIFTY
+    (live-observed as low as ~2 ticks/60s) -- a flat grace window would
+    keep it perpetually flagged unhealthy. `ws_health_grace_seconds_by_symbol`
+    lets one symbol get a wider window than the service's own default,
+    verified end-to-end here rather than just unit-testing `_grace_seconds_for`
+    in isolation, since the real bug this protects against is in the
+    threading.Timer wiring inside `start()`, not the lookup itself.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    with test_session_factory() as seed_db:
+        seed_db.add(
+            Instrument(
+                id=uuid.uuid4(),
+                symbol="INDIA VIX",
+                exchange="NSE",
+                lot_size=1,
+                tick_size=0.05,
+            )
+        )
+
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.05,
+        ws_health_grace_seconds_by_symbol={"INDIA VIX": 0.3},
+        rest_poll_interval_seconds=1000.0,
+    )
+
+    service.start([underlying_symbol, "INDIA VIX"])
+    time.sleep(0.15)
+    assert underlying_symbol in service.fallback_symbols  # default grace already elapsed
+    assert "INDIA VIX" not in service.fallback_symbols  # wider override not elapsed yet
+
+    time.sleep(0.25)
+    assert "INDIA VIX" in service.fallback_symbols  # now elapsed too
+
+    service.stop([underlying_symbol, "INDIA VIX"])
+
+    with test_session_factory() as cleanup_db:
+        cleanup_db.query(Instrument).filter(Instrument.symbol == "INDIA VIX").delete()
+
+
 def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
     seeded_universe, test_session_factory
 ):
@@ -373,6 +419,60 @@ def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
     time.sleep(0.3)
 
     assert underlying_symbol not in service._fallback_symbols  # noqa: SLF001
+    service.stop([underlying_symbol])
+
+
+def test_fallback_symbols_property_reflects_internal_state(
+    seeded_universe, test_session_factory
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.05,
+        rest_poll_interval_seconds=1000.0,
+    )
+    assert service.fallback_symbols == frozenset()
+
+    service.start([underlying_symbol])
+    time.sleep(0.2)
+
+    assert service.fallback_symbols == frozenset({underlying_symbol})
+    service.stop([underlying_symbol])
+
+
+def test_stale_last_tick_at_suppresses_the_watchdog_until_forget_symbol_clears_it(
+    seeded_universe, test_session_factory
+):
+    """2026-08-19 regression: reproduces the actual mechanism behind a real
+    live incident -- a symbol subscribed on a now-dead connection
+    ("yesterday") has a stale `_last_tick_at` entry. Calling `start()`
+    again for it (as `ensure_ingestion_running` does once
+    `registry._subscribed_symbols` is cleared for a new day) must not
+    silently skip re-arming the WS-health watchdog just because a tick was
+    seen at some point in the past -- `forget_symbol` is what makes a
+    fresh `start()` call genuinely fresh.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.05,
+        rest_poll_interval_seconds=1000.0,
+    )
+    service._last_tick_at[underlying_symbol] = datetime.now(UTC)  # noqa: SLF001 -- simulates yesterday's stale entry
+
+    service.start([underlying_symbol])
+    time.sleep(0.2)
+    # watchdog suppressed by the stale entry
+    assert underlying_symbol not in service.fallback_symbols
+
+    service.forget_symbol(underlying_symbol)
+    service.start([underlying_symbol])
+    time.sleep(0.2)
+    assert underlying_symbol in service.fallback_symbols  # watchdog now genuinely re-armed
     service.stop([underlying_symbol])
 
 

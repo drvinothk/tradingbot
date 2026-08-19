@@ -176,7 +176,7 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         return None
 
     def _env_metrics(self, db: Session) -> EnvPayload:
-        env = get_latest_env_metrics(db, self.instrument_id)
+        env = get_latest_env_metrics(db, self.instrument_id, self.expiry_date)
         if env is None:
             self._log_once(
                 logger, "env_metrics", "VWAP env metrics unavailable; env filters disabled"

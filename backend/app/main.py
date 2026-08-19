@@ -252,9 +252,8 @@ def _run_startup_recovery_check() -> None:
     from app.domain.broker.models import ReconciliationTrigger
     from app.domain.execution.models import Position, PositionStatus
     from app.domain.session.models import TradingSession
-    from app.modules.broker_adapter.composition import get_execution_broker
     from app.modules.execution_engine.paper.registry import ensure_position_manager_running
-    from app.modules.reconciliation.service import run_reconciliation
+    from app.modules.reconciliation.service import run_full_reconciliation
 
     with session_scope() as db:
         active_sessions = (
@@ -281,12 +280,7 @@ def _run_startup_recovery_check() -> None:
                 continue
 
             ensure_position_manager_running(trading_session.id)
-            run_reconciliation(
-                db,
-                get_execution_broker(trading_session),
-                trading_session,
-                ReconciliationTrigger.EVENT,
-            )
+            run_full_reconciliation(db, trading_session, ReconciliationTrigger.EVENT)
             resumed.append(trading_session.id)
 
         if resumed:

@@ -69,6 +69,16 @@ REPLAY_MODE_MARKET_CLOSE = time(23, 30)
 # own docstring already applies to phase timing.
 TRADABLE_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
 
+# Symbols streamed purely for VIX/PCR environment-metrics context
+# (`strategy_engine.env_metrics`), never traded and never selectable as a
+# strategy's own `underlying_symbol` -- kept deliberately separate from
+# TRADABLE_UNDERLYINGS above so nothing that treats that tuple as "the
+# tradable universe" (strategy-underlying validation, the auto-spawner, a
+# future picker UI) ever sees this symbol. Subscribed the same way
+# (`MarketDataScheduler._subscribe_known_underlyings`), through the same
+# provider-agnostic `ensure_ingestion_running`, just from its own loop.
+ENV_METRIC_SYMBOLS: tuple[str, ...] = ("INDIA VIX",)
+
 
 class MarketPhase(enum.Enum):
     PRE_MARKET = "pre_market"

@@ -59,11 +59,12 @@ from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.execution_engine.paper.service import (
     current_contract_price,
     evaluate_open_position,
+    resolve_broker_for_position,
 )
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
-from app.modules.reconciliation.service import run_reconciliation
+from app.modules.reconciliation.service import run_full_reconciliation
 
 logger = logging.getLogger("app.execution_engine.paper.position_manager")
 
@@ -221,8 +222,14 @@ class PositionManager:
         # run_eod_square_off's import in _run_cycle below.
         from app.modules.scheduler.eod_square_off import run_margin_breach_square_off
 
+        # self._broker_override, not `broker` (the account-wide broker this
+        # method used above for get_margin()) -- an account-wide margin
+        # breach must still close each position via *its own* strategy's
+        # correct broker, not force every position through whichever broker
+        # happened to report the breach. See resolve_broker_for_position's
+        # own docstring.
         run_margin_breach_square_off(
-            db, broker, trading_session, market_data_provider=market_data_provider
+            db, self._broker_override, trading_session, market_data_provider=market_data_provider
         )
 
         reason = f"margin breach: available_margin={margin.available_margin:.2f}"[:500]
@@ -318,7 +325,12 @@ class PositionManager:
         return broker.get_quote(symbol)
 
     def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
-        broker = self._broker_override or get_execution_broker(trading_session)
+        # Session-level/account-wide broker -- used only for checks that are
+        # inherently account-wide (margin-breach detection, reconciliation
+        # against the broker's own position book), never for evaluating or
+        # closing any *specific* position -- see resolve_broker_for_position's
+        # own docstring for the 2026-08-19 incident this split fixes.
+        session_broker = self._broker_override or get_execution_broker(trading_session)
         market_data_provider = self._market_data_provider_override or get_market_data_provider()
         open_positions = (
             db.query(Position)
@@ -332,8 +344,12 @@ class PositionManager:
         # positions (Phase 4: several concurrent strategy runs) commonly
         # share the same underlying instrument, and this only ever needs
         # its current price once per cycle regardless of how many
-        # positions reference it.
-        underlying_price_cache: dict[uuid.UUID, float] = {}
+        # positions reference it. Keyed by (instrument_id, broker identity)
+        # rather than instrument_id alone -- since 2026-08-19, different
+        # positions in the same cycle can resolve different brokers (one
+        # force_paper, one genuinely live), and the mock's synthetic price
+        # is not interchangeable with a real broker's quote.
+        underlying_price_cache: dict[tuple[uuid.UUID, int], float] = {}
 
         @contextmanager
         def _same_session() -> Iterator[Session]:
@@ -346,6 +362,13 @@ class PositionManager:
             yield db
 
         for position in open_positions:
+            # Resolved per-position, not once for the whole cycle -- see
+            # resolve_broker_for_position's own docstring for why a shared
+            # cycle-wide broker is unsafe once different open positions can
+            # belong to differently-configured strategies.
+            broker = self._broker_override or resolve_broker_for_position(
+                db, trading_session, position
+            )
             option_contract = db.get(OptionContract, position.option_contract_id)
             if option_contract is None:
                 continue
@@ -372,7 +395,8 @@ class PositionManager:
                 session_factory=_same_session,
             )
 
-            underlying_price = underlying_price_cache.get(option_contract.instrument_id)
+            cache_key = (option_contract.instrument_id, id(broker))
+            underlying_price = underlying_price_cache.get(cache_key)
             if underlying_price is None:
                 instrument = db.get(Instrument, option_contract.instrument_id)
                 if instrument is not None:
@@ -383,7 +407,7 @@ class PositionManager:
                     underlying_price = self._live_tick(
                         market_data_provider, instrument.symbol, broker
                     ).ltp
-                    underlying_price_cache[option_contract.instrument_id] = underlying_price
+                    underlying_price_cache[cache_key] = underlying_price
 
             evaluate_open_position(
                 db,
@@ -397,7 +421,7 @@ class PositionManager:
             )
 
         if open_positions and SafeMode(trading_session.mode) in _MARGIN_BREACH_MODES:
-            self._check_margin_breach(db, trading_session, broker, market_data_provider)
+            self._check_margin_breach(db, trading_session, session_broker, market_data_provider)
 
         # Local import: same load-time-cycle reasoning as
         # run_eod_square_off's import just below —
@@ -418,15 +442,29 @@ class PositionManager:
             # risk_engine.service.
             from app.modules.scheduler.eod_square_off import run_eod_square_off
 
+            # self._broker_override, not the position loop's `broker` --
+            # that variable is scoped inside the loop (and undefined if
+            # open_positions was empty) and, since 2026-08-19, resolves
+            # per-position rather than once for the cycle. Passing None in
+            # production lets run_eod_square_off resolve each position's
+            # own broker itself, the same way; the override is preserved
+            # for tests exactly as before.
             run_eod_square_off(
-                db, broker, trading_session, market_data_provider=market_data_provider
+                db,
+                self._broker_override,
+                trading_session,
+                market_data_provider=market_data_provider,
             )
 
         self._cycle_count += 1
         if self._cycle_count % self._reconcile_every_n_cycles == 0:
-            run_reconciliation(
-                db, broker, trading_session, ReconciliationTrigger.POLL
-            )
+            # run_full_reconciliation, not a single session_broker call --
+            # a session can hold both paper and live positions at once
+            # (per-strategy graduation), and session_broker (resolved with
+            # no strategy_run) would only ever be the real broker when the
+            # *whole* session is live_enabled. See that function's own
+            # docstring.
+            run_full_reconciliation(db, trading_session, ReconciliationTrigger.POLL)
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

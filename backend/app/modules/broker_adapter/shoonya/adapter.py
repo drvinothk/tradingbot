@@ -90,6 +90,22 @@ KNOWN_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
 _UNDERLYING_INDEX_TSYM: dict[str, str] = {
     "NIFTY": "Nifty 50",
     "BANKNIFTY": "Nifty Bank",
+    # Confirmed live 2026-08-19 via GET /shoonya/search-scrip -- unlike
+    # NIFTY/BANKNIFTY's "Nifty 50"/"Nifty Bank" display style, Shoonya's own
+    # real tsym for India VIX has no internal space: "INDIAVIX".
+    "INDIA VIX": "INDIAVIX",
+}
+
+# The NSE search_scrip anchor text used to *find* each tsym above --
+# `_resolve_underlying_token`'s own docstring already established that
+# Shoonya's fuzzy search needs *some* textual overlap with the real tsym
+# (searching "BANKNIFTY" itself never surfaces "Nifty Bank"; the fixed
+# anchor "NIFTY" works for both since they share that prefix). "INDIAVIX"
+# shares no substring with "NIFTY" at all, so it needs its own anchor.
+_UNDERLYING_INDEX_SEARCH_TEXT: dict[str, str] = {
+    "NIFTY": "NIFTY",
+    "BANKNIFTY": "NIFTY",
+    "INDIA VIX": "VIX",
 }
 
 # Re-exported for callers that only import from adapter.py — the actual
@@ -355,7 +371,12 @@ class ShoonyaBrokerAdapter(BrokerPort):
             return self._resolve_token(underlying)
         except ShoonyaApiError:
             index_tsym = _UNDERLYING_INDEX_TSYM.get(underlying.upper(), underlying).upper()
-            rows = self._rest.search_scrip(self._uid, "NSE", "NIFTY")
+            # 2026-08-19: per-underlying search anchor, not a hardcoded
+            # "NIFTY" literal -- see _UNDERLYING_INDEX_SEARCH_TEXT's own
+            # docstring for why India VIX's real tsym ("INDIAVIX") needs a
+            # different anchor than NIFTY/BANKNIFTY's shared "Nifty" prefix.
+            search_text = _UNDERLYING_INDEX_SEARCH_TEXT.get(underlying.upper(), "NIFTY")
+            rows = self._rest.search_scrip(self._uid, "NSE", search_text)
             for row in rows:
                 if str(row.get("tsym", "")).upper() == index_tsym:
                     token = str(row.get("token", ""))

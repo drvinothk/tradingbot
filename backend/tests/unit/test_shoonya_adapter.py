@@ -567,6 +567,27 @@ def test_resolve_underlying_token_searches_nse_with_fixed_nifty_anchor_for_bankn
     assert search_calls == [("FA1", "NSE", "NIFTY")]
 
 
+def test_resolve_underlying_token_searches_nse_with_vix_anchor_for_india_vix():
+    """2026-08-19: INDIA VIX's real tsym ("INDIAVIX", confirmed live via
+    GET /shoonya/search-scrip) shares no substring with the fixed "NIFTY"
+    anchor NIFTY/BANKNIFTY both resolve through, so the old hardcoded
+    "NIFTY" search text would never have found it -- this is the real bug
+    `_UNDERLYING_INDEX_SEARCH_TEXT` fixes, caught before it ever shipped.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "Nifty 50", "token": "26000"},
+        {"tsym": "INDIAVIX", "token": "26017"},
+    ]
+
+    exchange, token = adapter._resolve_underlying_token("INDIA VIX")
+
+    assert (exchange, token) == ("NSE", "26017")
+    search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
+    assert search_calls == [("FA1", "NSE", "VIX")]
+
+
 def test_resolve_symbol_token_for_a_known_underlying_falls_back_to_a_live_search():
     """2026-08-12: real gap found via a live-hours QC pass, not a live
     account this time -- `MarketDataIngestionService` subscribes to an

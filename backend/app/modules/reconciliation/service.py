@@ -11,6 +11,17 @@ exactly (`ALLOWED_TRANSITIONS` only wires `RECONCILIATION_LOCK` in from
 `paper_plus_guarded_live`/`live_enabled`), escalates to `reconciliation_lock`
 only from those two modes. A `paper_only` session has no live money at risk,
 so a mismatch there is flagged and left running, not blocked.
+
+**2026-08-19**: per-strategy paper/live graduation means a single session
+can now hold open positions in both modes at once. `run_reconciliation`
+itself only ever compares against *one* broker per call, so
+`_local_net_qty_by_symbol` is now scoped to the matching `Order.mode` —
+otherwise the other mode's positions would show up as phantom local-only
+mismatches. `run_full_reconciliation` is the account-wide entry point that
+runs both passes (paper always; live whenever a real broker is connected)
+so periodic/manual/startup callers actually cover both books instead of
+whichever one a session-level, no-strategy-context broker resolution
+happens to prefer (see that function's own docstring).
 """
 
 from __future__ import annotations
@@ -23,12 +34,18 @@ from sqlalchemy.orm import Session
 from app.core.modes.state_machine import transition_mode
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
-from app.domain.execution.models import OrderSide, Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, OrderSide, Position, PositionStatus
 from app.domain.market.models import OptionContract
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import SafeMode, TradingSession, TransitionTriggerType
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.composition import (
+    get_broker,
+    get_execution_mock,
+    is_execution_broker_live,
+    is_shoonya_configured,
+)
 
 # Only these two modes ever escalate to reconciliation_lock — matches
 # ALLOWED_TRANSITIONS in app.core.modes.transitions exactly.
@@ -42,20 +59,31 @@ def _utcnow() -> datetime:
 
 
 def _local_net_qty_by_symbol(
-    db: Session, trading_session_id: uuid.UUID
+    db: Session, trading_session_id: uuid.UUID, order_mode: OrderMode
 ) -> dict[str, tuple[int, uuid.UUID]]:
-    """symbol -> (net signed qty, option_contract_id). Net rather than a
-    simple count: a workspace could in principle hold offsetting positions
-    on the same contract from different trade_intents (not expected given
-    the same-strike lock, but reconciliation should reflect the true net
-    exposure, not assume the lock always held).
+    """symbol -> (net signed qty, option_contract_id), for open positions
+    whose *opening* order was placed in `order_mode` only. Net rather than
+    a simple count: a workspace could in principle hold offsetting
+    positions on the same contract from different trade_intents (not
+    expected given the same-strike lock, but reconciliation should reflect
+    the true net exposure, not assume the lock always held).
+
+    **Mode-scoped since 2026-08-19**: a session can now hold both paper and
+    live positions at once (per-strategy graduation). Without this filter,
+    a live-only comparison (real broker vs. every local position) would see
+    paper positions as phantom local-only holdings, and vice versa for a
+    paper-only comparison — a false mismatch on a real-money session.
+    `Position.opening_order_id` is non-nullable, so every position has
+    exactly one unambiguous mode to join through.
     """
     result: dict[str, tuple[int, uuid.UUID]] = {}
     positions = (
         db.query(Position)
+        .join(Order, Order.id == Position.opening_order_id)
         .filter(
             Position.trading_session_id == trading_session_id,
             Position.status == PositionStatus.OPEN,
+            Order.mode == order_mode,
         )
         .all()
     )
@@ -77,7 +105,8 @@ def run_reconciliation(
 ) -> ReconciliationRun:
     started_at = _utcnow()
 
-    local_by_symbol = _local_net_qty_by_symbol(db, trading_session.id)
+    order_mode = OrderMode.LIVE if is_execution_broker_live(broker) else OrderMode.PAPER
+    local_by_symbol = _local_net_qty_by_symbol(db, trading_session.id, order_mode)
     broker_by_symbol = {p.contract_symbol: p.qty for p in broker.get_positions()}
 
     mismatches: list[dict[str, object]] = []
@@ -178,3 +207,41 @@ def run_reconciliation(
     db.add(run)
     db.flush()
     return run
+
+
+def run_full_reconciliation(
+    db: Session,
+    trading_session: TradingSession,
+    trigger_type: ReconciliationTrigger,
+) -> list[ReconciliationRun]:
+    """The account-wide reconciliation entry point — always runs the paper
+    pass (against the persistent execution mock) and additionally runs the
+    live pass (against whatever real broker is currently connected)
+    whenever one is. Use this instead of calling `run_reconciliation`
+    directly with a single, session-resolved broker for any "check this
+    whole session" call site (periodic polling, manual trigger, startup
+    recovery) — `get_execution_broker(trading_session)` with no
+    `strategy_run` only ever resolves the real broker when the *entire*
+    session is `live_enabled`; in `paper_plus_guarded_live` (per-strategy
+    graduation) it always resolves the mock, so a single-broker call would
+    silently never check the real broker's book at all while a
+    live-graduated strategy could be holding real positions.
+
+    Deliberately unconditional on the paper pass (no skipping it just
+    because this session currently has zero known local paper positions) —
+    an orphan stray paper position is exactly the kind of thing
+    reconciliation exists to catch, symmetric to why the live pass always
+    runs when connected regardless of known local live positions. This also
+    preserves the existing "always writes at least one heartbeat run, even
+    when clean" behavior callers already rely on.
+
+    The two event-triggered calls inside `dispatch_trade_intent`/
+    `close_position` deliberately keep calling `run_reconciliation` directly
+    with the one broker just used for that dispatch/close — each is already
+    correctly scoped to the one mode that just changed, and doesn't need to
+    re-check the other side at that exact instant.
+    """
+    runs = [run_reconciliation(db, get_execution_mock(), trading_session, trigger_type)]
+    if is_shoonya_configured():
+        runs.append(run_reconciliation(db, get_broker(), trading_session, trigger_type))
+    return runs

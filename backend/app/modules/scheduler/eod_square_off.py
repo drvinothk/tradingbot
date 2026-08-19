@@ -14,6 +14,17 @@ of where price currently sits relative to its stop/target. Two callers share
 
 Both are safe to call repeatedly: a session with no open positions is a
 no-op, and `close_position` itself no-ops on an already-closed position.
+
+**`broker` is optional, resolved per-position when omitted (2026-08-19
+fix)**: a single caller-supplied broker used to be applied to *every* open
+position being force-closed, regardless of which strategy opened each one —
+the same bug shape `execution_engine.paper.service
+.resolve_broker_for_position`'s own docstring describes for
+`PositionManager._run_cycle`'s stop/target/trail path (a `force_paper`
+strategy's position force-closed via the real broker the instant a session
+reached `live_enabled`). Pass an explicit `broker` only to override every
+position uniformly — the established test-fake pattern, unchanged; leave it
+`None` in production so each position resolves its own correct broker.
 """
 
 from __future__ import annotations
@@ -27,13 +38,17 @@ from app.domain.execution.models import ExitReason, Position, PositionStatus, Tr
 from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.execution_engine.paper.service import close_position, current_contract_price
+from app.modules.execution_engine.paper.service import (
+    close_position,
+    current_contract_price,
+    resolve_broker_for_position,
+)
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 
 def _square_off_all_open_positions(
     db: Session,
-    broker: BrokerPort,
+    broker: BrokerPort | None,
     trading_session: TradingSession,
     exit_reason: ExitReason,
     *,
@@ -59,6 +74,11 @@ def _square_off_all_open_positions(
 
     outcomes: list[TradeOutcome] = []
     for position in open_positions:
+        # Resolved per-position -- see this module's own docstring and
+        # resolve_broker_for_position's for why a single shared broker is
+        # unsafe once different open positions can belong to differently-
+        # configured strategies.
+        position_broker = broker or resolve_broker_for_position(db, trading_session, position)
         option_contract = db.get(OptionContract, position.option_contract_id)
         if option_contract is None:
             continue
@@ -70,12 +90,12 @@ def _square_off_all_open_positions(
         tick = current_contract_price(
             db,
             option_contract,
-            broker,
+            position_broker,
             market_data_provider=market_data_provider,
             session_factory=_same_session,
         )
         outcome = close_position(
-            db, trading_session, position, exit_reason, tick.ltp, broker=broker
+            db, trading_session, position, exit_reason, tick.ltp, broker=position_broker
         )
         if outcome is not None:
             outcomes.append(outcome)
@@ -84,7 +104,7 @@ def _square_off_all_open_positions(
 
 def run_eod_square_off(
     db: Session,
-    broker: BrokerPort,
+    broker: BrokerPort | None,
     trading_session: TradingSession,
     *,
     market_data_provider: BaseMarketDataProvider | None = None,
@@ -100,7 +120,7 @@ def run_eod_square_off(
 
 def run_margin_breach_square_off(
     db: Session,
-    broker: BrokerPort,
+    broker: BrokerPort | None,
     trading_session: TradingSession,
     *,
     market_data_provider: BaseMarketDataProvider | None = None,

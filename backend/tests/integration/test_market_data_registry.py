@@ -202,6 +202,84 @@ def test_reset_daily_indicators_is_a_harmless_noop_before_any_service_exists():
     market_data_registry.reset_daily_indicators()  # must not raise
 
 
+class _FakeIngestionServiceWithFallbackTracking:
+    """Fake matching real `MarketDataIngestionService`'s `fallback_symbols`/
+    `forget_symbol` shape, for `reset_subscriptions_for_new_day` tests.
+    """
+
+    def __init__(self, provider, session_factory=None, indicator_engine=None):
+        self.starts: list[list[str]] = []
+        self.forgotten: list[str] = []
+        self._fallback: set[str] = set()
+
+    def start(self, symbols):
+        self.starts.append(list(symbols))
+
+    @property
+    def fallback_symbols(self):
+        return frozenset(self._fallback)
+
+    def forget_symbol(self, symbol):
+        self.forgotten.append(symbol)
+
+
+def test_reset_subscriptions_for_new_day_clears_bookkeeping_for_ws_symbols(monkeypatch):
+    """2026-08-19 regression: proves the actual mechanics of the fix --
+    a symbol subscribed "yesterday" (still in `_subscribed_symbols` from a
+    prior `ensure_ingestion_running` call, this process never having
+    restarted) must be forgotten so the *next* `ensure_ingestion_running`
+    call for it genuinely calls `.start()` again, rather than treating it
+    as already handled.
+    """
+    fake = _FakeIngestionServiceWithFallbackTracking(object())
+    monkeypatch.setattr(
+        market_data_registry, "MarketDataIngestionService", lambda *a, **k: fake
+    )
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    market_data_registry.ensure_ingestion_running("BANKNIFTY", provider=object())
+    fake.starts.clear()
+
+    market_data_registry.reset_subscriptions_for_new_day()
+
+    assert set(fake.forgotten) == {"NIFTY", "BANKNIFTY"}
+    assert market_data_registry._subscribed_symbols == set()
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    assert fake.starts == [["NIFTY"]], "must genuinely re-subscribe, not treat it as a no-op"
+
+
+def test_reset_subscriptions_for_new_day_leaves_rest_fallback_symbols_untouched(monkeypatch):
+    """A symbol already on REST fallback must not be forgotten or have its
+    `_subscribed_symbols` entry cleared -- re-triggering `.start()` for it
+    would re-send a WS subscribe that could race a REST-polled insert for
+    the same `price_bars` bucket, exactly what the fallback's own
+    unsubscribe-on-switch was built to prevent (see `forget_symbol`'s own
+    docstring).
+    """
+    fake = _FakeIngestionServiceWithFallbackTracking(object())
+    fake._fallback.add("NIFTY")  # NIFTY already fell back to REST
+    monkeypatch.setattr(
+        market_data_registry, "MarketDataIngestionService", lambda *a, **k: fake
+    )
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    market_data_registry.ensure_ingestion_running("BANKNIFTY", provider=object())
+    fake.starts.clear()
+
+    market_data_registry.reset_subscriptions_for_new_day()
+
+    assert fake.forgotten == ["BANKNIFTY"], "NIFTY (on REST fallback) must not be forgotten"
+    assert market_data_registry._subscribed_symbols == {"NIFTY"}
+
+    market_data_registry.ensure_ingestion_running("NIFTY", provider=object())
+    assert fake.starts == [], "still tracked as subscribed -- must stay a no-op"
+
+
+def test_reset_subscriptions_for_new_day_is_a_harmless_noop_before_any_service_exists():
+    market_data_registry.reset_subscriptions_for_new_day()  # must not raise
+
+
 def test_reset_for_reconnect_stops_and_rebuilds_every_previously_subscribed_symbol(
     monkeypatch, test_session_factory,
 ):
