@@ -14,7 +14,7 @@ import time
 import pytest
 
 from app.modules.market_data.providers import angel_ws_client as ws_module
-from app.modules.market_data.providers.angel_ws_client import AngelWSClient
+from app.modules.market_data.providers.angel_ws_client import AngelWSClient, _patch_on_close_arity
 
 
 class _FakeSmartWebSocketV2:
@@ -429,5 +429,75 @@ def test_no_proxy_url_still_uses_the_sdks_own_connect(monkeypatch):
 
     assert _FakeRawWebSocketApp.instances == []  # proxy path never touched
     assert len(_FakeSmartWebSocketV2.instances) == 1  # went through connect() as before
+
+    client.stop()
+
+
+# -- _on_close arity compatibility (2026-08-19) -----------------------------
+
+
+class _RealShapedSDK:
+    """Mirrors the real SmartWebSocketV2._on_close's exact 2-arg signature
+    (self, wsapp) -- unlike _FakeSmartWebSocketV2 above, this class is never
+    monkeypatched into SmartApi.smartWebSocketV2; it exists only to test
+    _patch_on_close_arity in isolation, against a class shaped exactly like
+    the real SDK, not the test harness's own fake.
+    """
+
+    def __init__(self) -> None:
+        self.close_calls: list[object] = []
+        self.on_close = lambda wsapp: None
+
+    def _on_close(self, wsapp: object) -> None:
+        self.on_close(wsapp)
+
+
+def test_patch_on_close_arity_tolerates_the_extra_args_websocket_client_passes():
+    """websocket-client==1.9.0 really does invoke on_close as
+    callback(self, close_status_code, close_reason) -- 3 args -- confirmed
+    directly against its installed _callback source. Before this patch,
+    SmartWebSocketV2._on_close(self, wsapp) TypeErrors on every real close.
+    """
+    _patch_on_close_arity(_RealShapedSDK)
+    instance = _RealShapedSDK()
+    seen: list[object] = []
+    instance.on_close = seen.append
+
+    instance._on_close("some-wsapp", 1000, "normal closure")  # noqa: SLF001
+
+    assert seen == ["some-wsapp"]
+
+
+def test_patch_on_close_arity_is_idempotent():
+    """Applied once per SmartWebSocketV2() construction (every reconnect
+    attempt) via _connect_and_run, not once at import time -- must not
+    double-wrap and call the original twice."""
+    calls: list[object] = []
+
+    class _Sdk:
+        def _on_close(self, wsapp: object) -> None:
+            calls.append(wsapp)
+
+    _patch_on_close_arity(_Sdk)
+    _patch_on_close_arity(_Sdk)
+    _patch_on_close_arity(_Sdk)
+
+    _Sdk()._on_close("wsapp-1", 1000, "normal closure")  # noqa: SLF001
+
+    assert calls == ["wsapp-1"]
+
+
+def test_connect_and_run_patches_the_real_import_targets_on_close():
+    """Integration-level proof that _connect_and_run actually calls the
+    patch against whatever SmartWebSocketV2 it imports -- not just that the
+    patch function works in isolation."""
+    client = AngelWSClient(
+        auth_token="jwt1", api_key="key1", client_code="C123", feed_token="feed1",
+        on_tick=lambda t: None,
+    )
+    client.start()
+    time.sleep(0.05)
+
+    assert getattr(_FakeSmartWebSocketV2._on_close, "_arity_patched", False) is True
 
     client.stop()

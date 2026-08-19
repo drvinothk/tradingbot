@@ -13,6 +13,28 @@ installed package, `smartapi-python==1.5.5`,
 `SmartApi/smartWebSocketV2.py`) does that work; this module only translates
 its already-parsed dict into `RawAngelTick`.
 
+**2026-08-19 — real `_on_close` arity bug confirmed and fixed.** Verified
+directly against both installed package sources: `websocket-client==1.9.0`'s
+`WebSocketApp._callback` invokes `on_close` as
+`callback(self, close_status_code, close_reason)` (3 args) on every real
+close, for any reason — but `SmartWebSocketV2._on_close(self, wsapp)` only
+accepts 1 arg beyond `self`. `_callback`'s own `try/except` swallows the
+resulting `TypeError` (not fatal — this does not crash the connection loop
+or drop the process) but then misattributes it as an `on_error` event
+("Max retry attempt reached - Connection closed") instead of ever calling
+through to this class's own `_handle_close`. Net effect: every real close,
+of any cause, gets logged as a generic error rather than a clean close,
+which is real observability noise but — traced through `_callback`'s and
+`_on_error`'s own control flow — does not itself explain a "connects
+successfully then delivers zero ticks" symptom (a session that never
+closes never reaches this path at all). `_patch_on_close_arity` fixes it by
+wrapping `SmartWebSocketV2._on_close` (idempotent, class-level, applied
+once before each `SmartWebSocketV2()` construction) to accept and discard
+the extra positional args `websocket-client` passes, then delegate to the
+original 2-arg method exactly as before. This was previously verified via
+an isolated monkeypatch test but never actually shipped into this file —
+this is that fix, finally landed.
+
 **Confirmed directly from the installed SDK source** (not guessed): prices
 in a SNAP_QUOTE (mode 3) packet — `last_traded_price` and the best-5 buy/
 sell `price` fields — are raw integers requiring `/100` to get real rupees
@@ -115,6 +137,24 @@ _TOKEN_REFRESH_AFTER_CONSECUTIVE_FAILURES = 3
 MODE_SNAP_QUOTE = 3
 EXCHANGE_TYPE_NSE_CM = 1  # underlying index/cash segment
 EXCHANGE_TYPE_NSE_FO = 2  # NFO options/futures
+
+
+def _patch_on_close_arity(smart_ws_cls: type) -> None:
+    """See this module's own docstring ("2026-08-19 — real _on_close arity
+    bug confirmed and fixed") for the full finding. Idempotent — checked via
+    a marker attribute on the wrapper itself, since this runs before every
+    `SmartWebSocketV2()` construction (each real reconnect attempt), not
+    once at import time.
+    """
+    original = getattr(smart_ws_cls, "_on_close", None)
+    if original is None or getattr(original, "_arity_patched", False):
+        return
+
+    def _on_close_compat(self: object, wsapp: object, *_extra: object) -> None:
+        original(self, wsapp)
+
+    _on_close_compat._arity_patched = True  # type: ignore[attr-defined]
+    smart_ws_cls._on_close = _on_close_compat  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True)
@@ -387,6 +427,8 @@ class AngelWSClient:
         # Local import: the one place in this codebase that ever imports
         # SmartApi (see module docstring).
         from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+
+        _patch_on_close_arity(SmartWebSocketV2)
 
         sws = SmartWebSocketV2(
             self._auth_token,
