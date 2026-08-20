@@ -345,6 +345,18 @@ def dispatch_trade_intent(
             _open_position_from_fill(
                 db, trading_session, trade_intent, option_contract, order, side
             )
+        elif order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
+            # 2026-08-20, live incident: a synchronously-rejected order left
+            # TradeIntent.status stuck at DISPATCHED forever -- nothing here
+            # ever moved it to a terminal state, which permanently blocked
+            # `_same_strike_locked` for this exact strategy+contract until a
+            # manual DB fix. Same terminal-status reasoning as
+            # `_apply_resolved_pending_order`'s identical fix for the
+            # asynchronous case (a pending order later discovered rejected)
+            # -- see that function's own docstring for why EXPIRED, not a
+            # new status.
+            trade_intent.status = TradeIntentStatus.EXPIRED
+            db.add(trade_intent)
 
         db.flush()
         run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
@@ -843,97 +855,247 @@ def close_position(
             db.flush()
             return None
 
-        exit_price = _dec(exit_order.avg_fill_price)
-        entry_price = _dec(position.entry_price)
-        # +1 for a long (BUY) position, -1 for a short (SELL) position —
-        # same sign convention risk_engine.service.compute_pre_trade_analytics
-        # uses for its P&L-scenario table.
-        sign = Decimal("1") if entry_side == SignalSide.BUY else Decimal("-1")
-        qty = Decimal(position.qty)
-        realized_pnl = (exit_price - entry_price) * qty * sign
-        slippage = (exit_price - _dec(intended_price)) * qty * sign
-
-        position.status = PositionStatus.CLOSED
-        position.closed_at = now
-        position.closing_order_id = exit_order.id
-        db.add(position)
-
-        # Releases this position's half of the sleep inhibitor's reference
-        # count — see the matching acquire in _open_position_from_fill.
-        get_sleep_inhibitor().release(f"position:{position.id}")
-
-        # No matching unsubscribe call here — see _open_position_from_fill's
-        # own comment for why this module never touches market-data
-        # subscriptions at all. PositionManager owns that lifecycle.
-
-        stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
-        if stop_plan is not None and stop_plan.status not in (
-            StopPlanStatus.TRIGGERED,
-            StopPlanStatus.CANCELLED,
-        ):
-            stop_plan.status = (
-                StopPlanStatus.TRIGGERED
-                if exit_reason == ExitReason.STOP
-                else StopPlanStatus.CANCELLED
-            )
-            stop_plan.updated_at = now
-            db.add(stop_plan)
-
-        trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one_or_none()
-        if trail_plan is not None and trail_plan.status != TrailPlanStatus.TRIGGERED:
-            if exit_reason == ExitReason.TRAIL:
-                trail_plan.status = TrailPlanStatus.TRIGGERED
-                trail_plan.updated_at = now
-                db.add(trail_plan)
-
-        outcome = TradeOutcome(
-            id=uuid.uuid4(),
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            position_id=position.id,
-            trade_intent_id=position.trade_intent_id,
-            entry_price=float(entry_price),
-            exit_price=float(exit_price),
-            qty=position.qty,
-            realized_pnl=float(realized_pnl),
-            slippage=float(slippage),
-            exit_reason=exit_reason,
-            closed_at=now,
+        outcome = _finalize_position_close(
+            db, trading_session, position, exit_order, exit_reason, order_mode, intended_price
         )
-        db.add(outcome)
-        db.flush()
-
-        record_event(
-            db,
-            workspace_id=trading_session.workspace_id,
-            actor_type=ActorType.SYSTEM,
-            event_category=EventCategory.ORDER_LIFECYCLE,
-            event_type="position.closed",
-            entity_type="position",
-            entity_id=position.id,
-            trading_session_id=trading_session.id,
-            payload={
-                "exit_reason": exit_reason.value,
-                "realized_pnl": float(realized_pnl),
-                "slippage": float(slippage),
-            },
-        )
-
-        # Imported here, not at module scope: risk_engine.service never
-        # imports this module (it only marks a TradeIntent DISPATCHED and
-        # lets the caller invoke dispatch_trade_intent), so this stays a
-        # one-directional dependency — importing at module scope would work
-        # too, but keeping it local makes that directionality obvious at the
-        # call site instead of relying on remembering it.
-        from app.modules.risk_engine.service import record_trade_outcome_effects
-
-        record_trade_outcome_effects(
-            db, trading_session, float(realized_pnl), is_live=(order_mode == OrderMode.LIVE)
-        )
-
         db.flush()
         run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
         return outcome
+
+
+def _finalize_position_close(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    exit_order: Order,
+    exit_reason: ExitReason,
+    order_mode: OrderMode,
+    intended_price: float | None,
+) -> TradeOutcome:
+    """PnL/slippage, StopPlan/TrailPlan updates, TradeOutcome, and risk
+    effects for a *filled* exit order — shared by `close_position` (the
+    synchronous, common case) and `_apply_resolved_pending_exit_order` (an
+    exit order that didn't fill synchronously, discovered filled later by
+    `reconcile_pending_live_exit_orders`) so the two paths can never
+    silently diverge. `intended_price` is the price level that justified
+    the exit (see `close_position`'s own docstring) — `None` for the
+    reconciled-late case, where the original trigger price was never
+    persisted anywhere and there's nothing honest to measure slippage
+    against; slippage is 0 in that case, not a fabricated number.
+    """
+    now = _utcnow()
+    entry_side = SignalSide(position.side)
+    exit_price = _dec(exit_order.avg_fill_price)
+    entry_price = _dec(position.entry_price)
+    # +1 for a long (BUY) position, -1 for a short (SELL) position — same
+    # sign convention risk_engine.service.compute_pre_trade_analytics uses
+    # for its P&L-scenario table.
+    sign = Decimal("1") if entry_side == SignalSide.BUY else Decimal("-1")
+    qty = Decimal(position.qty)
+    realized_pnl = (exit_price - entry_price) * qty * sign
+    slippage = (
+        (exit_price - _dec(intended_price)) * qty * sign
+        if intended_price is not None
+        else Decimal("0")
+    )
+
+    position.status = PositionStatus.CLOSED
+    position.closed_at = now
+    position.closing_order_id = exit_order.id
+    db.add(position)
+
+    # Releases this position's half of the sleep inhibitor's reference
+    # count — see the matching acquire in _open_position_from_fill.
+    get_sleep_inhibitor().release(f"position:{position.id}")
+
+    # No matching unsubscribe call here — see _open_position_from_fill's
+    # own comment for why this module never touches market-data
+    # subscriptions at all. PositionManager owns that lifecycle.
+
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    if stop_plan is not None and stop_plan.status not in (
+        StopPlanStatus.TRIGGERED,
+        StopPlanStatus.CANCELLED,
+    ):
+        stop_plan.status = (
+            StopPlanStatus.TRIGGERED if exit_reason == ExitReason.STOP else StopPlanStatus.CANCELLED
+        )
+        stop_plan.updated_at = now
+        db.add(stop_plan)
+
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one_or_none()
+    if trail_plan is not None and trail_plan.status != TrailPlanStatus.TRIGGERED:
+        if exit_reason == ExitReason.TRAIL:
+            trail_plan.status = TrailPlanStatus.TRIGGERED
+            trail_plan.updated_at = now
+            db.add(trail_plan)
+
+    outcome = TradeOutcome(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        position_id=position.id,
+        trade_intent_id=position.trade_intent_id,
+        entry_price=float(entry_price),
+        exit_price=float(exit_price),
+        qty=position.qty,
+        realized_pnl=float(realized_pnl),
+        slippage=float(slippage),
+        exit_reason=exit_reason,
+        closed_at=now,
+    )
+    db.add(outcome)
+    db.flush()
+
+    record_event(
+        db,
+        workspace_id=trading_session.workspace_id,
+        actor_type=ActorType.SYSTEM,
+        event_category=EventCategory.ORDER_LIFECYCLE,
+        event_type="position.closed",
+        entity_type="position",
+        entity_id=position.id,
+        trading_session_id=trading_session.id,
+        payload={
+            "exit_reason": exit_reason.value,
+            "realized_pnl": float(realized_pnl),
+            "slippage": float(slippage),
+        },
+    )
+
+    # Imported here, not at module scope: risk_engine.service never
+    # imports this module (it only marks a TradeIntent DISPATCHED and lets
+    # the caller invoke dispatch_trade_intent), so this stays a
+    # one-directional dependency — importing at module scope would work
+    # too, but keeping it local makes that directionality obvious at the
+    # call site instead of relying on remembering it.
+    from app.modules.risk_engine.service import record_trade_outcome_effects
+
+    record_trade_outcome_effects(
+        db, trading_session, float(realized_pnl), is_live=(order_mode == OrderMode.LIVE)
+    )
+
+    return outcome
+
+
+def reconcile_pending_live_exit_orders(
+    db: Session,
+    trading_session: TradingSession,
+    *,
+    allow_rest_fallback: bool,
+    broker: BrokerPort | None = None,
+) -> None:
+    """Exit-side counterpart to `reconcile_pending_live_orders` (2026-08-20)
+    -- an exit order that doesn't fill synchronously in `close_position`
+    already leaves the position correctly OPEN (see that function's own
+    "leaving position OPEN for reconciliation/retry" comment and its
+    `exit_order_unfilled` SystemAlert), but nothing ever actually
+    implemented that retry until now. Same two-layer WS-cache + throttled-
+    REST-fallback detection shape and the same `allow_rest_fallback`
+    cadence contract as the entry-side function — see that one's own
+    docstring for the full reasoning (not repeated here).
+
+    Only ever finds rows for LIVE exit orders — a PAPER exit always fills
+    synchronously via `MockBrokerAdapter`, same reasoning as the entry
+    side. `broker` is the same explicit test-injection override as
+    `reconcile_pending_live_orders`'s own param of the same name —
+    production never passes it, each order resolves its own broker via
+    `resolve_broker_for_position` instead.
+    """
+    pending_orders = (
+        db.query(Order)
+        .filter(
+            Order.trading_session_id == trading_session.id,
+            Order.mode == OrderMode.LIVE,
+            Order.position_id.is_not(None),
+            Order.status.in_(
+                [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+            ),
+        )
+        .all()
+    )
+    for order in pending_orders:
+        position = db.get(Position, order.position_id)
+        if position is None or position.status != PositionStatus.OPEN:
+            continue
+        resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
+
+        result = _peek_order_update(resolved_broker, order.broker_order_id)
+        if result is None and allow_rest_fallback:
+            try:
+                result = resolved_broker.get_order_status(order.broker_order_id)
+            except BrokerError:
+                logger.exception(
+                    "get_order_status failed while reconciling pending exit order %s "
+                    "(broker_order_id=%s)",
+                    order.id,
+                    order.broker_order_id,
+                )
+                continue
+
+        if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
+            continue
+
+        _apply_resolved_pending_exit_order(db, trading_session, position, order, result)
+        db.flush()
+
+
+def _apply_resolved_pending_exit_order(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    order: Order,
+    result: OrderResult,
+) -> None:
+    now = _utcnow()
+    order.status = _map_status(result.status)
+    order.filled_qty = result.filled_qty
+    order.avg_fill_price = result.avg_fill_price
+    order.updated_at = now
+    db.add(order)
+
+    db.add(
+        OrderEvent(
+            id=uuid.uuid4(),
+            order_id=order.id,
+            event_type="filled" if order.status == OrderStatus.FILLED else "resolved",
+            raw_payload={
+                "broker_order_id": result.broker_order_id,
+                "status": result.status.value,
+                "filled_qty": result.filled_qty,
+                "avg_fill_price": result.avg_fill_price,
+                "source": "reconcile_pending_live_exit_orders",
+            },
+            ts=now,
+        )
+    )
+
+    if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
+        _finalize_position_close(
+            db,
+            trading_session,
+            position,
+            order,
+            ExitReason.RECONCILED,
+            OrderMode(order.mode),
+            None,
+        )
+    # else: still REJECTED/CANCELLED discovered late -- position correctly
+    # stays OPEN, close_position's own exit_order_unfilled SystemAlert
+    # already covers alerting; nothing further to do beyond recording the
+    # terminal order state itself, above.
+
+    record_event(
+        db,
+        workspace_id=trading_session.workspace_id,
+        actor_type=ActorType.SYSTEM,
+        event_category=EventCategory.ORDER_LIFECYCLE,
+        event_type="order.reconciled",
+        entity_type="order",
+        entity_id=order.id,
+        trading_session_id=trading_session.id,
+        payload={"status": order.status.value, "filled_qty": order.filled_qty},
+    )
 
 
 def evaluate_open_position(

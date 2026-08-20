@@ -59,6 +59,7 @@ from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.execution_engine.paper.service import (
     current_contract_price,
     evaluate_open_position,
+    reconcile_pending_live_exit_orders,
     reconcile_pending_live_orders,
     resolve_broker_for_position,
 )
@@ -450,10 +451,10 @@ class PositionManager:
         # (free); only the REST fallback is throttled to
         # _order_poll_every_n_cycles, deliberately on a flat cadence rather
         # than gated on any WS-health signal.
-        reconcile_pending_live_orders(
-            db,
-            trading_session,
-            allow_rest_fallback=self._cycle_count % self._order_poll_every_n_cycles == 0,
+        order_poll_fallback = self._cycle_count % self._order_poll_every_n_cycles == 0
+        reconcile_pending_live_orders(db, trading_session, allow_rest_fallback=order_poll_fallback)
+        reconcile_pending_live_exit_orders(
+            db, trading_session, allow_rest_fallback=order_poll_fallback
         )
 
         if now_ist().time() >= trading_session.cutoff_time:

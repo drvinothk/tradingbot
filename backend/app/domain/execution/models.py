@@ -114,6 +114,16 @@ class ExitReason(enum.StrEnum):
     # guarded-live/live session, distinct from EOD_SQUARE_OFF so
     # reports can tell a scheduled flatten from a forced one apart.
     MARGIN_BREACH = "margin_breach"
+    # 2026-08-20: an exit order that didn't fill synchronously in
+    # close_position (left the position OPEN, per that function's own
+    # comment) and was only discovered filled later by
+    # reconcile_pending_live_exit_orders -- the original stop/target/
+    # trail/EOD trigger price is gone by then (never persisted on the
+    # Order itself), so slippage can't be measured against it the normal
+    # way. Distinct from every other reason so reports can tell "this
+    # exit's timing/slippage numbers are approximate, discovered late"
+    # apart from a normal exit.
+    RECONCILED = "reconciled"
 
 
 class Order(Base, UUIDPkMixin):

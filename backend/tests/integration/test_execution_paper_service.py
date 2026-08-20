@@ -25,6 +25,7 @@ from app.domain.execution.models import (
     Position,
     PositionStatus,
     StopPlan,
+    TradeOutcome,
     TrailPlan,
     TrailPlanStatus,
 )
@@ -51,6 +52,7 @@ from app.modules.execution_engine.paper.service import (
     close_position,
     dispatch_trade_intent,
     evaluate_open_position,
+    reconcile_pending_live_exit_orders,
     reconcile_pending_live_orders,
 )
 
@@ -396,6 +398,31 @@ def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
     # BUY side, 0.5% default buffer -- priced *above* entry_price so a real
     # limit order still tolerates adverse LTP movement and fills.
     assert _price(order.avg_fill_price) == pytest.approx(80.0 * 1.005, rel=1e-3)
+
+
+def test_dispatch_marks_trade_intent_expired_on_synchronous_rejection(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-08-20 live incident's original half: a *synchronously* rejected
+    order (place_order returns REJECTED immediately, the common case for a
+    real broker rejecting bad parameters outright) left TradeIntent stuck
+    at DISPATCHED forever -- the exact bug that permanently blocked
+    `_same_strike_locked` for a real strategy+contract until a manual DB
+    fix. `reconcile_pending_live_orders` already covers the *asynchronous*
+    version of this (a pending order later discovered rejected); this pins
+    the synchronous one in `dispatch_trade_intent` itself.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    broker.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+    )
+
+    order = dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+
+    assert order.status == OrderStatus.REJECTED
+    db.refresh(trade_intent)
+    assert trade_intent.status == TradeIntentStatus.EXPIRED
+    assert db.query(Position).filter(Position.trade_intent_id == trade_intent.id).count() == 0
 
 
 # -- reconcile_pending_live_orders --------------------------------------------
@@ -829,6 +856,165 @@ def test_close_position_does_not_update_session_pnl_for_a_paper_close(
     exit_order = db.query(Order).filter(Order.position_id == position.id).one()
     assert exit_order.order_type == OrderType.MARKET
     assert exit_order.mode == OrderMode.PAPER
+
+
+# -- reconcile_pending_live_exit_orders ---------------------------------------
+
+
+def _open_live_position(
+    db: Session, broker, trading_session, strategy_run, option_contract
+) -> Position:
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    position_id = position.id
+    # Real LIVE mode, not the broker fixture's default paper-shaped fill --
+    # reconcile_pending_live_exit_orders only ever looks at mode=LIVE
+    # orders, matching production (a PAPER exit always fills synchronously).
+    db.query(Order).filter(Order.trade_intent_id == trade_intent.id).update(
+        {"mode": OrderMode.LIVE}
+    )
+    db.flush()
+    refreshed = db.get(Position, position_id)
+    assert refreshed is not None
+    return refreshed
+
+
+def _make_pending_live_exit_order(
+    db: Session, trading_session: TradingSession, position: Position, *, broker_order_id: str
+) -> Order:
+    now = datetime.now(UTC)
+    order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=position.option_contract_id,
+        position_id=position.id,
+        idempotency_key=f"exit:{position.id}",
+        mode=OrderMode.LIVE,
+        side=OrderSide.SELL,
+        order_type=OrderType.LIMIT,
+        qty=position.qty,
+        status=OrderStatus.PENDING,
+        filled_qty=0,
+        avg_fill_price=None,
+        broker_order_id=broker_order_id,
+        submitted_at=now,
+        updated_at=now,
+    )
+    db.add(order)
+    db.flush()
+    return order
+
+
+def test_reconcile_pending_live_exit_orders_closes_position_on_ws_cached_fill(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order = _make_pending_live_exit_order(
+        db, trading_session, position, broker_order_id="EXIT-1"
+    )
+    fake_broker = _FakeOrderStatusBroker(
+        cached_result=OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id=exit_order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position.qty,
+            avg_fill_price=90.0,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(exit_order)
+    db.refresh(position)
+    assert exit_order.status == OrderStatus.FILLED
+    assert fake_broker.get_order_status_calls == []
+    assert position.status == PositionStatus.CLOSED
+    assert position.closing_order_id == exit_order.id
+
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.RECONCILED
+    assert float(outcome.exit_price) == pytest.approx(90.0)
+    # No original trigger price survives to a late-discovered fill -- 0.0
+    # slippage is the honest answer, not a fabricated comparison.
+    assert outcome.slippage == pytest.approx(0.0)
+
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.status == "cancelled"
+
+
+def test_reconcile_pending_live_exit_orders_falls_back_to_rest_when_allowed(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order = _make_pending_live_exit_order(
+        db, trading_session, position, broker_order_id="EXIT-2"
+    )
+    fake_broker = _FakeOrderStatusBroker(
+        rest_result=OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id=exit_order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position.qty,
+            avg_fill_price=90.0,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(position)
+    assert fake_broker.get_order_status_calls == [exit_order.broker_order_id]
+    assert position.status == PositionStatus.CLOSED
+
+
+def test_reconcile_pending_live_exit_orders_does_not_poll_rest_when_not_allowed(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    _make_pending_live_exit_order(db, trading_session, position, broker_order_id="EXIT-3")
+    fake_broker = _FakeOrderStatusBroker()  # no cache, no scripted REST result
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(position)
+    assert fake_broker.get_order_status_calls == []
+    assert position.status == PositionStatus.OPEN
+
+
+def test_reconcile_pending_live_exit_orders_leaves_position_open_on_rejection(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order = _make_pending_live_exit_order(
+        db, trading_session, position, broker_order_id="EXIT-4"
+    )
+    fake_broker = _FakeOrderStatusBroker(
+        rest_result=OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id=exit_order.broker_order_id,
+            status=BrokerOrderStatus.REJECTED,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(exit_order)
+    db.refresh(position)
+    assert exit_order.status == OrderStatus.REJECTED
+    assert position.status == PositionStatus.OPEN
+    assert position.closing_order_id is None
+    assert db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).count() == 0
 
 
 # -- evaluate_open_position: stop/target/trail --------------------------------
