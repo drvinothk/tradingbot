@@ -548,6 +548,127 @@ def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
     service.stop([underlying_symbol])
 
 
+class _RecoversOnSecondSubscribeBroker:
+    """Never ticks on the first `subscribe_quotes` call (the original
+    fallback trigger, same as `_NeverTicksBroker`), but fires one real
+    tick immediately and synchronously on any *later* subscribe call —
+    models a real WS recovery for `_try_ws_recovery`'s own probe, which
+    re-subscribes to test exactly this.
+    """
+
+    def __init__(self) -> None:
+        self.subscribe_calls: list[list[str]] = []
+        self.unsubscribed: list[str] = []
+
+    def subscribe_quotes(self, contract_symbols, on_tick, on_depth=None) -> None:
+        self.subscribe_calls.append(list(contract_symbols))
+        if len(self.subscribe_calls) >= 2:
+            for symbol in contract_symbols:
+                on_tick(
+                    Tick(
+                        contract_symbol=symbol,
+                        ltp=24000.0,
+                        bid=23999.5,
+                        ask=24000.5,
+                        volume=1,
+                        oi=None,
+                        ts=datetime.now(UTC),
+                    )
+                )
+
+    def unsubscribe_quotes(self, contract_symbols) -> None:
+        self.unsubscribed.extend(contract_symbols)
+
+    def get_price_history(
+        self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
+    ) -> list[PriceCandle]:
+        return []
+
+    def __getattr__(self, name):
+        raise AttributeError(name)
+
+
+def test_ws_recovery_probe_promotes_symbol_back_from_rest_polling(
+    seeded_universe, test_session_factory
+):
+    """2026-08-20: `_start_rest_fallback` used to be a permanent, one-way
+    trip -- this proves the new periodic probe actually promotes a symbol
+    back to WS-driven ticks once it starts delivering again, restoring
+    VWAP (frozen the whole time a symbol stayed on REST -- see
+    `IndicatorEngine.on_completed_bar`'s own docstring for why).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _RecoversOnSecondSubscribeBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.2,
+        min_plausible_price_by_symbol={},
+    )
+    # start() does two things a bare _fallback_symbols seed can't: builds
+    # _symbol_map (_on_tick silently drops any tick for an unknown symbol)
+    # and makes the real subscribe call #1 the fake's "only recovers from
+    # its second call onward" behavior depends on. Its own watchdog timer
+    # is harmless here -- manually seeding _fallback_symbols pre-empts it,
+    # and _check_ws_health's own guard makes a later no-op fire safe.
+    service.start([underlying_symbol])
+    service._fallback_symbols.add(underlying_symbol)  # noqa: SLF001
+
+    recovered = service._try_ws_recovery(underlying_symbol)  # noqa: SLF001
+
+    assert recovered is True
+    assert underlying_symbol not in service.fallback_symbols
+    assert len(broker.subscribe_calls) == 2  # the original subscribe + the probe's own
+
+
+def test_ws_recovery_probe_stays_on_rest_when_ws_still_silent(
+    seeded_universe, test_session_factory
+):
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker), session_factory=test_session_factory, ws_health_grace_seconds=0.05
+    )
+    service._fallback_symbols.add(underlying_symbol)  # noqa: SLF001
+
+    recovered = service._try_ws_recovery(underlying_symbol)  # noqa: SLF001
+
+    assert recovered is False
+    assert underlying_symbol in service.fallback_symbols
+    # Re-torn-down after the failed probe -- same "stopped must mean no
+    # more callbacks fire" discipline the original fallback decision uses.
+    assert underlying_symbol in broker.unsubscribed
+
+
+def test_poll_loop_promotes_back_to_ws_via_probe_end_to_end(
+    seeded_universe, test_session_factory
+):
+    """End-to-end through the real `_poll_loop` background thread (not
+    calling `_try_ws_recovery` directly) -- proves the probe cadence is
+    actually wired into the loop, not just correct in isolation.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _RecoversOnSecondSubscribeBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.05,
+        rest_poll_interval_seconds=0.05,
+        ws_recovery_probe_every_n_polls=1,  # probe every cycle for a fast test
+        min_plausible_price_by_symbol={},
+    )
+
+    service.start([underlying_symbol])
+    # With a 0.05s grace window and a 0.05s poll interval (probing every
+    # cycle), fallback and recovery both happen well within this single
+    # wait -- there's no stable intermediate moment worth asserting on
+    # separately without flaking on timing.
+    time.sleep(0.5)
+
+    assert underlying_symbol not in service.fallback_symbols
+    service.stop([underlying_symbol])
+
+
 def test_fallback_symbols_property_reflects_internal_state(
     seeded_universe, test_session_factory
 ):

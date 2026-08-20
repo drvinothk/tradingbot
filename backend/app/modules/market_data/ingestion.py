@@ -118,6 +118,15 @@ _RATE_LIMIT_BACKOFF_SECONDS = 300.0
 # market open) don't misfire, short enough to catch a real stall quickly.
 _EMPTY_POLL_WARNING_THRESHOLD_SECONDS = 90.0
 
+# 2026-08-20: how often (in REST poll cycles) a fallen-back symbol gets a
+# WS-recovery probe -- see `_try_ws_recovery`'s own docstring for the full
+# mechanism. 10 cycles at the default 25s poll interval is ~4 minutes;
+# frequent enough that VWAP doesn't stay frozen for hours after a real WS
+# recovery, infrequent enough not to churn subscribe/unsubscribe calls or
+# pause REST polling (each probe blocks polling for up to one grace window)
+# more than necessary.
+_WS_RECOVERY_PROBE_EVERY_N_POLLS = 10
+
 _SymbolRef = tuple[str, uuid.UUID]  # ("instrument" | "option_contract", row id)
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 
@@ -165,6 +174,7 @@ class MarketDataIngestionService:
         rest_poll_interval_seconds: float = _REST_POLL_INTERVAL_SECONDS,
         rate_limit_backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
         min_plausible_price_by_symbol: dict[str, float] | None = None,
+        ws_recovery_probe_every_n_polls: int = _WS_RECOVERY_PROBE_EVERY_N_POLLS,
     ) -> None:
         self._provider = provider
         self._session_factory = session_factory
@@ -192,6 +202,7 @@ class MarketDataIngestionService:
         self._implausible_price_logged: set[str] = set()
         self._last_tick_at: dict[str, datetime] = {}
         self._fallback_symbols: set[str] = set()
+        self._ws_recovery_probe_every_n_polls = ws_recovery_probe_every_n_polls
         self._poll_threads: dict[str, threading.Thread] = {}
         self._last_polled_bucket: dict[str, datetime | None] = {}
         # Wall-clock time a REST poll last returned at least one candle for
@@ -289,15 +300,18 @@ class MarketDataIngestionService:
         self._start_rest_fallback(symbol)
 
     def _start_rest_fallback(self, symbol: str) -> None:
-        """One-way fallback: once a symbol switches to REST polling it stays
-        there for the life of this service instance, even if WS later
-        recovers — flip-flopping back would need its own health check on
-        the *REST* side too, and this codebase has never once seen WS work
-        to know what "recovered" would even look like yet. Explicitly drops
-        the WS subscription for this symbol (not just leaving it dangling)
-        so a hypothetical later WS recovery can't race a REST-polled insert
-        for the same `price_bars` bucket — the same "stopped must mean no
-        more callbacks fire" discipline `unsubscribe_quotes` already
+        """**No longer strictly one-way, as of 2026-08-20** — the original
+        reasoning here ("this codebase has never once seen WS work, so
+        there's nothing to test recovery against") is stale now that real,
+        sustained Shoonya WS ticks are proven live for hours at a stretch.
+        `_poll_loop` now periodically probes for WS recovery
+        (`_try_ws_recovery`) and promotes the symbol back if it succeeds —
+        see that method's own docstring for why a probe, not a plain
+        concurrent re-subscribe, is what makes this safe. Still explicitly
+        drops the WS subscription here before REST polling starts (so a
+        stray WS tick can't race a REST-polled insert for the same
+        `price_bars` bucket in the meantime) — the same "stopped must mean
+        no more callbacks fire" discipline `unsubscribe_quotes` already
         promises elsewhere in this codebase.
         """
         ref = self._symbol_map.get(symbol)
@@ -347,7 +361,15 @@ class MarketDataIngestionService:
             ).scalar()
 
     def _poll_loop(self, symbol: str, instrument_id: uuid.UUID) -> None:
+        poll_count = 0
         while symbol in self._fallback_symbols:
+            poll_count += 1
+            if poll_count % self._ws_recovery_probe_every_n_polls == 0 and self._try_ws_recovery(
+                symbol
+            ):
+                return  # promoted back to WS -- this poll loop's job is done
+            if symbol not in self._fallback_symbols:
+                return
             wait_seconds = self._rest_poll_interval_seconds
             try:
                 self._poll_once(symbol, instrument_id)
@@ -381,6 +403,74 @@ class MarketDataIngestionService:
                 if symbol not in self._fallback_symbols:
                     return
                 threading.Event().wait(0.1)
+
+    def _try_ws_recovery(self, symbol: str) -> bool:
+        """2026-08-20: called from `_poll_loop` every
+        `_ws_recovery_probe_every_n_polls` cycles. Deliberately pauses REST
+        polling for the duration of the probe rather than re-subscribing WS
+        *alongside* an active poll loop — `_on_tick` has no fallback-aware
+        guard of its own (it processes any tick for a known symbol
+        unconditionally), so a stray WS tick landing while `_poll_once` is
+        also running for the same symbol could drive `IndicatorEngine`
+        through both `on_tick` and `on_completed_bar` concurrently for the
+        same instrument — a real risk to indicator state, not just a
+        `uq_price_bar_bucket` bump. Pausing during the probe avoids that
+        overlap entirely; this method runs synchronously inside
+        `_poll_loop`'s own thread, so there's nothing else to coordinate
+        with.
+
+        Reuses `_grace_seconds_for` — the exact same window the *original*
+        fallback decision was judged against — for symmetry: if that
+        duration was long enough to conclude "WS isn't delivering," it's
+        the right duration to conclude "WS is delivering again," too.
+        Returns True (and leaves the symbol removed from
+        `_fallback_symbols`) only if a real tick arrived within the
+        window; on any failure to promote, re-establishes the REST
+        subscription exactly as `_start_rest_fallback` originally did and
+        returns False so `_poll_loop` continues polling unchanged.
+        """
+        self._last_tick_at.pop(symbol, None)
+        probe_started = datetime.now(UTC)
+        try:
+            self._provider.subscribe_ticks(
+                [symbol], on_tick=self._on_tick, on_depth=self._on_depth
+            )
+        except Exception:
+            logger.exception(
+                "WS recovery probe subscribe failed for %r; staying on REST polling", symbol
+            )
+            return False
+
+        grace_seconds = self._grace_seconds_for(symbol)
+        deadline = probe_started + timedelta(seconds=grace_seconds)
+        while datetime.now(UTC) < deadline:
+            if symbol not in self._fallback_symbols:
+                return True  # something else already promoted it
+            last_tick = self._last_tick_at.get(symbol)
+            if last_tick is not None and last_tick >= probe_started:
+                self._fallback_symbols.discard(symbol)
+                logger.warning(
+                    "WS recovered for %r after a recovery probe -- promoting back from "
+                    "REST polling to WS-driven ticks (VWAP resumes)",
+                    symbol,
+                )
+                return True
+            threading.Event().wait(0.5)
+
+        logger.info(
+            "WS recovery probe for %r found no tick within %.0fs -- staying on REST polling",
+            symbol,
+            grace_seconds,
+        )
+        try:
+            self._provider.unsubscribe_ticks([symbol])
+        except Exception:
+            logger.exception(
+                "Failed to unsubscribe %r after a failed WS recovery probe -- continuing "
+                "on REST regardless",
+                symbol,
+            )
+        return False
 
     def _poll_once(self, symbol: str, instrument_id: uuid.UUID) -> None:
         timeframe_seconds = (
