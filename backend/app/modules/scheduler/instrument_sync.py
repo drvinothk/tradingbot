@@ -17,8 +17,10 @@ from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.domain.identity.models import Workspace
 from app.domain.market.models import Instrument, InstrumentMasterSyncLog, OptionContract, SyncStatus
 from app.domain.market.models import OptionType as MarketOptionType
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 
 logger = logging.getLogger("app.scheduler.instrument_sync")
@@ -26,6 +28,53 @@ logger = logging.getLogger("app.scheduler.instrument_sync")
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _alert_on_instrument_change(
+    db: Session,
+    instrument: Instrument,
+    *,
+    old_lot_size: int,
+    old_tick_size: float,
+    old_freeze_qty: int | None,
+) -> None:
+    """Best-effort — never raises past this, matching `sync_instrument_
+    master`'s own "a failed sync is recorded, not thrown" contract. This
+    function has no per-request workspace context (see the module-level
+    `sync_instrument_master` docstring — it's called from a scheduler, a
+    login callback, and startup, none of which have a natural one to pass
+    through), so it resolves the first `Workspace` row — the same
+    single-workspace simplification `provider_composition._seed_manual_
+    override` already documents as correct for this system's actual usage.
+    Silently does nothing if no workspace exists yet (a fresh, unseeded
+    DB) rather than crashing a sync over an alert that has nowhere to go.
+    """
+    workspace = db.query(Workspace).first()
+    if workspace is None:
+        return
+    changes = []
+    if old_lot_size != instrument.lot_size:
+        changes.append(f"lot_size {old_lot_size} -> {instrument.lot_size}")
+    if old_tick_size != instrument.tick_size:
+        changes.append(f"tick_size {old_tick_size} -> {instrument.tick_size}")
+    if instrument.freeze_qty != old_freeze_qty:
+        changes.append(f"freeze_qty {old_freeze_qty} -> {instrument.freeze_qty}")
+    if not changes:
+        return
+    db.add(
+        SystemAlert(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            severity=AlertSeverity.WARNING,
+            category="instrument_master_changed",
+            message=(
+                f"{instrument.symbol} ({instrument.exchange}) instrument data changed on "
+                f"sync: {', '.join(changes)}. Verify against the broker before the next "
+                "live order on this instrument."
+            ),
+            created_at=_utcnow(),
+        )
+    )
 
 
 def sync_instrument_master(
@@ -123,6 +172,23 @@ def sync_instrument_master(
                     # (binary float imprecision makes 0.05 != Decimal('0.0500') even
                     # when they represent the same value) — route the float through
                     # its string repr to get a matching Decimal first.
+                    #
+                    # 2026-08-20, live incident: this branch used to silently
+                    # overwrite lot_size/tick_size/freeze_qty with zero
+                    # visibility -- a real NIFTY lot_size mismatch (broker's
+                    # own stale reference data at the time) was only ever
+                    # discovered when a live order got rejected for it, hours
+                    # after the value had actually changed underneath. A
+                    # SystemAlert here can't validate the new value is
+                    # *correct* (unlike the price-plausibility guard, lot
+                    # sizes are legitimately revised by the exchange
+                    # periodically, so there's no stable floor/ceiling to
+                    # check against) -- but it turns a silent change into a
+                    # visible one, so a human can notice *before* the next
+                    # live order hits it instead of after.
+                    old_lot_size = instrument.lot_size
+                    old_tick_size = instrument.tick_size
+                    old_freeze_qty = instrument.freeze_qty
                     instrument.lot_size = info.lot_size
                     instrument.tick_size = info.tick_size
                     # Only overwrite when the broker actually supplies a value —
@@ -131,6 +197,13 @@ def sync_instrument_master(
                     if info.freeze_qty is not None:
                         instrument.freeze_qty = info.freeze_qty
                     instruments_updated += 1
+                    _alert_on_instrument_change(
+                        db,
+                        instrument,
+                        old_lot_size=old_lot_size,
+                        old_tick_size=old_tick_size,
+                        old_freeze_qty=old_freeze_qty,
+                    )
                 symbol_to_instrument_id[info.symbol] = instrument.id
 
             for info in option_infos:

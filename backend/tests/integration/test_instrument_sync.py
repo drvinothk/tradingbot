@@ -71,6 +71,62 @@ def test_sync_detects_a_real_lot_size_change(db: Session):
     assert nifty.lot_size == 30
 
 
+def test_sync_raises_a_system_alert_on_lot_size_change(db: Session, workspace):
+    """2026-08-20 live incident: this used to be a silent overwrite,
+    discovered only via a real live order rejection hours after the value
+    had actually changed. A SystemAlert can't validate the *new* value is
+    correct (lot sizes are legitimately revised by the exchange
+    periodically, unlike price which has a stable floor) -- but it makes
+    the change visible instead of silent.
+    """
+    from app.domain.ops.models import SystemAlert
+
+    broker = MockBrokerAdapter(instruments=build_mock_universe(EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+
+    changed_universe = [
+        InstrumentInfo(symbol="NIFTY", exchange="NFO", lot_size=65, tick_size=0.05)
+        if i.symbol == "NIFTY" and not i.is_option
+        else i
+        for i in build_mock_universe(EXPIRY)
+    ]
+    broker2 = MockBrokerAdapter(instruments=changed_universe, seed=1)
+    sync_instrument_master(db, broker2, exchanges=["NFO"])
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "instrument_master_changed")
+        .one()
+    )
+    assert alert.workspace_id == workspace.id
+    assert "NIFTY" in alert.message
+    assert "lot_size" in alert.message
+
+
+def test_sync_with_no_actual_change_raises_no_alert(db: Session, workspace):
+    """The Decimal-vs-float precision guard already prevents a spurious
+    `instruments_updated` count for an unchanged sync (see
+    test_sync_is_not_fooled_by_decimal_vs_float_precision) -- this pins
+    that the alert path inherits that same correctness, not just the
+    counter.
+    """
+    from app.domain.ops.models import SystemAlert
+
+    broker = MockBrokerAdapter(instruments=build_mock_universe(EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+
+    count = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "instrument_master_changed")
+        .count()
+    )
+    assert count == 0
+
+
 def test_sync_populates_freeze_qty_from_broker(db: Session):
     broker = MockBrokerAdapter(instruments=build_mock_universe(EXPIRY), seed=1)
     sync_instrument_master(db, broker, exchanges=["NFO"])
