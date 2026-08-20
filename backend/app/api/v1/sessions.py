@@ -445,6 +445,63 @@ def recover_from_degraded_mode(
     return trading_session
 
 
+@router.post("/{session_id}/recover-from-reconciliation-lock")
+def recover_from_reconciliation_lock(
+    session_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> dict:
+    """2026-08-20 addition, closing the same class of gap `recover_from_
+    kill_switch`/`recover_from_degraded_mode` closed for their own modes --
+    `reconciliation_lock` has been cleared at least once this session via a
+    raw `psql` UPDATE, with nothing in the app itself to do it.
+    `RECONCILIATION_LOCK -> PAPER_ONLY` is already a legal static edge in
+    `ALLOWED_TRANSITIONS` (`risk.override`, matching this endpoint's own
+    gate) -- the only real work here is not trusting a stale assumption
+    that the mismatch is actually resolved. Re-runs `run_full_reconciliation`
+    first (the mode-scoped, dual-pass function built earlier tonight) and
+    only transitions if that fresh check comes back clean; a still-mismatched
+    result is a normal, expected outcome (not a client error), same
+    "reflect it, don't except on it" contract `manual_reconcile` already
+    uses -- so this returns 200 either way, with `recovered: false` and the
+    fresh mismatch detail when it can't proceed.
+
+    Safe to call while already in `reconciliation_lock`:
+    `run_reconciliation`'s own escalation check
+    (`_RECONCILIATION_LOCK_ELIGIBLE_MODES`) only fires from
+    `paper_plus_guarded_live`/`live_enabled`, so re-checking from inside the
+    lock can't recurse into trying to re-enter it.
+    """
+    trading_session = _get_session_or_404(db, user, session_id)
+    if trading_session.mode != SafeMode.RECONCILIATION_LOCK:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"session is in {trading_session.mode}, not reconciliation_lock",
+        )
+
+    runs = run_full_reconciliation(db, trading_session, ReconciliationTrigger.EVENT)
+    mismatches = [m for run in runs for m in run.detail.get("mismatches", [])]
+
+    if mismatches:
+        db.commit()
+        return {"recovered": False, "mismatches_found": len(mismatches), "mismatches": mismatches}
+
+    try:
+        transition_mode(
+            db,
+            trading_session,
+            SafeMode.PAPER_ONLY,
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="manual recovery from reconciliation_lock, fresh reconciliation confirmed clean",
+        )
+    except ModeTransitionError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    db.commit()
+    db.refresh(trading_session)
+    return {"recovered": True, "session": SessionOut.model_validate(trading_session).model_dump()}
+
+
 @router.post("/{session_id}/kill-switch", response_model=SessionOut)
 def trigger_kill_switch(
     session_id: uuid.UUID,

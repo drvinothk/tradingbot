@@ -130,7 +130,9 @@ def seeded_admin(engine):
     # have already deleted the rows those subqueries depend on.
     with session_factory() as cleanup_db:
         from app.domain.audit.models import AuditEvent
+        from app.domain.broker.models import BrokerSyncState, ReconciliationRun
         from app.domain.identity.models import LoginSession
+        from app.domain.ops.models import SystemAlert
         from app.domain.session.models import SessionModeTransition, TradingSession
 
         # Every API call under test that succeeds writes at least one audit
@@ -139,6 +141,30 @@ def seeded_admin(engine):
         # pattern as the Permission rows below.
         cleanup_db.query(AuditEvent).filter(AuditEvent.workspace_id == ids["workspace_id"]).delete()
         cleanup_db.query(SessionModeTransition).delete()
+        # A real reconciliation mismatch also raises a SystemAlert
+        # (workspace_id FK) -- same reasoning as BrokerSyncState/
+        # ReconciliationRun just below.
+        cleanup_db.query(SystemAlert).filter(
+            SystemAlert.workspace_id == ids["workspace_id"]
+        ).delete()
+        # 2026-08-20: recover-from-reconciliation-lock's own tests are the
+        # first in this file to call run_full_reconciliation, which writes
+        # BrokerSyncState/ReconciliationRun rows FK'd to trading_sessions.id
+        # -- both must go before the TradingSession delete below.
+        cleanup_db.query(BrokerSyncState).filter(
+            BrokerSyncState.trading_session_id.in_(
+                cleanup_db.query(TradingSession.id).filter(
+                    TradingSession.workspace_id == ids["workspace_id"]
+                )
+            )
+        ).delete(synchronize_session=False)
+        cleanup_db.query(ReconciliationRun).filter(
+            ReconciliationRun.trading_session_id.in_(
+                cleanup_db.query(TradingSession.id).filter(
+                    TradingSession.workspace_id == ids["workspace_id"]
+                )
+            )
+        ).delete(synchronize_session=False)
         cleanup_db.query(TradingSession).filter(
             TradingSession.workspace_id == ids["workspace_id"]
         ).delete()
@@ -843,3 +869,106 @@ def test_recover_from_degraded_rejects_without_livetrade_execute_permission(
             cleanup_db.query(Role).filter(Role.id == limited_role_id).delete()
             cleanup_db.query(User).filter(User.id == limited_user_id).delete()
             cleanup_db.commit()
+
+
+# -- POST /sessions/{id}/recover-from-reconciliation-lock (2026-08-20) -------
+
+
+def _drop_session_into_reconciliation_lock(engine, session_id: str) -> None:
+    """Simulates what reconciliation.service.run_reconciliation actually
+    does on a real mismatch -- there is (deliberately) no API endpoint that
+    lets a human enter this mode directly, same reasoning as
+    `_drop_session_into_degraded`.
+    """
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        trading_session = db.get(TradingSession, uuid.UUID(session_id))
+        assert trading_session is not None
+        transition_mode(
+            db,
+            trading_session,
+            SafeMode.RECONCILIATION_LOCK,
+            TransitionTriggerType.SYSTEM,
+            reason="simulated reconciliation mismatch",
+        )
+        db.commit()
+
+
+def test_recover_from_reconciliation_lock_restores_paper_only_when_clean(
+    api_client: TestClient, seeded_admin, engine
+):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    _drop_session_into_reconciliation_lock(engine, session_id)
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/recover-from-reconciliation-lock"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["recovered"] is True
+    assert body["session"]["mode"] == "paper_only"
+
+    get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
+    assert get_resp.json()["mode"] == "paper_only"
+
+
+def test_recover_from_reconciliation_lock_refuses_when_still_mismatched(
+    api_client: TestClient, seeded_admin, engine
+):
+    """The real point of this endpoint over a bare permissioned override --
+    it re-checks first (`run_full_reconciliation`) and refuses to transition
+    if a fresh broker-side mismatch still exists, rather than trusting a
+    stale assumption that whatever caused the lock is already fixed.
+    """
+    from app.modules.broker_adapter import composition
+    from app.modules.broker_adapter.base.contracts import OrderRequest, OrderSide, OrderType
+
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    _drop_session_into_reconciliation_lock(engine, session_id)
+
+    # Same injection pattern test_reconciliation.py's own tests use -- a
+    # stray fill against the persistent execution mock with no matching
+    # local position, independent of any dispatch machinery.
+    composition.get_execution_mock().place_order(
+        OrderRequest(
+            idempotency_key=f"manual-injection-{uuid.uuid4()}",
+            contract_symbol="NIFTY26JUL22000CE-RECOVERYTEST",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=25,
+        )
+    )
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/recover-from-reconciliation-lock"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["recovered"] is False
+    assert body["mismatches_found"] >= 1
+
+    get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
+    assert get_resp.json()["mode"] == "reconciliation_lock"
+
+
+def test_recover_from_reconciliation_lock_rejects_when_not_in_lock(
+    api_client: TestClient, seeded_admin
+):
+    session_id = _login_and_create_session(api_client, seeded_admin)
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/recover-from-reconciliation-lock"
+    )
+
+    assert response.status_code == 409
+
+
+def test_recover_from_reconciliation_lock_requires_login(api_client: TestClient):
+    response = api_client.post(
+        f"/api/v1/sessions/{uuid.uuid4()}/recover-from-reconciliation-lock"
+    )
+    assert response.status_code == 401

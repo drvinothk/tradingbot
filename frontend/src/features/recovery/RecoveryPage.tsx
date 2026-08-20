@@ -1,6 +1,24 @@
+import { useMutation } from '@tanstack/react-query'
 import { useState } from 'react'
+import { api, ApiError } from '../../shared/api/client'
 import { useSessions } from '../../shared/hooks/useSessions'
 import { useReconciliationRuns, useSystemAlerts } from '../../shared/hooks/useRecovery'
+
+interface OpenLivePosition {
+  trading_session_id: string
+  contract_symbol: string
+  qty: number
+}
+
+interface RestartBackendResponse {
+  ok: boolean
+  message: string
+}
+
+interface RestartBlockedDetail {
+  message: string
+  open_live_positions: OpenLivePosition[]
+}
 
 export function RecoveryPage() {
   const alertsQuery = useSystemAlerts()
@@ -10,6 +28,52 @@ export function RecoveryPage() {
 
   const alerts = alertsQuery.data ?? []
   const sessions = sessionsQuery.data ?? []
+
+  const [restartReason, setRestartReason] = useState('')
+  const [restartStatus, setRestartStatus] = useState<string | null>(null)
+  const [blockedPositions, setBlockedPositions] = useState<OpenLivePosition[] | null>(null)
+
+  // force=false first, always -- the backend's own open-live-position guard
+  // is the real safety net; a second, explicitly-labeled click is required
+  // to override it once positions are actually shown, see below.
+  const restartMutation = useMutation({
+    mutationFn: (force: boolean) =>
+      api.post<RestartBackendResponse>('/system-settings/restart-backend', {
+        reason: restartReason,
+        force,
+      }),
+    onSuccess: (result) => {
+      setBlockedPositions(null)
+      setRestartStatus(result.message)
+    },
+    onError: (err) => {
+      if (err instanceof ApiError && err.status === 409) {
+        const detail = (err.body as { detail?: RestartBlockedDetail } | null)?.detail
+        setRestartStatus(detail?.message ?? 'Blocked by open live positions.')
+        setBlockedPositions(detail?.open_live_positions ?? [])
+      } else {
+        setBlockedPositions(null)
+        setRestartStatus(err instanceof ApiError ? err.message : 'Restart failed.')
+      }
+    },
+  })
+
+  function handleRestartClick() {
+    if (!restartReason.trim()) {
+      setRestartStatus('A reason is required.')
+      return
+    }
+    if (
+      !window.confirm(
+        'This restarts the entire backend process. Every open position’s stop/target/' +
+          'trail monitoring pauses for a few seconds while it comes back up. Continue?',
+      )
+    ) {
+      return
+    }
+    setBlockedPositions(null)
+    restartMutation.mutate(false)
+  }
 
   return (
     <div>
@@ -126,6 +190,61 @@ export function RecoveryPage() {
                 </tbody>
               </table>
             )}
+          </>
+        )}
+      </div>
+
+      <div className="card">
+        <h3>Restart backend</h3>
+        <p>
+          Last resort if a recovery action above doesn't fix a stuck session — restarts the
+          entire backend process. Every open position's stop/target/trail monitoring pauses
+          for a few seconds while it comes back up.
+        </p>
+        <div className="form-row">
+          <label htmlFor="restart-reason">Reason</label>
+          <textarea
+            id="restart-reason"
+            value={restartReason}
+            onChange={(e) => setRestartReason(e.target.value)}
+            rows={2}
+          />
+        </div>
+        <button
+          className="danger"
+          disabled={restartMutation.isPending}
+          onClick={handleRestartClick}
+        >
+          Restart backend
+        </button>
+        {restartStatus && <p>{restartStatus}</p>}
+        {blockedPositions && blockedPositions.length > 0 && (
+          <>
+            <table>
+              <thead>
+                <tr>
+                  <th>Session</th>
+                  <th>Contract</th>
+                  <th>Qty</th>
+                </tr>
+              </thead>
+              <tbody>
+                {blockedPositions.map((position, i) => (
+                  <tr key={i}>
+                    <td>{position.trading_session_id}</td>
+                    <td>{position.contract_symbol}</td>
+                    <td>{position.qty}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <button
+              className="danger"
+              disabled={restartMutation.isPending}
+              onClick={() => restartMutation.mutate(true)}
+            >
+              Restart anyway
+            </button>
           </>
         )}
       </div>

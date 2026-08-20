@@ -453,6 +453,43 @@ def test_trade_window_closed_blocks_the_explicit_toggle_too(
     assert db.query(StrategyRun).count() == 0
 
 
+def test_too_early_blocks_the_ambient_path(
+    db, workspace, trading_session, nifty, monkeypatch, _fake_snapshot_and_broker
+):
+    """2026-08-20: a real midnight login must not auto-spawn every enabled
+    strategy hours before market data even starts flowing -- see
+    AUTO_SPAWN_EARLIEST_TIME's own docstring for the live incident.
+    """
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 0, 5, tzinfo=IST)
+    )
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    outcome = _spawn_one(db, trading_session, config, TODAY, {}, set())
+
+    assert outcome.status == SpawnStatus.TOO_EARLY
+    assert db.query(StrategyRun).count() == 0
+
+
+def test_too_early_does_not_block_the_explicit_toggle(
+    db, workspace, trading_session, nifty, user, monkeypatch, _fake_snapshot_and_broker
+):
+    """Same 'a direct human command overrides an ambient protection' shape
+    as ignore_stopped_today -- a deliberate 2am Power-toggle click must
+    still work.
+    """
+    monkeypatch.setattr(
+        auto_spawner_module, "now_ist", lambda: datetime(2026, 8, 18, 2, 0, tzinfo=IST)
+    )
+    _contract(db, nifty, date(2026, 8, 20), 24000)
+    config = _enabled_config(db, workspace)
+
+    outcome = spawn_one_now(db, trading_session, config, actor_id=user.id)
+
+    assert outcome.status == SpawnStatus.SPAWNED
+
+
 def test_ambient_spawn_is_audited_as_system_with_no_actor(
     db, workspace, trading_session, nifty, _fake_snapshot_and_broker
 ):

@@ -51,6 +51,14 @@ shape, to make it safe to call far more often than once a day:
   same strategy_config). Same lock, same "network call outside, decision +
   insert inside" shape `api.v1.strategies.start_strategy` already
   established for its own identical race.
+
+**2026-08-20**: a third gate, `AUTO_SPAWN_EARLIEST_TIME` (08:00 IST) --
+live-observed a genuine midnight login auto-spawning every enabled
+strategy hours before market data even starts flowing, leaving them idle
+all night for nothing. Same "ambient trigger only" shape as the other two:
+`spawn_enabled_strategies` (both the login endpoint and the 09:00
+scheduler) is gated; `spawn_one_now`'s explicit Power-toggle path ignores
+it (`ignore_time_gate=True`), same reasoning as `ignore_stopped_today`.
 """
 
 from __future__ import annotations
@@ -89,12 +97,31 @@ MAX_DTE = 7
 # runs get the same cadence a human starting one manually would get.
 SPAWN_INTERVAL_SECONDS = 30.0
 
+# 2026-08-20: the login-triggered half of the Dual-Trigger Model
+# (`api.v1.sessions.bootstrap_now`) deliberately has no time gate of its own
+# -- it exists precisely so a login at any hour gets today's session ready.
+# But that meant a genuinely early login (a real midnight one, live-observed)
+# auto-spawned every enabled strategy hours before market data even starts
+# flowing (`market_data.market_hours`'s own ~08:30 IST connectivity window),
+# leaving them sitting SCANNING all night for nothing -- harmless (
+# TRADE_WINDOW_START already hard-blocks any entry before 09:31 IST
+# regardless of when the run itself was created, and EOD_SCANNING_STOP_TIME
+# self-stops an idle one by 15:10) but wasteful. This is the matching early
+# bound for that late one, applied only to the *ambient* trigger
+# (spawn_enabled_strategies, i.e. both the login endpoint and the 09:00
+# scheduler) -- `spawn_one_now`'s explicit Power-toggle path deliberately
+# ignores it (`ignore_time_gate=True`), same "a direct human command
+# overrides an ambient protection" reasoning already established there for
+# `ignore_stopped_today`.
+AUTO_SPAWN_EARLIEST_TIME = dt_time(8, 0)
+
 
 class SpawnStatus(StrEnum):
     SPAWNED = "spawned"
     ALREADY_ACTIVE = "already_active"
     ALREADY_RAN_TODAY = "already_ran_today"
     NOT_TRADING_DAY = "not_trading_day"
+    TOO_EARLY = "too_early"
     TRADE_WINDOW_CLOSED = "trade_window_closed"
     NO_UNDERLYING = "no_underlying"
     UNKNOWN_INSTRUMENT = "unknown_instrument"
@@ -201,6 +228,7 @@ def _spawn_one(
     snapshotted: set[tuple[uuid.UUID, date]],
     *,
     ignore_stopped_today: bool = False,
+    ignore_time_gate: bool = False,
     actor_type: ActorType = ActorType.SYSTEM,
     actor_id: uuid.UUID | None = None,
 ) -> SpawnOutcome:
@@ -211,6 +239,13 @@ def _spawn_one(
     if not is_trading_day(today):
         return SpawnOutcome(
             SpawnStatus.NOT_TRADING_DAY, f"{today.isoformat()} is not a trading day."
+        )
+
+    if not ignore_time_gate and now_ist().time() < AUTO_SPAWN_EARLIEST_TIME:
+        return SpawnOutcome(
+            SpawnStatus.TOO_EARLY,
+            f"Auto-spawn not allowed before {AUTO_SPAWN_EARLIEST_TIME.strftime('%H:%M')} IST -- "
+            "will spawn automatically once that time passes (next login or the 09:00 scheduler).",
         )
 
     if now_ist().time() >= TRADE_WINDOW_END:
@@ -381,6 +416,7 @@ def spawn_one_now(
         {},
         set(),
         ignore_stopped_today=True,
+        ignore_time_gate=True,
         actor_type=ActorType.USER,
         actor_id=actor_id,
     )

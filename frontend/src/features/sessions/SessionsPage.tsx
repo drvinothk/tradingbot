@@ -94,6 +94,29 @@ export function SessionsPage() {
       setActionError(err instanceof ApiError ? err.message : 'Recover from degraded failed'),
   })
 
+  // Unlike the other Recover buttons, this one can genuinely come back
+  // "not recovered" as a normal 200 response, not just an error -- the
+  // endpoint re-runs reconciliation fresh and refuses to clear the lock if
+  // a real mismatch still exists, so a still-mismatched result needs its
+  // own message rather than the generic error path.
+  const recoverFromReconciliationLockMutation = useMutation({
+    mutationFn: (sessionId: string) =>
+      api.post<{ recovered: boolean; mismatches_found?: number }>(
+        `/sessions/${sessionId}/recover-from-reconciliation-lock`,
+      ),
+    onSuccess: (result) => {
+      invalidateSessions()
+      if (!result.recovered) {
+        setActionError(
+          `Still ${result.mismatches_found ?? 'some'} mismatch(es) — not recovered. ` +
+            'Check Recovery for detail.',
+        )
+      }
+    },
+    onError: (err) =>
+      setActionError(err instanceof ApiError ? err.message : 'Recover from reconciliation_lock failed'),
+  })
+
   const bulkModeMutation = useMutation({
     mutationFn: (mode: 'force_paper' | null) =>
       api.post('/strategies/bulk-runtime-mode', { mode }),
@@ -290,6 +313,20 @@ export function SessionsPage() {
                         <button
                           disabled={recoverFromDegradedMutation.isPending}
                           onClick={() => recoverFromDegradedMutation.mutate(session.id)}
+                        >
+                          Recover
+                        </button>
+                      )}
+                      {/* reconciliation_lock: entered when a broker-vs-local
+                          position mismatch is found. Recover re-runs
+                          reconciliation fresh server-side and only clears the
+                          lock if that comes back clean -- a still-mismatched
+                          result surfaces via actionError instead of silently
+                          doing nothing, see the mutation's own onSuccess. */}
+                      {session.mode === 'reconciliation_lock' && (
+                        <button
+                          disabled={recoverFromReconciliationLockMutation.isPending}
+                          onClick={() => recoverFromReconciliationLockMutation.mutate(session.id)}
                         >
                           Recover
                         </button>
