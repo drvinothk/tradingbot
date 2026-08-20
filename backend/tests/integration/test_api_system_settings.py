@@ -437,11 +437,20 @@ def test_restart_backend_requires_login(api_client: TestClient):
     assert response.status_code == 401
 
 
-def test_restart_backend_refused_off_linux(api_client: TestClient, seeded_admin):
-    """The default (this test suite's own Windows/CI environment, no
-    `platform.system` monkeypatch) -- confirms the guard fires rather than
-    reaching the subprocess call at all.
+def test_restart_backend_refused_off_linux(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-20: explicit monkeypatch, not ambient OS state -- the
+    original version of this test relied on `platform.system()` returning
+    something other than "Linux" by default, true by coincidence on a
+    Windows dev machine but false on GitHub Actions' actual Linux runners,
+    where it silently exercised the *allowed* path instead and returned
+    200, not 400. Real CI failure, caught live 2026-08-20. Forcing a
+    concrete non-Linux value here makes the test deterministic regardless
+    of which OS actually runs pytest, matching the other three tests in
+    this file that already force "Linux" the same explicit way.
     """
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Windows")
     _login(api_client, seeded_admin)
 
     response = api_client.post(
