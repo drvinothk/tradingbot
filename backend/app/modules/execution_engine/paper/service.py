@@ -46,7 +46,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 from sqlalchemy.orm import Session
 
@@ -157,6 +157,32 @@ def _apply_slippage(price: Decimal, order_side: SignalSide, slippage_pct: Decima
     return price * (Decimal("1") - slippage_pct)
 
 
+def _round_to_tick(price: Decimal, tick_size: Decimal, order_side: SignalSide) -> Decimal:
+    """**2026-08-20, live incident**: a real Shoonya order was rejected for
+    a price that wasn't a multiple of the instrument's own tick size (NSE
+    requires 0.05 multiples for these contracts; anything else, e.g. a
+    stray 0.03, is rejected outright) -- `_apply_slippage`'s percentage-
+    based buffer (`AppSettings.live_limit_order_buffer_pct`) almost never
+    lands on a clean multiple on its own (a real quoted `entry_price` is
+    already tick-aligned, but multiplying it by `1 + buffer_pct` generally
+    isn't). Only ever actually mattered for LIVE limit orders -- PAPER
+    still sends MARKET, which has no price to round.
+
+    Rounds in the direction that preserves (or very slightly increases)
+    the buffer's own protective margin rather than eroding it, same "which
+    direction actually helps this order's own side" reasoning
+    `_apply_slippage` already uses: up for a BUY (rounding down would mean
+    paying *less* than the buffer intended, undermining the whole point of
+    padding the price to tolerate LTP movement since the trading decision
+    was made), down for a SELL (mirror reasoning).
+    """
+    if tick_size <= 0:
+        return price
+    ticks = price / tick_size
+    rounding = ROUND_CEILING if order_side == SignalSide.BUY else ROUND_FLOOR
+    return ticks.to_integral_value(rounding=rounding) * tick_size
+
+
 def dispatch_trade_intent(
     db: Session,
     trading_session: TradingSession,
@@ -234,7 +260,8 @@ def dispatch_trade_intent(
         # decision and placement").
         if order_mode == OrderMode.LIVE:
             buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-            limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, buffer_pct))
+            buffered_price = _apply_slippage(_dec(trade_intent.entry_price), side, buffer_pct)
+            limit_price = float(_round_to_tick(buffered_price, _dec(instrument.tick_size), side))
             broker_order_type = BrokerOrderType.LIMIT
             domain_order_type = OrderType.LIMIT
         else:
@@ -539,8 +566,9 @@ def close_position(
             # paper's fill_slippage_pct.
             if order_mode == OrderMode.LIVE:
                 buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+                exit_buffered_price = _apply_slippage(_dec(intended_price), exit_side, buffer_pct)
                 exit_limit_price = float(
-                    _apply_slippage(_dec(intended_price), exit_side, buffer_pct)
+                    _round_to_tick(exit_buffered_price, _dec(instrument.tick_size), exit_side)
                 )
                 exit_broker_order_type = BrokerOrderType.LIMIT
                 exit_domain_order_type = OrderType.LIMIT
