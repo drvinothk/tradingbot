@@ -74,12 +74,18 @@ from app.domain.execution.models import (
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import TradingSession
-from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent
+from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent, TradeIntentStatus
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, Tick
+from app.modules.broker_adapter.base.contracts import (
+    BrokerOrderStatus,
+    OrderRequest,
+    OrderResult,
+    Tick,
+)
 from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSide
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
+from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import (
     get_broker,
     get_execution_broker,
@@ -458,6 +464,183 @@ def _open_position_from_fill(
     # fixtures to accidentally bypass.
 
     return position
+
+
+# 2026-08-20, live incident: a real Shoonya LIVE LIMIT order (Test 1,
+# NIFTY25AUG26C24250) filled at the broker but was never detected locally --
+# `dispatch_trade_intent` only ever creates a Position when `place_order()`
+# returns FILLED *synchronously*, which held for every order this system had
+# ever placed until LIVE orders switched from MARKET to LIMIT (2026-08-19):
+# a LIMIT order can legitimately sit "pending" at the broker and fill later,
+# and nothing re-checked a pending order afterward. The position sat with no
+# local Position/StopPlan -- invisible to PositionManager's stop/target/
+# trail checks *and* its EOD square-off sweep, both of which only ever
+# iterate the `positions` table -- until reconciliation's own poll caught
+# the broker-vs-local qty mismatch and locked the session, correctly, but
+# reconciliation is deliberately alert-only and never self-heals (see that
+# module's own docstring). Fixed live via a hand-reconstructed Position/
+# StopPlan/TrailPlan against the user-confirmed real fill; this function is
+# the permanent fix so a human never has to do that again.
+_TERMINAL_BROKER_ORDER_STATUSES = frozenset(
+    {BrokerOrderStatus.FILLED, BrokerOrderStatus.REJECTED, BrokerOrderStatus.CANCELLED}
+)
+
+
+def reconcile_pending_live_orders(
+    db: Session,
+    trading_session: TradingSession,
+    *,
+    allow_rest_fallback: bool,
+    broker: BrokerPort | None = None,
+) -> None:
+    """Two-layer detection for a LIVE entry order that didn't resolve
+    synchronously at dispatch, called every `PositionManager` cycle:
+
+    1. **Fast path, every call, free**: check
+       `ShoonyaBrokerAdapter.peek_cached_order_update` — a cache the
+       adapter's WS `on_order_update` push (see `ws_client.py`) populates
+       in the background, no REST call. Near-instant when it works.
+    2. **Safety net, only when `allow_rest_fallback` is True**: an
+       unconditional `broker.get_order_status` REST call regardless of
+       what step 1 found (or didn't) — deliberately *not* gated on
+       whether WS looked healthy, since ticks and order-update pushes are
+       different message types on the same socket and there is no
+       reliable way to self-diagnose the order-update channel specifically
+       (it's event-driven/sparse, unlike the continuous tick stream
+       `market_data.freshness` can watch for staleness). The caller is
+       expected to pass `allow_rest_fallback=True` on a deliberately
+       conservative, flat cadence (~30s), independent of any WS-health
+       signal — see `PositionManager._run_cycle`'s own call site.
+
+    Only ever finds rows for LIVE orders — `MockBrokerAdapter` always
+    fills synchronously, so a PAPER order is never left PENDING for this
+    to pick up.
+
+    `broker`, like `dispatch_trade_intent`/`close_position`'s own param of
+    the same name, is an explicit test-injection override — every existing
+    test in this module passes its own `MockBrokerAdapter()` rather than
+    relying on the process-wide singleton. Production (`PositionManager`)
+    never passes it, so each order still resolves its own broker via
+    `get_execution_broker`, same per-order resolution `resolve_broker_for_
+    position` already established for open positions.
+    """
+    pending_orders = (
+        db.query(Order)
+        .filter(
+            Order.trading_session_id == trading_session.id,
+            Order.mode == OrderMode.LIVE,
+            Order.trade_intent_id.is_not(None),
+            Order.status.in_(
+                [OrderStatus.PENDING, OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED]
+            ),
+        )
+        .all()
+    )
+    for order in pending_orders:
+        trade_intent = db.get(TradeIntent, order.trade_intent_id)
+        if trade_intent is None:
+            continue
+        if broker is not None:
+            resolved_broker = broker
+        else:
+            strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+            resolved_broker = get_execution_broker(trading_session, strategy_run)
+
+        result = _peek_order_update(resolved_broker, order.broker_order_id)
+        if result is None and allow_rest_fallback:
+            try:
+                result = resolved_broker.get_order_status(order.broker_order_id)
+            except BrokerError:
+                logger.exception(
+                    "get_order_status failed while reconciling pending order %s "
+                    "(broker_order_id=%s)",
+                    order.id,
+                    order.broker_order_id,
+                )
+                continue
+
+        if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
+            continue
+
+        _apply_resolved_pending_order(db, trading_session, trade_intent, order, result)
+        db.flush()
+
+
+def _peek_order_update(broker: BrokerPort, broker_order_id: str) -> OrderResult | None:
+    """Reaches past `_AuthAwareBroker`'s `_inner` wrap (same pattern
+    `api.v1.shoonya`'s diagnostics already use) to `peek_cached_order_update`
+    — Shoonya-specific, not part of `BrokerPort`, since no other adapter has
+    a WS order-update push to cache from.
+    """
+    inner = getattr(broker, "_inner", broker)
+    peek = getattr(inner, "peek_cached_order_update", None)
+    if not callable(peek):
+        return None
+    return peek(broker_order_id)  # type: ignore[no-any-return]
+
+
+def _apply_resolved_pending_order(
+    db: Session,
+    trading_session: TradingSession,
+    trade_intent: TradeIntent,
+    order: Order,
+    result: OrderResult,
+) -> None:
+    now = _utcnow()
+    order.status = _map_status(result.status)
+    order.filled_qty = result.filled_qty
+    order.avg_fill_price = result.avg_fill_price
+    order.updated_at = now
+    db.add(order)
+
+    db.add(
+        OrderEvent(
+            id=uuid.uuid4(),
+            order_id=order.id,
+            event_type="filled" if order.status == OrderStatus.FILLED else "resolved",
+            raw_payload={
+                "broker_order_id": result.broker_order_id,
+                "status": result.status.value,
+                "filled_qty": result.filled_qty,
+                "avg_fill_price": result.avg_fill_price,
+                "source": "reconcile_pending_live_orders",
+            },
+            ts=now,
+        )
+    )
+
+    if order.status == OrderStatus.FILLED:
+        option_contract = db.get(OptionContract, order.option_contract_id)
+        if option_contract is not None:
+            side = SignalSide(trade_intent.side)
+            _open_position_from_fill(
+                db, trading_session, trade_intent, option_contract, order, side
+            )
+    else:
+        # REJECTED/CANCELLED discovered after the fact: TradeIntent.status
+        # must not stay DISPATCHED forever once the broker has definitively
+        # said this order never became a position, or `_same_strike_locked`
+        # blocks this exact strategy+contract permanently — the identical
+        # stuck-TradeIntent incident this same night required a manual DB
+        # fix for. EXPIRED is a slight semantic stretch (that status
+        # otherwise means a PENDING_APPROVAL timeout) but is the closest
+        # existing terminal status meaning "this never executed, treat as
+        # gone" — no TradeIntentStatus exists yet for "broker rejected it
+        # after dispatch".
+        trade_intent.status = TradeIntentStatus.EXPIRED
+        db.add(trade_intent)
+
+    record_event(
+        db,
+        workspace_id=trading_session.workspace_id,
+        actor_type=ActorType.SYSTEM,
+        event_category=EventCategory.ORDER_LIFECYCLE,
+        event_type="order.reconciled",
+        entity_type="order",
+        entity_id=order.id,
+        trading_session_id=trading_session.id,
+        payload={"status": order.status.value, "filled_qty": order.filled_qty},
+    )
 
 
 def resolve_broker_for_position(

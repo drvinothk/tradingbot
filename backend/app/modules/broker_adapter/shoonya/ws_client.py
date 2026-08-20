@@ -79,6 +79,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from websockets.sync.client import connect
@@ -90,6 +91,8 @@ from app.modules.broker_adapter.shoonya.normalizer import (
     parse_depth,
     parse_tick,
 )
+
+OrderUpdateCallback = Callable[[dict], None]
 
 logger = logging.getLogger("app.broker_adapter.shoonya.ws")
 
@@ -126,6 +129,7 @@ class ShoonyaWSClient:
         access_token: str,
         on_tick: TickCallback,
         on_depth: DepthCallback | None = None,
+        on_order_update: OrderUpdateCallback | None = None,
         source: str = "API",
     ) -> None:
         self._ws_host = ws_host
@@ -134,6 +138,7 @@ class ShoonyaWSClient:
         self._access_token = access_token
         self._on_tick = on_tick
         self._on_depth = on_depth
+        self._on_order_update = on_order_update
         self._source = source
 
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
@@ -368,6 +373,32 @@ class ShoonyaWSClient:
             return
 
         msg_type = message.get("t")
+
+        # 2026-08-20: order-update push, added alongside the existing tick/
+        # depth handling above -- **unconfirmed message type**. Noren's
+        # documented pattern (see NorenRestApiPy's `start_websocket`) is
+        # that order updates arrive automatically on this same connection
+        # once authenticated, no separate subscribe call needed, but the
+        # exact `"t"` value for the message ("om" by Noren convention,
+        # matching the tick/depth "tk"/"tf"/"dk"/"df" pattern) hasn't been
+        # live-confirmed against a real account yet -- same "flag until
+        # verified" discipline as every other unconfirmed Shoonya wire
+        # detail in this file's own history. Deliberately does not touch
+        # `_entries_by_key`/the tick-subscription-keyed lookup below: an
+        # order-update message is an account-level event, not tied to any
+        # subscribed instrument token, so it must be handled before that
+        # lookup would otherwise silently drop it. This is a best-effort
+        # fast path only -- `execution_engine.paper.service
+        # .reconcile_pending_live_orders`'s own unconditional REST poll is
+        # the actual safety net if this never fires or the message shape
+        # turns out to be wrong.
+        if msg_type == "om" and self._on_order_update is not None:
+            try:
+                self._on_order_update(message)
+            except Exception:
+                logger.exception("Shoonya WS order-update callback failed for %r", message)
+            return
+
         key = f"{message.get('e', '')}|{message.get('tk', '')}"
         with self._lock:
             entry = self._entries_by_key.get(key)

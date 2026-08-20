@@ -830,6 +830,36 @@ def test_run_once_runs_reconciliation_every_n_cycles(
     )
 
 
+def test_run_once_calls_reconcile_pending_live_orders_with_the_right_cadence(
+    db: Session, broker, trading_session, monkeypatch
+):
+    """2026-08-20: the WS-push cache check must run every cycle (free), but
+    the REST safety-net fallback only on the configured flat cadence,
+    deliberately independent of any cycle-count-unrelated signal — see
+    `reconcile_pending_live_orders`'s own docstring. Verified here purely as
+    a wiring/cadence check (the function's own real behavior is covered in
+    test_execution_paper_service.py) via monkeypatching the name
+    `position_manager` imports.
+    """
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.position_manager.reconcile_pending_live_orders",
+        lambda *args, **kwargs: calls.append(kwargs["allow_rest_fallback"]),
+    )
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        order_poll_every_n_cycles=3,
+        session_factory=_session_factory_for(db),
+    )
+
+    for _ in range(4):
+        manager.run_once()
+
+    assert calls == [True, False, False, True]
+
+
 def test_run_once_is_a_no_op_for_a_missing_or_inactive_session(db: Session, broker):
     manager = PositionManager(
         uuid.uuid4(),

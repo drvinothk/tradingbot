@@ -59,6 +59,7 @@ from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.execution_engine.paper.service import (
     current_contract_price,
     evaluate_open_position,
+    reconcile_pending_live_orders,
     resolve_broker_for_position,
 )
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
@@ -75,6 +76,13 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_RECONCILE_EVERY_N_CYCLES = 5
 
+# 2026-08-20: ~30s at the default 3s poll interval -- the unconditional REST
+# safety-net cadence for `reconcile_pending_live_orders`'s pending-LIVE-order
+# check, deliberately flat/not WS-health-gated (see that function's own
+# docstring for why). The fast, free, WS-push-cache check still runs every
+# cycle regardless; only the REST fallback is throttled to this cadence.
+DEFAULT_ORDER_POLL_EVERY_N_CYCLES = 10
+
 
 class PositionManager:
     def __init__(
@@ -84,6 +92,7 @@ class PositionManager:
         market_data_provider: BaseMarketDataProvider | None = None,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         reconcile_every_n_cycles: int = DEFAULT_RECONCILE_EVERY_N_CYCLES,
+        order_poll_every_n_cycles: int = DEFAULT_ORDER_POLL_EVERY_N_CYCLES,
         session_factory: SessionFactory = session_scope,
     ) -> None:
         self.trading_session_id = trading_session_id
@@ -103,6 +112,7 @@ class PositionManager:
         self._market_data_provider_override = market_data_provider
         self._poll_interval_seconds = poll_interval_seconds
         self._reconcile_every_n_cycles = reconcile_every_n_cycles
+        self._order_poll_every_n_cycles = order_poll_every_n_cycles
         self._session_factory = session_factory
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -431,6 +441,20 @@ class PositionManager:
         from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
         expire_stale_pending_approvals(db, trading_session)
+
+        # 2026-08-20: catches a LIVE entry order that didn't resolve
+        # synchronously at dispatch (a LIMIT order sitting pending at the
+        # broker, filled or rejected later) -- see
+        # reconcile_pending_live_orders's own docstring for the live
+        # incident this closes. The WS-push cache check runs every cycle
+        # (free); only the REST fallback is throttled to
+        # _order_poll_every_n_cycles, deliberately on a flat cadence rather
+        # than gated on any WS-health signal.
+        reconcile_pending_live_orders(
+            db,
+            trading_session,
+            allow_rest_fallback=self._cycle_count % self._order_poll_every_n_cycles == 0,
+        )
 
         if now_ist().time() >= trading_session.cutoff_time:
             # Local import: app.modules.scheduler's package __init__

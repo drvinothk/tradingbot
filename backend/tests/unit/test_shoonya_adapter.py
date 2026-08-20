@@ -9,6 +9,7 @@ from pydantic import SecretStr
 from app.config.settings import ShoonyaSettings
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
+    BrokerOrderStatus,
     InstrumentInfo,
     OptionType,
     OrderRequest,
@@ -1107,3 +1108,49 @@ def test_find_order_by_remarks_matches_tagged_remarks_via_prefix():
     result = adapter.place_order(request)
 
     assert result.broker_order_id == "ORD-TAGGED-1"
+
+
+def test_handle_order_update_populates_the_cache():
+    adapter, _ = _adapter()
+
+    adapter._handle_order_update(
+        {
+            "norenordno": "26082000267157",
+            "status": "COMPLETE",
+            "fillshares": "65",
+            "avgprc": "137.45",
+        }
+    )
+
+    result = adapter.peek_cached_order_update("26082000267157")
+    assert result is not None
+    assert result.status == BrokerOrderStatus.FILLED
+    assert result.filled_qty == 65
+    assert result.avg_fill_price == 137.45
+
+
+def test_peek_cached_order_update_returns_none_when_nothing_cached():
+    adapter, _ = _adapter()
+    assert adapter.peek_cached_order_update("no-such-order") is None
+
+
+def test_handle_order_update_swallows_a_malformed_message():
+    """Missing norenordno -> parse_order_result raises NormalizationError;
+    must be logged and skipped, never crash the WS receive thread that
+    calls this.
+    """
+    adapter, _ = _adapter()
+    adapter._handle_order_update({"status": "COMPLETE"})  # no norenordno
+    assert adapter.peek_cached_order_update("") is None
+
+
+def test_handle_order_update_overwrites_a_stale_cache_entry_for_the_same_order():
+    adapter, _ = _adapter()
+    adapter._handle_order_update({"norenordno": "1", "status": "OPEN"})
+    adapter._handle_order_update(
+        {"norenordno": "1", "status": "COMPLETE", "fillshares": "10", "avgprc": "50.0"}
+    )
+
+    result = adapter.peek_cached_order_update("1")
+    assert result is not None
+    assert result.status == BrokerOrderStatus.FILLED

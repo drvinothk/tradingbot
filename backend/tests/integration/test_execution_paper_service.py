@@ -19,6 +19,7 @@ from app.domain.execution.models import (
     ExitReason,
     Order,
     OrderMode,
+    OrderSide,
     OrderStatus,
     OrderType,
     Position,
@@ -43,12 +44,14 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.broker_adapter import composition
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderResult
+from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
     close_position,
     dispatch_trade_intent,
     evaluate_open_position,
+    reconcile_pending_live_orders,
 )
 
 EXPIRY = date(2026, 7, 30)
@@ -393,6 +396,239 @@ def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
     # BUY side, 0.5% default buffer -- priced *above* entry_price so a real
     # limit order still tolerates adverse LTP movement and fills.
     assert _price(order.avg_fill_price) == pytest.approx(80.0 * 1.005, rel=1e-3)
+
+
+# -- reconcile_pending_live_orders --------------------------------------------
+
+
+class _FakeOrderStatusBroker:
+    """Minimal `BrokerPort`-shaped double for `reconcile_pending_live_orders`
+    — a scripted `get_order_status` result, plus an optional
+    `peek_cached_order_update` to exercise the WS-cache fast path
+    (mirroring `ShoonyaBrokerAdapter`'s real one without needing a live WS).
+    """
+
+    def __init__(
+        self,
+        *,
+        rest_result: OrderResult | None = None,
+        cached_result: OrderResult | None = None,
+        rest_raises: Exception | None = None,
+    ) -> None:
+        self._rest_result = rest_result
+        self._cached_result = cached_result
+        self._rest_raises = rest_raises
+        self.get_order_status_calls: list[str] = []
+
+    def get_order_status(self, broker_order_id: str) -> OrderResult:
+        self.get_order_status_calls.append(broker_order_id)
+        if self._rest_raises is not None:
+            raise self._rest_raises
+        assert self._rest_result is not None
+        return self._rest_result
+
+    def peek_cached_order_update(self, broker_order_id: str) -> OrderResult | None:
+        return self._cached_result
+
+
+def _make_pending_live_order(
+    db: Session,
+    trading_session: TradingSession,
+    trade_intent: TradeIntent,
+    option_contract: OptionContract,
+    *,
+    broker_order_id: str = "BROKER-ORD-1",
+) -> Order:
+    now = datetime.now(UTC)
+    order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        trade_intent_id=trade_intent.id,
+        idempotency_key=trade_intent.idempotency_key,
+        mode=OrderMode.LIVE,
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        qty=25,
+        status=OrderStatus.PENDING,
+        filled_qty=0,
+        avg_fill_price=None,
+        broker_order_id=broker_order_id,
+        submitted_at=now,
+        updated_at=now,
+    )
+    db.add(order)
+    db.flush()
+    return order
+
+
+def test_reconcile_pending_live_orders_creates_position_on_ws_cached_fill(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """The fast path: a WS-pushed fill sitting in the cache is acted on
+    immediately, with zero REST calls, regardless of `allow_rest_fallback`.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = _make_pending_live_order(db, trading_session, trade_intent, option_contract)
+    fake_broker = _FakeOrderStatusBroker(
+        cached_result=OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=81.0,
+        )
+    )
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(order)
+    assert order.status == OrderStatus.FILLED
+    assert order.filled_qty == 25
+    assert fake_broker.get_order_status_calls == []
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    assert position.status == PositionStatus.OPEN
+    assert position.qty == 25
+
+
+def test_reconcile_pending_live_orders_does_not_poll_rest_when_not_allowed(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = _make_pending_live_order(db, trading_session, trade_intent, option_contract)
+    fake_broker = _FakeOrderStatusBroker()  # no cache, no scripted REST result
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(order)
+    assert order.status == OrderStatus.PENDING
+    assert fake_broker.get_order_status_calls == []
+    assert db.query(Position).filter(Position.trade_intent_id == trade_intent.id).count() == 0
+
+
+def test_reconcile_pending_live_orders_falls_back_to_rest_when_allowed(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = _make_pending_live_order(db, trading_session, trade_intent, option_contract)
+    fake_broker = _FakeOrderStatusBroker(
+        rest_result=OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=81.0,
+        )
+    )
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(order)
+    assert order.status == OrderStatus.FILLED
+    assert fake_broker.get_order_status_calls == [order.broker_order_id]
+    assert db.query(Position).filter(Position.trade_intent_id == trade_intent.id).count() == 1
+
+
+def test_reconcile_pending_live_orders_marks_trade_intent_expired_on_rejection(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """2026-08-20 live incident's other half: a pending order that
+    ultimately gets REJECTED (not filled) must not leave TradeIntent stuck
+    at DISPATCHED forever, or `_same_strike_locked` blocks this exact
+    contract for this strategy permanently — the same manual-DB-fix
+    incident this same night, just discovered the other way round.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = _make_pending_live_order(db, trading_session, trade_intent, option_contract)
+    fake_broker = _FakeOrderStatusBroker(
+        rest_result=OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=order.broker_order_id,
+            status=BrokerOrderStatus.REJECTED,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_message="margin insufficient",
+        )
+    )
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(order)
+    db.refresh(trade_intent)
+    assert order.status == OrderStatus.REJECTED
+    assert trade_intent.status == TradeIntentStatus.EXPIRED
+    assert db.query(Position).filter(Position.trade_intent_id == trade_intent.id).count() == 0
+
+
+def test_reconcile_pending_live_orders_ignores_a_still_non_terminal_status(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order = _make_pending_live_order(db, trading_session, trade_intent, option_contract)
+    fake_broker = _FakeOrderStatusBroker(
+        rest_result=OrderResult(
+            idempotency_key=order.idempotency_key,
+            broker_order_id=order.broker_order_id,
+            status=BrokerOrderStatus.OPEN,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+    )
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(order)
+    db.refresh(trade_intent)
+    assert order.status == OrderStatus.PENDING
+    assert trade_intent.status == TradeIntentStatus.DISPATCHED
+
+
+def test_reconcile_pending_live_orders_continues_after_one_orders_broker_error(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """A `get_order_status` failure for one order must not stop the loop
+    from resolving other pending orders in the same cycle.
+    """
+    intent_a = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order_a = _make_pending_live_order(
+        db, trading_session, intent_a, option_contract, broker_order_id="ORD-A"
+    )
+    intent_b = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    order_b = _make_pending_live_order(
+        db, trading_session, intent_b, option_contract, broker_order_id="ORD-B"
+    )
+
+    class _MixedBroker:
+        def get_order_status(self, broker_order_id: str) -> OrderResult:
+            if broker_order_id == "ORD-A":
+                raise BrokerError("transient failure")
+            return OrderResult(
+                idempotency_key=order_b.idempotency_key,
+                broker_order_id="ORD-B",
+                status=BrokerOrderStatus.FILLED,
+                filled_qty=25,
+                avg_fill_price=81.0,
+            )
+
+    reconcile_pending_live_orders(
+        db, trading_session, allow_rest_fallback=True, broker=_MixedBroker()  # type: ignore[arg-type]
+    )
+
+    db.refresh(order_a)
+    db.refresh(order_b)
+    assert order_a.status == OrderStatus.PENDING
+    assert order_b.status == OrderStatus.FILLED
 
 
 # -- close_position -----------------------------------------------------------

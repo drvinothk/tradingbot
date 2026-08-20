@@ -177,6 +177,19 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # to keep, same as MockBrokerAdapter's identical dict.
         self._orders_by_idempotency_key: dict[str, OrderResult] = {}
 
+        # broker_order_id -> OrderResult, from the WS order-update push
+        # (2026-08-20) -- a best-effort fast path for
+        # `execution_engine.paper.service.reconcile_pending_live_orders` to
+        # consult (via `peek_cached_order_update`, cache-only, never a REST
+        # call) before falling back to a throttled `get_order_status` poll.
+        # Never cleared on read: a later poll re-derives the same terminal
+        # state from `SingleOrdHist` regardless, so a stale-but-still-
+        # correct cache entry is harmless, and clearing on read would just
+        # reintroduce a race against a second concurrent reader for no
+        # benefit.
+        self._order_update_cache: dict[str, OrderResult] = {}
+        self._order_update_lock = threading.Lock()
+
     def close(self) -> None:
         if self._ws is not None:
             self._ws.stop()
@@ -576,6 +589,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 access_token=self._auth_result.session_token,
                 on_tick=on_tick,
                 on_depth=on_depth,
+                on_order_update=self._handle_order_update,
                 source=self._settings.ws_auth_source,
             )
             self._ws.start()
@@ -840,6 +854,42 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # Noren returns history oldest-first; the latest row is the order's
         # current state.
         return normalizer.parse_order_result(rows[-1], idempotency_key=broker_order_id)
+
+    def _handle_order_update(self, message: dict) -> None:
+        """`ShoonyaWSClient`'s `on_order_update` callback (2026-08-20) —
+        runs on the WS background thread, so deliberately does no DB work
+        here (same "background thread must never touch a production DB
+        session it wasn't explicitly given" discipline this codebase has
+        been burned by before, see `PositionManager`'s own market-data-
+        provider QC finding). Just normalizes and caches the result;
+        `execution_engine.paper.service.reconcile_pending_live_orders` is
+        what actually acts on it, from its own already-safe per-cycle DB
+        session. `parse_order_result` is reused as-is on the theory that a
+        Noren order-update push is shaped like one `OrderBook`/
+        `SingleOrdHist` row (same field names) — unconfirmed against a
+        real account; a shape mismatch just means this cache never
+        populates for that message, not a crash, and the REST poll in
+        `reconcile_pending_live_orders` still catches it regardless.
+        """
+        try:
+            result = normalizer.parse_order_result(
+                message, idempotency_key=str(message.get("norenordno", ""))
+            )
+        except normalizer.NormalizationError:
+            logger.exception("Failed to normalize Shoonya WS order-update message: %r", message)
+            return
+        with self._order_update_lock:
+            self._order_update_cache[result.broker_order_id] = result
+
+    def peek_cached_order_update(self, broker_order_id: str) -> OrderResult | None:
+        """Cache-only read (never a REST call) of the latest WS-pushed
+        order-update for `broker_order_id`, if one has arrived. Not part of
+        `BrokerPort` — Shoonya-specific, reached via the same `_inner`
+        unwrap pattern `api.v1.shoonya`'s diagnostics already use to see
+        past `_AuthAwareBroker`.
+        """
+        with self._order_update_lock:
+            return self._order_update_cache.get(broker_order_id)
 
     def get_positions(self) -> list[Position]:
         rows = self._rest.position_book(self._uid, self._actid)

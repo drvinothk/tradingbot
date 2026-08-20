@@ -228,6 +228,48 @@ def test_handle_message_swallows_normalization_error():
     assert ticks == []
 
 
+def test_handle_message_dispatches_order_update_to_on_order_update():
+    updates: list = []
+    client, _, _ = _client(on_order_update=lambda msg: updates.append(msg))
+
+    message = json.dumps({"t": "om", "norenordno": "26082000267157", "status": "COMPLETE"})
+    client._handle_message(message)
+
+    assert updates == [{"t": "om", "norenordno": "26082000267157", "status": "COMPLETE"}]
+
+
+def test_handle_message_order_update_does_not_require_a_matching_subscription():
+    """Order-update messages are account-level events, not tied to any
+    subscribed instrument token — must not be silently dropped by the
+    tick/depth subscription-key lookup, unlike a stray tick for an unknown
+    token (see test_handle_message_ignores_unknown_token).
+    """
+    updates: list = []
+    client, ticks, _ = _client(on_order_update=lambda msg: updates.append(msg))
+    # Deliberately no subscribe() call at all.
+
+    client._handle_message(json.dumps({"t": "om", "norenordno": "1", "status": "OPEN"}))
+
+    assert len(updates) == 1
+    assert ticks == []
+
+
+def test_handle_message_swallows_order_update_callback_exception():
+    def _boom(_msg: dict) -> None:
+        raise RuntimeError("boom")
+
+    client, ticks, _ = _client(on_order_update=_boom)
+    # Must not raise even though the callback itself blows up.
+    client._handle_message(json.dumps({"t": "om", "norenordno": "1", "status": "OPEN"}))
+    assert ticks == []
+
+
+def test_handle_message_ignores_order_update_when_no_callback_registered():
+    client, ticks, _ = _client()  # on_order_update defaults to None
+    client._handle_message(json.dumps({"t": "om", "norenordno": "1", "status": "OPEN"}))
+    assert ticks == []
+
+
 def test_authenticate_defaults_source_to_api():
     """Payload shape per Shoonya support's own 2026-08-11 reply — "t": "a"
     and "accesstoken", replacing the old "t": "c"/"susertoken" pair that
