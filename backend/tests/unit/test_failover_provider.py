@@ -655,3 +655,75 @@ def test_manual_override_property_defaults_to_none(make_provider):
     provider = make_provider(primary, backup, clock)
 
     assert provider.manual_override is None
+
+
+# -- replace_backup ------------------------------------------------------
+
+
+def test_replace_backup_swaps_reference_when_dormant_without_touching_primary(make_provider):
+    """The common case (primary healthy, backup never subscribed) — a
+    Shoonya reconnect while it's only the backup must be able to refresh
+    the stale reference without disturbing anything else. Neither the old
+    nor the new backup should see any subscribe/disconnect call, since
+    backup was never active in the first place.
+    """
+    primary, old_backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, old_backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    new_backup = _FakeProvider()
+
+    provider.replace_backup(new_backup)
+
+    assert old_backup.disconnect_calls == 0
+    assert new_backup.subscribe_attempts == 0
+
+    # The swap is real, not cosmetic: a later real trip must use the *new*
+    # backup, not the discarded one.
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+    assert new_backup.subscribe_calls == [["NIFTY"]]
+    assert old_backup.subscribe_calls == []
+
+
+def test_replace_backup_resubscribes_immediately_when_backup_already_active(make_provider):
+    """A real primary outage is already in progress (backup is the active
+    leg) when Shoonya reconnects -- the swap must not go dark: the old
+    backup is disconnected and the new one is subscribed with the same
+    symbols right away, not deferred to the next failover trip.
+    """
+    primary, old_backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, old_backup, clock)
+    forwarded: list[Tick] = []
+    provider.subscribe_ticks(["NIFTY"], on_tick=forwarded.append)
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+
+    new_backup = _FakeProvider()
+    provider.replace_backup(new_backup)
+
+    assert old_backup.disconnect_calls == 1
+    assert new_backup.subscribe_calls == [["NIFTY"]]
+
+    tick = _tick()
+    new_backup.fire_tick(tick)
+    assert forwarded[-1] is tick
+
+
+def test_replace_backup_new_subscribe_failure_is_swallowed_not_raised(make_provider):
+    """Mirrors _ensure_backup_subscribed's own failure handling — a
+    reconnect-triggered refresh must never itself raise (it runs from
+    oauth_callback's best-effort tail, see that call site's own comment)
+    even if the freshly-swapped-in backup immediately fails to subscribe.
+    """
+    primary, old_backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, old_backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+
+    failing_backup = _FakeProvider(subscribe_error=RuntimeError("shoonya ws down"))
+
+    provider.replace_backup(failing_backup)  # must not raise

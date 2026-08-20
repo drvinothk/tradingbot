@@ -223,3 +223,77 @@ def test_failover_enabled_with_mock_provider_is_noop(monkeypatch):
 
     assert not isinstance(provider, FailoverMarketDataProvider)
     assert not isinstance(provider, MarketHoursGatedProvider)
+
+
+# -- reset_shoonya_backup_leg -------------------------------------------------
+
+
+def test_reset_shoonya_backup_leg_replaces_backup_without_touching_primary(monkeypatch):
+    """2026-08-20: the real gap found while investigating why Shoonya WS
+    looked dead after a reconnect while TrueData was primary --
+    reset_for_reconnect's own `== "shoonya"` gate never fires for a
+    Shoonya-as-*backup* config, leaving BrokerPortMarketDataAdapter's
+    captured `get_broker()` reference stale forever. This proves the fix
+    swaps just the backup leg, leaving primary's own object identity
+    untouched.
+    """
+    from app.modules.market_data.providers.failover import FailoverMarketDataProvider
+
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "shoonya"),
+    )
+
+    provider = provider_composition.get_market_data_provider()
+    inner = provider._inner  # noqa: SLF001
+    assert isinstance(inner, FailoverMarketDataProvider)
+    original_primary = inner._primary  # noqa: SLF001
+    original_backup = inner._backup  # noqa: SLF001
+
+    provider_composition.reset_shoonya_backup_leg()
+
+    assert inner._primary is original_primary  # noqa: SLF001
+    assert inner._backup is not original_backup  # noqa: SLF001
+
+
+def test_reset_shoonya_backup_leg_noop_when_failover_disabled(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_provider("shoonya"),
+    )
+    provider_composition.get_market_data_provider()
+
+    # Must not raise -- the whole point is a safe no-op when failover isn't
+    # configured at all (reset_for_reconnect covers Shoonya-as-primary).
+    provider_composition.reset_shoonya_backup_leg()
+
+
+def test_reset_shoonya_backup_leg_noop_when_backup_is_not_shoonya(monkeypatch):
+    from app.modules.market_data.providers.failover import FailoverMarketDataProvider
+
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "angel_one"),
+    )
+    provider = provider_composition.get_market_data_provider()
+    inner = provider._inner  # noqa: SLF001
+    assert isinstance(inner, FailoverMarketDataProvider)
+    original_backup = inner._backup  # noqa: SLF001
+
+    provider_composition.reset_shoonya_backup_leg()
+
+    assert inner._backup is original_backup  # noqa: SLF001
+
+
+def test_reset_shoonya_backup_leg_noop_when_provider_not_yet_constructed(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "shoonya"),
+    )
+    # Deliberately never calling get_market_data_provider() first -- the
+    # singleton is None, same as a fresh process before first use.
+    provider_composition.reset_shoonya_backup_leg()

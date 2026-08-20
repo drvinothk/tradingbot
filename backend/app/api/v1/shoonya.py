@@ -430,6 +430,28 @@ def oauth_callback(
                 "reset_for_reconnect failed after a successful Shoonya login — "
                 "market-data ingestion may still be on the previous provider"
             )
+    else:
+        # 2026-08-20: the mirror-image gap found the same night as the
+        # missed-fill incident above -- when Shoonya is only the *backup*
+        # leg of a TrueData/Angel One-primary failover (today's actual
+        # config), reset_for_reconnect's own "== shoonya" gate never fires
+        # at all, leaving the backup's BrokerPortMarketDataAdapter pointed
+        # at a stale (often mock) broker reference forever. See
+        # reset_shoonya_backup_leg's own docstring for the full mechanism
+        # and why it's deliberately narrower than reset_for_reconnect
+        # (never touches a healthy primary connection). Exception-safe for
+        # the same reason as reset_for_reconnect above -- a resubscribe
+        # hiccup here is real but recoverable, not worth 500ing a login
+        # that otherwise succeeded.
+        from app.modules.market_data.provider_composition import reset_shoonya_backup_leg
+
+        try:
+            reset_shoonya_backup_leg()
+        except Exception:
+            logger.exception(
+                "reset_shoonya_backup_leg failed after a successful Shoonya login — "
+                "the failover backup leg may still reference the previous broker instance"
+            )
 
     record_event(
         db,

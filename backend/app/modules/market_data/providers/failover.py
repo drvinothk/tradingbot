@@ -208,6 +208,68 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             self._manual_override = provider_name
         logger.warning("Market-data provider manual override set to %r", provider_name)
 
+    def replace_backup(self, new_backup: BaseMarketDataProvider) -> None:
+        """2026-08-20: lets a Shoonya reconnect refresh just this leg's
+        possibly-stale reference (`BrokerPortMarketDataAdapter` captures
+        `get_broker()` once at construction, never re-fetches it — see that
+        class's own docstring) without disturbing a healthy primary
+        connection at all. Deliberately narrower than
+        `provider_composition.reset_for_reconnect`'s full-pipeline rebuild,
+        which tears down and reconstructs this *entire*
+        `FailoverMarketDataProvider` (primary included) — appropriate when
+        Shoonya itself is primary, but would mean every Shoonya reconnect
+        also briefly interrupts a perfectly healthy TrueData/Angel One
+        primary for no reason when Shoonya is only the backup. This method
+        only ever touches `self._backup`.
+
+        Safe regardless of whether backup is currently the active leg: if
+        it's dormant (the common case — primary healthy, backup never
+        subscribed), this just swaps the reference; the next real failover
+        subscribes the new instance fresh, correctly, with no special
+        handling needed. If backup is *already* active (a real primary
+        outage is in progress right now), this disconnects the old backup
+        and immediately resubscribes the new one with the same
+        symbols/handlers, so an in-progress failover doesn't go dark for
+        however long the swap takes.
+        """
+        with self._lock:
+            was_subscribed = self._backup_subscribed
+            old_backup = self._backup
+            symbols = sorted(self._symbols)
+
+        if was_subscribed:
+            try:
+                old_backup.disconnect()
+            except Exception:
+                logger.exception(
+                    "Failed to disconnect the old backup provider %r before replacing it "
+                    "-- continuing anyway, its ticks are simply dropped once replaced",
+                    self._backup_name,
+                )
+
+        with self._lock:
+            self._backup = new_backup
+
+        if was_subscribed:
+            try:
+                new_backup.subscribe_ticks(
+                    symbols,
+                    self._make_tick_handler(self._backup_name),
+                    self._make_depth_handler(self._backup_name),
+                )
+            except Exception:
+                logger.critical(
+                    "New backup provider %r failed to subscribe after being refreshed for "
+                    "a Shoonya reconnect -- both market-data feeds may now be unavailable",
+                    self._backup_name,
+                    exc_info=True,
+                )
+                with self._lock:
+                    self._backup_subscribed = False
+                return
+
+        logger.warning("Failover backup provider %r reference refreshed", self._backup_name)
+
     # -- BaseMarketDataProvider -------------------------------------------
 
     def connect(self) -> None:
