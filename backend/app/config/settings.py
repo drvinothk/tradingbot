@@ -79,17 +79,14 @@ class ShoonyaSettings(BaseSettings):
     primary_ip: str = ""
     backup_ip: str = ""
     totp_secret: SecretStr = SecretStr("")
-    # Phase 5 research spike (web search, GitHub-hosted Noren-API forks —
-    # no live account to verify against) found the official Shoonya-Dev
-    # GitHub org's own wrapper hardcoding `NorenWClientTP`/`NorenWSTP`
-    # instead of the `NorenWClientAPI`/`NorenWSAPI` paths recorded here
-    # since Phase 0. Left unchanged rather than silently overwritten,
-    # since Phase 0's docstring above claims direct verification against
-    # shoonya.com's docs and secondary research shouldn't override a
-    # primary source without a live account to confirm either way — but
-    # this is a real discrepancy. First thing to check once real
-    # credentials exist: if `GenAcsTok`/instrument-master calls 404,
-    # try the `NorenWClientTP`/`NorenWSTP` paths instead.
+    # **CONFIRMED, 2026-08-20** — the `NorenWClientTP`/`NorenWSTP` discrepancy
+    # this comment used to flag (a Phase 5 research spike found the official
+    # Shoonya-Dev GitHub org's own wrapper hardcoding those paths instead)
+    # is resolved: real, successful `GenAcsTok`/`PlaceOrder`/`PositionBook`
+    # calls against this actual account, live-logged all day 2026-08-20
+    # including the first genuine live order to reach the broker, all went
+    # through `NorenWClientAPI` with clean HTTP 200 responses. This is now a
+    # primary-source-confirmed value, not a researched guess.
     api_host: str = "https://api.shoonya.com/NorenWClientAPI"
     ws_host: str = "wss://api.shoonya.com/NorenWSAPI/"
     oauth_authorize_url: str = "https://api.shoonya.com/OAuthlogin/authorize/oauth"
