@@ -375,23 +375,32 @@ class ShoonyaWSClient:
         msg_type = message.get("t")
 
         # 2026-08-20: order-update push, added alongside the existing tick/
-        # depth handling above -- **unconfirmed message type**. Noren's
-        # documented pattern (see NorenRestApiPy's `start_websocket`) is
-        # that order updates arrive automatically on this same connection
-        # once authenticated, no separate subscribe call needed, but the
-        # exact `"t"` value for the message ("om" by Noren convention,
-        # matching the tick/depth "tk"/"tf"/"dk"/"df" pattern) hasn't been
-        # live-confirmed against a real account yet -- same "flag until
-        # verified" discipline as every other unconfirmed Shoonya wire
-        # detail in this file's own history. Deliberately does not touch
-        # `_entries_by_key`/the tick-subscription-keyed lookup below: an
-        # order-update message is an account-level event, not tied to any
-        # subscribed instrument token, so it must be handled before that
-        # lookup would otherwise silently drop it. This is a best-effort
-        # fast path only -- `execution_engine.paper.service
-        # .reconcile_pending_live_orders`'s own unconditional REST poll is
-        # the actual safety net if this never fires or the message shape
-        # turns out to be wrong.
+        # depth handling above. **Message type confirmed from primary
+        # source the same night** -- the official `NorenRestApiPy` package
+        # (PyPI, the actual library every Noren-broker wrapper, Shoonya's
+        # `ShoonyaApi-py` included, depends on) has its own WS dispatch
+        # doing exactly `if res['t'] == 'om': self.__order_update_callback
+        # (res)`, passing the raw message straight through with no
+        # reshaping -- matches this handler's own shape and supports
+        # reusing `parse_order_result`'s field names (`norenordno`/
+        # `status`/`fillshares`/`avgprc`) on the theory an `om` row shares
+        # the same OMS data model as `OrderBook`/`SingleOrdHist`. Order
+        # updates arrive automatically on this same connection once
+        # authenticated, no separate subscribe call needed, confirmed the
+        # same way. **Still not live-verified against a real account** --
+        # the message *type* is now primary-source-confirmed, not just
+        # inferred, but the exact field-for-field shape of a live `om` row
+        # hasn't been directly observed yet; that's what the WARNING logs
+        # just below and in `adapter.py`'s own callback exist to capture
+        # the next time a real order resolves asynchronously. Deliberately
+        # does not touch `_entries_by_key`/the tick-subscription-keyed
+        # lookup below: an order-update message is an account-level event,
+        # not tied to any subscribed instrument token, so it must be
+        # handled before that lookup would otherwise silently drop it.
+        # This is a best-effort fast path only --
+        # `execution_engine.paper.service.reconcile_pending_live_orders`'s
+        # own unconditional REST poll is the actual safety net if this
+        # never fires or the field shape turns out to be wrong.
         if msg_type == "om":
             # .warning, not .info -- see this module's own established
             # reasoning (no logging config anywhere in this app, stderr
