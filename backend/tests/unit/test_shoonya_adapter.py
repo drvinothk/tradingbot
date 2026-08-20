@@ -588,6 +588,40 @@ def test_resolve_underlying_token_searches_nse_with_vix_anchor_for_india_vix():
     assert search_calls == [("FA1", "NSE", "VIX")]
 
 
+def test_resolve_underlying_token_rejects_a_tsym_match_with_an_option_or_future_instname():
+    """2026-08-20: defense-in-depth after a live incident where the "NIFTY"
+    underlying's own WS subscription ended up carrying a different real
+    instrument's price for an extended period -- see market_data.ingestion's
+    own _MIN_PLAUSIBLE_PRICE_BY_SYMBOL docstring for the primary,
+    mechanism-agnostic fix. This is the secondary guard: a tsym match whose
+    own instname looks like an option/future must never be trusted/cached
+    as the underlying's token, even if the string match itself looks
+    correct -- the search must keep going past a false-positive tsym match
+    rather than stop at the first one.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "Nifty 50", "token": "99999", "instname": "OPTIDX"},  # must be rejected
+        {"tsym": "Nifty 50", "token": "26000", "instname": "UNDIND"},  # the real index row
+    ]
+
+    exchange, token = adapter._resolve_underlying_token("NIFTY")
+
+    assert (exchange, token) == ("NSE", "26000")
+
+
+def test_resolve_underlying_token_raises_when_only_a_bad_instname_match_exists():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "Nifty 50", "token": "99999", "instname": "FUTIDX"},
+    ]
+
+    with pytest.raises(ShoonyaApiError):
+        adapter._resolve_underlying_token("NIFTY")
+
+
 def test_resolve_symbol_token_for_a_known_underlying_falls_back_to_a_live_search():
     """2026-08-12: real gap found via a live-hours QC pass, not a live
     account this time -- `MarketDataIngestionService` subscribes to an

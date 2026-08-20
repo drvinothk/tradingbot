@@ -169,7 +169,14 @@ def test_streamed_ticks_are_persisted_for_underlying_instrument(
 ):
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=3, tick_interval_seconds=0.1)
-    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        # MockBrokerAdapter's crc32-seeded price for "NIFTY" is in the 50-250
+        # range (a deliberately synthetic scale) -- not what the 2026-08-20
+        # plausibility guard exists to test.
+        min_plausible_price_by_symbol={},
+    )
 
     service.start([underlying_symbol])
     time.sleep(0.35)
@@ -200,8 +207,10 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
         return {row.indicator_name for row in rows}
 
     base_ts = broker.get_quote(underlying_symbol).ts
+    # Realistic index-scale prices -- _MIN_PLAUSIBLE_PRICE_BY_SYMBOL (2026-08-20)
+    # would otherwise reject a synthetic sub-5000 "NIFTY" tick as implausible.
     first_tick = Tick(
-        underlying_symbol, ltp=100.0, bid=99.9, ask=100.1, volume=10, oi=None, ts=base_ts
+        underlying_symbol, ltp=24100.0, bid=24099.9, ask=24100.1, volume=10, oi=None, ts=base_ts
     )
     # First tick: VWAP should persist immediately (one sample is enough),
     # EMA9/EMA20 need 9 completed 60s bars, so neither should exist yet.
@@ -212,7 +221,7 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
     for i in range(1, 10):
         tick_ts = base_ts + timedelta(seconds=60 * i)
         service._on_tick(  # noqa: SLF001
-            Tick(underlying_symbol, ltp=100.0 + i, bid=0, ask=0, volume=10, oi=None, ts=tick_ts)
+            Tick(underlying_symbol, ltp=24100.0 + i, bid=0, ask=0, volume=10, oi=None, ts=tick_ts)
         )
 
     names_after_warmup = snapshot_names()
@@ -243,7 +252,9 @@ def test_reset_daily_indicators_resets_the_underlying_engine(
 
     base_ts = broker.get_quote(underlying_symbol).ts
     service._on_tick(  # noqa: SLF001
-        Tick(underlying_symbol, ltp=100.0, bid=99.9, ask=100.1, volume=10, oi=None, ts=base_ts)
+        Tick(
+            underlying_symbol, ltp=24100.0, bid=24099.9, ask=24100.1, volume=10, oi=None, ts=base_ts
+        )
     )
     assert engine._vwap[instrument_id].value is not None  # noqa: SLF001
 
@@ -277,14 +288,14 @@ def test_completed_bars_are_persisted_for_underlying_instrument(
 
     base_ts = broker.get_quote(underlying_symbol).ts
     service._on_tick(  # noqa: SLF001
-        Tick(underlying_symbol, ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=base_ts)
+        Tick(underlying_symbol, ltp=24100.0, bid=0, ask=0, volume=10, oi=None, ts=base_ts)
     )
     assert db.query(PriceBar).count() == 0  # no bucket boundary crossed yet
 
     service._on_tick(  # noqa: SLF001
         Tick(
             underlying_symbol,
-            ltp=105.0,
+            ltp=24105.0,
             bid=0,
             ask=0,
             volume=5,
@@ -295,9 +306,117 @@ def test_completed_bars_are_persisted_for_underlying_instrument(
 
     bars = db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).all()
     assert len(bars) == 1
-    assert float(bars[0].open) == 100.0
-    assert float(bars[0].close) == 100.0
+    assert float(bars[0].open) == 24100.0
+    assert float(bars[0].close) == 24100.0
     assert bars[0].timeframe == "60s"
+
+
+# -- price-plausibility guard (2026-08-20) ----------------------------------
+
+
+def test_on_tick_rejects_an_implausible_price_for_a_known_underlying(
+    seeded_universe, test_session_factory, db: Session
+):
+    """See ingestion.py's own _MIN_PLAUSIBLE_PRICE_BY_SYMBOL docstring for
+    the live incident this guards against: a known underlying (NIFTY/
+    BANKNIFTY) receiving a real but wrongly-attributed instrument's price
+    (option-premium scale, not index scale) must never reach quote_ticks/
+    price_bars/indicator_snapshots."""
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=1)
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+    )
+    service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
+
+    tick_ts = broker.get_quote(underlying_symbol).ts
+    service._on_tick(  # noqa: SLF001
+        Tick(underlying_symbol, ltp=124.5, bid=124.4, ask=124.6, volume=100, oi=None, ts=tick_ts)
+    )
+
+    assert db.query(QuoteTick).filter(QuoteTick.instrument_id == nifty.id).count() == 0
+    assert (
+        db.query(IndicatorSnapshot).filter(IndicatorSnapshot.instrument_id == nifty.id).count()
+        == 0
+    )
+    assert underlying_symbol not in service._last_tick_at  # noqa: SLF001 -- must not look healthy
+
+
+def test_on_tick_accepts_a_realistic_price_for_a_known_underlying(
+    seeded_universe, test_session_factory, db: Session
+):
+    """Sanity check the other direction -- the guard is a floor, not a
+    blanket block on the symbol."""
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=1)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
+
+    tick_ts = broker.get_quote(underlying_symbol).ts
+    service._on_tick(  # noqa: SLF001
+        Tick(
+            underlying_symbol,
+            ltp=24150.0,
+            bid=24149.9,
+            ask=24150.1,
+            volume=100,
+            oi=None,
+            ts=tick_ts,
+        )
+    )
+
+    assert db.query(QuoteTick).filter(QuoteTick.instrument_id == nifty.id).count() == 1
+    assert underlying_symbol in service._last_tick_at  # noqa: SLF001
+
+
+def test_on_tick_never_rejects_an_option_contract_regardless_of_price(
+    seeded_universe, test_session_factory, db: Session
+):
+    """The plausibility floor is scoped to known underlyings only -- an
+    option contract's own (deliberately much lower) premium must never be
+    checked against an index-scale floor."""
+    option_symbol = next(i.symbol for i in seeded_universe if i.is_option)
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=1)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._symbol_map = service._build_symbol_map([option_symbol])  # noqa: SLF001
+
+    tick_ts = broker.get_quote(option_symbol).ts
+    service._on_tick(  # noqa: SLF001
+        Tick(option_symbol, ltp=12.5, bid=12.4, ask=12.6, volume=100, oi=None, ts=tick_ts)
+    )
+
+    assert db.query(QuoteTick).filter(QuoteTick.option_contract_id.isnot(None)).count() == 1
+
+
+def test_poll_once_rejects_implausible_candles_without_advancing_last_polled_bucket(
+    seeded_universe, test_session_factory, db: Session
+):
+    """get_price_history routes through the exact same underlying-token
+    resolution the WS path does -- a rejected candle must not silently
+    "fix itself" by falling back to REST, since REST would carry the same
+    corruption. _last_polled_bucket staying unadvanced means a later,
+    genuinely-fixed poll can still make forward progress."""
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+    now = datetime.now(UTC)
+    bad_bucket = now - timedelta(seconds=now.timestamp() % 60 + 60)
+    candles = [
+        PriceCandle(
+            bucket_start=bad_bucket, open=124.0, high=125.0, low=123.0, close=124.5, volume=0
+        )
+    ]
+    broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._symbol_map = service._build_symbol_map([underlying_symbol])  # noqa: SLF001
+
+    service._poll_once(underlying_symbol, nifty.id)  # noqa: SLF001
+
+    assert db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).count() == 0
+    assert service._last_polled_bucket.get(underlying_symbol) is None  # noqa: SLF001
 
 
 class _NeverTicksBroker:
@@ -412,7 +531,14 @@ def test_ws_health_watchdog_does_not_fall_back_if_a_tick_arrives_in_time(
     underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
     broker = MockBrokerAdapter(instruments=seeded_universe, seed=1, tick_interval_seconds=0.02)
     service = MarketDataIngestionService(
-        _provider(broker), session_factory=test_session_factory, ws_health_grace_seconds=0.2
+        _provider(broker),
+        session_factory=test_session_factory,
+        ws_health_grace_seconds=0.2,
+        # MockBrokerAdapter's crc32-seeded price for "NIFTY" is in the 50-250
+        # range (a deliberately synthetic scale, unrelated to real index
+        # levels) -- this test is about WS-health timing, not price content,
+        # so the 2026-08-20 plausibility guard is explicitly not relevant here.
+        min_plausible_price_by_symbol={},
     )
 
     service.start([underlying_symbol])
@@ -490,10 +616,20 @@ def test_rest_fallback_persists_a_completed_candle_and_skips_the_still_forming_o
     completed_bucket = current_bucket - timedelta(seconds=60)
     candles = [
         PriceCandle(
-            bucket_start=completed_bucket, open=100.0, high=101.0, low=99.0, close=100.5, volume=0
+            bucket_start=completed_bucket,
+            open=24100.0,
+            high=24101.0,
+            low=24099.0,
+            close=24100.5,
+            volume=0,
         ),
         PriceCandle(  # still forming — must not be persisted
-            bucket_start=current_bucket, open=100.5, high=100.6, low=100.4, close=100.5, volume=0
+            bucket_start=current_bucket,
+            open=24100.5,
+            high=24100.6,
+            low=24100.4,
+            close=24100.5,
+            volume=0,
         ),
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
@@ -512,7 +648,7 @@ def test_rest_fallback_persists_a_completed_candle_and_skips_the_still_forming_o
     bars = db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).all()
     assert len(bars) == 1
     assert bars[0].bucket_start == completed_bucket
-    assert float(bars[0].close) == 100.5
+    assert float(bars[0].close) == 24100.5
     ticks = db.query(QuoteTick).filter(QuoteTick.instrument_id == nifty.id).all()
     assert len(ticks) == 1
     snapshot_names = {
@@ -530,7 +666,12 @@ def test_rest_fallback_does_not_repersist_a_bucket_already_seen(
     completed_bucket = now - timedelta(seconds=now.timestamp() % 60 + 60)
     candles = [
         PriceCandle(
-            bucket_start=completed_bucket, open=100.0, high=101.0, low=99.0, close=100.5, volume=0
+            bucket_start=completed_bucket,
+            open=24100.0,
+            high=24101.0,
+            low=24099.0,
+            close=24100.5,
+            volume=0,
         )
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})
@@ -584,10 +725,10 @@ def test_rest_fallback_seeds_last_polled_bucket_from_db_across_a_restart(
                 instrument_id=nifty.id,
                 timeframe="60s",
                 bucket_start=already_persisted_bucket,
-                open=100.0,
-                high=101.0,
-                low=99.0,
-                close=100.5,
+                open=24100.0,
+                high=24101.0,
+                low=24099.0,
+                close=24100.5,
                 volume=0,
             )
         )
@@ -595,14 +736,19 @@ def test_rest_fallback_seeds_last_polled_bucket_from_db_across_a_restart(
     candles = [
         PriceCandle(  # already in the DB — must be skipped, not re-inserted
             bucket_start=already_persisted_bucket,
-            open=100.0,
-            high=101.0,
-            low=99.0,
-            close=100.5,
+            open=24100.0,
+            high=24101.0,
+            low=24099.0,
+            close=24100.5,
             volume=0,
         ),
         PriceCandle(  # genuinely new — must still be persisted this cycle
-            bucket_start=newer_bucket, open=100.5, high=100.7, low=100.4, close=100.6, volume=0
+            bucket_start=newer_bucket,
+            open=24100.5,
+            high=24100.7,
+            low=24100.4,
+            close=24100.6,
+            volume=0,
         ),
     ]
     broker = _NeverTicksBroker(candles_by_symbol={underlying_symbol: candles})

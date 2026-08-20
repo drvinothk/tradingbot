@@ -124,6 +124,11 @@ def test_one_shared_service_delivers_ticks_for_both_underlyings(
         BrokerPortMarketDataAdapter(broker),
         session_factory=test_session_factory,
         indicator_engine=IndicatorEngine(),
+        # MockBrokerAdapter's crc32-seeded prices for "NIFTY"/"BANKNIFTY" are
+        # in the 50-250 range (a deliberately synthetic scale) -- this test
+        # is about callback-clobbering across two underlyings, not price
+        # content, so the 2026-08-20 plausibility guard isn't relevant here.
+        min_plausible_price_by_symbol={},
     )
 
     service.start(["NIFTY"])

@@ -96,6 +96,25 @@ _UNDERLYING_INDEX_TSYM: dict[str, str] = {
     "INDIA VIX": "INDIAVIX",
 }
 
+# 2026-08-20 — defense-in-depth after a live incident where the "NIFTY"
+# underlying's own WS subscription ended up carrying a different real
+# instrument's price for an extended period (see market_data.ingestion
+# module docstring, _MIN_PLAUSIBLE_PRICE_BY_SYMBOL, for the primary,
+# mechanism-agnostic fix). Re-testing this exact matching logic fresh,
+# live, on the same account and day, always reproduced the single correct
+# match -- so this couldn't be confirmed as *the* trigger -- but it's a
+# real, free hardening regardless: a search_scrip row's own `instname`
+# field is already present in the response (no extra API call), and a
+# genuine index/underlying row should never carry an option or future's
+# instrument-type code. Blocklist, not an allowlist, since the *correct*
+# instname value isn't independently confirmed for every symbol in
+# _UNDERLYING_INDEX_TSYM (only NIFTY's "UNDIND" is live-confirmed) --
+# rejecting known-wrong types is safe without risking a false rejection of
+# a legitimate-but-unconfirmed index instname.
+_DISALLOWED_UNDERLYING_INSTNAME: frozenset[str] = frozenset(
+    {"OPTIDX", "OPTSTK", "FUTIDX", "FUTSTK"}
+)
+
 # The NSE search_scrip anchor text used to *find* each tsym above --
 # `_resolve_underlying_token`'s own docstring already established that
 # Shoonya's fuzzy search needs *some* textual overlap with the real tsym
@@ -379,6 +398,18 @@ class ShoonyaBrokerAdapter(BrokerPort):
             rows = self._rest.search_scrip(self._uid, "NSE", search_text)
             for row in rows:
                 if str(row.get("tsym", "")).upper() == index_tsym:
+                    instname = str(row.get("instname", "")).upper()
+                    if instname in _DISALLOWED_UNDERLYING_INSTNAME:
+                        logger.error(
+                            "Matched tsym %r for underlying %r but its instname %r looks "
+                            "like an option/future, not an index -- refusing to cache this "
+                            "token rather than risk subscribing the wrong instrument. Row: %r",
+                            index_tsym,
+                            underlying,
+                            instname,
+                            row,
+                        )
+                        continue
                     token = str(row.get("token", ""))
                     self._remember_token(underlying, "NSE", token)
                     return "NSE", token

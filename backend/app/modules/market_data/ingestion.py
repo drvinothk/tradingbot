@@ -53,6 +53,41 @@ _WS_HEALTH_GRACE_SECONDS_BY_SYMBOL: dict[str, float] = {
     "INDIA VIX": 60.0,
 }
 
+# 2026-08-20 — real live incident: the "NIFTY" underlying's own WS tick
+# stream silently carried a different real instrument's price (~120-180,
+# option-premium-scale) for an extended period while every other signal
+# (connection alive, ticks arriving on schedule, real-looking volume)
+# looked completely healthy — corrupting price_bars/VWAP/EMA for every
+# strategy sharing that instrument (they all do; there's one shared row
+# per underlying). Root-caused as far as static analysis + live read-only
+# re-verification could reach: ShoonyaBrokerAdapter._resolve_underlying_
+# token's own resolution logic re-verified correct on a fresh process
+# (same live account, same day) every time it was re-tested — meaning
+# whatever mismatched the *live* process's cached token did so through a
+# path not reproducible on demand (most likely a one-time race during the
+# reconnect window), not a deterministic bug in the matching logic itself.
+# Since the exact trigger couldn't be pinned down with certainty, this
+# guards the *symptom class* directly rather than only the one suspected
+# mechanism: a known underlying's own ingested price is checked against a
+# minimum plausible floor (real index levels are always in the thousands;
+# an option premium or a broken/garbage read never is) before it's ever
+# allowed to reach quote_ticks/price_bars/indicator_snapshots, on both the
+# WS-tick path (_on_tick) and the REST-fallback candle path (_poll_once) —
+# deliberately both, since get_price_history routes through the exact same
+# underlying-token cache and would carry an identical corruption if that
+# cache were ever the actual cause. A rejected tick/candle is simply
+# dropped (never persisted) rather than "corrected" — the existing
+# freshness-gating machinery (market_data.freshness) already treats an
+# instrument with no fresh data as STALE/DEAD and correctly refuses to
+# trade on it; that's the right degraded behavior here too, not something
+# this guard needs to reimplement. Deliberately a *floor* only, not a
+# tight band — the goal is catching "wrong instrument entirely," not
+# tracking real price movement, which this module has no business judging.
+_MIN_PLAUSIBLE_PRICE_BY_SYMBOL: dict[str, float] = {
+    "NIFTY": 5000.0,
+    "BANKNIFTY": 10000.0,
+}
+
 # REST-poll cadence — deliberately shorter than the 60s bar timeframe so a
 # just-closed candle is picked up within roughly half a bar, not up to a
 # full minute late, while staying far under Shoonya's 10/sec GetQuotes-class
@@ -129,6 +164,7 @@ class MarketDataIngestionService:
         ws_health_grace_seconds_by_symbol: dict[str, float] | None = None,
         rest_poll_interval_seconds: float = _REST_POLL_INTERVAL_SECONDS,
         rate_limit_backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
+        min_plausible_price_by_symbol: dict[str, float] | None = None,
     ) -> None:
         self._provider = provider
         self._session_factory = session_factory
@@ -147,6 +183,13 @@ class MarketDataIngestionService:
         )
         self._rest_poll_interval_seconds = rest_poll_interval_seconds
         self._rate_limit_backoff_seconds = rate_limit_backoff_seconds
+        # See _MIN_PLAUSIBLE_PRICE_BY_SYMBOL's own module-level docstring.
+        self._min_plausible_price_by_symbol = (
+            min_plausible_price_by_symbol
+            if min_plausible_price_by_symbol is not None
+            else _MIN_PLAUSIBLE_PRICE_BY_SYMBOL
+        )
+        self._implausible_price_logged: set[str] = set()
         self._last_tick_at: dict[str, datetime] = {}
         self._fallback_symbols: set[str] = set()
         self._poll_threads: dict[str, threading.Thread] = {}
@@ -162,6 +205,35 @@ class MarketDataIngestionService:
 
     def _grace_seconds_for(self, symbol: str) -> float:
         return self._ws_health_grace_seconds_by_symbol.get(symbol, self._ws_health_grace_seconds)
+
+    def _is_plausible_price(self, symbol: str, price: float) -> bool:
+        """See `_MIN_PLAUSIBLE_PRICE_BY_SYMBOL`'s own module-level docstring
+        for the live incident this exists to catch. A symbol with no
+        configured floor (every option contract, and any underlying not
+        explicitly listed) is always plausible as far as this check is
+        concerned — this is deliberately a narrow, known-underlyings-only
+        guard, not a general price-sanity system.
+        """
+        floor = self._min_plausible_price_by_symbol.get(symbol)
+        return floor is None or price >= floor
+
+    def _warn_implausible_price_once(self, symbol: str, price: float, source: str) -> None:
+        if symbol in self._implausible_price_logged:
+            return
+        self._implausible_price_logged.add(symbol)
+        logger.error(
+            "REJECTED implausible %s price %.4f for known underlying %r (below configured "
+            "floor %.1f) -- some real broker data is being received under the wrong symbol "
+            "(a token-resolution mismatch, not a market move; a real index never trades this "
+            "low). Dropping rather than persisting -- price_bars/indicators for %r will go "
+            "stale until this clears, which is the safe degraded behavior. Logged once per "
+            "symbol per process to avoid flooding logs on every subsequent tick/poll.",
+            source,
+            price,
+            symbol,
+            self._min_plausible_price_by_symbol.get(symbol, 0.0),
+            symbol,
+        )
 
     def _build_symbol_map(self, contract_symbols: list[str]) -> dict[str, _SymbolRef]:
         symbol_map: dict[str, _SymbolRef] = {}
@@ -356,10 +428,27 @@ class MarketDataIngestionService:
             return
         new_candles.sort(key=lambda c: c.bucket_start)
 
+        # See _MIN_PLAUSIBLE_PRICE_BY_SYMBOL's own module-level docstring --
+        # get_price_history routes through the exact same underlying-token
+        # cache the WS path does, so a rejected candle here isn't
+        # hypothetical, it's the same real corruption via a different
+        # transport. _last_polled_bucket deliberately does NOT advance past
+        # a rejected candle -- it stays eligible to be reconsidered (and
+        # correctly persisted) on the very next poll if the underlying
+        # cause ever clears, rather than being permanently skipped.
+        plausible_candles = []
+        for candle in new_candles:
+            if self._is_plausible_price(symbol, candle.close):
+                plausible_candles.append(candle)
+            else:
+                self._warn_implausible_price_once(symbol, candle.close, "REST candle")
+        if not plausible_candles:
+            return
+
         with self._session_factory() as db:
-            for candle in new_candles:
+            for candle in plausible_candles:
                 self._persist_candle(db, instrument_id, candle, timeframe_seconds)
-        self._last_polled_bucket[symbol] = new_candles[-1].bucket_start
+        self._last_polled_bucket[symbol] = plausible_candles[-1].bucket_start
 
     def _persist_candle(
         self, db: Session, instrument_id: uuid.UUID, candle: PriceCandle, timeframe_seconds: int
@@ -482,11 +571,19 @@ class MarketDataIngestionService:
         ref = self._symbol_map.get(tick.contract_symbol)
         if ref is None:
             return
+        kind, row_id = ref
+        if kind == "instrument" and not self._is_plausible_price(tick.contract_symbol, tick.ltp):
+            self._warn_implausible_price_once(tick.contract_symbol, tick.ltp, "WS tick")
+            # Deliberately does NOT update _last_tick_at -- a rejected tick
+            # must not look like a healthy one to the WS-health watchdog.
+            # Falling back to REST goes through this exact same guard (see
+            # _poll_once), so it can't silently "fix" this by switching
+            # paths; both correctly degrade to stale/no-data instead.
+            return
         # Recorded regardless of what happens below — this is the WS-health
         # signal `_check_ws_health` reads, decoupled from whether the DB
         # write itself succeeds.
         self._last_tick_at[tick.contract_symbol] = tick.ts
-        kind, row_id = ref
         with self._session_factory() as db:
             db.add(
                 QuoteTickRow(
