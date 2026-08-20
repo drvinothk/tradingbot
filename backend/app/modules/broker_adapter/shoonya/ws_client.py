@@ -392,11 +392,20 @@ class ShoonyaWSClient:
         # .reconcile_pending_live_orders`'s own unconditional REST poll is
         # the actual safety net if this never fires or the message shape
         # turns out to be wrong.
-        if msg_type == "om" and self._on_order_update is not None:
-            try:
-                self._on_order_update(message)
-            except Exception:
-                logger.exception("Shoonya WS order-update callback failed for %r", message)
+        if msg_type == "om":
+            # .warning, not .info -- see this module's own established
+            # reasoning (no logging config anywhere in this app, stderr
+            # WARNING+ only). Logged on *every* raw "om" frame received,
+            # separate from adapter.py's own "successfully cached" log --
+            # this line proves the message *type* assumption is correct
+            # even if parsing later fails, the two signals this whole
+            # unconfirmed mechanism needs to be diagnosable tomorrow.
+            logger.warning("Shoonya WS order-update frame received: %r", message)
+            if self._on_order_update is not None:
+                try:
+                    self._on_order_update(message)
+                except Exception:
+                    logger.exception("Shoonya WS order-update callback failed for %r", message)
             return
 
         key = f"{message.get('e', '')}|{message.get('tk', '')}"

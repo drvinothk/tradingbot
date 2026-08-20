@@ -878,6 +878,21 @@ class ShoonyaBrokerAdapter(BrokerPort):
         except normalizer.NormalizationError:
             logger.exception("Failed to normalize Shoonya WS order-update message: %r", message)
             return
+        # .warning, not .info -- this app has no logging configuration
+        # anywhere, so with no handler attached Python falls back to its
+        # "handler of last resort" (stderr, WARNING+ only); an .info call
+        # here would never appear in production logs. Deliberately logged
+        # on every successful cache, not once-per-order -- this line is the
+        # only live evidence this whole push mechanism actually works,
+        # unconfirmed against a real account as of 2026-08-20 (see this
+        # method's own docstring) -- worth the extra log volume until that
+        # changes.
+        logger.warning(
+            "Shoonya WS order-update cached: broker_order_id=%r status=%r filled_qty=%d",
+            result.broker_order_id,
+            result.status.value,
+            result.filled_qty,
+        )
         with self._order_update_lock:
             self._order_update_cache[result.broker_order_id] = result
 
