@@ -47,10 +47,12 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
 from app.main import app
+from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.service import submit_signal
 
@@ -571,7 +573,7 @@ def test_approve_unknown_trade_approval_is_404(api_client: TestClient, seeded_ad
 
 
 def test_approving_a_pending_trade_dispatches_to_a_real_position(
-    api_client: TestClient, seeded_admin, engine
+    api_client: TestClient, seeded_admin, engine, monkeypatch
 ):
     """Regression test: approving a trade must not leave it DISPATCHED
     forever with nothing downstream — Phase 2 had no real Execution Service
@@ -579,7 +581,25 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
     api.v1.strategies.approve_trade_approval now hands off to
     execution_engine.paper.service.dispatch_trade_intent, which must produce
     a real open Position, not just flip the TradeIntent's status.
+
+    2026-08-21: needs genuine live-routing (session LIVE_ENABLED + strategy
+    LIVE) now that paper trades always auto-dispatch regardless of
+    execution_mode — a PENDING_APPROVAL state can only actually occur for a
+    live-routed strategy any more. Two separate broker-resolution points
+    need mocking since they're two different modules' own imports of
+    get_execution_broker: risk_engine.service (at submit_signal time) and
+    execution_engine.paper.service (at approve/dispatch time) — otherwise
+    either would hit the real ALLOW_REAL_MONEY_DISPATCH gate.
     """
+    mock_broker = MockBrokerAdapter()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: mock_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: mock_broker,
+    )
     _login(api_client, seeded_admin)
     session_id = api_client.post(
         "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
@@ -616,13 +636,14 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
 
             trading_session = db.get(TradingSession, uuid.UUID(session_id))
             assert trading_session is not None
-            trading_session.mode = SafeMode.PAPER_ONLY
+            trading_session.mode = SafeMode.LIVE_ENABLED
             trading_session.funding_mode = FundingMode.CASH
 
             strategy_config = StrategyConfig(
                 id=uuid.uuid4(),
                 workspace_id=seeded_admin["workspace_id"],
                 name="approval-flow-test",
+                status=StrategyStatus.LIVE,
             )
             db.add(strategy_config)
             db.flush()

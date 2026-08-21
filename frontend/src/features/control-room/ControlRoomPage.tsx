@@ -36,6 +36,11 @@ const STATUS_BADGE_CLASS: Record<TradeRowStatus, string> = {
 const LIVE_MODES = new Set(['paper_plus_guarded_live', 'live_enabled'])
 const EMERGENCY_MODES = new Set(['kill_switch', 'degraded_mode', 'reconciliation_lock'])
 
+// Stable reference so `?? EMPTY_RUNS` doesn't defeat downstream useMemo
+// dependency checks the way `?? []` (a fresh array literal every render)
+// would.
+const EMPTY_RUNS: RunningStrategyOut[] = []
+
 export function ControlRoomPage() {
   const queryClient = useQueryClient()
   const { liveSession, paperSession, isLoading: bucketsLoading } = useSessionBuckets()
@@ -45,7 +50,57 @@ export function ControlRoomPage() {
   const [paperExpanded, setPaperExpanded] = useState(false)
 
   const runningQuery = useRunningStrategies()
-  const runs = runningQuery.data ?? []
+  const runs = runningQuery.data ?? EMPTY_RUNS
+
+  // Fetch both sessions' orders/positions here (not per-bucket) so a
+  // trade can be bucketed by what it actually fired to the broker
+  // (`TradeRow.mode`) rather than by which session's query it happened to
+  // come from -- a strategy's force_paper override can put a paper-mode
+  // order under the Live session's trading_session_id, and the old
+  // per-session-scoped fetch had no way to catch that. See
+  // buildTradeRows' own docstring.
+  const liveOrdersQuery = useOrders(liveSession?.id ?? null)
+  const livePositionsQuery = usePositions(liveSession?.id ?? null)
+  const paperOrdersQuery = useOrders(paperSession?.id ?? null)
+  const paperPositionsQuery = usePositions(paperSession?.id ?? null)
+  const instrumentsQuery = useInstruments()
+
+  const sessionModeById = useMemo(() => {
+    const m = new Map<string, 'live' | 'paper'>()
+    if (liveSession) m.set(liveSession.id, 'live')
+    if (paperSession) m.set(paperSession.id, 'paper')
+    return m
+  }, [liveSession, paperSession])
+
+  const allRows = useMemo(
+    () =>
+      buildTradeRows(
+        runs,
+        [...(liveOrdersQuery.data ?? []), ...(paperOrdersQuery.data ?? [])],
+        [...(livePositionsQuery.data ?? []), ...(paperPositionsQuery.data ?? [])],
+        instrumentsQuery.data ?? [],
+        sessionModeById,
+      ),
+    [
+      runs,
+      liveOrdersQuery.data,
+      paperOrdersQuery.data,
+      livePositionsQuery.data,
+      paperPositionsQuery.data,
+      instrumentsQuery.data,
+      sessionModeById,
+    ],
+  )
+
+  // mode is the ground truth; sessionId is only consulted for the rare
+  // data-integrity edge case where mode itself is null (see TradeRow's own
+  // docstring) so such a row still shows up somewhere instead of vanishing.
+  const liveRows = allRows.filter(
+    (r) => r.mode === 'live' || (r.mode === null && r.sessionId === liveSession?.id),
+  )
+  const paperRows = allRows.filter(
+    (r) => r.mode === 'paper' || (r.mode === null && r.sessionId === paperSession?.id),
+  )
 
   const invalidateTrades = () => {
     queryClient.invalidateQueries({ queryKey: ['strategies', 'running'] })
@@ -73,7 +128,7 @@ export function ControlRoomPage() {
       <TradeBucketCard
         title="Today's Trades (Live)"
         session={liveSession}
-        runs={runs.filter((r) => liveSession && r.trading_session_id === liveSession.id)}
+        rows={liveRows}
         defaultExpanded
         hiddenRowKeys={hiddenRowKeys}
         onHideRow={hideRow}
@@ -85,7 +140,7 @@ export function ControlRoomPage() {
       <TradeBucketCard
         title="Today's Paper Trades"
         session={paperSession}
-        runs={runs.filter((r) => paperSession && r.trading_session_id === paperSession.id)}
+        rows={paperRows}
         defaultExpanded={false}
         expanded={paperExpanded}
         onToggleExpanded={() => setPaperExpanded((v) => !v)}
@@ -306,7 +361,7 @@ function AuditTickerPlaceholder() {
 function TradeBucketCard({
   title,
   session,
-  runs,
+  rows,
   defaultExpanded,
   expanded: expandedProp,
   onToggleExpanded,
@@ -318,7 +373,7 @@ function TradeBucketCard({
 }: {
   title: string
   session: SessionOut | null
-  runs: RunningStrategyOut[]
+  rows: TradeRow[]
   defaultExpanded: boolean
   expanded?: boolean
   onToggleExpanded?: () => void
@@ -332,15 +387,6 @@ function TradeBucketCard({
   const isExpanded = expandedProp ?? localExpanded
   const toggle = onToggleExpanded ?? (() => setLocalExpanded((v) => !v))
 
-  const ordersQuery = useOrders(session?.id ?? null)
-  const positionsQuery = usePositions(session?.id ?? null)
-  const instrumentsQuery = useInstruments()
-
-  const rows = useMemo(
-    () =>
-      buildTradeRows(runs, ordersQuery.data ?? [], positionsQuery.data ?? [], instrumentsQuery.data ?? []),
-    [runs, ordersQuery.data, positionsQuery.data, instrumentsQuery.data],
-  )
   const visibleRows = rows.filter((r) => !hiddenRowKeys.has(r.key))
 
   // Which single row is currently being acted on -- Approve/Reject/

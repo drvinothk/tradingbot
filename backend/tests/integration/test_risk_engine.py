@@ -424,7 +424,7 @@ def test_same_strike_lock_does_not_cross_strategies(
 
 
 def test_same_strike_locked_blocks_a_pending_approval_duplicate(
-    db: Session, trading_session, strategy_config, user: User, option_contract
+    db: Session, broker, trading_session, strategy_config, user: User, option_contract, monkeypatch
 ):
     """2026-08-19: `_same_strike_locked` checks both PENDING_APPROVAL and
     DISPATCHED, but every existing test only ever exercised the DISPATCHED
@@ -432,7 +432,22 @@ def test_same_strike_locked_blocks_a_pending_approval_duplicate(
     same order if already pending or open" -- a strategy whose first
     trade_intent on a contract is still awaiting manual approval must not
     be able to propose a second one on the identical contract.
+
+    2026-08-21: needs genuine live-routing now that paper trades always
+    auto-dispatch regardless of execution_mode (see risk_engine.service's
+    approval-required branch) -- a PENDING_APPROVAL state can only actually
+    occur for a live-routed strategy any more.
     """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     approval_run = StrategyRun(
         id=uuid.uuid4(),
         strategy_config_id=strategy_config.id,
@@ -1178,8 +1193,29 @@ def test_evaluate_trade_intent_rejection_alert_message_has_friendly_context(
 
 
 def test_evaluate_trade_intent_approval_required_creates_pending_approval(
-    db: Session, trading_session, strategy_config, user: User, option_contract
+    db: Session, broker, trading_session, strategy_config, user: User, option_contract, monkeypatch
 ):
+    """Approval-required only actually gates a *live* trade (2026-08-21:
+    paper trades always auto-dispatch regardless of execution_mode, see the
+    sibling test below) -- must set up genuine live-routing here
+    (trading_session.mode + strategy_config.status), same pattern the
+    is_strategy_routed_live regression tests above already use, or this
+    test would exercise the paper-auto-dispatch path instead. The
+    get_execution_broker monkeypatch is the same one those tests use --
+    is_strategy_routed_live itself never resolves a broker, but this
+    module's actual dispatch path does, and would otherwise hit the real
+    ALLOW_REAL_MONEY_DISPATCH gate in a test environment that doesn't set it.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     approval_run = StrategyRun(
         id=uuid.uuid4(),
         strategy_config_id=strategy_config.id,
@@ -1205,12 +1241,59 @@ def test_evaluate_trade_intent_approval_required_creates_pending_approval(
     assert pending.capital_required == pytest.approx(float(decision.capital_required))
 
 
+def test_evaluate_trade_intent_approval_required_still_auto_dispatches_when_paper(
+    db: Session, trading_session, strategy_config, user: User, option_contract
+):
+    """2026-08-21: a strategy set to Approval-required but actually routed
+    paper (the default trading_session/strategy_config fixtures here are
+    paper_only/not-force-live, i.e. is_strategy_routed_live is False) must
+    still auto-dispatch -- approval-required exists to gate real-money
+    risk, and a paper trade carries none. This is the actual new behavior;
+    the sibling test above proves the untouched live case still gates."""
+    approval_run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.APPROVAL_REQUIRED,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(approval_run)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, approval_run, option_contract)
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, approval_run)
+
+    assert decision.decision == "approved"
+    assert trade_intent.status == TradeIntentStatus.DISPATCHED
+    assert (
+        db.query(PendingTradeApproval)
+        .filter(PendingTradeApproval.trade_intent_id == trade_intent.id)
+        .one_or_none()
+        is None
+    )
+
+
 # -- expire_stale_pending_approvals: proactive expiry -------------------------
 
 
 def test_expire_stale_pending_approvals_expires_past_window(
-    db: Session, trading_session, strategy_config, user: User, option_contract
+    db: Session, broker, trading_session, strategy_config, user: User, option_contract, monkeypatch
 ):
+    """2026-08-21: needs genuine live-routing now that paper trades always
+    auto-dispatch regardless of execution_mode -- a PENDING_APPROVAL state
+    can only actually occur for a live-routed strategy any more."""
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     approval_run = StrategyRun(
         id=uuid.uuid4(),
         strategy_config_id=strategy_config.id,
@@ -1245,8 +1328,20 @@ def test_expire_stale_pending_approvals_expires_past_window(
 
 
 def test_expire_stale_pending_approvals_leaves_fresh_ones_alone(
-    db: Session, trading_session, strategy_config, user: User, option_contract
+    db: Session, broker, trading_session, strategy_config, user: User, option_contract, monkeypatch
 ):
+    """2026-08-21: needs genuine live-routing, same reasoning as the sibling
+    expiry test above."""
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     approval_run = StrategyRun(
         id=uuid.uuid4(),
         strategy_config_id=strategy_config.id,

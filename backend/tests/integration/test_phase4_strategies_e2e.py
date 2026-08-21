@@ -54,7 +54,6 @@ from app.domain.market.models import (
 )
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
-    ApprovalStatus,
     ExecutionMode,
     PendingTradeApproval,
     StrategyConfig,
@@ -476,13 +475,19 @@ def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     vwap_intent = (
         db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_runs["vwap"].id).one()
     )
-    assert vwap_intent.status == TradeIntentStatus.PENDING_APPROVAL
-    approval = (
+    # 2026-08-21: both sessions in this test are PAPER_ONLY, and paper trades
+    # now always auto-dispatch regardless of execution_mode (approval-
+    # required exists to gate real-money risk, which a paper trade carries
+    # none of) -- vwap's APPROVAL_REQUIRED setting is now a no-op here. The
+    # live case (approval-required genuinely creating a pending approval)
+    # is covered directly in test_risk_engine.py instead.
+    assert vwap_intent.status == TradeIntentStatus.DISPATCHED
+    assert (
         db.query(PendingTradeApproval)
         .filter(PendingTradeApproval.trade_intent_id == vwap_intent.id)
-        .one()
+        .one_or_none()
+        is None
     )
-    assert approval.status == ApprovalStatus.PENDING
 
     ema_intent = (
         db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_runs["ema"].id).one()
@@ -497,17 +502,19 @@ def test_five_strategies_run_concurrently_across_two_sessions_mixed_modes(
     oivol_intent = (
         db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_runs["oivol"].id).one()
     )
-    assert oivol_intent.status == TradeIntentStatus.PENDING_APPROVAL
-    oivol_approval = (
+    # 2026-08-21: same reasoning as vwap above -- paper always auto-dispatches.
+    assert oivol_intent.status == TradeIntentStatus.DISPATCHED
+    assert (
         db.query(PendingTradeApproval)
         .filter(PendingTradeApproval.trade_intent_id == oivol_intent.id)
-        .one()
+        .one_or_none()
+        is None
     )
-    assert oivol_approval.status == ApprovalStatus.PENDING
 
     assert strategy_runs["orb"].status == StrategyRunStatus.IN_POSITION
-    # vwap/oivol never dispatched (still pending approval) -> no Position yet.
-    assert strategy_runs["vwap"].status == StrategyRunStatus.SCANNING
+    # 2026-08-21: vwap/oivol now dispatch immediately too (paper auto-
+    # dispatch), same as every other strategy here.
+    assert strategy_runs["vwap"].status == StrategyRunStatus.IN_POSITION
     assert strategy_runs["ema"].status == StrategyRunStatus.IN_POSITION
     assert strategy_runs["sweep"].status == StrategyRunStatus.IN_POSITION
-    assert strategy_runs["oivol"].status == StrategyRunStatus.SCANNING
+    assert strategy_runs["oivol"].status == StrategyRunStatus.IN_POSITION

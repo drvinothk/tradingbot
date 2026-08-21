@@ -18,6 +18,7 @@ export function App() {
           <Route path="/reports" element={<ReportsPage />} />
           <Route path="/advanced" element={<AdvancedPage />} />
           <Route path="/" element={<Navigate to="/control-room" replace />} />
+          <Route path="*" element={<Navigate to="/control-room" replace />} />
         </Route>
       </Route>
     </Routes>

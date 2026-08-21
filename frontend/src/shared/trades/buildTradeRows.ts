@@ -46,6 +46,19 @@ export interface TradeRow {
   // that order; this flag is just what the UI uses to disable a second
   // Square Off click on the position row itself.
   hasPendingExit?: boolean
+  // Which broker a trade actually fired to (or, for a not-yet-dispatched
+  // pending approval, the best guess available pre-dispatch) -- 'live'/
+  // 'paper'/null. This is what buckets a row into Today's Trades vs
+  // Today's Paper Trades; see buildTradeRows' own docstring for why this
+  // is the order's own recorded mode, not the session/strategy's current
+  // config.
+  mode: 'live' | 'paper' | null
+  // The session this row's underlying run/order/position actually belongs
+  // to -- only used as a last-resort bucketing fallback when `mode` itself
+  // is null (a data-integrity gap, e.g. a position whose opening order
+  // can't be resolved), so such a row still appears somewhere rather than
+  // silently vanishing from both buckets.
+  sessionId: string | null
 }
 
 const STATUS_ORDER: Record<TradeRowStatus, number> = {
@@ -83,28 +96,42 @@ function qtyToLots(qty: number, lotSize: number | null): number | null {
   return lotSize ? Math.round(qty / lotSize) : null
 }
 
-/** Builds the unified "Today's Trades" row list for one session bucket
- * (Live or Paper) — see the UI dashboard plan's Control Room spec. Merges
- * three sources that each only cover part of a trade's lifecycle:
- * `RunningStrategyOut.pending_approvals` (Approve/Reject stage),
- * `GET /orders` (order-sent / rejected stage), and `GET /positions`
- * (open / closed stage).
+/** Builds the unified "Today's Trades" row list — see the UI dashboard
+ * plan's Control Room spec. Merges three sources that each only cover part
+ * of a trade's lifecycle: `RunningStrategyOut.pending_approvals` (Approve/
+ * Reject stage), `GET /orders` (order-sent / rejected stage), and
+ * `GET /positions` (open / closed stage).
  *
  * `GET /orders`/`GET /positions` now join `OptionContract` (symbol/strike/
  * expiry/option_type — all plain stored columns, populated verbatim from
  * the broker's instrument master at sync time, not computed at read time)
- * plus strategy_type/target/stop/trail/LTP/P&L server-side, so a row for an
- * actual order or position always has the real tradable-contract identity.
- * `pending_approvals` (from `GET /strategies/running`) has no such join —
- * that endpoint only ever carries `option_contract_id`, so an
- * approval-stage row still falls back to the strategy+time label until it
- * either fills (becomes an order/position row) or is rejected.
+ * plus strategy_type/target/stop/trail/LTP/P&L/mode server-side, so a row
+ * for an actual order or position always has the real tradable-contract
+ * identity AND the real mode it fired to the broker with. `pending_
+ * approvals` (from `GET /strategies/running`) has no such join — that
+ * endpoint only ever carries `option_contract_id`, so an approval-stage
+ * row still falls back to the strategy+time label until it either fills
+ * (becomes an order/position row) or is rejected.
+ *
+ * This function does NOT scope its inputs to one session — pass every
+ * run/order/position from every session, and use each row's own `mode`
+ * to bucket it into Live vs Paper afterward (see ControlRoomPage). Mode is
+ * the entry order's *actual recorded* live/paper tag, not the session's or
+ * strategy's *current* config — a strategy's force_paper override can be
+ * flipped after a position already opened, and the config at render time
+ * would misrepresent what actually happened. Approval rows have no order
+ * yet (nothing's been fired to a broker), so `sessionModeById` (session id
+ * -> 'live'/'paper', from `useSessionBuckets`) is the best available guess
+ * pre-dispatch — approvals are gated on execution_mode, not paper/live, so
+ * in practice this is nearly always 'live', but nothing enforces that
+ * server-side today.
  */
 export function buildTradeRows(
   runs: RunningStrategyOut[],
   orders: OrderOut[],
   positions: PositionOut[],
   instruments: InstrumentOut[] = [],
+  sessionModeById: Map<string, 'live' | 'paper'> = new Map(),
 ): TradeRow[] {
   const rows: TradeRow[] = []
 
@@ -136,6 +163,8 @@ export function buildTradeRows(
         closedAt: null,
         timestamp: approval.expires_at,
         approvalId: approval.approval_id,
+        mode: sessionModeById.get(run.trading_session_id) ?? null,
+        sessionId: run.trading_session_id,
       })
     }
   }
@@ -187,6 +216,8 @@ export function buildTradeRows(
         openedAt: null,
         closedAt: null,
         timestamp: order.submitted_at,
+        mode: order.mode === 'live' ? 'live' : 'paper',
+        sessionId: order.trading_session_id,
       })
       continue
     }
@@ -217,6 +248,8 @@ export function buildTradeRows(
       openedAt: null,
       closedAt: null,
       timestamp: order.submitted_at,
+      mode: order.mode === 'live' ? 'live' : 'paper',
+      sessionId: order.trading_session_id,
     })
   }
 
@@ -250,6 +283,8 @@ export function buildTradeRows(
       timestamp: position.closed_at ?? position.opened_at,
       positionId: position.id,
       hasPendingExit: isOpen && positionIdsWithPendingExit.has(position.id),
+      mode: position.mode === 'live' ? 'live' : position.mode === 'paper' ? 'paper' : null,
+      sessionId: position.trading_session_id,
     })
   }
 

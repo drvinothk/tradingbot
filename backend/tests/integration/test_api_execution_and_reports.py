@@ -545,6 +545,12 @@ def test_full_flow_orders_positions_reports_square_off(
         positions = positions_resp.json()
         assert len(positions) == 1
         assert positions[0]["status"] == "open"
+        # mode is the entry order's actual recorded mode (ground truth for
+        # Live/Paper bucketing), not the session's current config -- see
+        # PositionOut.mode's own docstring. _dispatch_one_position dispatches
+        # with no broker passed explicitly, so this resolves through the
+        # default (mock) broker and should be tagged 'paper'.
+        assert positions[0]["mode"] == "paper"
 
         # Daily report before any close: one signal/dispatch/fill, zero closed trades.
         daily_before = api_client.get(f"/api/v1/reports/sessions/{session_id}/daily")

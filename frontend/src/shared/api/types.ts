@@ -167,6 +167,11 @@ export interface PositionOut {
   unrealized_pnl: number | null
   exit_price: number | null
   realized_pnl: number | null
+  // The entry order's mode ('live'/'paper') -- what actually fired to the
+  // broker when this position opened, not the session's/strategy's current
+  // config (which can drift after the fact). Ground truth for Live vs
+  // Paper bucketing.
+  mode: string | null
 }
 
 export interface SquareOffPositionOut {

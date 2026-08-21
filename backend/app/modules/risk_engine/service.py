@@ -699,7 +699,17 @@ def evaluate_trade_intent(
                         created_at=_utcnow(),
                     )
                 )
-        elif strategy_run.execution_mode == ExecutionMode.AUTO:
+        elif (
+            strategy_run.execution_mode == ExecutionMode.AUTO
+            # Paper trades always auto-dispatch, regardless of the
+            # strategy's configured execution_mode -- approval-required
+            # exists to gate real-money risk, and a paper trade carries
+            # none. Uses the same is_strategy_routed_live predicate this
+            # function already gates its risk caps on (2026-08-19 fix,
+            # see that function's own docstring) so this stays consistent
+            # with every other paper-vs-live decision in this module.
+            or not is_strategy_routed_live(trading_session, strategy_run)
+        ):
             trade_intent.status = TradeIntentStatus.DISPATCHED
             trade_intent.dispatched_at = _utcnow()
             db.add(trade_intent)

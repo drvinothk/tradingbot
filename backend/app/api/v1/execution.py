@@ -159,6 +159,12 @@ class PositionOut(BaseModel):
     unrealized_pnl: float | None = None
     exit_price: float | None = None
     realized_pnl: float | None = None
+    # The entry (opening) order's mode -- what actually got fired to the
+    # broker when this position was opened, not the session's or strategy's
+    # *current* config, which can drift after the fact (a strategy's
+    # force_paper override can flip after a position already opened). This
+    # is the ground truth for bucketing a position as Live vs Paper.
+    mode: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -214,6 +220,7 @@ def list_positions(
             StopPlan,
             TrailPlan,
             TradeOutcome,
+            Order.mode,
         )
         .join(OptionContract, Position.option_contract_id == OptionContract.id)
         .outerjoin(TradeIntent, Position.trade_intent_id == TradeIntent.id)
@@ -222,6 +229,12 @@ def list_positions(
         .outerjoin(StopPlan, StopPlan.position_id == Position.id)
         .outerjoin(TrailPlan, TrailPlan.position_id == Position.id)
         .outerjoin(TradeOutcome, TradeOutcome.position_id == Position.id)
+        # opening_order_id is non-nullable, but an inner join here would
+        # silently drop a position if its opening Order row were ever
+        # missing -- outerjoin so a data-integrity gap surfaces as mode=None
+        # (falls back safely in the frontend) rather than hiding the whole
+        # position from the list.
+        .outerjoin(Order, Position.opening_order_id == Order.id)
         .filter(Position.trading_session_id == trading_session.id)
         .order_by(Position.opened_at.desc())
         .all()
@@ -239,13 +252,23 @@ def list_positions(
     now = datetime.now(UTC)
 
     result: list[PositionOut] = []
-    for position, contract, strategy_type, trade_intent, stop_plan, trail_plan, outcome in rows:
+    for (
+        position,
+        contract,
+        strategy_type,
+        trade_intent,
+        stop_plan,
+        trail_plan,
+        outcome,
+        opening_order_mode,
+    ) in rows:
         out = PositionOut.model_validate(position)
         out.contract_symbol = contract.symbol
         out.strike = float(contract.strike)
         out.expiry_date = contract.expiry_date
         out.option_type = str(contract.option_type)
         out.strategy_type = strategy_type
+        out.mode = str(opening_order_mode) if opening_order_mode is not None else None
         if trade_intent is not None:
             out.target_price = float(trade_intent.target_price)
         if stop_plan is not None:
