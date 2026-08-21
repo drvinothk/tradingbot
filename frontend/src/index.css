@@ -8,11 +8,16 @@
 :root {
   color-scheme: dark;
   --bg-base: #0b0914;
+  /* Center intensity (0%) and midpoint (60%) are the finalized values from
+     the original plan — left untouched. Only the edge (100%) was changed
+     from a full fade to var(--bg-base) (zero purple) to a dim retained
+     tint, so the glow no longer disappears completely toward the screen
+     edges. */
   --bg-glow: radial-gradient(
     circle at 50% 50%,
     rgba(76, 29, 149, 0.25) 0%,
     rgba(20, 15, 35, 0.2) 60%,
-    var(--bg-base) 100%
+    rgba(76, 29, 149, 0.08) 100%
   );
   --bg-panel: #110e1b;
   --bg-card: #151122;
@@ -298,6 +303,47 @@ tbody tr:hover {
   background: rgba(224, 108, 117, 0.15);
   color: var(--danger);
   font-weight: 600;
+}
+
+/* Broker connection ribbon (Market Terminal) -- status text is the thing
+   that matters at a glance, so it gets full brightness/weight; the
+   Connect/Reconnect button next to it is deliberately de-emphasized
+   (.btn-ghost) since it's only relevant once a day, not something to
+   glance at repeatedly. */
+.broker-ribbon {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  flex-wrap: wrap;
+  padding: 1rem 0;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.broker-ribbon .row-actions {
+  align-items: center;
+}
+
+.broker-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text-main);
+}
+
+.broker-ribbon button {
+  padding: 0.6rem 1.2rem;
+  font-size: 1rem;
+}
+
+.broker-status.on {
+  color: var(--success);
+}
+
+.broker-status.off {
+  color: var(--danger);
 }
 
 .content {
