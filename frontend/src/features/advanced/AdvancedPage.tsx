@@ -204,37 +204,58 @@ function StrategyTypeGroup({
   paperSession: SessionOut | null
   onChanged: () => void
 }) {
+  // Real data untouched either way -- this only changes what's rendered.
+  // Disabled configs (almost always old test/leftover ones once a type has
+  // more than one) fold behind "show more" instead of always cluttering
+  // the type's row list; an enabled config always shows regardless of this
+  // toggle, since that's the one actually running or ready to run.
+  const [showDisabled, setShowDisabled] = useState(false)
+  const enabledConfigs = configs.filter((c) => c.is_enabled)
+  const disabledConfigs = configs.filter((c) => !c.is_enabled)
+  const visibleConfigs = showDisabled ? configs : enabledConfigs
+
   return (
     <div style={{ marginBottom: '1rem' }}>
       <div className="section-title">{strategyTypeLabel(type)}</div>
       {configs.length === 0 ? (
         <p className="muted">No strategy config of this type exists yet.</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Power</th>
-              <th>Mode</th>
-              <th>Instrument</th>
-              <th>Status</th>
-              <th>Running</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {configs.map((config) => (
-              <StrategyConfigRow
-                key={config.id}
-                config={config}
-                run={runs.find((r) => r.strategy_config_id === config.id) ?? null}
-                instruments={instruments}
-                liveSession={liveSession}
-                paperSession={paperSession}
-                onChanged={onChanged}
-              />
-            ))}
-          </tbody>
-        </table>
+        <>
+          {visibleConfigs.length === 0 ? (
+            <p className="muted">No enabled config of this type — {disabledConfigs.length} disabled.</p>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Power</th>
+                  <th>Mode</th>
+                  <th>Instrument</th>
+                  <th>Status</th>
+                  <th>Running</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleConfigs.map((config) => (
+                  <StrategyConfigRow
+                    key={config.id}
+                    config={config}
+                    run={runs.find((r) => r.strategy_config_id === config.id) ?? null}
+                    instruments={instruments}
+                    liveSession={liveSession}
+                    paperSession={paperSession}
+                    onChanged={onChanged}
+                  />
+                ))}
+              </tbody>
+            </table>
+          )}
+          {disabledConfigs.length > 0 && (
+            <button className="btn-ghost" onClick={() => setShowDisabled((v) => !v)}>
+              {showDisabled ? 'Hide' : `Show ${disabledConfigs.length} more (disabled)`}
+            </button>
+          )}
+        </>
       )}
     </div>
   )
@@ -590,8 +611,17 @@ function ReconciliationAndRecoveryCard() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null)
   const reconciliationQuery = useReconciliationRuns(selectedSessionId)
   const [error, setError] = useState<string | null>(null)
+  // Ended sessions accumulate one per trading day, most with nothing
+  // actionable (only 'active' ones get buttons) -- fold the rest behind
+  // "show more" instead of always listing every one. Nothing here deletes
+  // or filters the underlying data (SessionOut has no timestamp field to
+  // sort by), it's purely how many of the already-returned rows render.
+  const [showAllSessions, setShowAllSessions] = useState(false)
+  const SESSIONS_VISIBLE_DEFAULT = 5
 
   const sessions = sessionsQuery.data ?? []
+  const visibleSessions = showAllSessions ? sessions : sessions.slice(0, SESSIONS_VISIBLE_DEFAULT)
+  const hiddenSessionCount = sessions.length - visibleSessions.length
   const invalidateSessions = () => queryClient.invalidateQueries({ queryKey: ['sessions'] })
 
   const squareOffMutation = useMutation({
@@ -659,7 +689,7 @@ function ReconciliationAndRecoveryCard() {
           </tr>
         </thead>
         <tbody>
-          {sessions.map((session) => (
+          {visibleSessions.map((session) => (
             <tr key={session.id}>
               <td>
                 <span className="badge">{session.mode}</span>
@@ -720,6 +750,16 @@ function ReconciliationAndRecoveryCard() {
           ))}
         </tbody>
       </table>
+      {hiddenSessionCount > 0 && (
+        <button className="btn-ghost" onClick={() => setShowAllSessions(true)}>
+          Show {hiddenSessionCount} more
+        </button>
+      )}
+      {showAllSessions && sessions.length > SESSIONS_VISIBLE_DEFAULT && (
+        <button className="btn-ghost" onClick={() => setShowAllSessions(false)}>
+          Hide
+        </button>
+      )}
 
       <div className="section-title">Reconciliation history</div>
       <div className="form-row">

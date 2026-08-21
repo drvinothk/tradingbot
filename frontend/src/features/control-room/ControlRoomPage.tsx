@@ -284,6 +284,15 @@ function ControlRoomHeader({
   const isEmergency = liveSession != null && EMERGENCY_MODES.has(liveSession.mode)
   const killClassName = [
     'kill-switch',
+    // 'danger' gives the default (non-locked, non-armed) state its red
+    // text/border -- previously never actually applied despite a comment
+    // in index.css claiming the default state used it, so the button
+    // rendered as plain white text the whole time. .locked/.armed below
+    // still correctly override it when active: both are more specific
+    // compound selectors (button.kill-switch.locked/.armed) than the
+    // single-class button.danger rule, regardless of danger also being
+    // present in the class list.
+    'danger',
     killSwitchMutation.isPending ? 'locked' : '',
     killArmed && !killSwitchMutation.isPending ? 'armed' : '',
   ]
@@ -294,7 +303,7 @@ function ControlRoomHeader({
     <div className="page-header">
       <h2>Control Room</h2>
       <div className="row-actions">
-        <span className="muted">
+        <span className="broker-status-text">
           <span className={`status-dot ${shoonyaConnected ? 'on' : 'off'}`} />{' '}
           Broker: {shoonyaConnected ? 'Shoonya (REAL)' : 'Mock'}
         </span>

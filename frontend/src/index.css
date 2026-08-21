@@ -227,6 +227,14 @@ tbody tr:hover {
   font-size: 0.85rem;
 }
 
+/* Same size/weight as .muted (it sits right next to a .muted sibling in
+   Control Room's header), but full brightness -- the broker connection
+   status is worth a glance, unlike the WIP latency placeholder beside it. */
+.broker-status-text {
+  color: var(--text-main);
+  font-size: 0.85rem;
+}
+
 /* ---------- Layout shell ---------- */
 .layout {
   display: flex;
@@ -296,13 +304,23 @@ tbody tr:hover {
   font-size: 0.82rem;
   border-bottom: 1px solid var(--border);
   background: rgba(139, 92, 246, 0.06);
-  color: var(--text-muted);
+  color: var(--text-main);
 }
 
 .mode-banner-alarm {
   background: rgba(224, 108, 117, 0.15);
   color: var(--danger);
   font-weight: 600;
+}
+
+/* The routine "Shoonya (REAL)" broker badge here is deliberately white,
+   not the --danger red .badge-live normally means -- that red signals a
+   genuine warning (critical alerts, a rejected trade) elsewhere this same
+   class is used; a connected real broker in the everyday case isn't a
+   warning, so this scoped override keeps it out of that visual language
+   without touching .badge-live's other, still-legitimate uses. */
+.mode-banner .badge-live {
+  color: var(--text-main);
 }
 
 /* Broker connection ribbon (Market Terminal) -- status text is the thing
@@ -528,7 +546,7 @@ tbody tr:hover {
 
 .grid-2 {
   display: grid;
-  grid-template-columns: 1.4fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 1.25rem;
   align-items: start;
 }
