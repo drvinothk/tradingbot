@@ -133,7 +133,7 @@ class MarketDataSettings(BaseSettings):
         env_prefix="MARKET_DATA_", env_file=DOTENV_PATH, extra="ignore"
     )
 
-    provider: str = "mock"  # "angel_one" | "shoonya" | "truedata" | "mock"
+    provider: str = "mock"  # "angel_one" | "shoonya" | "truedata" | "alice_blue" | "mock"
     # Off by default: the 08:30-16:00 IST market-hours gate
     # (market_data.market_hours / MarketHoursGatedProvider) applies to
     # whichever real provider is selected. Set MARKET_DATA_ALLOW_OFFHOURS_
@@ -264,6 +264,101 @@ class AngelOneSettings(BaseSettings):
 
         node = _uuid.getnode()
         return ":".join(f"{(node >> shift) & 0xFF:02X}" for shift in range(40, -8, -8))
+
+
+class AliceBlueSettings(BaseSettings):
+    """Loaded from config/credentials/alice_blue.env (gitignored, same secret
+    discipline as ShoonyaSettings/AngelOneSettings/TrueDataSettings).
+
+    Market-data-only, per explicit user decision 2026-08-21 -- Shoonya stays
+    the execution broker, untouched. Auth is a browser-redirect OAuth-style
+    flow (App Code + a human login on Alice Blue's own site), **not** Angel
+    One's direct server-to-server password+TOTP login -- confirmed live
+    2026-08-21 against Alice Blue's own official ANT V3 docs
+    (ant.aliceblueonline.com/productdocumentation), not inferred from an
+    older `pya3`-style wrapper (the docs explicitly warn those may target an
+    earlier API generation). Confirmed flow:
+
+    1. Browser -> `{authorize_base_url}?appcode={app_code}` (no redirect_uri
+       param -- Alice's docs show only `appcode`, presumably because the
+       redirect URL is already tied to the App Code at registration time,
+       same as this account's own registered
+       `https://68-233-110-76.sslip.io/aliceblue/callback`).
+    2. User logs in with their own Alice Blue credentials on Alice's site
+       (this backend never sees that password -- same reasoning
+       ShoonyaSettings' own docstring gives for its OAuth flow).
+    3. Browser redirected back to `redirect_url` with `authCode` + `userId`
+       query params.
+    4. checksum = SHA256(userId + authCode + api_secret) (hex digest,
+       plain concatenation -- same "concatenate then hex-digest" convention
+       `ShoonyaSettings`' own `GenAcsTok` checksum uses, confirmed
+       independently for Alice Blue by its own docs).
+    5. POST `{"checkSum": "<checksum>"}` (confirmed: no userId/authCode in
+       the body itself) to `{api_host}/open-api/od/v1/vendor/getUserDetails`
+       -> `{"stat": "Ok", "clientId": ..., "userSession": <JWT>}`.
+
+    **Unconfirmed, flagged rather than silently assumed** (Alice's own docs
+    didn't show a worked REST example): the exact `Authorization` header
+    shape for every *later* REST call using `userSession` -- see
+    `alice_blue_rest_client.py`'s own docstring for the hedge applied and
+    what to check first if a call 401s. The WebSocket connect frame *is*
+    confirmed (`Websocket/` doc page, matches Shoonya's own Noren-family
+    protocol almost exactly): `susertoken` is
+    `sha256(sha256(userSession))`, not the raw session -- see
+    `alice_blue_ws_client.py`.
+
+    Contract-master download (`contract_master_*_url`) is confirmed live
+    2026-08-21 by downloading and inspecting the real file directly (same
+    "public, no-auth, daily-updated" discipline as Shoonya's own
+    `NFO_symbols.txt.zip` pipeline) -- real fields: `symbol`, `option_type`,
+    `expiry_date` (epoch *milliseconds*), `token`, `trading_symbol`,
+    `exch`/`exchange_segment`, `lot_size`, `strike_price`, `tick_size`. The
+    legacy (pre-V2) contract-master download was discontinued 2025-11-30
+    per Alice's own docs -- only the V2 JSON endpoints below are current.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ALICEBLUE_",
+        env_file=CREDENTIALS_DIR / "alice_blue.env",
+        extra="ignore",
+    )
+
+    app_code: str = ""
+    api_secret: SecretStr = SecretStr("")
+    redirect_url: str = ""
+    authorize_base_url: str = "https://ant.aliceblueonline.com/"
+    api_host: str = "https://a3.aliceblueonline.com"
+    # 2026-08-21, live-confirmed: the bare (no trailing slash) URL 301s at
+    # the plain-HTTP level (nginx: "Location: .../NorenWS/") -- harmless
+    # for a browser's own WS client (which follows this automatically) but
+    # `websockets.sync.client.connect` doesn't follow redirects during the
+    # handshake at all, so every connection attempt failed with
+    # `InvalidStatus: 301` and silent reconnect-loop retries, never once
+    # reaching authentication. Trailing slash added directly rather than
+    # inferred from Alice Blue's own docs (which show it without one) --
+    # confirmed by hitting the bare host directly from the OCI box.
+    ws_host: str = "wss://ws1.aliceblueonline.com/NorenWS/"
+    contract_master_nfo_url: str = (
+        "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/NFO"
+    )
+    contract_master_nse_url: str = (
+        "https://v2api.aliceblueonline.com/restpy/static/contract_master/V2/NSE"
+    )
+    # Same reasoning as AngelOneSettings.auth_proxy -- unset by default (this
+    # account hasn't hit an IP block on Alice Blue's side yet, unlike Angel
+    # One), but present so a future block doesn't need a code change, just an
+    # env var.
+    auth_proxy: str = ""
+
+    def missing_required_fields(self) -> list[str]:
+        missing = []
+        if not self.app_code:
+            missing.append("ALICEBLUE_APP_CODE")
+        if not self.api_secret.get_secret_value():
+            missing.append("ALICEBLUE_API_SECRET")
+        if not self.redirect_url:
+            missing.append("ALICEBLUE_REDIRECT_URL")
+        return missing
 
 
 class TrueDataSettings(BaseSettings):
@@ -406,6 +501,7 @@ class Settings:
         self.shoonya = ShoonyaSettings()
         self.market_data = MarketDataSettings()
         self.angel_one = AngelOneSettings()
+        self.alice_blue = AliceBlueSettings()
         self.truedata = TrueDataSettings()
         self.risk_defaults = RiskDefaults()
         self.paper_trading = PaperTradingSettings()

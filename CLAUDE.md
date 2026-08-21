@@ -602,6 +602,129 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-21: Angel One archived — settings/code preserved, hidden from
+  UI-driven activation.** Kept aside pending an IP/proxy fix, per explicit
+  user decision ("keep angel one aside... local only... not in the list of
+  brokers listed for activation"). `angel_one.env` credentials removed from
+  the OCI deployment (byte-identical copy confirmed preserved locally
+  first); `AdvancedPage.tsx`'s `FAILOVER_PROVIDERS` and
+  `api.v1.market_data.RECOGNIZED_OVERRIDE_PROVIDERS` no longer list
+  `angel_one` (dropping it from that hardcoded pair also fixed a real
+  pre-existing bug: selecting it would 502, since the live failover backup
+  is actually `shoonya`, not `angel_one` — the two had drifted out of sync
+  with the real `MARKET_DATA_FAILOVER_BACKUP_PROVIDER` config). Everything
+  else — `AngelOneSettings`, `AngelOneMarketDataProvider`,
+  `provider_composition`'s `"angel_one"` support in both
+  `_RECOGNIZED_PROVIDERS` and `_RECOGNIZED_FAILOVER_BACKUPS` — is fully
+  untouched; reactivating is a `MARKET_DATA_FAILOVER_BACKUP_PROVIDER=
+  angel_one` env-var change plus restoring the credentials file, no code
+  changes needed.
+- **2026-08-21: Alice Blue added as a new, market-data-only provider —
+  OAuth login and real WS tick streaming both live-confirmed against the
+  user's real account; not yet the active provider anywhere.** Same
+  "market data and execution are separate ports" architecture Angel
+  One/TrueData already established (`market_data/providers/alice_blue.py`
+  implements `BaseMarketDataProvider`; Shoonya stays execution-only,
+  untouched). `AliceBlueSettings` (`config/credentials/alice_blue.env`,
+  gitignored, real App Code/Secret/Redirect URL from the user's own Alice
+  Blue portal registration) plus `alice_blue_auth.py`
+  (`build_authorize_url`/`exchange_for_session`/`create_ws_session`),
+  `alice_blue_ws_client.py` (Noren-family WS client, deliberately built
+  starting from Shoonya's own *fixed* `ws_client.py` — inherits the
+  `_live_ws` publish-on-connect fix and partial-touchline-merge fix from
+  day one instead of rediscovering them), `alice_blue_scrip_master.py`
+  (confirmed-live V2 JSON contract-master pipeline — NFO options plus a
+  separate `INDICES` endpoint for NIFTY 50/NIFTY BANK index tokens, which
+  turned out to be the exact same `26000`/`26009` NSE tokens Shoonya uses —
+  real evidence Alice Blue runs the same underlying Noren-OMS platform
+  family), and `api.v1.alice_blue` (`/login-url`, `/callback`,
+  `/ws-tick-diagnostic`, `/health-monitor/{start,stop}` + `GET`). Session
+  is disk-cached (`config/credentials/.alice_blue_session_cache.json`,
+  `chmod 600`, gitignored) specifically so a backend restart doesn't force
+  a fresh human browser-login every time — added after landing a real
+  session, then needing it twice more the same session purely to deploy
+  more not-yet-existing code.
+
+  **Two real, live-only bugs found and fixed the same day, both against
+  Alice Blue's own official docs turning out to be wrong**, not just
+  incomplete (same pattern as Shoonya's WS auth saga): (1) the documented
+  WS host (`wss://ws1.aliceblueonline.com/NorenWS`, no trailing slash)
+  301-redirects at the plain-HTTP level to the same URL *with* a trailing
+  slash — `websockets.sync.client.connect` doesn't follow redirects during
+  the handshake, so every connect attempt died before authentication was
+  ever reached; fixed in `AliceBlueSettings.ws_host`'s own default. (2)
+  Even past that, every auth attempt was rejected
+  (`{"t":"ck","s":"NOT_OK"}` — also revealing the doc's own ack-shape
+  example, `{"t":"cf","k":"OK"}`, was wrong too) until two more fixes
+  landed together: a separate `POST .../profile/createWsSess` call
+  (`alice_blue_auth.create_ws_session`, `Authorization: Bearer
+  <userSession>`) must register the WS session server-side *before* every
+  connect attempt (first connect and every reconnect alike — wired into
+  `AliceBlueWSClient` via an `ensure_ws_session` callback, not a one-time
+  call), and the connect frame's `uid`/`actid` must be
+  `f"{client_id}_API"`, not the bare `client_id`. Both fixes together,
+  live-verified: real, correctly-priced NIFTY 50 (~24,252) and NIFTY BANK
+  (~57,762) ticks streamed successfully, both the full `"tk"` snapshot and
+  subsequent `"tf"` partial updates parsing correctly.
+
+  **2026-08-22 superseded**: the standalone `alice_blue_health_monitor.py`
+  module and its `/aliceblue/health-monitor/*` endpoints (the process-
+  boundary problem this note originally described — minting an
+  authenticated session to start it kept getting blocked by the safety
+  classifier) were deleted and replaced by the broker-agnostic "WS Quality
+  Test" feature described in its own entry below, which the *user's own
+  already-authenticated browser session* drives via a real Market Terminal
+  button — no session-minting needed at all. `get_price_history` (REST
+  candle data) is still not implemented — no confirmed endpoint yet,
+  returns `[]`, flagged in its own docstring; doesn't affect the WS tick
+  path at all. `alice_blue` is deliberately not yet added to
+  `provider_composition._RECOGNIZED_FAILOVER_BACKUPS` or the frontend's
+  failover-override dropdown — promote it once a real multi-hour live run
+  (via the new WS Quality Test "Test Failback" button, not just the ~20s
+  connectivity proof from 2026-08-21) exists, same bar Angel One/Shoonya
+  themselves had to clear first.
+- **2026-08-22: "WS Quality Test" — a broker-agnostic market-data health
+  diagnostic, replacing the Alice-Blue-only health-monitor above.** Added
+  to the Market Terminal ribbon (right side, next to the Shoonya/Alice Blue
+  connect buttons): a dropdown ("Test Default" / "Test Failback" / "Both")
+  + Run/Stop button. Deliberately never names a broker anywhere in the UI
+  or backend — "Default" always means whatever `Settings.market_data
+  .provider` currently resolves to, "Failback" always means whatever
+  `Settings.market_data.failover_backup_provider` currently is, resolved
+  fresh every time a test starts (`market_data/diagnostic_session.py`, the
+  same lesson the Angel One archiving bug already taught: never hardcode a
+  provider list that can drift from the real config). Two genuinely
+  different mechanisms per role: "default" just polls the *already-warm*
+  production provider's `get_latest_tick()` (zero new connections, zero
+  added load); "failback" actively tests the backup, either reusing
+  Shoonya's single shared connection (Shoonya allows exactly one — see
+  `BrokerPort.subscribe_quotes`'s own docstring — so this deliberately
+  never unsubscribes when the run stops, to avoid clobbering a different
+  caller's subscription to the same symbol, the same live incident class
+  `broker_port_shim.py`'s own docstring documents twice already) or opening
+  a genuinely isolated `AliceBlueWSClient` connection. Every ~30s while
+  running, one `MarketDataDiagnosticRun`/`MarketDataDiagnosticSnapshot` row
+  pair is written per symbol (migration `0022`) — durable across a backend
+  restart, unlike the old health-monitor's in-memory-only state — and
+  downloadable as a CSV from the Reports tab's now-real "WS/feed quality
+  report" option (`GET /reports/ws-quality-export?on=YYYY-MM-DD`, default
+  today IST). The Reports tab's "EOD trade-log Excel" option was also wired
+  up the same session (`GET /reports/trade-log-export`) — the file itself
+  already existed (`TradeLogExportScheduler`, per-workspace, daily), it
+  just had no download endpoint before (previously pulled by hand over
+  SSH). "Both" mode starts default+failback atomically — validated
+  synchronously against real preconditions (Shoonya connected? Alice Blue
+  session live? is the failback provider even one this module knows how to
+  test?) *before* either thread starts, so an error response is guaranteed
+  to mean nothing started, not "half of it silently did" (a real bug found
+  and fixed via the test suite itself, not live). A second real bug found
+  the same way: this module's first draft called the bare production
+  `session_scope()` directly, which would have written real rows into the
+  dev DB from every test run — the exact incident class this file's own
+  QC-pass notes already warn about for a different module; fixed by
+  threading a swappable `session_factory` through, matching `market_data/
+  registry.py`'s own established pattern. 1032/1032 backend tests pass (up
+  from 1009), ruff/mypy clean.
 - **2026-08-12: Shoonya WS is now the live `MARKET_DATA_PROVIDER`, real
   end-to-end tick streaming confirmed.** `MARKET_DATA_PROVIDER=shoonya` set
   on the OCI `.env`. Found and fixed three real, live-only bugs to get here:

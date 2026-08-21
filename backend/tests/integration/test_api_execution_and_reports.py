@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
 
+from app.core.clock import IST
 from app.core.db.session import get_db
 from app.core.security.passwords import hash_password
 from app.domain.execution.models import Order, Position
@@ -958,3 +959,147 @@ def test_square_off_position_reports_not_filled_synchronously_reason(
         assert "reconciliation/retry" in body["detail"]
     finally:
         _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+# ---------- trade-log-export / ws-quality-export (report downloads) ----------
+
+
+def test_trade_log_export_requires_login(api_client: TestClient):
+    assert api_client.get("/api/v1/reports/trade-log-export").status_code == 401
+
+
+def test_trade_log_export_404s_when_no_workbook_exists_yet(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    response = api_client.get("/api/v1/reports/trade-log-export")
+    assert response.status_code == 404
+
+
+def test_trade_log_export_streams_the_existing_workbook(
+    api_client: TestClient, seeded_admin, tmp_path, monkeypatch
+):
+    import app.api.v1.reports as reports_api
+
+    fake_reports_dir = tmp_path
+    monkeypatch.setattr(reports_api, "REPORTS_DIR", fake_reports_dir)
+    workspace_id = seeded_admin["workspace_id"]
+    fake_path = fake_reports_dir / f"trade_log_{workspace_id}.xlsx"
+    fake_path.write_bytes(b"not a real workbook, just proving the download plumbing works")
+
+    _login(api_client, seeded_admin)
+    response = api_client.get("/api/v1/reports/trade-log-export")
+
+    assert response.status_code == 200
+    assert response.content == fake_path.read_bytes()
+    assert (
+        response.headers["content-type"]
+        == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    assert f"trade_log_{workspace_id}.xlsx" in response.headers["content-disposition"]
+
+
+def test_ws_quality_export_requires_login(api_client: TestClient):
+    assert api_client.get("/api/v1/reports/ws-quality-export").status_code == 401
+
+
+def test_ws_quality_export_returns_header_only_csv_when_nothing_recorded(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    response = api_client.get("/api/v1/reports/ws-quality-export")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    lines = response.text.strip().splitlines()
+    assert lines == ["recorded_at_ist,role,provider,symbol,connected,ltp,tick_ts_ist"]
+
+
+def test_ws_quality_export_includes_this_workspaces_snapshots_only(
+    api_client: TestClient, seeded_admin, engine
+):
+    import uuid as uuid_mod
+    from datetime import UTC, datetime
+
+    from app.domain.ops.models import MarketDataDiagnosticRun, MarketDataDiagnosticSnapshot
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    other_workspace_id = uuid_mod.uuid4()
+    run_id = uuid_mod.uuid4()
+    other_run_id = uuid_mod.uuid4()
+    now = datetime.now(UTC)
+
+    with session_factory() as db:
+        db.add(Workspace(id=other_workspace_id, name=f"other-ws-{other_workspace_id.hex[:8]}"))
+        db.flush()
+        db.add(
+            MarketDataDiagnosticRun(
+                id=run_id,
+                workspace_id=seeded_admin["workspace_id"],
+                role="default",
+                provider="truedata",
+                started_at=now,
+                status="running",
+            )
+        )
+        db.add(
+            MarketDataDiagnosticRun(
+                id=other_run_id,
+                workspace_id=other_workspace_id,
+                role="default",
+                provider="truedata",
+                started_at=now,
+                status="running",
+            )
+        )
+        db.commit()
+        db.add(
+            MarketDataDiagnosticSnapshot(
+                id=uuid_mod.uuid4(),
+                run_id=run_id,
+                recorded_at=now,
+                symbol="NIFTY",
+                connected=True,
+                ltp=24250.5,
+                tick_ts=now,
+            )
+        )
+        db.add(
+            MarketDataDiagnosticSnapshot(
+                id=uuid_mod.uuid4(),
+                run_id=other_run_id,
+                recorded_at=now,
+                symbol="NIFTY",
+                connected=True,
+                ltp=99999.0,
+                tick_ts=now,
+            )
+        )
+        db.commit()
+
+    try:
+        _login(api_client, seeded_admin)
+        # `on` is an IST calendar date (see the endpoint's own docstring),
+        # not `now`'s own UTC date -- these diverge for ~5.5 hours a day
+        # (midnight-5:30am IST), which is exactly the window this test
+        # flaked in when run late at night: `now.date()` (UTC) landed on
+        # the *previous* IST day, so the snapshot recorded "now" fell
+        # outside the queried day's IST boundary the endpoint filters by.
+        response = api_client.get(
+            "/api/v1/reports/ws-quality-export",
+            params={"on": now.astimezone(IST).date().isoformat()},
+        )
+
+        assert response.status_code == 200
+        assert "24250.5" in response.text
+        assert "99999" not in response.text
+    finally:
+        with session_factory() as cleanup_db:
+            cleanup_db.query(MarketDataDiagnosticSnapshot).filter(
+                MarketDataDiagnosticSnapshot.run_id.in_([run_id, other_run_id])
+            ).delete(synchronize_session=False)
+            cleanup_db.query(MarketDataDiagnosticRun).filter(
+                MarketDataDiagnosticRun.id.in_([run_id, other_run_id])
+            ).delete(synchronize_session=False)
+            cleanup_db.query(Workspace).filter(Workspace.id == other_workspace_id).delete()
+            cleanup_db.commit()

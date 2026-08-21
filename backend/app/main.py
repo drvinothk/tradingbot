@@ -53,6 +53,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.v1 import (
+    alice_blue,
     audit,
     auth,
     execution,
@@ -484,6 +485,7 @@ async def lifespan(app: FastAPI):
 
     from app.core.locking import release_advisory_lock
     from app.modules.execution_engine.paper.registry import stop_all as stop_all_position_managers
+    from app.modules.market_data import diagnostic_session
     from app.modules.market_data.market_data_scheduler import stop_market_data_scheduler
     from app.modules.market_data.provider_composition import get_market_data_provider
     from app.modules.market_data.scrip_master_scheduler import (
@@ -501,6 +503,7 @@ async def lifespan(app: FastAPI):
     stop_trade_log_export_scheduler()
     stop_contract_sync_scheduler()
     stop_daily_bootstrap_scheduler()
+    diagnostic_session.stop_all()
     # 2026-08-11: found missing during a live-WS troubleshooting audit —
     # `stop_market_data_scheduler()` only stops that class's own polling
     # thread; it never tears down the actual provider connection.
@@ -545,6 +548,10 @@ def create_app() -> FastAPI:
     # break that redirect. /login-url and /status live at the same
     # unprefixed path for consistency, not because they need to.
     app.include_router(shoonya.router)
+    # Same reasoning as shoonya.router above: ALICEBLUE_REDIRECT_URL
+    # (registered in Alice Blue's own portal) is
+    # https://.../aliceblue/callback with no /api/v1 in it.
+    app.include_router(alice_blue.router)
 
     @app.get("/health")
     def health() -> dict:

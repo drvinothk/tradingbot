@@ -58,6 +58,7 @@ class MarketDataProviderName(enum.StrEnum):
 
     ANGEL_ONE = "angel_one"
     SHOONYA = "shoonya"
+    ALICE_BLUE = "alice_blue"
     MOCK = "mock"
 
 

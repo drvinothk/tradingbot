@@ -108,6 +108,7 @@ def seeded_admin(engine):
     with session_factory() as cleanup_db:
         from app.domain.audit.models import AuditEvent
         from app.domain.identity.models import LoginSession
+        from app.domain.ops.models import MarketDataDiagnosticRun, MarketDataDiagnosticSnapshot
 
         cleanup_db.query(AuditEvent).filter(
             AuditEvent.workspace_id == ids["workspace_id"]
@@ -115,6 +116,19 @@ def seeded_admin(engine):
         cleanup_db.query(MarketDataProviderPreference).filter(
             MarketDataProviderPreference.workspace_id == ids["workspace_id"]
         ).delete()
+        run_ids = [
+            row[0]
+            for row in cleanup_db.query(MarketDataDiagnosticRun.id).filter(
+                MarketDataDiagnosticRun.workspace_id == ids["workspace_id"]
+            )
+        ]
+        if run_ids:
+            cleanup_db.query(MarketDataDiagnosticSnapshot).filter(
+                MarketDataDiagnosticSnapshot.run_id.in_(run_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(MarketDataDiagnosticRun).filter(
+                MarketDataDiagnosticRun.id.in_(run_ids)
+            ).delete(synchronize_session=False)
         cleanup_db.query(LoginSession).filter(LoginSession.user_id == ids["user_id"]).delete()
         cleanup_db.query(UserRole).filter(UserRole.user_id == ids["user_id"]).delete()
         cleanup_db.query(User).filter(User.id == ids["user_id"]).delete()
@@ -152,14 +166,14 @@ def test_patch_sets_a_preference(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
 
     response = api_client.patch(
-        "/api/v1/market-data/provider-preference", json={"active_provider": "angel_one"}
+        "/api/v1/market-data/provider-preference", json={"active_provider": "shoonya"}
     )
 
     assert response.status_code == 200
-    assert response.json()["active_provider"] == "angel_one"
+    assert response.json()["active_provider"] == "shoonya"
 
     get_response = api_client.get("/api/v1/market-data/provider-preference")
-    assert get_response.json()["active_provider"] == "angel_one"
+    assert get_response.json()["active_provider"] == "shoonya"
 
 
 def test_patch_rejects_an_unrecognized_provider(api_client: TestClient, seeded_admin):
@@ -167,6 +181,19 @@ def test_patch_rejects_an_unrecognized_provider(api_client: TestClient, seeded_a
 
     response = api_client.patch(
         "/api/v1/market-data/provider-preference", json={"active_provider": "truedata"}
+    )
+
+    assert response.status_code == 400
+
+
+def test_patch_rejects_archived_angel_one(api_client: TestClient, seeded_admin):
+    """angel_one was archived 2026-08-21 (see CLAUDE.md) -- still a valid
+    provider_composition backend, but no longer a UI-selectable override.
+    """
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/market-data/provider-preference", json={"active_provider": "angel_one"}
     )
 
     assert response.status_code == 400
@@ -214,8 +241,8 @@ def test_patch_applies_live_to_an_existing_failover_provider(
     failover = FailoverMarketDataProvider(
         primary=primary,
         backup=backup,
-        primary_name="shoonya",
-        backup_name="angel_one",
+        primary_name="truedata",
+        backup_name="shoonya",
         failover_threshold_seconds=5.0,
         recovery_stabilization_seconds=20.0,
         backup_retry_seconds=30.0,
@@ -229,12 +256,161 @@ def test_patch_applies_live_to_an_existing_failover_provider(
     _login(api_client, seeded_admin)
 
     response = api_client.patch(
-        "/api/v1/market-data/provider-preference", json={"active_provider": "angel_one"}
+        "/api/v1/market-data/provider-preference", json={"active_provider": "shoonya"}
     )
 
     assert response.status_code == 200
-    assert response.json()["live_active_leg"] == "angel_one"
-    assert failover.active_provider_name == "angel_one"
+    assert response.json()["live_active_leg"] == "shoonya"
+    assert failover.active_provider_name == "shoonya"
     assert backup.subscribe_calls == [["NIFTY"]]
 
     failover.disconnect()
+
+
+# ---------- WS quality diagnostic (Test Default/Test Failback/Both) ----------
+
+
+@pytest.fixture(autouse=True)
+def _reset_diagnostic_session(engine) -> Generator[None, None, None]:
+    """`diagnostic_session` defaults to the production `session_scope` --
+    without this, its background threads would write real rows into the dev
+    DB from inside a test run, the exact incident class CLAUDE.md already
+    documents for a different module. Bound to this file's own isolated
+    `engine` fixture instead, same real-commit-not-rolled-back-transaction
+    reasoning `seeded_admin`'s own `session_factory` already relies on
+    (a background thread needs a real commit to be visible to the test's
+    own separate connection, not a transaction the test fixture will roll
+    back).
+    """
+    from contextlib import contextmanager
+
+    from app.modules.market_data import diagnostic_session
+
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    @contextmanager
+    def _test_session_scope():
+        db = session_factory()
+        try:
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+    diagnostic_session.reset_for_tests(session_factory=_test_session_scope)
+    yield
+    diagnostic_session.reset_for_tests()
+
+
+def test_diagnostic_endpoints_require_login(api_client: TestClient):
+    start_resp = api_client.post(
+        "/api/v1/market-data/diagnostic/start", json={"mode": "default"}
+    )
+    stop_resp = api_client.post("/api/v1/market-data/diagnostic/stop", json={"mode": "default"})
+
+    assert start_resp.status_code == 401
+    assert stop_resp.status_code == 401
+    assert api_client.get("/api/v1/market-data/diagnostic/status").status_code == 401
+
+
+def test_diagnostic_start_rejects_an_unknown_mode(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    response = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "bogus"})
+    assert response.status_code == 400
+
+
+def test_diagnostic_default_role_starts_and_stops_cleanly(api_client: TestClient, seeded_admin):
+    """"default" never needs a real broker connection -- it only reads
+    `get_market_data_provider().get_latest_tick()`, which never triggers a
+    real connect (no ticks have ever arrived, so it just returns `None`),
+    matching `_validate_can_run`'s own "always safe" reasoning regardless
+    of which provider `MARKET_DATA_PROVIDER` happens to resolve to in
+    whatever environment the suite runs in -- deliberately not asserting a
+    specific provider name here, since that's environment config, not this
+    endpoint's own behavior.
+    """
+    from app.config.settings import get_settings
+
+    expected_provider = get_settings().market_data.provider
+    _login(api_client, seeded_admin)
+
+    start_response = api_client.post(
+        "/api/v1/market-data/diagnostic/start", json={"mode": "default"}
+    )
+    assert start_response.status_code == 200
+    body = start_response.json()
+    assert body["default"]["already_running"] is False
+    assert body["default"]["provider"] == expected_provider
+
+    status_response = api_client.get("/api/v1/market-data/diagnostic/status")
+    assert status_response.json()["default"]["running"] is True
+
+    stop_response = api_client.post(
+        "/api/v1/market-data/diagnostic/stop", json={"mode": "default"}
+    )
+    assert stop_response.status_code == 200
+    assert stop_response.json()["default"]["was_running"] is True
+
+    status_after_stop = api_client.get("/api/v1/market-data/diagnostic/status")
+    assert status_after_stop.json()["default"]["running"] is False
+
+
+def test_diagnostic_default_role_start_is_idempotent(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    first = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "default"})
+    second = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "default"})
+
+    assert first.json()["default"]["already_running"] is False
+    assert second.json()["default"]["already_running"] is True
+    assert first.json()["default"]["run_id"] == second.json()["default"]["run_id"]
+
+
+def test_diagnostic_failback_role_rejects_unsupported_provider_synchronously(
+    api_client: TestClient, seeded_admin
+):
+    """Test settings default `failover_backup_provider` is `"angel_one"` --
+    not a broker `diagnostic_session` knows how to run an isolated/shared
+    test against, so this must fail synchronously (409), not silently start
+    a thread that only errors out later -- see `_validate_can_run`'s own
+    docstring for why this distinction was worth a dedicated fix.
+    """
+    _login(api_client, seeded_admin)
+    response = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "failback"})
+    assert response.status_code == 409
+
+    status_response = api_client.get("/api/v1/market-data/diagnostic/status")
+    assert status_response.json()["failback"]["running"] is False
+
+
+def test_diagnostic_failback_role_rejects_when_shoonya_not_connected(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    from app.config.settings import get_settings
+
+    monkeypatch.setattr(get_settings().market_data, "failover_backup_provider", "shoonya")
+    _login(api_client, seeded_admin)
+
+    response = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "failback"})
+    assert response.status_code == 409
+    assert "Shoonya is not connected" in response.json()["detail"]
+
+
+def test_diagnostic_both_mode_is_atomic_when_one_role_fails_validation(
+    api_client: TestClient, seeded_admin
+):
+    """"both" validates every role before starting any of them -- a
+    rejection (failback: unsupported "angel_one" in test settings) must
+    leave *nothing* running, including the otherwise-always-safe "default"
+    role. See `diagnostic_session.start_many`'s own docstring for why this
+    atomicity was a deliberate design choice, not incidental.
+    """
+    _login(api_client, seeded_admin)
+    response = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "both"})
+    assert response.status_code == 409
+
+    status_response = api_client.get("/api/v1/market-data/diagnostic/status").json()
+    assert status_response["default"]["running"] is False
+    assert status_response["failback"]["running"] is False

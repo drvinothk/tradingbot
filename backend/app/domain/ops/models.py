@@ -173,3 +173,54 @@ class GlobalDailyLimitsConfig(Base, UUIDPkMixin, TimestampMixin):
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"), unique=True)
     daily_budget_amount: Mapped[float] = mapped_column(Numeric(14, 2))
     daily_max_lots: Mapped[int] = mapped_column(Integer)
+
+
+class MarketDataDiagnosticRun(Base, UUIDPkMixin, TimestampMixin):
+    """2026-08-22. One row per "Test Default"/"Test Failback" click (`POST
+    /market-data/diagnostic/start`) — see `market_data.diagnostic_session`'s
+    own module docstring for the full mechanism. `role` is `"default"` |
+    `"failback"`, never a broker name directly — the whole point (per
+    explicit user request) is that these buttons never hardcode which
+    provider they test, only *which slot* (primary vs. failover backup),
+    resolved fresh from `Settings.market_data.provider`/
+    `failover_backup_provider` at start time. `provider` records whichever
+    concrete name that resolved to *at that moment*, purely for the report
+    — a mid-run config change is never retroactively relabeled.
+    """
+
+    __tablename__ = "market_data_diagnostic_runs"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
+    role: Mapped[str] = mapped_column(String(20))
+    provider: Mapped[str] = mapped_column(String(20))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20))  # "running" | "stopped" | "error"
+    detail: Mapped[str] = mapped_column(String(500), default="")
+
+    __table_args__ = (
+        Index("ix_market_data_diagnostic_runs_workspace_started", "workspace_id", "started_at"),
+    )
+
+
+class MarketDataDiagnosticSnapshot(Base, UUIDPkMixin):
+    """One row per (run, symbol) roughly every 30s while a run is active —
+    deliberately not every raw tick (which could be several rows a second
+    per symbol across a full trading day for no analytical benefit this
+    report actually needs) — see `diagnostic_session._SNAPSHOT_INTERVAL_
+    SECONDS`. No `TimestampMixin`: `recorded_at` already carries the "when"
+    this row means, same reasoning as `ScripMasterSyncLog.run_at`.
+    """
+
+    __tablename__ = "market_data_diagnostic_snapshots"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("market_data_diagnostic_runs.id"))
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    symbol: Mapped[str] = mapped_column(String(30))
+    connected: Mapped[bool] = mapped_column(Boolean)
+    ltp: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    tick_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_market_data_diagnostic_snapshots_run_recorded", "run_id", "recorded_at"),
+    )

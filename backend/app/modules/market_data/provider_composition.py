@@ -40,6 +40,8 @@ from app.config.settings import get_settings
 from app.core.db.session import session_scope
 from app.domain.ops.models import MarketDataProviderPreference
 from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured
+from app.modules.market_data.providers.alice_blue import AliceBlueMarketDataProvider
+from app.modules.market_data.providers.alice_blue_scrip_master import AliceBlueScripMasterService
 from app.modules.market_data.providers.angel_one import AngelOneMarketDataProvider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
@@ -50,7 +52,7 @@ from app.modules.market_data.scrip_master import ScripMasterService
 
 logger = logging.getLogger("app.market_data.provider_composition")
 
-_RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
+_RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "alice_blue", "mock")
 # Backup legs supported for MARKET_DATA_FAILOVER_BACKUP_PROVIDER today --
 # narrower than _RECOGNIZED_PROVIDERS on purpose: "mock"/self-as-backup are
 # never valid regardless of provider. "shoonya" added 2026-08-17 for the
@@ -61,9 +63,16 @@ _RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "mock")
 # *backup* value -- nothing in this codebase configures it that way yet, and
 # adding it speculatively would just be one more untested combination.
 _RECOGNIZED_FAILOVER_BACKUPS = ("angel_one", "shoonya")
+# alice_blue deliberately excluded from failover-backup scope for now (added
+# 2026-08-21, not yet live-verified past an isolated WS-tick diagnostic) --
+# same "don't let an unproven provider quietly become a live leg" reasoning
+# TrueData's own exclusion comment above already gives. Promote it here once
+# a real multi-hour live tick comparison exists, matching how angel_one/
+# shoonya themselves earned this list.
 
 _provider: BaseMarketDataProvider | None = None
 _scrip_master: ScripMasterService | None = None
+_alice_blue_scrip_master: AliceBlueScripMasterService | None = None
 
 
 def get_scrip_master() -> ScripMasterService:
@@ -81,6 +90,14 @@ def get_scrip_master() -> ScripMasterService:
     return _scrip_master
 
 
+def get_alice_blue_scrip_master() -> AliceBlueScripMasterService:
+    """Same reasoning as `get_scrip_master` above, Alice Blue's own mirror."""
+    global _alice_blue_scrip_master
+    if _alice_blue_scrip_master is None:
+        _alice_blue_scrip_master = AliceBlueScripMasterService()
+    return _alice_blue_scrip_master
+
+
 def _build_provider(name: str, settings: object) -> BaseMarketDataProvider:
     """Constructs a single raw provider by name -- shared by primary
     selection and, when failover is enabled, backup selection below, so
@@ -90,6 +107,8 @@ def _build_provider(name: str, settings: object) -> BaseMarketDataProvider:
         return AngelOneMarketDataProvider(settings.angel_one, get_scrip_master())  # type: ignore[attr-defined]
     if name == "truedata":
         return TrueDataProvider(settings.truedata)  # type: ignore[attr-defined]
+    if name == "alice_blue":
+        return AliceBlueMarketDataProvider(settings.alice_blue, get_alice_blue_scrip_master())  # type: ignore[attr-defined]
     return BrokerPortMarketDataAdapter(get_broker())
 
 
@@ -289,10 +308,11 @@ def set_market_data_provider(provider: BaseMarketDataProvider | None) -> None:
 
 
 def reset_for_tests() -> None:
-    global _provider, _scrip_master
+    global _provider, _scrip_master, _alice_blue_scrip_master
     if _provider is not None:
         close = getattr(_provider, "close", None)
         if callable(close):
             close()
     _provider = None
     _scrip_master = None
+    _alice_blue_scrip_master = None
