@@ -78,6 +78,95 @@ logger = logging.getLogger("app.broker_adapter.shoonya")
 # NFO contract, per this module's own docstring.
 KNOWN_UNDERLYINGS: tuple[str, ...] = ("NIFTY", "BANKNIFTY")
 
+# ModifyOrder's own Noren field names, per Shoonya-Dev's README -- see
+# ShoonyaBrokerAdapter.modify_order's own docstring for why this mapping
+# exists (keeping this broker's own field names out of the broker-agnostic
+# execution_engine.paper.service caller).
+_MODIFY_FIELD_TO_SHOONYA: dict[str, str] = {
+    "trigger_price": "trgprc",
+    "limit_price": "prc",
+    "qty": "qty",
+}
+
+# Bracket-order research Phase A — candidate field names for `prarr`'s
+# per-object exchange/product-code, since the primary source (Shoonya-Dev's
+# own README) documents `prarr` only as "Json array of Product Obj with
+# enabled products" without ever specifying the object's own field names.
+# Deliberately a short, explicit list rather than a broad heuristic (e.g.
+# "any key containing 'exch'") — a wrong guess here must fail closed
+# (return `None`, not a confident wrong boolean), never silently match
+# something unrelated.
+#
+# **Live-confirmed 2026-08-21** against a real account's `UserDetails`
+# response: `prd` and `exch` were both right on the first guess, but
+# `exch` is a **list** of exchange codes per product
+# (`{'prd': 'B', 's_prdt_ali': 'BO', 'exch': ['NSE', 'NFO', 'CDS', 'MCX',
+# 'BSE']}`), not a single string — the original scalar-only comparison
+# silently matched nothing and fell through to the "unrecognized shape"
+# branch on real data. Fixed to accept either shape. Also confirmed live:
+# `UserDetails` is a real, working endpoint for this codebase's OAuth flow
+# (returned rich data, not an error) — the "unconfirmed for OAuth" caveat
+# on `ShoonyaRestClient.user_details` no longer applies, though left
+# in place there since it's harmless context. The OAuth `GenAcsTok`
+# response's own `prarr` was a real but empty list (`[]`) the same call —
+# `UserDetails` is the only source that actually works, not just a backup.
+_PRARR_EXCHANGE_FIELD_CANDIDATES: tuple[str, ...] = ("exch", "s_exch", "exchange")
+_PRARR_PRODUCT_FIELD_CANDIDATES: tuple[str, ...] = ("prd", "s_prdt_ali", "prod", "product")
+
+
+def _derive_nfo_bo_co_flags(prarr: object) -> dict:
+    """Best-effort only — see the module-level candidate lists above for
+    why. Returns `None` for both flags (never a guessed `False`) unless an
+    NFO-scoped entry is actually found using a recognized field-name shape,
+    so this can never look identical to a confirmed "not enabled." Always
+    pair this with the raw `prarr` in any log line — a human should verify
+    the derivation, not trust it blindly, per this session's own bracket-
+    order research plan.
+    """
+    if not isinstance(prarr, list):
+        return {
+            "nfo_bo_enabled": None,
+            "nfo_co_enabled": None,
+            "derivation": "prarr missing or not a list — inspect raw_prarr manually",
+        }
+
+    matched_products: set[str] = set()
+    for item in prarr:
+        if not isinstance(item, dict):
+            continue
+        exch_raw = next(
+            (item[key] for key in _PRARR_EXCHANGE_FIELD_CANDIDATES if key in item), None
+        )
+        if exch_raw is None:
+            continue
+        # Live-confirmed shape is a list of exchange codes per product, but
+        # accept a bare string too in case some other account/response
+        # shape uses one exchange per prarr entry instead.
+        exch_values = exch_raw if isinstance(exch_raw, list) else [exch_raw]
+        if not any(str(exch).upper() == "NFO" for exch in exch_values):
+            continue
+        prd_value = next(
+            (str(item[key]).upper() for key in _PRARR_PRODUCT_FIELD_CANDIDATES if key in item),
+            None,
+        )
+        if prd_value:
+            matched_products.add(prd_value)
+
+    if not matched_products:
+        return {
+            "nfo_bo_enabled": None,
+            "nfo_co_enabled": None,
+            "derivation": (
+                "no NFO-scoped prarr entry matched a known exchange/product field name — "
+                "inspect raw_prarr manually"
+            ),
+        }
+    return {
+        "nfo_bo_enabled": "B" in matched_products,
+        "nfo_co_enabled": "H" in matched_products,
+        "derivation": f"matched NFO product codes: {sorted(matched_products)}",
+    }
+
 # Live-confirmed via a diagnostic log of real search_scrip("NSE", "NIFTY")
 # results: Shoonya's NSE tsym for the index isn't the bare "NIFTY"/
 # "BANKNIFTY" name used everywhere else in this codebase — it's a distinct
@@ -626,6 +715,42 @@ class ShoonyaBrokerAdapter(BrokerPort):
         if self._ws is not None:
             self._ws.unsubscribe(contract_symbols)
 
+    def get_product_capabilities(self) -> dict:
+        """Bracket-order research **Phase A** (2026-08-21) — read-only,
+        places/modifies/cancels nothing. Calls `UserDetails` (unconfirmed
+        for this OAuth-authenticated flow, see
+        `ShoonyaRestClient.user_details`'s own docstring) to get this
+        *specific account's* enabled exchange/product list (`exarr`/
+        `prarr`) — the only reliable way to know whether `prd='B'`/`'H'`
+        (bracket/cover order) are actually usable on NFO for this account,
+        per Shoonya-Dev's own README ("select prd from prarr, allowed for
+        the selected exchange").
+
+        Never raises — a diagnostic failing must never take down whatever
+        called it (same discipline as `diagnose_ws_auth` just below).
+        `nfo_bo_enabled`/`nfo_co_enabled` are best-effort
+        (`_derive_nfo_bo_co_flags`) and can be `None`; always inspect
+        `raw_prarr` directly before trusting them for anything.
+        """
+        try:
+            details = self._rest.user_details(self._uid)
+        except Exception as exc:
+            return {
+                "read_only": True,
+                "source": "UserDetails",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        exarr = details.get("exarr")
+        prarr = details.get("prarr")
+        return {
+            "read_only": True,
+            "source": "UserDetails",
+            "raw_exarr": exarr,
+            "raw_prarr": prarr,
+            **_derive_nfo_bo_co_flags(prarr),
+        }
+
     def diagnose_ws_auth(self) -> dict:
         """One-shot, synchronous connect+auth against `ws_host` — bypasses
         `ShoonyaWSClient`'s background reconnect loop so a live diagnostic
@@ -833,11 +958,38 @@ class ShoonyaBrokerAdapter(BrokerPort):
         return None
 
     def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
+        """`ModifyOrder`'s required fields per Shoonya-Dev's own README are
+        `norenordno`/`exch`/`tsym`/`uid` -- not just the order id, unlike
+        `CancelOrder`'s minimal `{uid, norenordno}` shape. **Real bug fixed
+        here, caught before ever going live**: Phase B found zero
+        production callers of `modify_order` anywhere in this codebase, so
+        this had never actually been exercised -- the original version
+        sent only `uid`/`norenordno` plus whatever `**changes` were given,
+        which a real account would have rejected outright for missing
+        `exch`/`tsym`. `contract_symbol` is therefore a required key in
+        `changes` now (raises `ValueError` if missing, same "fail loud on
+        a real design error" reasoning as `place_order`'s own 1-lot
+        hardcap), and callers use the same broker-agnostic kwarg names
+        `OrderRequest` already uses (`trigger_price`, `limit_price`),
+        translated to Noren's own field names here -- the identical
+        abstraction boundary `to_place_order_payload` already keeps for
+        `place_order`, so a caller in `execution_engine.paper.service`
+        never has to know Shoonya's own field names.
+        """
+        remaining = dict(changes)
+        contract_symbol = remaining.pop("contract_symbol", None)
+        if not isinstance(contract_symbol, str) or not contract_symbol:
+            raise ValueError("modify_order requires a contract_symbol kwarg to derive exch/tsym")
+
         payload = {
             "uid": self._uid,
             "norenordno": broker_order_id,
-            **{k: str(v) for k, v in changes.items()},
+            "exch": normalizer._exchange_from_symbol(contract_symbol),  # noqa: SLF001
+            "tsym": contract_symbol,
         }
+        for key, value in remaining.items():
+            payload[_MODIFY_FIELD_TO_SHOONYA.get(key, key)] = str(value)
+
         raw = self._rest.modify_order(payload)
         return normalizer.parse_order_result(raw, idempotency_key=broker_order_id)
 

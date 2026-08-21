@@ -69,6 +69,33 @@ def test_exchange_code_for_token_non_json_body_raises():
         auth.exchange_code_for_token(SETTINGS, "auth-code", http_client=client)
 
 
+def test_exchange_code_for_token_captures_raw_login_capabilities_when_present():
+    """Bracket-order research Phase A — whether GenAcsTok's OAuth response
+    ever actually includes exarr/prarr is unconfirmed against a real
+    account; this only locks in the pass-through behavior this codebase
+    controls (capture verbatim if present).
+    """
+    client = _client_with_response(
+        {
+            "susertoken": "tok-123",
+            "actid": "FA12345",
+            "exarr": ["NFO", "NSE"],
+            "prarr": [{"exch": "NFO", "prd": "M"}],
+        }
+    )
+    session = auth.exchange_code_for_token(SETTINGS, "auth-code", http_client=client)
+    assert session.raw_login_capabilities == {
+        "exarr": ["NFO", "NSE"],
+        "prarr": [{"exch": "NFO", "prd": "M"}],
+    }
+
+
+def test_exchange_code_for_token_raw_login_capabilities_none_when_absent():
+    client = _client_with_response({"susertoken": "tok-123", "actid": "FA12345"})
+    session = auth.exchange_code_for_token(SETTINGS, "auth-code", http_client=client)
+    assert session.raw_login_capabilities is None
+
+
 def test_exchange_code_for_token_sends_jdata_form_field():
     """Live-corrected shape — `GenAcsTok` (like every other Noren endpoint)
     wants a `jData=<json-string>` form field, not a plain JSON body. A real

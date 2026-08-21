@@ -70,6 +70,8 @@ class _FakeRestClient:
         # connection (with __cause__ set to an httpx.HTTPError) vs a clean
         # stat:Not_Ok rejection (no httpx cause).
         self.place_order_raises: Exception | None = None
+        self.user_details_response: dict = {"exarr": [], "prarr": []}
+        self.user_details_raises: Exception | None = None
 
     def _record(self, name, *args, **kwargs):
         self.calls.append((name, args, kwargs))
@@ -124,6 +126,12 @@ class _FakeRestClient:
         self._record("position_book", uid, actid)
         return [{"tsym": "NIFTY30JUL26C24000", "netqty": "25", "netavgprc": "119.5"}]
 
+    def user_details(self, uid):
+        self._record("user_details", uid)
+        if self.user_details_raises is not None:
+            raise self.user_details_raises
+        return self.user_details_response
+
     def close(self):
         pass
 
@@ -139,6 +147,124 @@ def _adapter(
 def test_authenticate_returns_the_held_auth_result():
     adapter, _ = _adapter()
     assert adapter.authenticate() == AUTH_RESULT
+
+
+def test_modify_order_derives_exch_tsym_and_translates_field_names():
+    """Real bug fixed before ever going live: the original `modify_order`
+    sent only `uid`/`norenordno`, missing Shoonya's own *required*
+    `exch`/`tsym` fields (confirmed via Shoonya-Dev's own README) — never
+    caught earlier since Phase B found zero production callers. This locks
+    in the fix: `contract_symbol` derives `exch`/`tsym`, and broker-
+    agnostic kwarg names translate to Noren's own field names.
+    """
+    rest = _FakeRestClient()
+    adapter, rest = _adapter(rest)
+
+    adapter.modify_order(
+        "ORD1", contract_symbol="NIFTY25AUG26C24250", trigger_price=90.35, limit_price=90.15
+    )
+
+    call = next(c for c in rest.calls if c[0] == "modify_order")
+    payload = call[1][0]
+    assert payload["norenordno"] == "ORD1"
+    assert payload["uid"] == "FA1"
+    assert payload["exch"] == "NFO"
+    assert payload["tsym"] == "NIFTY25AUG26C24250"
+    assert payload["trgprc"] == "90.35"
+    assert payload["prc"] == "90.15"
+    assert "contract_symbol" not in payload
+    assert "trigger_price" not in payload
+    assert "limit_price" not in payload
+
+
+def test_modify_order_requires_contract_symbol():
+    adapter, _ = _adapter()
+
+    with pytest.raises(ValueError, match="contract_symbol"):
+        adapter.modify_order("ORD1", trigger_price=90.35)
+
+
+def test_get_product_capabilities_derives_nfo_bo_co_flags_from_prarr():
+    """Bracket-order research Phase A — confirms the derivation logic
+    correctly reads a recognizable exch/prd shape, without asserting that
+    this is actually the real Shoonya `prarr` object shape (unconfirmed,
+    see `_derive_nfo_bo_co_flags`'s own docstring).
+    """
+    rest = _FakeRestClient()
+    rest.user_details_response = {
+        "exarr": ["NFO", "NSE"],
+        "prarr": [
+            {"exch": "NSE", "prd": "C"},
+            {"exch": "NFO", "prd": "M"},
+            {"exch": "NFO", "prd": "B"},
+        ],
+    }
+    adapter, rest = _adapter(rest)
+
+    result = adapter.get_product_capabilities()
+
+    assert result["read_only"] is True
+    assert result["raw_exarr"] == ["NFO", "NSE"]
+    assert result["nfo_bo_enabled"] is True
+    assert result["nfo_co_enabled"] is False
+    assert [c[0] for c in rest.calls] == ["user_details"]
+
+
+def test_get_product_capabilities_handles_live_confirmed_list_shaped_exch():
+    """2026-08-21, live-confirmed against a real account: `exch` is a list
+    of exchange codes per product, not a single string
+    (`{'prd': 'B', 's_prdt_ali': 'BO', 'exch': ['NSE', 'NFO', ...]}`) — the
+    real regression this test locks in, found via the live diagnostic
+    itself. This account has both BO ('B') and CO ('H') enabled for NFO.
+    """
+    rest = _FakeRestClient()
+    rest.user_details_response = {
+        "exarr": ["NSE", "NFO", "CDS", "BSE", "MCX", "BCD", "NIPO", "BFO", "BIPO"],
+        "prarr": [
+            {"prd": "B", "s_prdt_ali": "BO", "exch": ["NSE", "NFO", "CDS", "MCX", "BSE"]},
+            {"prd": "C", "s_prdt_ali": "CNC", "exch": ["NSE", "BSE", "NIPO", "BIPO"]},
+            {"prd": "H", "s_prdt_ali": "CO", "exch": ["NSE", "NFO", "CDS", "MCX", "BSE"]},
+            {
+                "prd": "I",
+                "s_prdt_ali": "MIS",
+                "exch": ["NSE", "BSE", "NFO", "BFO", "CDS", "BCD", "MCX"],
+            },
+            {"prd": "M", "s_prdt_ali": "NRML", "exch": ["NFO", "BFO", "CDS", "BCD", "MCX"]},
+        ],
+    }
+    adapter, _ = _adapter(rest)
+
+    result = adapter.get_product_capabilities()
+
+    assert result["nfo_bo_enabled"] is True
+    assert result["nfo_co_enabled"] is True
+
+
+def test_get_product_capabilities_returns_none_flags_when_prarr_shape_unrecognized():
+    """Must fail closed — a `prarr` object shape that doesn't match any
+    known field name must never be silently reported as `False`
+    (indistinguishable from a confirmed "not enabled").
+    """
+    rest = _FakeRestClient()
+    rest.user_details_response = {"exarr": ["NFO"], "prarr": [{"unexpected_field": "NFO/B"}]}
+    adapter, _ = _adapter(rest)
+
+    result = adapter.get_product_capabilities()
+
+    assert result["nfo_bo_enabled"] is None
+    assert result["nfo_co_enabled"] is None
+    assert result["raw_prarr"] == [{"unexpected_field": "NFO/B"}]
+
+
+def test_get_product_capabilities_survives_user_details_failure():
+    rest = _FakeRestClient()
+    rest.user_details_raises = ShoonyaApiError("UserDetails", "no such endpoint")
+    adapter, _ = _adapter(rest)
+
+    result = adapter.get_product_capabilities()
+
+    assert result["read_only"] is True
+    assert "no such endpoint" in result["error"]
 
 
 def test_get_instrument_master_prefers_the_static_scrip_master_for_nfo(monkeypatch):

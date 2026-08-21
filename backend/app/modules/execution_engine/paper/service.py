@@ -43,6 +43,7 @@ crossed with this one, which nothing in this codebase does.
 
 from __future__ import annotations
 
+import enum
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -353,7 +354,7 @@ def dispatch_trade_intent(
 
         if order.status == OrderStatus.FILLED:
             _open_position_from_fill(
-                db, trading_session, trade_intent, option_contract, order, side
+                db, trading_session, trade_intent, option_contract, order, side, broker
             )
         elif order.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED):
             # 2026-08-20, live incident: a synchronously-rejected order left
@@ -380,6 +381,7 @@ def _open_position_from_fill(
     option_contract: OptionContract,
     order: Order,
     side: SignalSide,
+    broker: BrokerPort,
 ) -> Position:
     now = _utcnow()
     entry_price = _dec(order.avg_fill_price)
@@ -451,6 +453,18 @@ def _open_position_from_fill(
     db.add_all([stop_plan, trail_plan])
     db.flush()
 
+    # LIVE-only crash-resilience layer (bracket/cover orders confirmed
+    # unavailable for options on Shoonya -- see the build plan's bracket-
+    # order research; this is the "Hard SL with Local Target" design that
+    # replaced it). `order` is this position's own opening order, so its
+    # `mode` *is* the per-position live/paper signal -- same source of
+    # truth as `broker_adapter.composition._position_opened_live`, just
+    # read directly since it's already in hand here rather than re-fetched.
+    # PAPER positions are untouched: today's pure local-monitoring stays
+    # the only mechanism, unchanged.
+    if order.mode == OrderMode.LIVE:
+        _place_protective_stop(db, trading_session, position, stop_plan, option_contract, broker)
+
     record_event(
         db,
         workspace_id=trading_session.workspace_id,
@@ -486,6 +500,158 @@ def _open_position_from_fill(
     # fixtures to accidentally bypass.
 
     return position
+
+
+def _place_protective_stop(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    stop_plan: StopPlan,
+    option_contract: OptionContract,
+    broker: BrokerPort,
+) -> None:
+    """LIVE-only crash-resilience layer: places a real broker-side SL-LMT
+    immediately on entry fill, tagged `stop:{position_id}` (distinct from
+    the existing `exit:{position_id}` convention `close_position` uses) so
+    `reconcile_pending_live_exit_orders`/`_apply_resolved_pending_exit_order`
+    can tell "the resting stop itself filled" apart from "a manual/target
+    exit filled" — see that function's own branch. `SL-MKT` is exchange-
+    banned for options since 2021-09-27 (confirmed, see project memory),
+    hence `SL_LIMIT`, never `SL_MARKET`.
+
+    Never raises — a placement failure must leave the position exactly as
+    protected as it was before this feature existed (today's pure local
+    stop/target/trail monitoring), not worse. On failure: log, raise a
+    CRITICAL `SystemAlert`, and return with `stop_plan.resting_order_id`
+    left `None` — `evaluate_open_position`'s own stop check only skips
+    itself when `resting_order_id` is set, so a `None` here means local
+    monitoring keeps working exactly as it does for every position today.
+
+    Deliberately does **not** call `run_preflight_checks` (unlike every
+    other LIVE order this module places) — that gate exists to block a
+    *new risk-taking* dispatch on stale option-chain data or thin margin,
+    but a protective stop *reduces* risk. Gating it the same way would be
+    actively counterproductive: margin is often at its tightest right after
+    the entry that just consumed it, which is exactly when this must not
+    be skipped.
+    """
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    if instrument is None:
+        return
+
+    exit_side = _opposite(SignalSide(position.side))
+    tick_size = _dec(instrument.tick_size)
+    trigger_price = _round_to_tick(_dec(stop_plan.stop_price), tick_size, exit_side)
+    # Same buffer/tick discipline as every other LIVE limit-priced exit in
+    # this module (see `_apply_slippage`/`_round_to_tick`'s own docstrings)
+    # -- the limit price trails the trigger by the protective buffer so the
+    # order can actually execute once triggered, not sit rejected-on-fill
+    # for being priced exactly at a level the market has already passed.
+    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+    limit_price = _round_to_tick(
+        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    )
+    stop_idempotency_key = f"stop:{position.id}"
+
+    try:
+        order_result = broker.place_order(
+            OrderRequest(
+                idempotency_key=stop_idempotency_key,
+                contract_symbol=option_contract.symbol,
+                side=_to_broker_side(exit_side),
+                order_type=BrokerOrderType.SL_LIMIT,
+                qty=position.qty,
+                limit_price=float(limit_price),
+                trigger_price=float(trigger_price),
+                lot_size=instrument.lot_size,
+                tag=f"session:{trading_session.id}",
+            )
+        )
+    except Exception:  # noqa: BLE001 - see this function's own "never raises" contract
+        # Broader than `BrokerError` deliberately: this function's own
+        # docstring promises to never leave the position worse off than
+        # before this feature existed, and `_open_position_from_fill`
+        # (this function's only caller) has nothing wrapping it either --
+        # an uncaught exception here would abort the entire entry-fill
+        # transaction for a position the broker has *already genuinely
+        # filled*, or (via evaluate_open_position's own un-wrapped
+        # PositionManager call site) abort that whole cycle's handling of
+        # every other open position in the session, not just this one.
+        # `place_order`'s own 1-lot `CriticalSafetyException` is a real,
+        # concrete example of a non-`BrokerError` this must still catch.
+        logger.exception(
+            "protective SL-LMT placement failed for position %s -- falling back to "
+            "local-only stop/target/trail monitoring for this position",
+            position.id,
+        )
+        db.add(
+            SystemAlert(
+                id=uuid.uuid4(),
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="protective_stop_placement_failed",
+                message=(
+                    f"Protective SL-LMT placement failed for position {position.id}; "
+                    "using local-only monitoring."
+                ),
+                created_at=_utcnow(),
+            )
+        )
+        db.flush()
+        return
+
+    now = _utcnow()
+    stop_order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        position_id=position.id,
+        idempotency_key=stop_idempotency_key,
+        mode=OrderMode.LIVE,
+        side=_to_domain_side(exit_side),
+        order_type=OrderType.SL_LIMIT,
+        qty=position.qty,
+        status=_map_status(order_result.status),
+        filled_qty=order_result.filled_qty,
+        avg_fill_price=order_result.avg_fill_price,
+        broker_order_id=order_result.broker_order_id,
+        submitted_at=now,
+        updated_at=now,
+    )
+    db.add(stop_order)
+    stop_plan.resting_order_id = order_result.broker_order_id
+    stop_plan.resting_order_price = float(trigger_price)
+    stop_plan.updated_at = now
+    db.add(stop_plan)
+    db.flush()
+
+    db.add(
+        OrderEvent(
+            id=uuid.uuid4(),
+            order_id=stop_order.id,
+            event_type="filled" if stop_order.status == OrderStatus.FILLED else "submitted",
+            raw_payload={
+                "broker_order_id": order_result.broker_order_id,
+                "status": order_result.status.value,
+                "filled_qty": order_result.filled_qty,
+                "avg_fill_price": order_result.avg_fill_price,
+            },
+            ts=now,
+        )
+    )
+
+    # Defensive only -- a real resting stop shouldn't fill synchronously at
+    # placement (its trigger is on the wrong side of the current price by
+    # construction), but every other order in this system already handles
+    # this synchronous/asynchronous duality, so this does too rather than
+    # leaving a FILLED order dangling with resting_order_id still set.
+    if stop_order.status == OrderStatus.FILLED and stop_order.avg_fill_price is not None:
+        _finalize_position_close(
+            db, trading_session, position, stop_order, ExitReason.STOP, OrderMode.LIVE, None
+        )
+        db.flush()
 
 
 # 2026-08-20, live incident: a real Shoonya LIVE LIMIT order (Test 1,
@@ -584,7 +750,9 @@ def reconcile_pending_live_orders(
         if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
             continue
 
-        _apply_resolved_pending_order(db, trading_session, trade_intent, order, result)
+        _apply_resolved_pending_order(
+            db, trading_session, trade_intent, order, result, resolved_broker
+        )
         db.flush()
 
 
@@ -607,6 +775,7 @@ def _apply_resolved_pending_order(
     trade_intent: TradeIntent,
     order: Order,
     result: OrderResult,
+    broker: BrokerPort,
 ) -> None:
     now = _utcnow()
     order.status = _map_status(result.status)
@@ -636,7 +805,7 @@ def _apply_resolved_pending_order(
         if option_contract is not None:
             side = SignalSide(trade_intent.side)
             _open_position_from_fill(
-                db, trading_session, trade_intent, option_contract, order, side
+                db, trading_session, trade_intent, option_contract, order, side, broker
             )
     else:
         # REJECTED/CANCELLED discovered after the fact: TradeIntent.status
@@ -699,6 +868,232 @@ def resolve_broker_for_position(
     return get_execution_broker(trading_session, strategy_run, position=position)
 
 
+class _CancelOutcome(enum.Enum):
+    """Result of `_cancel_resting_protective_stop` — deliberately not
+    exposed anywhere beyond `close_position`'s own use of it; this is
+    call-site plumbing, not a domain concept."""
+
+    CANCELLED = "cancelled"
+    ALREADY_FILLED = "already_filled"
+    FAILED = "failed"
+
+
+def _cancel_resting_protective_stop(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    stop_plan: StopPlan,
+    resting_order_id: str,
+    broker: BrokerPort,
+) -> _CancelOutcome:
+    """Cancels this position's resting protective SL-LMT before
+    `close_position` proceeds with any other exit reason — see that
+    function's own comment for the safety invariant this exists to
+    protect. Never raises; every outcome (including a genuine failure) is
+    reported back as a `_CancelOutcome` so the caller can decide what's
+    safe to do next rather than this helper guessing. `resting_order_id`
+    is passed explicitly (not re-read from `stop_plan`) so a caller that
+    already narrowed it non-`None` doesn't lose that at this call boundary.
+    """
+    now = _utcnow()
+    try:
+        result = broker.cancel_order(resting_order_id)
+    except Exception:  # noqa: BLE001 - see _place_protective_stop's identical reasoning
+        # Broader than `BrokerError` deliberately -- `close_position` has
+        # nothing wrapping this call either, and an uncaught exception here
+        # would abort whatever closed this position for (target/EOD/
+        # manual/margin-breach), same "never worse off, never crash the
+        # caller" contract every helper in this feature makes.
+        logger.exception(
+            "failed to cancel resting protective stop %s for position %s -- "
+            "not proceeding with a new exit order until this is resolved",
+            resting_order_id,
+            position.id,
+        )
+        db.add(
+            SystemAlert(
+                id=uuid.uuid4(),
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="protective_stop_cancel_failed",
+                message=(
+                    f"Failed to cancel resting protective stop for position "
+                    f"{position.id}; exit deferred."
+                ),
+                created_at=now,
+            )
+        )
+        db.flush()
+        return _CancelOutcome.FAILED
+
+    if result.status == BrokerOrderStatus.FILLED:
+        # The stop fired before our cancel reached the broker -- record its
+        # real fill on the stop order's own row; the caller finalizes the
+        # position as STOP from there.
+        stop_order = (
+            db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one_or_none()
+        )
+        if stop_order is not None:
+            stop_order.status = OrderStatus.FILLED
+            stop_order.filled_qty = result.filled_qty
+            stop_order.avg_fill_price = result.avg_fill_price
+            stop_order.updated_at = now
+            db.add(stop_order)
+        stop_plan.resting_order_id = None
+        stop_plan.resting_order_price = None
+        stop_plan.updated_at = now
+        db.add(stop_plan)
+        db.flush()
+        return _CancelOutcome.ALREADY_FILLED
+
+    if result.status == BrokerOrderStatus.CANCELLED:
+        stop_plan.resting_order_id = None
+        stop_plan.resting_order_price = None
+        stop_plan.updated_at = now
+        db.add(stop_plan)
+        db.flush()
+        return _CancelOutcome.CANCELLED
+
+    # Any other status (still pending-cancel, an unexpected rejection of
+    # the cancel itself, etc.) is ambiguous -- same conservative treatment
+    # as the BrokerError case above, never guess.
+    logger.error(
+        "cancel_order for resting protective stop %s (position %s) returned "
+        "unexpected status %s -- not proceeding with a new exit order",
+        resting_order_id,
+        position.id,
+        result.status,
+    )
+    db.add(
+        SystemAlert(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="protective_stop_cancel_unresolved",
+            message=(
+                f"Cancelling resting protective stop for position {position.id} "
+                f"returned unexpected status {result.status.value}; exit deferred."
+            ),
+            created_at=now,
+        )
+    )
+    db.flush()
+    return _CancelOutcome.FAILED
+
+
+def _sync_resting_protective_stop(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    stop_plan: StopPlan,
+    resting_order_id: str,
+    desired_trigger_price: Decimal,
+    broker: BrokerPort | None,
+) -> None:
+    """Keeps this position's resting protective SL-LMT's own trigger/limit
+    price in step with `desired_trigger_price` (the current effective
+    protective floor — `trail_plan.current_stop_price` once trail is
+    active, computed by `evaluate_open_position`'s own step 5) via a real
+    `ModifyOrder` call — the TSL half of "Hard SL with Local Target",
+    `_place_protective_stop`'s placement being the other half.
+
+    **Fallback if the modify is rejected**: never raises, and never
+    touches `stop_plan.resting_order_id` — the resting order itself is
+    untouched, still armed at its last successfully-confirmed price, which
+    is real, valid protection, just not yet at the tightened level. Only
+    `stop_plan.resting_order_price` tracks "the price we last successfully
+    confirmed" versus "the price we currently want" — if a modify fails,
+    those two values keep disagreeing, so this same function retries on
+    every later cycle the trail is active, with no separate retry/backoff
+    bookkeeping needed. Critically, the position's actual exit (target/
+    trail/structure/spread/EOD/manual/margin-breach) never depends on the
+    resting order's own armed price at all — `close_position`'s Path B
+    (`_cancel_resting_protective_stop`) always cancels whatever is resting
+    and places a fresh exit at the locally-computed intended price,
+    regardless of what price the resting order happened to be armed at —
+    so a stuck/failed sync only degrades this position's *crash-only*
+    resilience for the trailed delta, never its normal (process-alive)
+    exit correctness. A `WARNING`, not `CRITICAL`, `SystemAlert` reflects
+    that: the position is not left unprotected, just running on its last
+    confirmed level.
+    """
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        return
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    if instrument is None:
+        return
+
+    exit_side = _opposite(SignalSide(position.side))
+    tick_size = _dec(instrument.tick_size)
+    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
+
+    # Compare tick-*rounded* values, not the raw Decimal the trail
+    # arithmetic produced -- `desired_trigger_price` creeps by sub-tick
+    # amounts most cycles, which would otherwise trigger a redundant
+    # ModifyOrder call even when the actual price at the broker wouldn't
+    # change at all once rounded.
+    current_price = (
+        _dec(stop_plan.resting_order_price) if stop_plan.resting_order_price is not None else None
+    )
+    if current_price is not None and current_price == trigger_price:
+        return
+
+    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+    limit_price = _round_to_tick(
+        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    )
+    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
+
+    try:
+        resolved_broker.modify_order(
+            resting_order_id,
+            contract_symbol=option_contract.symbol,
+            trigger_price=float(trigger_price),
+            limit_price=float(limit_price),
+        )
+    except Exception:  # noqa: BLE001 - see _place_protective_stop's identical reasoning
+        # Broader than `BrokerError` deliberately -- `evaluate_open_
+        # position` has nothing wrapping this call, and PositionManager's
+        # own per-position loop has no try/except around evaluate_open_
+        # position either, so an uncaught exception here would abort that
+        # entire cycle's handling of every other open position in the
+        # session, not just this one's TSL sync.
+        logger.warning(
+            "TSL sync failed for position %s (resting order %s) -- resting stop stays "
+            "armed at its last confirmed price %s, not the newly tightened %s; will "
+            "retry next cycle",
+            position.id,
+            resting_order_id,
+            stop_plan.resting_order_price,
+            float(trigger_price),
+            exc_info=True,
+        )
+        db.add(
+            SystemAlert(
+                id=uuid.uuid4(),
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.WARNING,
+                category="protective_stop_modify_failed",
+                message=(
+                    f"TSL modify failed for position {position.id}; resting stop still "
+                    f"armed at {stop_plan.resting_order_price}, not yet {float(trigger_price)}."
+                ),
+                created_at=_utcnow(),
+            )
+        )
+        db.flush()
+        return
+
+    stop_plan.resting_order_price = float(trigger_price)
+    stop_plan.updated_at = _utcnow()
+    db.add(stop_plan)
+    db.flush()
+
+
 def close_position(
     db: Session,
     trading_session: TradingSession,
@@ -746,6 +1141,51 @@ def close_position(
         exit_side = _opposite(entry_side)
         now = _utcnow()
         exit_idempotency_key = f"exit:{position.id}"
+
+        # LIVE-only resting-protective-stop safety invariant: never have
+        # both a resting SL-LMT and a fresh exit order active for the same
+        # position at once. `evaluate_open_position`'s own STOP check
+        # already skips itself while a resting order exists (see that
+        # function's own comment), so `exit_reason` reaching here is never
+        # STOP for a position with one -- every other exit reason must
+        # cancel the resting order first.
+        stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+        if stop_plan is not None and stop_plan.resting_order_id is not None:
+            cancel_outcome = _cancel_resting_protective_stop(
+                db, trading_session, position, stop_plan, stop_plan.resting_order_id, broker
+            )
+            if cancel_outcome is _CancelOutcome.ALREADY_FILLED:
+                # Reality beat us to it -- the resting stop fired before
+                # our cancel reached the broker. Finalize as STOP using
+                # its own real fill data instead of placing a redundant
+                # second exit order.
+                stop_order = (
+                    db.query(Order)
+                    .filter(Order.idempotency_key == f"stop:{position.id}")
+                    .one_or_none()
+                )
+                # Same defensive guard `_apply_resolved_pending_exit_order`
+                # already applies before calling `_finalize_position_close`
+                # -- a malformed FILLED response with no fill price would
+                # otherwise crash on `_dec(None)` rather than leaving the
+                # position OPEN for the next cycle to sort out.
+                if stop_order is None or stop_order.avg_fill_price is None:
+                    return None
+                outcome = _finalize_position_close(
+                    db, trading_session, position, stop_order, ExitReason.STOP, order_mode, None
+                )
+                db.flush()
+                run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
+                return outcome
+            if cancel_outcome is _CancelOutcome.FAILED:
+                # Can't confirm the resting stop is gone -- never place a
+                # second live exit order while that's ambiguous; the
+                # SystemAlert already raised inside the helper covers
+                # alerting, and the position stays OPEN for the next
+                # cycle/manual intervention to retry.
+                return None
+            # cancel_outcome is _CancelOutcome.CANCELLED -- fall through to
+            # the existing exit-order placement logic below, unchanged.
 
         exit_order = (
             db.query(Order).filter(Order.idempotency_key == exit_idempotency_key).one_or_none()
@@ -932,6 +1372,15 @@ def _finalize_position_close(
             StopPlanStatus.TRIGGERED if exit_reason == ExitReason.STOP else StopPlanStatus.CANCELLED
         )
         stop_plan.updated_at = now
+        # Single centralized cleanup point for the LIVE-only resting
+        # protective-stop feature -- every path that ends a position (a
+        # normal close_position exit, the resting stop's own async fill
+        # discovered by reconcile_pending_live_exit_orders, or the
+        # already-filled race _cancel_resting_protective_stop can hit)
+        # funnels through here, so this is the one place that needs to
+        # clear it rather than duplicating that at every call site.
+        stop_plan.resting_order_id = None
+        stop_plan.resting_order_price = None
         db.add(stop_plan)
 
     trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one_or_none()
@@ -1081,20 +1530,42 @@ def _apply_resolved_pending_exit_order(
         )
     )
 
+    # `stop:` orders are this position's own resting protective SL-LMT
+    # (see `_place_protective_stop`) -- distinct idempotency-key prefix
+    # from the `exit:` orders `close_position` places, so its own fill is
+    # a genuine STOP exit, not a late-discovered RECONCILED one.
+    is_protective_stop = order.idempotency_key.startswith("stop:")
+
     if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
+        exit_reason = ExitReason.STOP if is_protective_stop else ExitReason.RECONCILED
         _finalize_position_close(
             db,
             trading_session,
             position,
             order,
-            ExitReason.RECONCILED,
+            exit_reason,
             OrderMode(order.mode),
             None,
         )
-    # else: still REJECTED/CANCELLED discovered late -- position correctly
-    # stays OPEN, close_position's own exit_order_unfilled SystemAlert
-    # already covers alerting; nothing further to do beyond recording the
-    # terminal order state itself, above.
+    elif is_protective_stop:
+        # The resting stop resolved to CANCELLED/REJECTED without this app
+        # having initiated the cancel itself -- `close_position`'s own
+        # `_cancel_resting_protective_stop` already clears
+        # `resting_order_id` synchronously when *it* cancels one, so this
+        # only fires for a broker-unilateral cancel/rejection discovered
+        # here later. Position is untouched either way -- just stop
+        # pointing at a dead order.
+        stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+        if stop_plan is not None and stop_plan.resting_order_id == order.broker_order_id:
+            stop_plan.resting_order_id = None
+            stop_plan.resting_order_price = None
+            stop_plan.updated_at = now
+            db.add(stop_plan)
+    # else: still REJECTED/CANCELLED discovered late for a normal ("exit:")
+    # order -- position correctly stays OPEN, close_position's own
+    # exit_order_unfilled SystemAlert already covers alerting; nothing
+    # further to do beyond recording the terminal order state itself,
+    # above.
 
     record_event(
         db,
@@ -1154,8 +1625,18 @@ def evaluate_open_position(
     # a target that happens to be hit the same tick, which can't actually
     # occur for a sane stop < entry < target but is checked in this order
     # regardless, for defense-in-depth).
+    #
+    # Skipped entirely when a LIVE resting protective SL-LMT already exists
+    # (`stop_plan.resting_order_id` set, see `_place_protective_stop`) --
+    # the broker is now the authoritative stop mechanism for this position,
+    # and this local check firing at the same time would race
+    # `close_position` against `reconcile_pending_live_exit_orders`'s own
+    # async discovery of that same order's fill, risking a double-exit
+    # (the exact invariant the resting-stop design must never violate). A
+    # position whose protective placement failed (`resting_order_id` still
+    # `None`, the documented fallback) keeps this check exactly as today.
     hit_stop = price <= stop_price if favorable else price >= stop_price
-    if hit_stop:
+    if hit_stop and stop_plan.resting_order_id is None:
         return close_position(
             db, trading_session, position, ExitReason.STOP, float(stop_price), broker=broker
         )
@@ -1258,6 +1739,27 @@ def evaluate_open_position(
                     ExitReason.TRAIL,
                     float(new_trail_stop),
                     broker=broker,
+                )
+
+            # LIVE-only TSL: keep the resting protective stop's own
+            # trigger/limit in step with whichever level is now the
+            # current protective floor. Checked every cycle the trail is
+            # active (not just when `tightened` fired this cycle) so a
+            # previously failed sync keeps retrying — see
+            # `_sync_resting_protective_stop`'s own docstring for the
+            # fallback when a `ModifyOrder` call is rejected. Skipped on
+            # the same cycle `hit_trail` fires above (position is closing
+            # anyway, `close_position`'s own Path B cancels the resting
+            # order right after this returns).
+            if stop_plan.resting_order_id is not None:
+                _sync_resting_protective_stop(
+                    db,
+                    trading_session,
+                    position,
+                    stop_plan,
+                    stop_plan.resting_order_id,
+                    new_trail_stop,
+                    broker,
                 )
 
     return None

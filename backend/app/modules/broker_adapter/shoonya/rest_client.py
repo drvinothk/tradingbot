@@ -290,3 +290,25 @@ class ShoonyaRestClient:
         if not isinstance(result, dict):
             raise ShoonyaApiError("Limits", f"unexpected list response: {result!r}")
         return result
+
+    def user_details(self, uid: str) -> dict:
+        """`UserDetails` — **not documented as a distinct endpoint in the
+        primary source** (Shoonya-Dev's own `ShoonyaApi-py` README only
+        documents `exarr`/`prarr` as fields of the classic direct-login
+        response, which this codebase's OAuth flow
+        (`auth.exchange_code_for_token`) never calls). Several secondary
+        sources describe a separate `UserDetails` POST, same `{"uid": ...}`
+        shape as every other authenticated call here, returning the same
+        `exarr`/`prarr` fields regardless of login method — unconfirmed
+        against a real OAuth-authenticated session. This is bracket-order
+        research Phase A (see the build plan's Phase 5 section) — the
+        eligibility question ("does this account have `prd='B'`/`'H'`
+        enabled for NFO") can only be answered from this account's own
+        response, never assumed from generic docs. Callers must treat a
+        `ShoonyaApiError` here (including a not-found-shaped one) as "this
+        account/flow doesn't expose it this way," not a bug to fix blindly.
+        """
+        result = self._post("UserDetails", {"uid": uid})
+        if not isinstance(result, dict):
+            raise ShoonyaApiError("UserDetails", f"unexpected list response: {result!r}")
+        return result

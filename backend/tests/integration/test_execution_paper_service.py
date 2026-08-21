@@ -31,7 +31,7 @@ from app.domain.execution.models import (
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
-from app.domain.ops.models import SystemAlert
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -45,7 +45,7 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.broker_adapter import composition
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderResult
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, OrderResult
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
@@ -462,6 +462,22 @@ class _FakeOrderStatusBroker:
     def peek_cached_order_update(self, broker_order_id: str) -> OrderResult | None:
         return self._cached_result
 
+    def place_order(self, request):
+        """A resolved-FILLED entry order now also triggers protective-stop
+        placement (`_place_protective_stop`, LIVE-only) — this double must
+        answer that call too, not just the entry-side `get_order_status`/
+        `peek_cached_order_update` it was originally built for. A plain
+        `OPEN` ack is enough; these tests assert on the entry order/
+        position/trade_intent, not on the protective stop itself.
+        """
+        return OrderResult(
+            idempotency_key=request.idempotency_key,
+            broker_order_id=f"STOP-{request.idempotency_key}",
+            status=BrokerOrderStatus.OPEN,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
 
 def _make_pending_live_order(
     db: Session,
@@ -651,6 +667,19 @@ def test_reconcile_pending_live_orders_continues_after_one_orders_broker_error(
                 status=BrokerOrderStatus.FILLED,
                 filled_qty=25,
                 avg_fill_price=81.0,
+            )
+
+        def place_order(self, request):
+            """order_b resolving to FILLED now also triggers protective-
+            stop placement (`_place_protective_stop`, LIVE-only) — see
+            `_FakeOrderStatusBroker.place_order`'s identical comment.
+            """
+            return OrderResult(
+                idempotency_key=request.idempotency_key,
+                broker_order_id=f"STOP-{request.idempotency_key}",
+                status=BrokerOrderStatus.OPEN,
+                filled_qty=0,
+                avg_fill_price=None,
             )
 
     reconcile_pending_live_orders(
@@ -1353,6 +1382,169 @@ def test_evaluate_open_position_trail_activates_then_triggers(
     )
     assert outcome is not None
     assert outcome.exit_reason == ExitReason.TRAIL
+
+
+class _FakeLiveBrokerWithModify:
+    """Controllable LIVE-classified double for the TSL/resting-protective-
+    stop tests — full scripted control over `place_order` (synchronous
+    entry fill, `OPEN`-not-`FILLED` ack for the `stop:`-tagged protective
+    order, matching a real resting stop's own ack shape) and `modify_order`
+    (scriptable success/failure) that `MockBrokerAdapter` can't give
+    (always fills synchronously; `modify_order` is a no-op stub). Not a
+    `MockBrokerAdapter` subclass, so `is_execution_broker_live` reads it as
+    LIVE with no extra wrapper needed.
+    """
+
+    def __init__(self, entry_fill_price: float) -> None:
+        self.entry_fill_price = entry_fill_price
+        self.modify_calls: list[dict] = []
+        self.modify_raises: Exception | None = None
+        self._next_stop_id = 1
+
+    def place_order(self, request: OrderRequest) -> OrderResult:
+        if request.idempotency_key.startswith("stop:"):
+            broker_order_id = f"STOP-{self._next_stop_id}"
+            self._next_stop_id += 1
+            return OrderResult(
+                idempotency_key=request.idempotency_key,
+                broker_order_id=broker_order_id,
+                status=BrokerOrderStatus.OPEN,
+                filled_qty=0,
+                avg_fill_price=None,
+            )
+        return OrderResult(
+            idempotency_key=request.idempotency_key,
+            broker_order_id="ENTRY-1",
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=request.qty,
+            avg_fill_price=self.entry_fill_price,
+        )
+
+    def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
+        self.modify_calls.append({"broker_order_id": broker_order_id, **changes})
+        if self.modify_raises is not None:
+            raise self.modify_raises
+        return OrderResult(
+            idempotency_key=broker_order_id,
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.OPEN,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
+    def cancel_order(self, broker_order_id: str) -> OrderResult:
+        raise AssertionError("cancel_order should not be called in this test")
+
+    def get_positions(self) -> list:
+        # dispatch_trade_intent/close_position both run an event-triggered
+        # reconciliation pass after every real fill -- an empty book is a
+        # harmless, real mismatch (local position exists, broker doesn't)
+        # rather than a crash; not what these tests are exercising.
+        return []
+
+
+def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """TSL half of "Hard SL with Local Target": once the resting protective
+    stop exists (`_place_protective_stop`), every trail tightening must
+    push a real `ModifyOrder` to keep it in step — this is that happy path.
+    """
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=100.0, stop_price=90.0, target_price=140.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.resting_order_id == "STOP-1"
+    assert _price(stop_plan.resting_order_price) == pytest.approx(90.0)
+
+    # Activation: trail tightens to lock in 0 gain beyond activation (100 +
+    # 50% of the 40-wide range = 120) -- the resting stop should move from
+    # its original 90 up to 120.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=120.0, broker=live_broker  # type: ignore[arg-type]
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == 1
+    assert live_broker.modify_calls[0]["broker_order_id"] == "STOP-1"
+    assert live_broker.modify_calls[0]["contract_symbol"] == option_contract.symbol
+    assert live_broker.modify_calls[0]["trigger_price"] == pytest.approx(120.0)
+    assert _price(stop_plan.resting_order_price) == pytest.approx(120.0)
+
+    # Further tightening (126 -> locks in 123) syncs again.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=126.0, broker=live_broker  # type: ignore[arg-type]
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == 2
+    assert live_broker.modify_calls[1]["trigger_price"] == pytest.approx(123.0)
+    assert _price(stop_plan.resting_order_price) == pytest.approx(123.0)
+
+
+def test_evaluate_open_position_tsl_sync_retries_after_a_rejected_modify(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Fallback for a rejected/failed `ModifyOrder`: the resting stop stays
+    armed at its last *confirmed* price (never touched on failure), and the
+    next cycle retries automatically since `resting_order_price` still
+    disagrees with the locally-tightened level — no separate retry/backoff
+    bookkeeping, and no CRITICAL alert (the position isn't unprotected).
+    """
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=100.0, stop_price=90.0, target_price=140.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    live_broker.modify_raises = BrokerError("simulated rejection")
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=120.0, broker=live_broker  # type: ignore[arg-type]
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == 1
+    # Untouched -- still the resting order and its last *confirmed* price,
+    # not the failed 120 attempt.
+    assert stop_plan.resting_order_id == "STOP-1"
+    assert _price(stop_plan.resting_order_price) == pytest.approx(90.0)
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "protective_stop_modify_failed")
+        .one()
+    )
+    assert alert.severity == AlertSeverity.WARNING
+
+    # Same price again (no further real-world movement) -- the trail's own
+    # local level already tightened to 120 on the first call, so this only
+    # re-attempts the sync (comparing against resting_order_price, not
+    # against whether the trail tightened *this* cycle) -- not a fresh
+    # tightening event.
+    live_broker.modify_raises = None
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=120.0, broker=live_broker  # type: ignore[arg-type]
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == 2
+    assert _price(stop_plan.resting_order_price) == pytest.approx(120.0)
 
 
 def test_evaluate_open_position_exits_on_structure_break(

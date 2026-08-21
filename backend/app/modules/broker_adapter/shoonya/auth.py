@@ -44,10 +44,20 @@ class OAuthSession:
     `AuthResult` — the refresh token isn't part of `AuthResult` (that DTO
     is broker-agnostic and no other adapter has a refresh concept), so it's
     threaded separately for `ShoonyaBrokerAdapter` to hold privately.
+
+    `raw_login_capabilities` is bracket-order research Phase A (2026-08-21,
+    read-only, no order placed anywhere) — `exarr`/`prarr` (enabled
+    exchanges/products for this account) are documented by Shoonya-Dev's
+    own README as fields of the classic direct-login response; whether
+    `GenAcsTok` (this codebase's OAuth flow) also returns them is
+    unconfirmed. Captured here, verbatim, if present — `None` if absent,
+    which is itself useful evidence (means the separate `UserDetails` probe
+    in `adapter.get_product_capabilities` is the only route for this flow).
     """
 
     auth_result: AuthResult
     refresh_token: str | None
+    raw_login_capabilities: dict | None = None
 
 
 def build_authorize_url(settings: ShoonyaSettings) -> str:
@@ -132,6 +142,11 @@ def exchange_code_for_token(
         ) from exc
 
     refresh_token = body.get("refresh_token")
+    raw_login_capabilities = (
+        {"exarr": body.get("exarr"), "prarr": body.get("prarr")}
+        if "exarr" in body or "prarr" in body
+        else None
+    )
     return OAuthSession(
         auth_result=AuthResult(
             session_token=access_token,
@@ -139,4 +154,5 @@ def exchange_code_for_token(
             expires_at=None,
         ),
         refresh_token=str(refresh_token) if refresh_token else None,
+        raw_login_capabilities=raw_login_capabilities,
     )

@@ -90,6 +90,46 @@ def test_post_raises_on_not_ok_status():
         client._post("PlaceOrder", {"uid": "FA1"})
 
 
+def test_user_details_posts_uid_and_returns_body():
+    """Bracket-order research Phase A — `UserDetails` is unconfirmed as a
+    distinct endpoint for this codebase's OAuth flow (see the method's own
+    docstring); this only asserts the request shape and pass-through
+    parsing this codebase controls, not that the endpoint exists for real.
+    """
+    import json
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raw = request.content.decode()
+        jdata_part = raw.split("&jKey=")[0][len("jData=") :]
+        captured["jdata"] = json.loads(jdata_part)
+        return httpx.Response(
+            200,
+            json={
+                "stat": "Ok",
+                "exarr": ["NFO", "NSE"],
+                "prarr": [{"exch": "NFO", "prd": "M"}],
+            },
+        )
+
+    client = _client(handler)
+    result = client.user_details("FA1")
+
+    assert captured["jdata"] == {"uid": "FA1"}
+    assert result["exarr"] == ["NFO", "NSE"]
+    assert result["prarr"] == [{"exch": "NFO", "prd": "M"}]
+
+
+def test_user_details_raises_on_not_ok_status():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"stat": "Not_Ok", "emsg": "Invalid Input"})
+
+    client = _client(handler)
+    with pytest.raises(ShoonyaApiError, match="Invalid Input"):
+        client.user_details("FA1")
+
+
 def test_post_raises_on_http_error_status():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="Service Unavailable")

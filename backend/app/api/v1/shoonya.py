@@ -381,6 +381,31 @@ def oauth_callback(
     adapter = ShoonyaBrokerAdapter(settings, session.auth_result)
     set_broker(adapter)
 
+    # 2026-08-21: bracket-order research Phase A — read-only, no order
+    # placed/modified/cancelled anywhere in this block. Logs this account's
+    # actual enabled exchange/product list (exarr/prarr) from both possible
+    # sources (the GenAcsTok login response itself, and a separate
+    # UserDetails probe) so a human can decide whether NFO bracket/cover
+    # orders (prd='B'/'H') are even reachable on this account before any
+    # further BO work — see docs' bracket-order research memo. Exception-
+    # safe, same pattern as the reconnect calls below: a diagnostic failing
+    # must never fail a login that otherwise succeeded.
+    if session.raw_login_capabilities is not None:
+        logger.info(
+            "shoonya.product_capabilities (from GenAcsTok login response): exarr=%r prarr=%r",
+            session.raw_login_capabilities.get("exarr"),
+            session.raw_login_capabilities.get("prarr"),
+        )
+    else:
+        logger.info(
+            "shoonya.product_capabilities: GenAcsTok login response had no exarr/prarr fields"
+        )
+    try:
+        capabilities = adapter.get_product_capabilities()
+        logger.info("shoonya.product_capabilities (from UserDetails): %r", capabilities)
+    except Exception:
+        logger.exception("shoonya.product_capabilities: UserDetails diagnostic failed")
+
     # Live-found bug: `composition.py`'s own docstring claims "once Phase 5's
     # real Shoonya adapter is configured, that adapter syncs its own
     # instrument master from the exchange" — it never actually did.
