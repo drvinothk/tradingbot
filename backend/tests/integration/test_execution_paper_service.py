@@ -55,6 +55,11 @@ from app.modules.execution_engine.paper.service import (
     reconcile_pending_live_exit_orders,
     reconcile_pending_live_orders,
 )
+from app.modules.scheduler.eod_square_off import (
+    UnresolvableOptionContractError,
+    run_eod_square_off,
+    run_single_position_square_off,
+)
 
 EXPIRY = date(2026, 7, 30)
 
@@ -695,6 +700,44 @@ def test_close_position_computes_pnl_and_slippage_on_stop(
     assert stop_plan.status == "triggered"
 
 
+def test_close_position_routes_realized_pnl_and_slippage_through_the_shared_signed_pnl(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """`_finalize_position_close`'s `realized_pnl`/`slippage` used to
+    hand-derive the sign convention independently (see `app.core.pnl`'s own
+    module docstring for the three-way duplication this closed). Pins that
+    it now genuinely calls the shared `app.core.pnl.signed_pnl` -- not just
+    a formula that happens to still match it -- by monkeypatching the name
+    imported into this module and asserting it's actually invoked (twice:
+    once for realized_pnl, once for slippage). Against the pre-fix code this
+    assertion would fail outright, since `signed_pnl` was never imported or
+    called there at all.
+    """
+    import app.modules.execution_engine.paper.service as paper_service_module
+
+    calls: list[tuple] = []
+    real_signed_pnl = paper_service_module.signed_pnl
+
+    def _spy(entry_price, other_price, qty, side):
+        calls.append((entry_price, other_price, qty, side))
+        return real_signed_pnl(entry_price, other_price, qty, side)
+
+    monkeypatch.setattr(paper_service_module, "signed_pnl", _spy)
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+
+    assert outcome is not None
+    # realized_pnl(entry, exit) and slippage(intended, exit) -- both routed
+    # through the same shared function.
+    assert len(calls) == 2
+
+
 def test_close_position_is_idempotent_when_already_closed(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -824,6 +867,194 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     exit_order = db.query(Order).filter(Order.position_id == position.id).one()
     assert exit_order.order_type == OrderType.LIMIT
     assert exit_order.mode == OrderMode.LIVE
+
+
+def test_run_single_position_square_off_routes_a_live_positions_exit_through_its_own_broker(
+    db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
+    option_contract, monkeypatch,
+):
+    """`api.v1.execution.square_off_position` (the new single-position manual
+    square-off endpoint) calls `run_single_position_square_off`, not
+    `close_position` directly — pins that the exit for a position resolved
+    to a non-mock broker (`resolve_broker_for_position`) actually places its
+    exit order through *that* broker, not silently through
+    `get_execution_mock()`'s default.
+
+    **2026-08-20: this used to document a known pre-existing gap; now pins
+    the fix instead.** `eod_square_off.run_single_position_square_off` (same
+    as `_square_off_all_open_positions` before it) pre-resolves the broker
+    once (needed to price *and* close with the same instance) and passes it
+    into `close_position` explicitly — unlike `PositionManager`'s stop/
+    target/trail path, which used to call `close_position(..., broker=None)`
+    specifically so its own internal resolution could "detect live"
+    (`is_execution_broker_live`) without tripping the old `broker_was_
+    provided` guard. That guard used to force every explicit-broker exit
+    `OrderMode.PAPER` and a MARKET order regardless of whether the broker
+    actually used was real — it couldn't distinguish "caller pre-resolved
+    the correct broker" (this endpoint, EOD/margin-breach square-off, the
+    `POST /sessions/{id}/square-off` manual endpoint) from "caller injected
+    a test fake". Removed: `order_mode` is now decided purely by
+    `is_execution_broker_live(broker)`, whether or not `broker=` was passed
+    explicitly — see `close_position`'s own docstring. This test now proves
+    the real consequence that used to be silently wrong: a genuinely live
+    position's manual square-off gets real PnL/consecutive-loss/kill_switch
+    effects and a LIMIT order (MARKET is what live Shoonya rejects for API
+    orders), not a paper-tagged MARKET fill.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    class _FakeLiveBroker:
+        def __init__(self, inner):
+            self._inner = inner
+            self.place_order_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def place_order(self, request):
+            self.place_order_calls += 1
+            return self._inner.place_order(request)
+
+    fake_live_broker = _FakeLiveBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda trading_session, strategy_run=None, **kwargs: fake_live_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+
+    outcome = run_single_position_square_off(
+        db, None, trading_session, position, ExitReason.MANUAL
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.MANUAL
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    # The exit order really went through the position's own resolved
+    # broker (fake_live_broker), not a different/default one.
+    assert fake_live_broker.place_order_calls == 1
+    exit_order = db.query(Order).filter(Order.position_id == position.id).one()
+    assert exit_order.status == OrderStatus.FILLED
+    # The actual fix this test now pins: an explicitly-passed but genuinely
+    # live broker must still be tagged LIVE (LIMIT order, real preflight
+    # gate), not force-tagged PAPER just because it was pre-resolved and
+    # passed in rather than resolved internally.
+    assert exit_order.mode == OrderMode.LIVE
+    assert exit_order.order_type == OrderType.LIMIT
+
+
+def test_run_single_position_square_off_still_tags_a_mock_brokers_exit_as_paper(
+    db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
+    option_contract,
+):
+    """The other direction of the 2026-08-20 fix above: `broker=` being
+    explicitly passed through `eod_square_off.py`'s resolution chain must
+    not, by itself, make an exit read as live -- only a broker that's
+    genuinely not a `MockBrokerAdapter` should. No monkeypatching here:
+    `resolve_broker_for_position` resolves the real (mock) broker itself,
+    same as every production call with no `strategy_run`/session override.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    outcome = run_single_position_square_off(
+        db, broker, trading_session, position, ExitReason.MANUAL
+    )
+
+    assert outcome is not None
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    exit_order = db.query(Order).filter(Order.position_id == position.id).one()
+    assert exit_order.mode == OrderMode.PAPER
+    assert exit_order.order_type == OrderType.MARKET
+    # A paper close must never touch session-level real-money effects.
+    assert float(trading_session.cumulative_realized_pnl) == 0.0
+    assert trading_session.consecutive_losses == 0
+
+
+def test_run_single_position_square_off_raises_on_unresolvable_option_contract(
+    db: Session, broker, trading_session
+):
+    """QC fix #4: `run_single_position_square_off` used to fold "the
+    position's own option_contract_id doesn't resolve to a real
+    OptionContract row" into the same `None` return as "exit order didn't
+    fill synchronously" -- a data-integrity problem silently
+    indistinguishable from a normal timing outcome. It must now raise
+    `UnresolvableOptionContractError` instead. `broker=broker` is passed
+    explicitly so `resolve_broker_for_position` (which needs a real
+    `trade_intent_id` lookup) is never reached -- a bare stand-in with just
+    `option_contract_id` set is enough to exercise the early-return branch,
+    and avoids needing an actually-corrupt DB row (the real FK constraint
+    on `positions.option_contract_id` would reject that outright, same as
+    production data can never really get into this state via a normal
+    write).
+    """
+    from types import SimpleNamespace
+
+    fake_position = SimpleNamespace(option_contract_id=uuid.uuid4())
+
+    with pytest.raises(UnresolvableOptionContractError) as exc_info:
+        run_single_position_square_off(
+            db, broker, trading_session, fake_position, ExitReason.MANUAL  # type: ignore[arg-type]
+        )
+    assert exc_info.value.option_contract_id == fake_position.option_contract_id
+
+
+def test_square_off_all_open_positions_skips_a_corrupt_position_and_closes_the_rest(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """The EOD/margin-breach batch sweep (`_square_off_all_open_positions`,
+    exercised here via `run_eod_square_off`) must not let one position's
+    `UnresolvableOptionContractError` block the rest of the session's forced
+    flatten -- same effective "skip and continue" behavior this sweep
+    already had before the exception existed (when this case silently
+    returned `None`), just no longer silent. `position_a`'s failure is
+    simulated by monkeypatching `run_single_position_square_off` itself
+    (real corrupt FK data isn't constructible -- see the test above), while
+    `position_b` goes through the real, unmocked function and must still
+    close normally.
+    """
+    import app.modules.scheduler.eod_square_off as eod_square_off_module
+
+    trade_intent_a = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent_a, broker=broker)
+    position_a = db.query(Position).filter(Position.trade_intent_id == trade_intent_a.id).one()
+
+    trade_intent_b = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent_b, broker=broker)
+    position_b = db.query(Position).filter(Position.trade_intent_id == trade_intent_b.id).one()
+
+    real_run_single = eod_square_off_module.run_single_position_square_off
+
+    def _fake_run_single(db_, broker_, trading_session_, position, exit_reason, **kwargs):
+        if position.id == position_a.id:
+            raise UnresolvableOptionContractError(position.option_contract_id)
+        return real_run_single(db_, broker_, trading_session_, position, exit_reason, **kwargs)
+
+    monkeypatch.setattr(eod_square_off_module, "run_single_position_square_off", _fake_run_single)
+
+    outcomes = run_eod_square_off(db, broker, trading_session)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].position_id == position_b.id
+
+    db.refresh(position_a)
+    db.refresh(position_b)
+    assert position_a.status == PositionStatus.OPEN
+    assert position_b.status == PositionStatus.CLOSED
 
 
 def test_close_position_does_not_update_session_pnl_for_a_paper_close(

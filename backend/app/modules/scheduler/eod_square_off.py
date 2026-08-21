@@ -29,6 +29,8 @@ position uniformly — the established test-fake pattern, unchanged; leave it
 
 from __future__ import annotations
 
+import logging
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -44,6 +46,87 @@ from app.modules.execution_engine.paper.service import (
     resolve_broker_for_position,
 )
 from app.modules.market_data.providers.base import BaseMarketDataProvider
+
+logger = logging.getLogger("app.scheduler.eod_square_off")
+
+
+class UnresolvableOptionContractError(Exception):
+    """Raised by `run_single_position_square_off` when a `Position`'s own
+    `option_contract_id` doesn't resolve to a real `OptionContract` row -- a
+    data-integrity problem, categorically different from "the exit order
+    didn't fill synchronously" (a normal, expected timing outcome that keeps
+    returning `None`, same as before). Callers that need to tell the two
+    apart -- `api.v1.execution.square_off_position`, so it can give the user
+    an accurate message instead of a misleading "wait for reconciliation/
+    retry" -- can catch this distinctly. The EOD/margin-breach batch sweep
+    (`_square_off_all_open_positions`) deliberately catches this and moves
+    on to the next position instead, since one corrupt position must never
+    block the rest of a session's forced flatten.
+    """
+
+    def __init__(self, option_contract_id: uuid.UUID) -> None:
+        self.option_contract_id = option_contract_id
+        super().__init__(f"unknown option_contract_id {option_contract_id}")
+
+
+def run_single_position_square_off(
+    db: Session,
+    broker: BrokerPort | None,
+    trading_session: TradingSession,
+    position: Position,
+    exit_reason: ExitReason,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
+) -> TradeOutcome | None:
+    """The resolve-broker -> price -> `close_position` chain
+    `_square_off_all_open_positions` runs per-position, factored out so a
+    single-position manual square-off
+    (`POST /positions/{id}/square-off`, `api.v1.execution.square_off_position`)
+    can reuse it exactly instead of duplicating the resolution chain.
+    `broker` follows the same convention as the batch callers below: `None`
+    resolves the correct broker for *this* position's own strategy via
+    `resolve_broker_for_position` (never a single broker shared across
+    positions -- see this module's own docstring), a caller-supplied broker
+    overrides it (the established test-fake pattern).
+
+    Returns `None` if the position is already closed or the exit order
+    didn't fill synchronously (see `close_position`'s own docstring) -- a
+    `None` outcome in either of those cases is not itself an error, same as
+    every other caller of `close_position` in this codebase already treats
+    it. Raises `UnresolvableOptionContractError` if the option contract
+    can't be resolved -- a data-integrity problem, not a timing one, so it
+    must not be collapsed into the same `None` return as the two genuinely
+    unremarkable cases above (see that exception's own docstring).
+    """
+    position_broker = broker or resolve_broker_for_position(db, trading_session, position)
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        raise UnresolvableOptionContractError(position.option_contract_id)
+
+    @contextmanager
+    def _same_session() -> Iterator[Session]:
+        # Without this, current_contract_price's option-chain refresh would
+        # default to a brand new, independently-committing session_scope()
+        # -- a real, previously-documented trap in this codebase (a second
+        # connection can't see this transaction's own uncommitted rows,
+        # e.g. a test's own not-yet-committed Instrument/OptionContract).
+        yield db
+
+    # Same REST-option-chain-snapshot-preferring price source as every
+    # other paper-execution price decision -- was broker.get_quote()
+    # directly, which (since get_execution_broker() always resolves to
+    # the mock) returned the mock's own synthetic, strategy-independent
+    # price, same as the bug current_contract_price exists to close.
+    tick = current_contract_price(
+        db,
+        option_contract,
+        position_broker,
+        market_data_provider=market_data_provider,
+        session_factory=_same_session,
+    )
+    return close_position(
+        db, trading_session, position, exit_reason, tick.ltp, broker=position_broker
+    )
 
 
 def _square_off_all_open_positions(
@@ -63,40 +146,30 @@ def _square_off_all_open_positions(
         .all()
     )
 
-    @contextmanager
-    def _same_session() -> Iterator[Session]:
-        # Without this, current_contract_price's option-chain refresh would
-        # default to a brand new, independently-committing session_scope()
-        # -- a real, previously-documented trap in this codebase (a second
-        # connection can't see this transaction's own uncommitted rows,
-        # e.g. a test's own not-yet-committed Instrument/OptionContract).
-        yield db
-
     outcomes: list[TradeOutcome] = []
     for position in open_positions:
-        # Resolved per-position -- see this module's own docstring and
-        # resolve_broker_for_position's for why a single shared broker is
-        # unsafe once different open positions can belong to differently-
-        # configured strategies.
-        position_broker = broker or resolve_broker_for_position(db, trading_session, position)
-        option_contract = db.get(OptionContract, position.option_contract_id)
-        if option_contract is None:
+        try:
+            outcome = run_single_position_square_off(
+                db,
+                broker,
+                trading_session,
+                position,
+                exit_reason,
+                market_data_provider=market_data_provider,
+            )
+        except UnresolvableOptionContractError:
+            # A data-integrity problem on one position must never block the
+            # rest of a session's forced flatten -- log and move on to the
+            # next position, same effective behavior this batch sweep
+            # already had before UnresolvableOptionContractError existed
+            # (when this case was silently folded into a `None` return).
+            logger.error(
+                "square-off skipped position %s: option_contract_id %s does not "
+                "resolve to a real OptionContract row",
+                position.id,
+                position.option_contract_id,
+            )
             continue
-        # Same REST-option-chain-snapshot-preferring price source as every
-        # other paper-execution price decision -- was broker.get_quote()
-        # directly, which (since get_execution_broker() always resolves to
-        # the mock) returned the mock's own synthetic, strategy-independent
-        # price, same as the bug current_contract_price exists to close.
-        tick = current_contract_price(
-            db,
-            option_contract,
-            position_broker,
-            market_data_provider=market_data_provider,
-            session_factory=_same_session,
-        )
-        outcome = close_position(
-            db, trading_session, position, exit_reason, tick.ltp, broker=position_broker
-        )
         if outcome is not None:
             outcomes.append(outcome)
     return outcomes

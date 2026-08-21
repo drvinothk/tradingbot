@@ -327,6 +327,41 @@ def test_create_strategy_then_duplicate_name_conflicts(api_client: TestClient, s
     assert second.status_code == 409
 
 
+def test_create_strategy_without_name_auto_generates_one(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.post("/api/v1/strategies", json={"strategy_type": "orb"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"]
+    assert body["name"].startswith("orb-")
+
+
+def test_create_strategy_without_name_twice_does_not_collide(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+
+    first = api_client.post("/api/v1/strategies", json={"strategy_type": "vwap_pullback"})
+    second = api_client.post("/api/v1/strategies", json={"strategy_type": "vwap_pullback"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["name"] != second.json()["name"]
+
+
+def test_create_strategy_with_explicit_name_still_accepted(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.post(
+        "/api/v1/strategies", json={"name": "explicit-name-test", "strategy_type": "orb"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "explicit-name-test"
+
+
 def test_start_strategy_creates_run_and_stop_ends_it(
     api_client: TestClient, seeded_admin, fake_runner, engine
 ):

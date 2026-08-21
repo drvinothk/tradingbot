@@ -3,7 +3,14 @@ import { useState } from 'react'
 import { api, ApiError } from '../../shared/api/client'
 import { useSessions } from '../../shared/hooks/useSessions'
 import { useStrategies } from '../../shared/hooks/useStrategies'
+import { strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type { DailyReportOut, PerformanceStatsOut, ScorecardOut } from '../../shared/api/types'
+
+const DOWNLOAD_OPTIONS = [
+  { value: 'eod-excel', label: 'EOD trade-log Excel' },
+  { value: 'scorecard', label: 'Strategy Scorecard export' },
+  { value: 'ws-quality', label: 'WS/feed quality report' },
+] as const
 
 export function ReportsPage() {
   const sessionsQuery = useSessions()
@@ -11,6 +18,8 @@ export function ReportsPage() {
 
   const [sessionId, setSessionId] = useState('')
   const [strategyId, setStrategyId] = useState('')
+  const [downloadChoice, setDownloadChoice] = useState('')
+  const [downloadNote, setDownloadNote] = useState<string | null>(null)
 
   const dailyReportQuery = useQuery({
     queryKey: ['reports', 'daily', sessionId],
@@ -27,11 +36,36 @@ export function ReportsPage() {
   const sessions = sessionsQuery.data ?? []
   const strategies = strategiesQuery.data ?? []
 
+  function handleDownload() {
+    if (!downloadChoice) return
+    const option = DOWNLOAD_OPTIONS.find((o) => o.value === downloadChoice)
+    setDownloadNote(`"${option?.label}" is not available yet — the download endpoint isn't built yet. No request was sent.`)
+  }
+
   return (
     <div>
       <div className="page-header">
         <h2>Reports</h2>
+        <div className="row-actions">
+          <select value={downloadChoice} onChange={(e) => setDownloadChoice(e.target.value)}>
+            <option value="">Download...</option>
+            {DOWNLOAD_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          <button className="btn-ghost" disabled={!downloadChoice} onClick={handleDownload}>
+            Download
+          </button>
+        </div>
       </div>
+
+      {downloadNote && (
+        <p className="muted">
+          {downloadNote} <span className="badge badge-wip">WIP</span>
+        </p>
+      )}
 
       <div className="card">
         <h3>Daily report</h3>
@@ -39,7 +73,7 @@ export function ReportsPage() {
           <option value="">Select a session...</option>
           {sessions.map((s) => (
             <option key={s.id} value={s.id}>
-              {s.id.slice(0, 8)} ({s.mode})
+              {s.mode} — {s.status}
             </option>
           ))}
         </select>
@@ -59,7 +93,7 @@ export function ReportsPage() {
           <option value="">Select a strategy...</option>
           {strategies.map((s) => (
             <option key={s.id} value={s.id}>
-              {s.name}
+              {strategyTypeLabel(s.strategy_type)}
             </option>
           ))}
         </select>

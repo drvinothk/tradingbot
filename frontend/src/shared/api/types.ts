@@ -109,12 +109,80 @@ export interface RunningStrategyOut {
   started_at: string
   open_position: RunningPositionOut | null
   pending_approvals: PendingApprovalOut[]
+  data_freshness: string | null
 }
 
 export interface StrategyRunOut {
   strategy_run_id: string
   status: string
   execution_mode: string
+}
+
+export interface OrderOut {
+  id: string
+  trading_session_id: string
+  option_contract_id: string
+  trade_intent_id: string | null
+  position_id: string | null
+  mode: string
+  side: string
+  order_type: string
+  qty: number
+  status: string
+  filled_qty: number
+  avg_fill_price: number | null
+  broker_order_id: string
+  submitted_at: string
+  // Additive lookups joined server-side (GET /orders) -- null when the
+  // underlying join has nothing (e.g. an exit order has no trade_intent_id,
+  // so no strategy_type).
+  contract_symbol: string | null
+  strike: number | null
+  expiry_date: string | null
+  option_type: string | null
+  strategy_type: string | null
+}
+
+export interface PositionOut {
+  id: string
+  trading_session_id: string
+  option_contract_id: string
+  trade_intent_id: string
+  side: string
+  qty: number
+  entry_price: number
+  status: string
+  opened_at: string
+  closed_at: string | null
+  // Additive lookups joined server-side (GET /positions).
+  contract_symbol: string | null
+  strike: number | null
+  expiry_date: string | null
+  option_type: string | null
+  strategy_type: string | null
+  target_price: number | null
+  stop_price: number | null
+  trail_stop_price: number | null
+  ltp: number | null
+  unrealized_pnl: number | null
+  exit_price: number | null
+  realized_pnl: number | null
+}
+
+export interface SquareOffPositionOut {
+  success: boolean
+  position_id: string
+  detail?: string
+  exit_price?: number
+  realized_pnl?: number
+  slippage?: number
+  exit_reason?: string
+  closed_at?: string
+}
+
+export interface DailyLimitsOut {
+  daily_budget_amount: number
+  daily_max_lots: number
 }
 
 export interface PerformanceStatsOut {

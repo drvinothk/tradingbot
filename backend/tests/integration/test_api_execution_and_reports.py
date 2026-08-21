@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db.session import get_db
@@ -33,7 +34,7 @@ from app.domain.identity.models import (
     UserRole,
     Workspace,
 )
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -43,6 +44,7 @@ from app.domain.strategy.models import (
     StrategyRunStatus,
 )
 from app.main import app
+from app.modules.scheduler.eod_square_off import UnresolvableOptionContractError
 from app.modules.strategy_engine.interface import TradeProposal
 from app.modules.strategy_engine.service import submit_signal
 
@@ -417,6 +419,109 @@ def test_orders_and_positions_require_login(api_client: TestClient):
     assert api_client.get("/api/v1/positions", params=params).status_code == 401
 
 
+def test_square_off_position_requires_login(api_client: TestClient):
+    resp = api_client.post(f"/api/v1/positions/{uuid.uuid4()}/square-off")
+    assert resp.status_code == 401
+
+
+def test_square_off_position_closes_a_single_open_paper_position_and_audits_it(
+    api_client: TestClient, seeded_admin, engine
+):
+    """The narrower sibling of `test_full_flow_orders_positions_reports_square_off`
+    below -- `POST /positions/{id}/square-off` closes exactly the one
+    position named, reuses `close_position`'s own idempotency/locking (no
+    new Order/Position lifecycle invented here), and writes a `USER`-actor
+    `MANUAL_OVERRIDE` audit event distinct from `close_position`'s own
+    `SYSTEM`-actor `position.closed` event -- both must exist afterward.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        resp = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["position_id"] == position_id
+        assert body["exit_reason"] == "manual"
+        assert body["exit_price"] is not None
+        assert body["closed_at"] is not None
+
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "closed"
+
+        session_factory = sessionmaker(bind=engine, future=True)
+        with session_factory() as db:
+            from app.domain.audit.models import ActorType, AuditEvent
+
+            manual_events = (
+                db.query(AuditEvent)
+                .filter(
+                    AuditEvent.workspace_id == seeded_admin["workspace_id"],
+                    AuditEvent.event_type == "position.manual_square_off_requested",
+                )
+                .all()
+            )
+            assert len(manual_events) == 1
+            assert manual_events[0].actor_type == ActorType.USER
+            assert manual_events[0].actor_id == seeded_admin["user_id"]
+            assert str(manual_events[0].entity_id) == position_id
+            assert manual_events[0].payload["success"] is True
+
+            system_events = (
+                db.query(AuditEvent)
+                .filter(
+                    AuditEvent.workspace_id == seeded_admin["workspace_id"],
+                    AuditEvent.event_type == "position.closed",
+                )
+                .all()
+            )
+            assert len(system_events) == 1
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_square_off_position_rejects_an_already_closed_position(
+    api_client: TestClient, seeded_admin, engine
+):
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        first = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert first.status_code == 200
+        assert first.json()["success"] is True
+
+        second = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert second.status_code == 409
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_square_off_position_denies_unknown_or_cross_workspace_position_id(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    resp = api_client.post(f"/api/v1/positions/{uuid.uuid4()}/square-off")
+    assert resp.status_code == 404
+
+
 def test_full_flow_orders_positions_reports_square_off(
     api_client: TestClient, seeded_admin, engine
 ):
@@ -509,5 +614,341 @@ def test_scorecard_reflects_dispatched_strategy(api_client: TestClient, seeded_a
         assert body["strategy_config_id"] == strategy_config_id
         assert body["dispatched_count"] == 1
         assert body["filled_count"] == 1
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+# -- GET /positions: ltp freshness (QC fix #2) --------------------------------
+
+
+def test_positions_reports_a_fresh_ltp_as_not_stale(
+    api_client: TestClient, seeded_admin, engine
+):
+    """A just-written tick (well within `TICK_THRESHOLDS.degraded_after_
+    seconds`) must classify as not-stale via the shared `market_data
+    .freshness` module -- `ltp_stale`/`ltp_age_seconds` didn't exist at all
+    before this fix, so a position's `ltp` was returned with no way for a
+    caller to tell an ancient tick from a live one.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]
+        contract_id = uuid.UUID(position["option_contract_id"])
+
+        session_factory = sessionmaker(bind=engine, future=True)
+        with session_factory() as db:
+            db.add(
+                QuoteTick(
+                    id=uuid.uuid4(),
+                    option_contract_id=contract_id,
+                    ltp=85.5,
+                    bid=85.0,
+                    ask=86.0,
+                    volume=10,
+                    ts=datetime.now(UTC) - timedelta(seconds=2),
+                )
+            )
+            db.commit()
+
+        after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]
+        assert after["ltp"] == pytest.approx(85.5)
+        assert after["ltp_stale"] is False
+        assert after["ltp_age_seconds"] is not None
+        assert after["ltp_age_seconds"] < 10.0
+        # entry_price=80.0 (see _dispatch_one_position's TradeProposal), qty
+        # 25 (lot_size) * 1 lot, BUY side: (85.5 - 80.0) * 25.
+        assert after["unrealized_pnl"] == pytest.approx(137.5)
+
+        with session_factory() as db:
+            db.query(QuoteTick).filter(QuoteTick.option_contract_id == contract_id).delete()
+            db.commit()
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_positions_reports_an_old_ltp_as_stale(api_client: TestClient, seeded_admin, engine):
+    """A tick older than `TICK_THRESHOLDS.stale_after_seconds` must classify
+    as stale -- same freshness module every other price read in this
+    codebase already goes through (`classify_option_chain` etc.), reused
+    here rather than a new, ad hoc staleness policy.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]
+        contract_id = uuid.UUID(position["option_contract_id"])
+
+        session_factory = sessionmaker(bind=engine, future=True)
+        with session_factory() as db:
+            db.add(
+                QuoteTick(
+                    id=uuid.uuid4(),
+                    option_contract_id=contract_id,
+                    ltp=90.0,
+                    bid=89.0,
+                    ask=91.0,
+                    volume=10,
+                    ts=datetime.now(UTC) - timedelta(seconds=300),
+                )
+            )
+            db.commit()
+
+        after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]
+        assert after["ltp"] == pytest.approx(90.0)
+        assert after["ltp_stale"] is True
+        assert after["ltp_age_seconds"] >= 300.0
+
+        with session_factory() as db:
+            db.query(QuoteTick).filter(QuoteTick.option_contract_id == contract_id).delete()
+            db.commit()
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_positions_with_no_tick_leaves_ltp_and_staleness_fields_none(
+    api_client: TestClient, seeded_admin, engine
+):
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]
+        assert position["ltp"] is None
+        assert position["ltp_stale"] is None
+        assert position["ltp_age_seconds"] is None
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+# -- _latest_ticks: N+1 fix (QC fix #3) ----------------------------------------
+
+
+def test_latest_ticks_batches_every_contract_into_a_single_query(engine, seeded_admin):
+    """`_latest_ticks` must issue exactly one SQL statement regardless of how
+    many `option_contract_id`s are passed -- previously `_latest_ltp` ran
+    once per open position inside `list_positions`'s own loop (an N+1 that
+    scaled with open-position count). Also pins that `DISTINCT ON
+    (option_contract_id) ... ORDER BY option_contract_id, ts DESC` actually
+    picks the *latest* tick per contract, not an arbitrary one.
+    """
+    from app.api.v1.execution import _latest_ticks
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    tag = uuid.uuid4().hex[:8]
+    with session_factory() as db:
+        instrument = Instrument(
+            id=uuid.uuid4(),
+            symbol=f"NIFTY-LTPBATCH-{tag}",
+            exchange="NFO",
+            lot_size=25,
+            tick_size=0.05,
+        )
+        db.add(instrument)
+        db.flush()
+
+        now = datetime.now(UTC)
+        contract_ids: list[uuid.UUID] = []
+        for i in range(3):
+            contract_id = uuid.uuid4()
+            contract = OptionContract(
+                id=contract_id,
+                instrument_id=instrument.id,
+                expiry_date=EXPIRY,
+                strike=22000 + i * 100,
+                option_type=OptionType.CE,
+                symbol=f"NIFTY-LTPBATCH-{tag}-{i}",
+            )
+            db.add(contract)
+            db.flush()
+            # An older tick and a newer one per contract -- the batched
+            # query must return the newer ltp, not just any row.
+            db.add(
+                QuoteTick(
+                    id=uuid.uuid4(),
+                    option_contract_id=contract_id,
+                    ltp=10.0 + i,
+                    bid=9.0,
+                    ask=11.0,
+                    volume=1,
+                    ts=now - timedelta(seconds=30),
+                )
+            )
+            db.add(
+                QuoteTick(
+                    id=uuid.uuid4(),
+                    option_contract_id=contract_id,
+                    ltp=20.0 + i,
+                    bid=19.0,
+                    ask=21.0,
+                    volume=1,
+                    ts=now,
+                )
+            )
+            contract_ids.append(contract_id)
+        db.commit()
+
+        # contract_ids is a plain list of UUIDs captured before commit --
+        # deliberately not `[c.id for c in contracts]` read after commit,
+        # which would itself trigger one SELECT per object to refresh
+        # attributes expired by commit (`expire_on_commit` default) and
+        # pollute the query count this test is trying to pin.
+        query_count = 0
+
+        def _count(*_args, **_kwargs) -> None:
+            nonlocal query_count
+            query_count += 1
+
+        event.listen(engine, "before_cursor_execute", _count)
+        try:
+            result = _latest_ticks(db, contract_ids)
+        finally:
+            event.remove(engine, "before_cursor_execute", _count)
+
+        assert query_count == 1
+        assert len(result) == 3
+        for i, contract_id in enumerate(contract_ids):
+            ltp, ts = result[contract_id]
+            assert ltp == pytest.approx(20.0 + i)
+            assert ts == now
+
+        db.query(QuoteTick).filter(QuoteTick.option_contract_id.in_(contract_ids)).delete(
+            synchronize_session=False
+        )
+        db.query(OptionContract).filter(OptionContract.instrument_id == instrument.id).delete(
+            synchronize_session=False
+        )
+        db.query(Instrument).filter(Instrument.id == instrument.id).delete()
+        db.commit()
+
+
+def test_latest_ticks_with_no_ids_returns_empty_without_querying(engine):
+    """The empty-input short circuit -- an all-closed-positions session must
+    never issue a `WHERE option_contract_id IN ()` query at all.
+    """
+    from app.api.v1.execution import _latest_ticks
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        assert _latest_ticks(db, []) == {}
+
+
+# -- POST /positions/{id}/square-off: differentiated failure (QC fix #4) ------
+
+
+def test_square_off_position_reports_unresolvable_option_contract_distinctly(
+    api_client: TestClient, seeded_admin, engine, monkeypatch
+):
+    """`run_single_position_square_off` can fail two different ways -- an
+    exit order that didn't fill synchronously (a normal timing outcome) and
+    an unresolvable `option_contract_id` (a data-integrity problem) -- the
+    endpoint used to show the same misleading "wait for reconciliation/
+    retry" message for both. Simulated here by monkeypatching the function
+    to raise the new, distinct exception -- against the pre-fix code this
+    test can't even be constructed (`UnresolvableOptionContractError`
+    didn't exist, and both failure modes collapsed into the same `None`
+    return), which is itself the proof the two used to be indistinguishable.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        bad_contract_id = uuid.uuid4()
+
+        def _raise(*_args, **_kwargs):
+            raise UnresolvableOptionContractError(bad_contract_id)
+
+        monkeypatch.setattr(
+            "app.api.v1.execution.run_single_position_square_off", _raise
+        )
+
+        resp = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is False
+        assert body["reason"] == "unresolvable_option_contract"
+        assert str(bad_contract_id) in body["detail"]
+        # The old, generic message both failure reasons used to share --
+        # must not appear here now that the two are distinguished.
+        assert "exit order did not fill synchronously" not in body["detail"]
+
+        # The endpoint reported the failure but never actually closed
+        # anything -- the position is still open.
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "open"
+
+        session_factory = sessionmaker(bind=engine, future=True)
+        with session_factory() as db:
+            from app.domain.audit.models import AuditEvent
+
+            event_row = (
+                db.query(AuditEvent)
+                .filter(
+                    AuditEvent.workspace_id == seeded_admin["workspace_id"],
+                    AuditEvent.event_type == "position.manual_square_off_requested",
+                )
+                .one()
+            )
+            assert event_row.payload["success"] is False
+            assert event_row.payload["reason"] == "unresolvable_option_contract"
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_square_off_position_reports_not_filled_synchronously_reason(
+    api_client: TestClient, seeded_admin, engine, monkeypatch
+):
+    """The other, pre-existing failure reason (`outcome is None` --
+    `close_position`'s own idempotent-no-op/unfilled-exit-order case) must
+    keep its own distinct `reason` tag now that a second failure reason
+    exists, not collapse into the same generic message.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        monkeypatch.setattr(
+            "app.api.v1.execution.run_single_position_square_off",
+            lambda *_args, **_kwargs: None,
+        )
+
+        resp = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is False
+        assert body["reason"] == "not_filled_synchronously"
+        assert "reconciliation/retry" in body["detail"]
     finally:
         _cleanup_instrument_and_dependents(engine, instrument_id)

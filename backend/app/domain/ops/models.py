@@ -13,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -125,3 +125,51 @@ class InstrumentFirewallConfig(Base, UUIDPkMixin, TimestampMixin):
     # list/dict-shaped column in this codebase (StrategyConfig.params,
     # OptionChainSnapshot.chain_data) rather than a native Postgres ARRAY.
     active_live_instruments: Mapped[list[str]] = mapped_column(JSONB)
+
+
+# 2026-08-20: seed/fallback values for GlobalDailyLimitsConfig below --
+# same values as RiskDefaults.default_budget (settings.py) and
+# RiskLimitConfig.per_trade_lot_cap's own default (1), reused here only as
+# starting points for a *separate* concept (see that class's own
+# docstring for why this isn't just an alias of either).
+DEFAULT_DAILY_BUDGET_AMOUNT: float = 50_000.0
+DEFAULT_DAILY_MAX_LOTS: int = 1
+
+
+class GlobalDailyLimitsConfig(Base, UUIDPkMixin, TimestampMixin):
+    """One row per workspace -- a read/update-able global settings surface
+    for "total daily budget" and "total lots per day", following the exact
+    same DB-backed-settings-row pattern as `InstrumentFirewallConfig`/
+    `MarketDataProviderPreference` above (GET returns the row or a
+    documented default when none exists yet, PATCH upserts + audits).
+
+    Deliberately NOT a rename of an existing concept -- checked both
+    candidates in `app.modules.risk_engine` before adding this table:
+    `RiskLimitConfig.per_trade_lot_cap` caps lots *per individual trade*
+    (versioned, already enforced in `evaluate_trade_intent`'s
+    `per_trade_lot_cap_exceeded` check), not a running total across a
+    day's worth of trades; `TradingSession.budget_amount` is a *per-session*
+    value seeded once at session-creation time from
+    `RiskDefaults.default_budget` (`app.config.settings`), not a live,
+    workspace-wide setting a user can change mid-day the way this table's
+    PATCH allows. Neither is "total lots dispatched today" or "the daily
+    budget right now" in the workspace-global, always-current sense the UI
+    dashboard plan asked for.
+
+    Scope note: this is a settings surface only (mirrors the UI plan's
+    "small new settings surface... displayed above the Strategy Control
+    card" spec) -- reading/writing the two values, nothing more. It is not
+    wired into any pre-trade enforcement path (unlike `per_trade_lot_cap`/
+    `budget_amount`, which already are); wiring a real "total lots used
+    today" / "total budget committed today" check into
+    `risk_engine.evaluate_trade_intent` is a separate, not-yet-scoped
+    follow-up, same "settings surface first, enforcement later" shape this
+    codebase's own Global Execution Timings item is flagged the same way
+    in the build plan.
+    """
+
+    __tablename__ = "global_daily_limits_configs"
+
+    workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"), unique=True)
+    daily_budget_amount: Mapped[float] = mapped_column(Numeric(14, 2))
+    daily_max_lots: Mapped[int] = mapped_column(Integer)

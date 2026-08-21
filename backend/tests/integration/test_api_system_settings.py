@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 import app.api.v1.system_settings as system_settings_module
 from app.core.db.session import get_db
@@ -39,7 +39,7 @@ from app.domain.identity.models import (
     Workspace,
 )
 from app.domain.market.models import Instrument, OptionContract, OptionType
-from app.domain.ops.models import InstrumentFirewallConfig
+from app.domain.ops.models import GlobalDailyLimitsConfig, InstrumentFirewallConfig
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -127,6 +127,9 @@ def seeded_admin(engine):
         cleanup_db.query(InstrumentFirewallConfig).filter(
             InstrumentFirewallConfig.workspace_id == ids["workspace_id"]
         ).delete()
+        cleanup_db.query(GlobalDailyLimitsConfig).filter(
+            GlobalDailyLimitsConfig.workspace_id == ids["workspace_id"]
+        ).delete()
         cleanup_db.query(LoginSession).filter(LoginSession.user_id == ids["user_id"]).delete()
         cleanup_db.query(UserRole).filter(UserRole.user_id == ids["user_id"]).delete()
         cleanup_db.query(User).filter(User.id == ids["user_id"]).delete()
@@ -197,6 +200,159 @@ def test_patch_can_set_an_empty_list(api_client: TestClient, seeded_admin):
 
     assert response.status_code == 200
     assert response.json()["active_live_instruments"] == []
+
+
+# -- GET/PATCH /system-settings/daily-limits ---------------------------------
+
+
+def test_get_daily_limits_requires_login(api_client: TestClient):
+    response = api_client.get("/api/v1/system-settings/daily-limits")
+    assert response.status_code == 401
+
+
+def test_get_daily_limits_with_no_row_defaults(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.get("/api/v1/system-settings/daily-limits")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["daily_budget_amount"] == 50000.0
+    assert body["daily_max_lots"] == 1
+
+
+def test_patch_sets_the_daily_limits(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/system-settings/daily-limits",
+        json={"daily_budget_amount": 75000, "daily_max_lots": 3},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["daily_budget_amount"] == 75000.0
+    assert body["daily_max_lots"] == 3
+
+    get_response = api_client.get("/api/v1/system-settings/daily-limits")
+    get_body = get_response.json()
+    assert get_body["daily_budget_amount"] == 75000.0
+    assert get_body["daily_max_lots"] == 3
+
+
+def test_patch_daily_limits_rejects_non_positive_budget(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/system-settings/daily-limits",
+        json={"daily_budget_amount": 0, "daily_max_lots": 1},
+    )
+
+    assert response.status_code == 422
+
+
+def test_patch_daily_limits_rejects_non_positive_lots(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/system-settings/daily-limits",
+        json={"daily_budget_amount": 50000, "daily_max_lots": 0},
+    )
+
+    assert response.status_code == 422
+
+
+def test_patch_daily_limits_twice_updates_the_same_row(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    api_client.patch(
+        "/api/v1/system-settings/daily-limits",
+        json={"daily_budget_amount": 60000, "daily_max_lots": 2},
+    )
+    second = api_client.patch(
+        "/api/v1/system-settings/daily-limits",
+        json={"daily_budget_amount": 90000, "daily_max_lots": 4},
+    )
+
+    assert second.status_code == 200
+    assert second.json() == {"daily_budget_amount": 90000.0, "daily_max_lots": 4}
+
+
+def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin, monkeypatch):
+    """QC fix #6: `set_daily_limits`'s select-then-insert had no guard
+    against `GlobalDailyLimitsConfig.workspace_id`'s real DB unique
+    constraint -- two concurrent PATCH calls landing on a not-yet-seeded
+    workspace could both see `config is None` from their own SELECT before
+    either commits, and the loser's INSERT would then 500 on an unhandled
+    IntegrityError.
+
+    Reproduced deterministically without real threads, via a precise
+    interleaving hook rather than a re-implementation of the guarded logic:
+    `_upsert_daily_limits`'s own initial `SELECT` runs for real first (sees
+    no row, exactly as a genuine race's "loser" would) -- then, at the exact
+    point it calls `db.add(...)` for the new row (before its own `flush()`),
+    a monkeypatched `Session.add` fires once to have a second session
+    insert-and-commit a conflicting row first. Postgres's default READ
+    COMMITTED isolation means the still-pending `flush()` that follows then
+    genuinely collides with that just-committed row -- the real race,
+    reproduced deterministically. Against the pre-fix code this raises an
+    unhandled `IntegrityError` instead of recovering.
+    """
+    import app.api.v1.system_settings as system_settings_module
+    from app.domain.ops.models import (
+        DEFAULT_DAILY_BUDGET_AMOUNT,
+        DEFAULT_DAILY_MAX_LOTS,
+        GlobalDailyLimitsConfig,
+    )
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    workspace_id = seeded_admin["workspace_id"]
+    db_b = session_factory()
+    triggered = {"done": False}
+    real_add = Session.add
+
+    def _add_with_interleaved_conflict(self, instance, *args, **kwargs):
+        if not triggered["done"] and isinstance(instance, GlobalDailyLimitsConfig):
+            triggered["done"] = True
+            db_b.add(
+                GlobalDailyLimitsConfig(
+                    workspace_id=workspace_id, daily_budget_amount=40000, daily_max_lots=1
+                )
+            )
+            db_b.commit()
+        return real_add(self, instance, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "add", _add_with_interleaved_conflict)
+
+    try:
+        with session_factory() as db_a:
+            result_config, previous = system_settings_module._upsert_daily_limits(
+                db_a, workspace_id, 75000.0, 3
+            )
+            db_a.commit()
+
+            # Session A's own SELECT ran before B's row existed, so the
+            # "previous" values it captured are the pre-seeded defaults --
+            # correct given what A actually saw, at the time it saw it.
+            assert previous == {
+                "daily_budget_amount": DEFAULT_DAILY_BUDGET_AMOUNT,
+                "daily_max_lots": DEFAULT_DAILY_MAX_LOTS,
+            }
+            assert float(result_config.daily_budget_amount) == pytest.approx(75000.0)
+            assert result_config.daily_max_lots == 3
+        assert triggered["done"] is True  # the race was actually exercised
+    finally:
+        db_b.close()
+
+    with session_factory() as check_db:
+        rows = (
+            check_db.query(GlobalDailyLimitsConfig)
+            .filter(GlobalDailyLimitsConfig.workspace_id == workspace_id)
+            .all()
+        )
+        assert len(rows) == 1
+        assert float(rows[0].daily_budget_amount) == pytest.approx(75000.0)
+        assert rows[0].daily_max_lots == 3
 
 
 # -- POST /system-settings/restart-backend -----------------------------------

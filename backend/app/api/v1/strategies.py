@@ -357,7 +357,11 @@ def _validate_underlying_symbol_or_404(db: Session, underlying_symbol: str) -> N
 
 
 class CreateStrategyRequest(BaseModel):
-    name: str
+    # Optional as of 2026-08-20 -- a caller that omits it gets a
+    # server-generated default (see _generate_strategy_name below);
+    # anyone who still passes it explicitly is accepted as-is, unchanged,
+    # for backward compatibility.
+    name: str | None = None
     strategy_type: str = "synthetic"
     params: dict = {}
     underlying_symbol: str | None = None
@@ -376,6 +380,27 @@ def list_strategies(
     )
 
 
+def _generate_strategy_name(db: Session, workspace_id: uuid.UUID, strategy_type: str) -> str:
+    """Server-side default when a caller omits `name` entirely -- derived
+    from `strategy_type` plus a short random suffix for uniqueness (not a
+    sequential counter, which would need a read-then-write that could race
+    under concurrent creates). Loops on the vanishingly unlikely collision
+    rather than trusting the suffix alone, same defensive style as this
+    endpoint's own explicit-name 409 check below.
+    """
+    for _ in range(10):
+        candidate = f"{strategy_type}-{uuid.uuid4().hex[:8]}"
+        exists = (
+            db.query(StrategyConfig)
+            .filter(StrategyConfig.workspace_id == workspace_id, StrategyConfig.name == candidate)
+            .one_or_none()
+        )
+        if exists is None:
+            return candidate
+    # Practically unreachable -- fall back to a full UUID, guaranteed unique.
+    return f"{strategy_type}-{uuid.uuid4()}"
+
+
 @router.post("/strategies", response_model=StrategyConfigOut)
 def create_strategy(
     body: CreateStrategyRequest,
@@ -387,13 +412,22 @@ def create_strategy(
             status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{body.strategy_type}'"
         )
 
-    existing = (
-        db.query(StrategyConfig)
-        .filter(StrategyConfig.workspace_id == user.workspace_id, StrategyConfig.name == body.name)
-        .one_or_none()
-    )
-    if existing is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A strategy with this name already exists")
+    if body.name is None:
+        name = _generate_strategy_name(db, user.workspace_id, body.strategy_type)
+    else:
+        existing = (
+            db.query(StrategyConfig)
+            .filter(
+                StrategyConfig.workspace_id == user.workspace_id,
+                StrategyConfig.name == body.name,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "A strategy with this name already exists"
+            )
+        name = body.name
 
     if body.underlying_symbol is not None:
         _validate_underlying_symbol_or_404(db, body.underlying_symbol)
@@ -401,7 +435,7 @@ def create_strategy(
     config = StrategyConfig(
         id=uuid.uuid4(),
         workspace_id=user.workspace_id,
-        name=body.name,
+        name=name,
         strategy_type=body.strategy_type,
         params=body.params,
         underlying_symbol=body.underlying_symbol,

@@ -52,6 +52,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
+from app.core.pnl import signed_pnl
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
@@ -202,22 +203,31 @@ def dispatch_trade_intent(
     same `LOCK_EXECUTION_SINGLETON` scope as the insert, so two concurrent
     callers can't both pass it.
     """
-    # `is_execution_broker_live`'s isinstance check is only meaningful for a
-    # broker `get_execution_broker` itself resolved -- an explicitly-passed
-    # `broker` (the established test-injection pattern throughout this
-    # codebase: fakes/doubles that are never MockBrokerAdapter instances
-    # either) must never be misread as "live" just because it isn't the
-    # mock class. Explicit injection always means paper/no-preflight,
-    # matching every existing test's own assumption that passing `broker=`
-    # bypasses real-vs-mock gating entirely.
-    broker_was_provided = broker is not None
+    # order_mode is decided purely by `is_execution_broker_live(broker)` --
+    # whatever broker is actually about to place this order, real or mock,
+    # explicitly passed in or resolved here via `get_execution_broker`.
+    # 2026-08-20 fix: this used to also require "broker wasn't explicitly
+    # passed in", on the theory that an explicit `broker=` could only ever
+    # be a test fake that `is_execution_broker_live`'s plain `isinstance`
+    # check can't correctly classify. That's true for the test suite's own
+    # `_FakeLiveBroker`-style doubles (still correctly read as live because
+    # they aren't `MockBrokerAdapter` instances -- see that class's own
+    # docstring) but false for `eod_square_off.py`'s callers and
+    # `PositionManager`'s stop/target/trail loop, both real production code
+    # paths that pre-resolve the correct broker once (to reuse it for
+    # pricing) and then pass it in explicitly -- a genuinely live position's
+    # exit was being force-tagged PAPER by this guard, skipping real PnL/
+    # loss-cap/kill_switch effects and placing a MARKET order live Shoonya
+    # rejects. See `is_execution_broker_live`'s own docstring: every
+    # broker/test-double actually used across this codebase either really
+    # is a `MockBrokerAdapter` (tagged paper, correctly) or really isn't
+    # (tagged live, correctly) -- nothing in this codebase constructs a
+    # broker-shaped object that is genuinely mock-backed but fails the
+    # `isinstance` check, so the extra guard was never protecting a real
+    # case, only miscategorizing this one.
     strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
     broker = broker or get_execution_broker(trading_session, strategy_run)
-    order_mode = (
-        OrderMode.LIVE
-        if not broker_was_provided and is_execution_broker_live(broker)
-        else OrderMode.PAPER
-    )
+    order_mode = OrderMode.LIVE if is_execution_broker_live(broker) else OrderMode.PAPER
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         existing = (
@@ -709,16 +719,17 @@ def close_position(
     # always be closeable for real, regardless of current SafeMode
     # (kill_switch/degraded_mode exist to stop *new* risk, not strand
     # *existing* real risk) -- see get_execution_broker's own docstring.
-    # broker_was_provided: see the identical guard in dispatch_trade_intent
-    # -- an explicitly-injected broker (the established test-fake pattern)
-    # must never be misread as live just because it isn't MockBrokerAdapter.
-    broker_was_provided = broker is not None
+    # order_mode: see the identical, identically-reasoned fix in
+    # dispatch_trade_intent -- decided purely by `is_execution_broker_live
+    # (broker)`, not by whether the caller passed `broker=` explicitly.
+    # `eod_square_off.py`'s callers (EOD/margin-breach/manual square-off)
+    # and `PositionManager`'s stop/target/trail loop (`evaluate_open_
+    # position`) both pre-resolve the correct broker once, to reuse it for
+    # pricing, and pass it in here explicitly -- the old `broker_was_
+    # provided` guard force-tagged every one of those exits PAPER even when
+    # the broker actually resolved was the real one.
     broker = broker or resolve_broker_for_position(db, trading_session, position)
-    order_mode = (
-        OrderMode.LIVE
-        if not broker_was_provided and is_execution_broker_live(broker)
-        else OrderMode.PAPER
-    )
+    order_mode = OrderMode.LIVE if is_execution_broker_live(broker) else OrderMode.PAPER
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         if position.status != PositionStatus.OPEN:
@@ -887,14 +898,14 @@ def _finalize_position_close(
     entry_side = SignalSide(position.side)
     exit_price = _dec(exit_order.avg_fill_price)
     entry_price = _dec(position.entry_price)
-    # +1 for a long (BUY) position, -1 for a short (SELL) position — same
-    # sign convention risk_engine.service.compute_pre_trade_analytics uses
-    # for its P&L-scenario table.
-    sign = Decimal("1") if entry_side == SignalSide.BUY else Decimal("-1")
     qty = Decimal(position.qty)
-    realized_pnl = (exit_price - entry_price) * qty * sign
+    # Same shared sign convention `risk_engine.service
+    # .compute_pre_trade_analytics` and `api.v1.execution`'s unrealized P&L
+    # use — see app.core.pnl.signed_pnl's own docstring for why this used
+    # to be hand-copied in three places.
+    realized_pnl = signed_pnl(entry_price, exit_price, qty, entry_side)
     slippage = (
-        (exit_price - _dec(intended_price)) * qty * sign
+        signed_pnl(intended_price, exit_price, qty, entry_side)
         if intended_price is not None
         else Decimal("0")
     )

@@ -267,6 +267,46 @@ def test_compute_pre_trade_analytics_ce_capital_breakeven_and_pnl(
     assert analytics.pnl_scenarios["stretch"] == pytest.approx((104.0 - 80.0) * 25 * 2)
 
 
+def test_compute_pre_trade_analytics_routes_pnl_scenarios_through_shared_signed_pnl(
+    db: Session, option_contract: OptionContract, monkeypatch
+):
+    """QC fix #1: `compute_pre_trade_analytics`'s `_pnl_at` used to hand-
+    derive the sign convention independently of `execution_engine.paper
+    .service`/`api.v1.execution`'s identical formulas (see `app.core.pnl`'s
+    own module docstring for the three-way duplication this closed). Pins
+    that it now genuinely calls the shared `app.core.pnl.signed_pnl` --
+    once per pnl_scenarios entry that isn't the trivial `at_breakeven: 0.0`
+    special case -- rather than a formula that merely still happens to
+    match it. Against the pre-fix code this assertion fails outright, since
+    `signed_pnl` was never imported or called there at all.
+    """
+    import app.modules.risk_engine.service as risk_engine_module
+
+    calls: list[tuple] = []
+    real_signed_pnl = risk_engine_module.signed_pnl
+
+    def _spy(entry_price, other_price, qty, side):
+        calls.append((entry_price, other_price, qty, side))
+        return real_signed_pnl(entry_price, other_price, qty, side)
+
+    monkeypatch.setattr(risk_engine_module, "signed_pnl", _spy)
+
+    compute_pre_trade_analytics(
+        db,
+        option_contract,
+        side=SignalSide.BUY,
+        qty_lots=2,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        funding_mode=FundingMode.CASH,
+    )
+
+    # at_stop, at_target, stretch -- three _pnl_at() calls; at_breakeven is
+    # a hardcoded 0.0 and never calls signed_pnl at all.
+    assert len(calls) == 3
+
+
 def test_compute_pre_trade_analytics_pe_breakeven_is_strike_minus_premium(
     db: Session, instrument: Instrument
 ):
@@ -509,13 +549,15 @@ def test_max_concurrent_positions_does_not_block_a_paper_routed_strategy(
 
 
 def _mark_last_order_live(db: Session, trade_intent: TradeIntent) -> None:
-    """Test helper: `_dispatch` always passes an explicit `broker=`, so the
-    resulting `Order.mode` is always `PAPER` regardless of session/strategy
-    state (`dispatch_trade_intent`'s own `broker_was_provided` guard — see
-    its docstring). The `max_trades_per_day` cap now counts only genuinely
-    `LIVE` orders (2026-08-19 fix), so tests that need to simulate "this
-    strategy's earlier dispatch actually went out live" flip it directly
-    here rather than threading real broker-resolution plumbing through
+    """Test helper: `_dispatch` always passes this file's `broker` fixture
+    (a real `MockBrokerAdapter`) explicitly, so `dispatch_trade_intent`'s
+    `is_execution_broker_live` check correctly reads it as paper and the
+    resulting `Order.mode` is always `PAPER`, regardless of session/strategy
+    state. The `max_trades_per_day` cap now counts only genuinely `LIVE`
+    orders (2026-08-19 fix), so tests that need to simulate "this strategy's
+    earlier dispatch actually went out live" flip it directly here rather
+    than threading real broker-resolution plumbing (a broker that isn't a
+    `MockBrokerAdapter`, plus a monkeypatched `get_execution_broker`) through
     every risk-engine test in this file.
     """
     order = db.query(Order).filter(Order.trade_intent_id == trade_intent.id).one()
@@ -1108,6 +1150,31 @@ def test_evaluate_trade_intent_rejection_raises_system_alert(
     )
     assert len(alerts) == 1
     assert alerts[0].category == "risk_limit_breach"
+
+
+def test_evaluate_trade_intent_rejection_alert_message_has_friendly_context(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """The alert message must carry readable context (strategy type,
+    instrument, timestamp) alongside the raw TradeIntent id -- not just a
+    bare UUID an operator would have to look up. The UUID itself must stay
+    present too, unchanged, since it's still the real identifier.
+    """
+    trading_session.mode = SafeMode.KILL_SWITCH
+    db.add(trading_session)
+    db.flush()
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    alert = (
+        db.query(SystemAlert).filter(SystemAlert.trading_session_id == trading_session.id).one()
+    )
+    # strategy_config fixture defaults strategy_type to "synthetic";
+    # instrument fixture is "NIFTY".
+    assert "SYNTHETIC NIFTY" in alert.message
+    assert str(trade_intent.id) in alert.message
+    assert "TradeIntent " + str(trade_intent.id) + " rejected" not in alert.message
 
 
 def test_evaluate_trade_intent_approval_required_creates_pending_approval(

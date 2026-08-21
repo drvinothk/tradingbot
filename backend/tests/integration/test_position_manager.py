@@ -486,17 +486,30 @@ def test_run_once_is_idempotent_when_already_degraded(
     assert trading_session.mode == SafeMode.DEGRADED_MODE
 
 
-class _LowMarginBroker:
-    """Wraps a real `MockBrokerAdapter` but makes `get_margin` report a
-    negative available margin, standing in for a real broker mid-margin-
-    breach — proves `PositionManager` reacts via the narrow emergency-
-    square-off trigger (Addendum hardening batch), not via kill-switch.
+def _with_low_margin(broker: MockBrokerAdapter) -> MockBrokerAdapter:
+    """Overrides `get_margin` directly on a real `MockBrokerAdapter`
+    instance to report a negative available margin, standing in for a
+    broker mid-margin-breach — proves `PositionManager` reacts via the
+    narrow emergency-square-off trigger (Addendum hardening batch), not via
+    kill-switch.
+
+    2026-08-20: this used to be a `_LowMarginBroker` delegate class wrapping
+    `broker` via `__getattr__` forwarding instead of patching the method
+    directly. That broke once `dispatch_trade_intent`/`close_position`'s
+    `broker_was_provided` guard was removed (see that fix's own
+    changelog): `is_execution_broker_live`'s isinstance check against
+    `MockBrokerAdapter` is exactly the right test for every *production*
+    broker `get_execution_broker` can resolve (per its own docstring), but
+    a plain delegate class that wraps a real mock and isn't itself a
+    `MockBrokerAdapter` subclass fails that same check and reads as "live"
+    — which used to silently not matter here only because the old guard
+    force-tagged every explicitly-passed broker PAPER regardless. Patching
+    the method directly on the real instance keeps it a genuine
+    `MockBrokerAdapter` for isinstance purposes, so this test still
+    exercises a paper-tagged close, matching its own intent (a mock-backed
+    margin breach, not a live one).
     """
-
-    def __init__(self, inner: MockBrokerAdapter):
-        self._inner = inner
-
-    def get_margin(self):
+    def _get_margin():
         from app.modules.broker_adapter.base.contracts import MarginInfo
 
         return MarginInfo(
@@ -506,8 +519,8 @@ class _LowMarginBroker:
             ts=datetime.now(UTC),
         )
 
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+    broker.get_margin = _get_margin  # type: ignore[method-assign]
+    return broker
 
 
 def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_session(
@@ -523,7 +536,7 @@ def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_se
 
     manager = PositionManager(
         trading_session.id,
-        broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        broker=_with_low_margin(broker),
         market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )
@@ -565,7 +578,7 @@ def test_run_once_does_not_check_margin_for_paper_only_session(
 
     manager = PositionManager(
         trading_session.id,
-        broker=_LowMarginBroker(broker),  # type: ignore[arg-type]
+        broker=_with_low_margin(broker),
         market_data_provider=_NullMarketDataProvider(),
         session_factory=_session_factory_for(db),
     )

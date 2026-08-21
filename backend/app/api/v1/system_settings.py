@@ -5,6 +5,12 @@ how this is actually enforced at dispatch time. Gated behind `risk.override`
 (not `session.start`, which Phase 4's market-data endpoints use) since this
 directly controls which instruments real money can flow to -- a
 risk-governance action, not a connectivity toggle.
+
+2026-08-20: `GET`/`PATCH /system-settings/daily-limits` added, same file,
+same router, same `risk.override` gate -- the global "total daily budget"/
+"total lots per day" settings surface from the UI dashboard plan. See
+`GlobalDailyLimitsConfig`'s own docstring (`app.domain.ops.models`) for why
+it's a new table rather than a rename of an existing risk-engine concept.
 """
 
 from __future__ import annotations
@@ -13,9 +19,11 @@ import platform
 import subprocess
 import threading
 import time as time_module
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.db.session import get_db
@@ -24,7 +32,13 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import User
 from app.domain.market.models import OptionContract
-from app.domain.ops.models import DEFAULT_ACTIVE_LIVE_INSTRUMENTS, InstrumentFirewallConfig
+from app.domain.ops.models import (
+    DEFAULT_ACTIVE_LIVE_INSTRUMENTS,
+    DEFAULT_DAILY_BUDGET_AMOUNT,
+    DEFAULT_DAILY_MAX_LOTS,
+    GlobalDailyLimitsConfig,
+    InstrumentFirewallConfig,
+)
 from app.modules.audit_service.service import record_event
 
 router = APIRouter(prefix="/system-settings", tags=["system-settings"])
@@ -120,6 +134,142 @@ def set_instrument_firewall(
     return InstrumentFirewallOut(
         active_live_instruments=config.active_live_instruments,
         recognized_instruments=list(RECOGNIZED_FIREWALL_INSTRUMENTS),
+    )
+
+
+class DailyLimitsOut(BaseModel):
+    daily_budget_amount: float
+    daily_max_lots: int
+
+
+class SetDailyLimitsRequest(BaseModel):
+    daily_budget_amount: float = Field(gt=0)
+    daily_max_lots: int = Field(gt=0)
+
+
+@router.get("/daily-limits", response_model=DailyLimitsOut)
+def get_daily_limits(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> DailyLimitsOut:
+    """2026-08-20 addition -- global "total daily budget" / "total lots per
+    day" settings surface, same GET-returns-row-or-documented-default shape
+    as get_instrument_firewall above. See GlobalDailyLimitsConfig's own
+    docstring (app.domain.ops.models) for why this is a new table, not a
+    rename of RiskLimitConfig.per_trade_lot_cap or
+    TradingSession.budget_amount -- and why it's a settings surface only,
+    not yet wired into any pre-trade enforcement path.
+    """
+    config = (
+        db.query(GlobalDailyLimitsConfig)
+        .filter(GlobalDailyLimitsConfig.workspace_id == user.workspace_id)
+        .one_or_none()
+    )
+    if config is None:
+        return DailyLimitsOut(
+            daily_budget_amount=DEFAULT_DAILY_BUDGET_AMOUNT,
+            daily_max_lots=DEFAULT_DAILY_MAX_LOTS,
+        )
+    return DailyLimitsOut(
+        daily_budget_amount=float(config.daily_budget_amount),
+        daily_max_lots=config.daily_max_lots,
+    )
+
+
+def _upsert_daily_limits(
+    db: Session,
+    workspace_id: uuid.UUID,
+    daily_budget_amount: float,
+    daily_max_lots: int,
+) -> tuple[GlobalDailyLimitsConfig, dict]:
+    """select-then-insert, guarded against the real DB unique constraint on
+    `GlobalDailyLimitsConfig.workspace_id`. Two concurrent `PATCH` calls
+    landing on the same not-yet-seeded workspace can both run their own
+    `SELECT` and see `config is None` before either commits -- the loser's
+    `INSERT` then hits a genuine `IntegrityError` instead of silently
+    succeeding (previously unguarded: this would have surfaced as an
+    unhandled 500). Recovered by treating that specific conflict as "someone
+    else just created this row -- update it instead", the same effective
+    outcome a real upsert would produce. No existing IntegrityError-recovery
+    pattern was found elsewhere in this codebase to reuse (`InstrumentFirewallConfig`'s
+    own near-identical select-then-insert in `set_instrument_firewall` above
+    has the same latent race, out of scope for this fix) -- this is a new,
+    narrowly-scoped one.
+    """
+    config = (
+        db.query(GlobalDailyLimitsConfig)
+        .filter(GlobalDailyLimitsConfig.workspace_id == workspace_id)
+        .one_or_none()
+    )
+    previous = (
+        {
+            "daily_budget_amount": float(config.daily_budget_amount),
+            "daily_max_lots": config.daily_max_lots,
+        }
+        if config is not None
+        else {
+            "daily_budget_amount": DEFAULT_DAILY_BUDGET_AMOUNT,
+            "daily_max_lots": DEFAULT_DAILY_MAX_LOTS,
+        }
+    )
+    if config is None:
+        config = GlobalDailyLimitsConfig(
+            workspace_id=workspace_id,
+            daily_budget_amount=daily_budget_amount,
+            daily_max_lots=daily_max_lots,
+        )
+        db.add(config)
+        try:
+            db.flush()
+        except IntegrityError:
+            db.rollback()
+            config = (
+                db.query(GlobalDailyLimitsConfig)
+                .filter(GlobalDailyLimitsConfig.workspace_id == workspace_id)
+                .one()
+            )
+            config.daily_budget_amount = daily_budget_amount
+            config.daily_max_lots = daily_max_lots
+            db.flush()
+    else:
+        config.daily_budget_amount = daily_budget_amount
+        config.daily_max_lots = daily_max_lots
+        db.flush()
+    return config, previous
+
+
+@router.patch("/daily-limits", response_model=DailyLimitsOut)
+def set_daily_limits(
+    body: SetDailyLimitsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> DailyLimitsOut:
+    config, previous = _upsert_daily_limits(
+        db, user.workspace_id, body.daily_budget_amount, body.daily_max_lots
+    )
+
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.RISK_DECISION,
+        event_type="global_daily_limits.updated",
+        entity_type="global_daily_limits_config",
+        entity_id=config.id,
+        payload={
+            "previous": previous,
+            "new": {
+                "daily_budget_amount": body.daily_budget_amount,
+                "daily_max_lots": body.daily_max_lots,
+            },
+        },
+    )
+    db.commit()
+    db.refresh(config)
+    return DailyLimitsOut(
+        daily_budget_amount=float(config.daily_budget_amount),
+        daily_max_lots=config.daily_max_lots,
     )
 
 

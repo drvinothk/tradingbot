@@ -38,8 +38,10 @@ from sqlalchemy import or_ as sa_or
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
+from app.core.clock import to_ist
 from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
+from app.core.pnl import signed_pnl
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import User
@@ -58,6 +60,7 @@ from app.domain.strategy.models import (
     ExecutionMode,
     PendingTradeApproval,
     SignalSide,
+    StrategyConfig,
     StrategyRun,
     TradeIntent,
     TradeIntentStatus,
@@ -104,6 +107,29 @@ def _is_tick_aligned(price: Decimal, tick_size: Decimal) -> bool:
     if tick_size <= 0:
         return True
     return price % tick_size == 0
+
+
+def _friendly_trade_intent_label(
+    db: Session,
+    trade_intent: TradeIntent,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+) -> str:
+    """Human-readable context ("ORB BANKNIFTY 2026-08-20 09:42") for
+    SystemAlert message text -- a bare UUID gives an operator nothing to
+    act on without a DB lookup. Purely a message-text convenience: the
+    real UUID stays the system's actual identifier everywhere else (FKs,
+    `entity_id`, `payload["trade_intent_id"]`), unchanged. Falls back to
+    the option contract's own symbol/a generic label if a lookup somehow
+    misses -- should never happen given the FK relationships involved, but
+    a friendlier message text is not worth a 500.
+    """
+    strategy_config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+    strategy_label = strategy_config.strategy_type.upper() if strategy_config else "strategy"
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    instrument_label = instrument.symbol if instrument else option_contract.symbol
+    ts_label = to_ist(trade_intent.created_at).strftime("%Y-%m-%d %H:%M")
+    return f"{strategy_label} {instrument_label} {ts_label}"
 
 
 @dataclass(frozen=True)
@@ -232,7 +258,6 @@ def compute_pre_trade_analytics(
         raise ValueError(f"unknown instrument for option_contract {option_contract.id}")
     lot_size = Decimal(instrument.lot_size)
     lots = Decimal(qty_lots)
-    sign = Decimal("1") if side == SignalSide.BUY else Decimal("-1")
 
     capital_required = _dec(entry_price) * lot_size * lots
     if funding_mode == FundingMode.MTF:
@@ -250,7 +275,10 @@ def compute_pre_trade_analytics(
         breakeven_price = _dec(option_contract.strike) - _dec(entry_price)
 
     def _pnl_at(price: Decimal) -> float:
-        return float((price - _dec(entry_price)) * lot_size * lots * sign)
+        # Same shared sign convention `execution_engine.paper.service` and
+        # `api.v1.execution` use — see app.core.pnl.signed_pnl's own
+        # docstring for why this used to be hand-copied in three places.
+        return float(signed_pnl(entry_price, price, lot_size * lots, side))
 
     stretch_price = _dec(target_price) + (_dec(target_price) - _dec(entry_price))
 
@@ -653,6 +681,9 @@ def evaluate_trade_intent(
             )
 
             if _is_alert_worthy(reasons):
+                label = _friendly_trade_intent_label(
+                    db, trade_intent, strategy_run, option_contract
+                )
                 db.add(
                     SystemAlert(
                         id=uuid.uuid4(),
@@ -660,7 +691,10 @@ def evaluate_trade_intent(
                         trading_session_id=trading_session.id,
                         severity=AlertSeverity.WARNING,
                         category="risk_limit_breach",
-                        message=f"TradeIntent {trade_intent.id} rejected: {', '.join(reasons)}",
+                        message=(
+                            f"TradeIntent for {label} ({trade_intent.id}) rejected: "
+                            f"{', '.join(reasons)}"
+                        ),
                         payload={"trade_intent_id": str(trade_intent.id), "reasons": reasons},
                         created_at=_utcnow(),
                     )

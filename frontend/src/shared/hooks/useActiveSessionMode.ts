@@ -9,6 +9,8 @@ import type { SessionOut, ShoonyaStatusOut } from '../api/types'
 // this banner is the fastest way an operator would notice that happening,
 // on top of the backend fix that actually closes the gap
 // (composition.get_execution_broker).
+const EMERGENCY_MODES = new Set(['degraded_mode', 'reconciliation_lock', 'kill_switch'])
+
 export interface ActiveSessionMode {
   isLoading: boolean
   activeSession: SessionOut | null
@@ -21,13 +23,27 @@ export function useActiveSessionMode(): ActiveSessionMode {
     queryFn: () => api.get<SessionOut[]>('/sessions'),
   })
 
+  // Same queryKey AdvancedPage's ShoonyaConnectionRow uses for the
+  // identical endpoint -- previously two independent keys
+  // (['shoonya-status'] here, ['shoonya', 'status'] there) meant this
+  // header banner could keep showing stale status for up to 15s after a
+  // real Connect succeeded on Advanced, since invalidating one cache never
+  // touched the other.
   const shoonyaStatusQuery = useQuery({
-    queryKey: ['shoonya-status'],
+    queryKey: ['shoonya', 'status'],
     queryFn: () => shoonyaApi.get<ShoonyaStatusOut>('/shoonya/status'),
     refetchInterval: 15_000,
   })
 
-  const activeSession = sessionsQuery.data?.find((s) => s.status === 'active') ?? null
+  const activeSessions = sessionsQuery.data?.filter((s) => s.status === 'active') ?? []
+  // Prefer surfacing a session that's actually in an emergency state --
+  // with two simultaneously-active sessions (Live + Paper), picking
+  // whichever happened to come first in array order could pick the boring
+  // paper_only one and hide the fact that the other is in kill_switch/
+  // degraded_mode/reconciliation_lock, which is exactly the case this
+  // banner exists to surface.
+  const activeSession =
+    activeSessions.find((s) => EMERGENCY_MODES.has(s.mode)) ?? activeSessions[0] ?? null
 
   return {
     isLoading: sessionsQuery.isLoading || shoonyaStatusQuery.isLoading,
