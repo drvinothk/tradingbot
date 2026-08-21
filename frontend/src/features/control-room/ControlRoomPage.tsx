@@ -134,7 +134,13 @@ export function ControlRoomPage() {
         onHideRow={hideRow}
         onChanged={invalidateTrades}
         onError={setActionError}
-        emptyHint={bucketsLoading ? 'Loading...' : 'No Live trading session is active today.'}
+        emptyHint={
+          bucketsLoading
+            ? 'Loading...'
+            : liveSession
+              ? 'No trades yet today.'
+              : 'No trading session is active today.'
+        }
       />
 
       <TradeBucketCard
@@ -148,7 +154,7 @@ export function ControlRoomPage() {
         onHideRow={hideRow}
         onChanged={invalidateTrades}
         onError={setActionError}
-        emptyHint={bucketsLoading ? 'Loading...' : 'No Paper trading session is active today.'}
+        emptyHint={bucketsLoading ? 'Loading...' : 'No paper-mode trades yet today.'}
       />
 
       <AuditTickerPlaceholder />
@@ -432,10 +438,15 @@ function TradeBucketCard({
         <span className={`chevron ${isExpanded ? 'open' : ''}`}>▶</span>
       </div>
       {isExpanded &&
-        (!session ? (
-          <p className="muted">{emptyHint}</p>
-        ) : visibleRows.length === 0 ? (
-          <p className="muted">No trades yet today.</p>
+        // Rows are bucketed by each trade's own recorded mode now, not by
+        // this session existing (see buildTradeRows' own docstring) -- a
+        // workspace can have real paper-mode trades with no separate
+        // mock-backed session at all (e.g. force_paper strategies routed
+        // through the one real broker's session). Gating the whole table
+        // on `!session` here would hide genuinely real trades behind a
+        // stale "no session" message -- check rows first, always.
+        (visibleRows.length === 0 ? (
+          <p className="muted">{session ? 'No trades yet today.' : emptyHint}</p>
         ) : (
           <table>
             <thead>
