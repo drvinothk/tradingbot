@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState, type FormEvent } from 'react'
-import { api, ApiError, shoonyaApi } from '../../shared/api/client'
+import { api, ApiError } from '../../shared/api/client'
 import { useSessions } from '../../shared/hooks/useSessions'
 import { useSessionBuckets } from '../../shared/hooks/useSessionBuckets'
 import { useStrategies } from '../../shared/hooks/useStrategies'
@@ -18,8 +18,6 @@ import type {
   RuntimeMode,
   SessionOut,
   SetStrategyPowerOut,
-  ShoonyaLoginUrlOut,
-  ShoonyaStatusOut,
   StrategyConfigOut,
   StrategyRunOut,
   StrategyType,
@@ -27,7 +25,9 @@ import type {
 } from '../../shared/api/types'
 
 const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
-const FAILOVER_PROVIDERS = ['shoonya', 'angel_one'] as const
+// "angel_one" archived 2026-08-21 -- see CLAUDE.md's Angel One section.
+// Must match backend RECOGNIZED_OVERRIDE_PROVIDERS (app/api/v1/market_data.py).
+const FAILOVER_PROVIDERS = ['shoonya'] as const
 
 // The user's real current 5 strategy types plus Synthetic, folded at the
 // bottom — see the plan's "Advanced" section. Order matters: it's the
@@ -676,7 +676,6 @@ function ReconciliationAndRecoveryCard() {
   return (
     <div className="card">
       <h3>Reconciliation &amp; Recovery</h3>
-      <ShoonyaConnectionRow />
 
       {error && <p className="error">{error}</p>}
 
@@ -901,50 +900,6 @@ function DailyPlanEditor({
       <span className="muted" style={{ fontSize: '0.75rem' }}>
         session {session.mode}
       </span>
-    </div>
-  )
-}
-
-function ShoonyaConnectionRow() {
-  const queryClient = useQueryClient()
-  const [error, setError] = useState<string | null>(null)
-
-  // Same queryKey useActiveSessionMode (header/ModeBanner) uses for this
-  // endpoint -- keeping them unified is what lets the Connect mutation's
-  // invalidate below actually refresh the header too, instead of just this
-  // row's own independent cache.
-  const statusQuery = useQuery({
-    queryKey: ['shoonya', 'status'],
-    queryFn: () => shoonyaApi.get<ShoonyaStatusOut>('/shoonya/status'),
-    refetchOnWindowFocus: true,
-  })
-
-  const connectMutation = useMutation({
-    mutationFn: () => shoonyaApi.get<ShoonyaLoginUrlOut>('/shoonya/login-url'),
-    onSuccess: (data) => {
-      window.open(data.authorize_url, '_blank', 'noopener,noreferrer')
-      // The actual "connected" flip happens on Shoonya's own OAuth
-      // callback (a separate tab/redirect), not this response -- refetch
-      // on window focus (already set above) picks it up once the user
-      // comes back, but invalidate now too so both this row and the
-      // header banner reconcile together rather than drifting.
-      queryClient.invalidateQueries({ queryKey: ['shoonya', 'status'] })
-    },
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not start login'),
-  })
-
-  const connected = statusQuery.data?.connected ?? false
-
-  return (
-    <div className="row-actions" style={{ marginBottom: '1rem' }}>
-      <span className="muted">
-        <span className={`status-dot ${connected ? 'on' : 'off'}`} /> Shoonya:{' '}
-        {statusQuery.isLoading ? 'checking...' : connected ? 'connected' : 'not connected'}
-      </span>
-      <button disabled={connectMutation.isPending} onClick={() => connectMutation.mutate()}>
-        {connected ? 'Reconnect Shoonya' : 'Connect Shoonya'}
-      </button>
-      {error && <span className="error">{error}</span>}
     </div>
   )
 }

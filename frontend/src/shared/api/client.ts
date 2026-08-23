@@ -50,10 +50,40 @@ export const api = {
     }),
 }
 
-// Shoonya's OAuth routes live outside /api/v1 on purpose (the backend's
-// SHOONYA_REDIRECT_URL is a fixed URL registered on Shoonya's own API key
-// form — prefixing it would break that registration), so they need their
-// own unprefixed client rather than going through `api` above.
+// File downloads (trade-log Excel, WS-quality CSV) need the raw response
+// blob + Content-Disposition filename, not `request`'s JSON parsing --
+// separate helper rather than overloading `api.get`.
+export async function downloadFile(path: string, fallbackFilename: string): Promise<void> {
+  const response = await fetch(`${BASE}${path}`, { credentials: 'include' })
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    throw new ApiError(response.status, body)
+  }
+  const blob = await response.blob()
+  const disposition = response.headers.get('content-disposition') ?? ''
+  const match = /filename="?([^";]+)"?/.exec(disposition)
+  const filename = match?.[1] ?? fallbackFilename
+
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+// Shoonya's (and Alice Blue's) OAuth routes live outside /api/v1 on purpose
+// (the registered redirect URL on each broker's own portal is a fixed URL —
+// prefixing it would break that registration), so they need their own
+// unprefixed client rather than going through `api` above. Shared between
+// both brokers since the shape is identical, not duplicated per-broker.
 export const shoonyaApi = {
   get: <T>(path: string) => request<T>('', path),
+  post: <T>(path: string, body?: unknown) =>
+    request<T>('', path, {
+      method: 'POST',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }),
 }

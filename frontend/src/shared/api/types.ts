@@ -72,6 +72,16 @@ export interface InstrumentFirewallOut {
   recognized_instruments: string[]
 }
 
+export type DiagnosticRole = 'default' | 'failback'
+
+export interface DiagnosticRoleStatus {
+  running: boolean
+  provider: string | null
+  run_id: string | null
+}
+
+export type DiagnosticStatusOut = Record<DiagnosticRole, DiagnosticRoleStatus>
+
 export interface InstrumentOut {
   id: string
   symbol: string

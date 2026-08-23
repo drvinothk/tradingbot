@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { api, ApiError } from '../../shared/api/client'
+import { api, ApiError, downloadFile } from '../../shared/api/client'
 import { useSessions } from '../../shared/hooks/useSessions'
 import { useStrategies } from '../../shared/hooks/useStrategies'
 import { strategyTypeLabel } from '../../shared/format/friendlyLabel'
@@ -8,8 +8,8 @@ import type { DailyReportOut, PerformanceStatsOut, ScorecardOut } from '../../sh
 
 const DOWNLOAD_OPTIONS = [
   { value: 'eod-excel', label: 'EOD trade-log Excel' },
-  { value: 'scorecard', label: 'Strategy Scorecard export' },
   { value: 'ws-quality', label: 'WS/feed quality report' },
+  { value: 'scorecard', label: 'Strategy Scorecard export' },
 ] as const
 
 export function ReportsPage() {
@@ -20,6 +20,7 @@ export function ReportsPage() {
   const [strategyId, setStrategyId] = useState('')
   const [downloadChoice, setDownloadChoice] = useState('')
   const [downloadNote, setDownloadNote] = useState<string | null>(null)
+  const [downloading, setDownloading] = useState(false)
 
   const dailyReportQuery = useQuery({
     queryKey: ['reports', 'daily', sessionId],
@@ -36,10 +37,29 @@ export function ReportsPage() {
   const sessions = sessionsQuery.data ?? []
   const strategies = strategiesQuery.data ?? []
 
-  function handleDownload() {
+  async function handleDownload() {
     if (!downloadChoice) return
-    const option = DOWNLOAD_OPTIONS.find((o) => o.value === downloadChoice)
-    setDownloadNote(`"${option?.label}" is not available yet — the download endpoint isn't built yet. No request was sent.`)
+    setDownloadNote(null)
+
+    if (downloadChoice === 'scorecard') {
+      setDownloadNote(
+        'Strategy Scorecard export is not available yet — the download endpoint isn’t built yet.',
+      )
+      return
+    }
+
+    setDownloading(true)
+    try {
+      if (downloadChoice === 'eod-excel') {
+        await downloadFile('/reports/trade-log-export', 'trade_log.xlsx')
+      } else if (downloadChoice === 'ws-quality') {
+        await downloadFile('/reports/ws-quality-export', 'ws_quality.csv')
+      }
+    } catch (err) {
+      setDownloadNote(err instanceof ApiError ? err.message : 'Download failed')
+    } finally {
+      setDownloading(false)
+    }
   }
 
   return (
@@ -55,17 +75,17 @@ export function ReportsPage() {
               </option>
             ))}
           </select>
-          <button className="btn-ghost" disabled={!downloadChoice} onClick={handleDownload}>
+          <button
+            className="btn-ghost"
+            disabled={!downloadChoice || downloading}
+            onClick={() => void handleDownload()}
+          >
             Download
           </button>
         </div>
       </div>
 
-      {downloadNote && (
-        <p className="muted">
-          {downloadNote} <span className="badge badge-wip">WIP</span>
-        </p>
-      )}
+      {downloadNote && <p className="muted">{downloadNote}</p>}
 
       <div className="card">
         <h3>Daily report</h3>

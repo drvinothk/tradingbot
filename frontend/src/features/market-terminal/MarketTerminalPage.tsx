@@ -1,5 +1,91 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
-import type { UnderlyingSymbol } from '../../shared/api/types'
+import { api, ApiError } from '../../shared/api/client'
+import { BrokerConnectionRow } from '../../shared/components/BrokerConnectionRow'
+import type { DiagnosticRole, DiagnosticStatusOut, UnderlyingSymbol } from '../../shared/api/types'
+
+type DiagnosticMode = 'default' | 'failback' | 'both'
+
+const DIAGNOSTIC_MODE_OPTIONS: { value: DiagnosticMode; label: string }[] = [
+  { value: 'default', label: 'Test Default' },
+  { value: 'failback', label: 'Test Failback' },
+  { value: 'both', label: 'Both' },
+]
+
+function rolesForMode(mode: DiagnosticMode): DiagnosticRole[] {
+  return mode === 'both' ? ['default', 'failback'] : [mode]
+}
+
+// "Default"/"Failback" never name a broker on purpose -- see
+// diagnostic_session.py's own module docstring. Whichever provider each
+// slot resolves to today (shown next to the dropdown once a run starts) is
+// resolved fresh by the backend, not hardcoded here.
+function WsQualityTestControl() {
+  const queryClient = useQueryClient()
+  const [mode, setMode] = useState<DiagnosticMode>('default')
+  const [error, setError] = useState<string | null>(null)
+
+  const statusQuery = useQuery({
+    queryKey: ['market-data', 'diagnostic-status'],
+    queryFn: () => api.get<DiagnosticStatusOut>('/market-data/diagnostic/status'),
+    refetchInterval: 15_000,
+  })
+
+  const invalidateStatus = () =>
+    queryClient.invalidateQueries({ queryKey: ['market-data', 'diagnostic-status'] })
+
+  const startMutation = useMutation({
+    mutationFn: () => api.post('/market-data/diagnostic/start', { mode }),
+    onSuccess: () => {
+      setError(null)
+      invalidateStatus()
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not start test'),
+  })
+
+  const stopMutation = useMutation({
+    mutationFn: () => api.post('/market-data/diagnostic/stop', { mode }),
+    onSuccess: invalidateStatus,
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not stop test'),
+  })
+
+  const roles = rolesForMode(mode)
+  const running = roles.map((role) => statusQuery.data?.[role])
+  const anyRunning = running.some((r) => r?.running)
+  const providers = running
+    .filter((r) => r?.running && r.provider)
+    .map((r) => r?.provider)
+    .join(' + ')
+
+  return (
+    <div className="row-actions">
+      {/* Deliberately .muted, not .broker-status -- this is a rarely-used
+          diagnostic tool, not a status worth the same visual weight as the
+          actual broker connection state next to it. */}
+      <span className="muted">WS Quality Test</span>
+      <select
+        value={mode}
+        disabled={anyRunning}
+        onChange={(e) => setMode(e.target.value as DiagnosticMode)}
+      >
+        {DIAGNOSTIC_MODE_OPTIONS.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      <button
+        className="btn-ghost"
+        disabled={startMutation.isPending || stopMutation.isPending}
+        onClick={() => (anyRunning ? stopMutation.mutate() : startMutation.mutate())}
+      >
+        {anyRunning ? 'Stop' : 'Run'}
+      </button>
+      {anyRunning && providers && <span className="muted">({providers})</span>}
+      {error && <span className="error">{error}</span>}
+    </div>
+  )
+}
 
 const TRADINGVIEW_SYMBOL: Record<UnderlyingSymbol, string> = {
   NIFTY: 'NSE:NIFTY',
@@ -21,6 +107,24 @@ export function MarketTerminalPage() {
 
   return (
     <div>
+      <div className="broker-ribbon">
+        <div className="broker-ribbon-left">
+          <BrokerConnectionRow
+            brokerLabel="Shoonya"
+            statusPath="/shoonya/status"
+            loginUrlPath="/shoonya/login-url"
+            queryKeyPrefix="shoonya"
+          />
+          <BrokerConnectionRow
+            brokerLabel="Alice Blue"
+            statusPath="/aliceblue/status"
+            loginUrlPath="/aliceblue/login-url"
+            queryKeyPrefix="alice_blue"
+          />
+        </div>
+        <WsQualityTestControl />
+      </div>
+
       <div className="page-header">
         <h2>Market Terminal</h2>
         <div className="row-actions">

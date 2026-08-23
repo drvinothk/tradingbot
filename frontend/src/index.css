@@ -331,11 +331,19 @@ tbody tr:hover {
 .broker-ribbon {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 2rem;
   flex-wrap: wrap;
   padding: 1rem 0;
   margin-bottom: 1rem;
   border-bottom: 1px solid var(--border);
+}
+
+.broker-ribbon-left {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+  flex-wrap: wrap;
 }
 
 .broker-ribbon .row-actions {
