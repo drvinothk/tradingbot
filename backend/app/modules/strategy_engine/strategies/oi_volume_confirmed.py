@@ -133,7 +133,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         max_range_banknifty_points: float = 180.0,
         min_body_ratio: float = 0.40,
         oi_morning_window_start: str = "09:31",
-        oi_morning_window_end: str = "11:00",
+        oi_morning_window_end: str = "15:00",
         oi_afternoon_window_start: str = "13:00",
         oi_afternoon_window_end: str = "15:00",
         oi_max_trades_per_session: int = 3,

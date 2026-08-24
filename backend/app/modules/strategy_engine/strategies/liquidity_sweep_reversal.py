@@ -117,7 +117,7 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
         sweep_max_range_width_banknifty_points: float = 360.0,
         min_body_ratio: float = 0.40,
         sweep_morning_window_start: str = "09:31",
-        sweep_morning_window_end: str = "11:00",
+        sweep_morning_window_end: str = "15:00",
         sweep_afternoon_window_start: str = "13:00",
         sweep_afternoon_window_end: str = "15:00",
         sweep_max_trades_per_session: int = 3,

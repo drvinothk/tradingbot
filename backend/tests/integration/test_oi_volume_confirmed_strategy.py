@@ -402,7 +402,9 @@ class TestOIVolumeConfirmedStrategy:
             db, instrument, midday, open=22030, high=22055, low=22028, close=22050,
         )
 
-        strategy = OIVolumeConfirmedStrategy(instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS)
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_morning_window_end="11:00",
+        )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
         assert OptionType.CE in strategy._pending_breakout  # noqa: SLF001
 
@@ -417,7 +419,9 @@ class TestOIVolumeConfirmedStrategy:
         breakout_bar = _seed_bar(
             db, instrument, midday, open=22030, high=22055, low=22028, close=22050,
         )
-        strategy = OIVolumeConfirmedStrategy(instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS)
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_morning_window_end="11:00",
+        )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
 
         # One bar later, price falls back inside the *frozen* [21990, 22030]
@@ -463,7 +467,9 @@ class TestOIVolumeConfirmedStrategy:
         breakout_bar = _seed_bar(
             db, instrument, midday, open=22030, high=22055, low=22028, close=22050,
         )
-        strategy = OIVolumeConfirmedStrategy(instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS)
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_morning_window_end="11:00",
+        )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
         assert OptionType.CE in strategy._pending_breakout  # noqa: SLF001
 
@@ -590,7 +596,9 @@ class TestOIVolumeConfirmedStrategy:
             db, instrument, midday, open=22030, high=22055, low=22028, close=22050,
         )
 
-        strategy = OIVolumeConfirmedStrategy(instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS)
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_morning_window_end="11:00",
+        )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
 
     def test_no_signal_once_max_trades_per_session_reached(

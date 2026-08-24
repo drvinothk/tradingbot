@@ -117,7 +117,7 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         ema_expansion_lookback: int = 3,
         min_body_ratio: float = 0.40,
         ema_morning_window_start: str = "09:31",
-        ema_morning_window_end: str = "11:00",
+        ema_morning_window_end: str = "15:00",
         ema_afternoon_window_start: str = "13:00",
         ema_afternoon_window_end: str = "15:00",
         ema_max_trades_per_session: int = 3,

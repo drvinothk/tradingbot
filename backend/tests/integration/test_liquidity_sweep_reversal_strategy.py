@@ -625,7 +625,7 @@ class TestLiquiditySweepReversalStrategy:
         )
 
         strategy = LiquiditySweepReversalStrategy(
-            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS,
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, sweep_morning_window_end="11:00",
         )
         assert strategy.check_setup(db, strategy_run, sweep_bar) is None
         confirmation_bar = _seed_bar(

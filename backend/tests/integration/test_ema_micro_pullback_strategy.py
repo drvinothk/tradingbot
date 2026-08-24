@@ -514,7 +514,7 @@ class TestEMAMicroPullbackStrategy:
         entry_bar = _seed_bar(db, instrument, midday,
                                open=21990, high=22015, low=21988, close=22010)
 
-        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY)
+        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY, ema_morning_window_end="11:00")
         assert strategy.check_setup(db, strategy_run, entry_bar) is None
 
     def test_no_signal_once_max_trades_per_session_reached(
