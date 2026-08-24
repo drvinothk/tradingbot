@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, ApiError } from '../../shared/api/client'
 import { useSessions } from '../../shared/hooks/useSessions'
 import { useSessionBuckets } from '../../shared/hooks/useSessionBuckets'
@@ -1017,6 +1017,11 @@ interface OpenLivePosition {
 interface RestartBackendResponse {
   ok: boolean
   message: string
+  boot_id: string
+}
+
+interface BootStatusResponse {
+  boot_id: string
 }
 
 interface RestartBlockedDetail {
@@ -1024,10 +1029,67 @@ interface RestartBlockedDetail {
   open_live_positions: OpenLivePosition[]
 }
 
+// How long to keep polling /boot-status for a new boot_id before giving up
+// and telling the user to go check server logs themselves.
+const RESTART_POLL_INTERVAL_MS = 2000
+const RESTART_POLL_TIMEOUT_MS = 60_000
+
 function BackendRestartCard() {
   const [restartReason, setRestartReason] = useState('')
   const [restartStatus, setRestartStatus] = useState<string | null>(null)
   const [blockedPositions, setBlockedPositions] = useState<OpenLivePosition[] | null>(null)
+  const [isWaitingForRestart, setIsWaitingForRestart] = useState(false)
+  // Bumped on every new restart attempt (and on unmount) so a poll loop
+  // started by an earlier attempt recognizes it's stale and stops instead
+  // of racing a newer one or updating state after the component is gone.
+  const pollTokenRef = useRef(0)
+
+  useEffect(() => {
+    return () => {
+      pollTokenRef.current += 1
+    }
+  }, [])
+
+  function pollForNewBoot(previousBootId: string, token: number) {
+    const deadline = Date.now() + RESTART_POLL_TIMEOUT_MS
+
+    const tick = () => {
+      if (pollTokenRef.current !== token) return
+      api
+        .get<BootStatusResponse>('/system-settings/boot-status')
+        .then((result) => {
+          if (pollTokenRef.current !== token) return
+          if (result.boot_id !== previousBootId) {
+            setIsWaitingForRestart(false)
+            setRestartStatus('Restart successful — the new backend process is up.')
+            return
+          }
+          scheduleNext()
+        })
+        .catch(() => {
+          // Expected while the process is actually down (connection refused,
+          // proxy error, etc.) -- not a failure on its own, keep polling
+          // until the overall timeout below gives up.
+          if (pollTokenRef.current !== token) return
+          scheduleNext()
+        })
+    }
+
+    const scheduleNext = () => {
+      if (pollTokenRef.current !== token) return
+      if (Date.now() >= deadline) {
+        setIsWaitingForRestart(false)
+        setRestartStatus(
+          "Restart was scheduled, but the backend hasn't confirmed coming back up after " +
+            '60s. Check the server logs.',
+        )
+        return
+      }
+      setTimeout(tick, RESTART_POLL_INTERVAL_MS)
+    }
+
+    setTimeout(tick, RESTART_POLL_INTERVAL_MS)
+  }
 
   const restartMutation = useMutation({
     mutationFn: (force: boolean) =>
@@ -1037,7 +1099,10 @@ function BackendRestartCard() {
       }),
     onSuccess: (result) => {
       setBlockedPositions(null)
-      setRestartStatus(result.message)
+      setRestartStatus(`${result.message} Waiting for the new process to come up…`)
+      setIsWaitingForRestart(true)
+      pollTokenRef.current += 1
+      pollForNewBoot(result.boot_id, pollTokenRef.current)
     },
     onError: (err) => {
       if (err instanceof ApiError && err.status === 409) {
@@ -1085,7 +1150,11 @@ function BackendRestartCard() {
           rows={2}
         />
       </div>
-      <button className="danger" disabled={restartMutation.isPending} onClick={handleRestartClick}>
+      <button
+        className="danger"
+        disabled={restartMutation.isPending || isWaitingForRestart}
+        onClick={handleRestartClick}
+      >
         Restart backend
       </button>
       {restartStatus && <p>{restartStatus}</p>}
@@ -1109,7 +1178,11 @@ function BackendRestartCard() {
               ))}
             </tbody>
           </table>
-          <button className="danger" disabled={restartMutation.isPending} onClick={() => restartMutation.mutate(true)}>
+          <button
+            className="danger"
+            disabled={restartMutation.isPending || isWaitingForRestart}
+            onClick={() => restartMutation.mutate(true)}
+          >
             Restart anyway
           </button>
         </>

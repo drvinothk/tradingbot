@@ -52,6 +52,17 @@ router = APIRouter(prefix="/system-settings", tags=["system-settings"])
 _RESTART_SERVICE_NAME = "trading-bot.service"
 _RESTART_DELAY_SECONDS = 3.0
 
+# Generated once per process, at import time -- i.e. once per real backend
+# boot. `POST /restart-backend` echoes this back so the frontend can remember
+# "the boot this restart was requested from"; `GET /boot-status` (unauthenticated
+# poll target, see its own docstring) returns whatever the *current* process's
+# value is. A restart genuinely landing is "the value returned by /boot-status
+# is no longer the one /restart-backend returned" -- 2026-08-24 addition, closing
+# the gap where the UI's "Restart scheduled in ~3s" message never updated to
+# confirm the new process actually came back up (previously the frontend just
+# stored the scheduling response's message and never polled anything further).
+_BOOT_ID = str(uuid.uuid4())
+
 # This system only ever trades these two underlyings -- same scoping as
 # api.v1.shoonya._KNOWN_UNDERLYINGS / broker_adapter/shoonya/adapter.py's
 # KNOWN_UNDERLYINGS.
@@ -278,6 +289,10 @@ class RestartBackendRequest(BaseModel):
     force: bool = False
 
 
+class BootStatusOut(BaseModel):
+    boot_id: str
+
+
 class OpenLivePositionOut(BaseModel):
     trading_session_id: str
     contract_symbol: str
@@ -303,6 +318,19 @@ def _schedule_restart() -> None:
         )
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+@router.get("/boot-status", response_model=BootStatusOut)
+def boot_status() -> BootStatusOut:
+    """Deliberately unauthenticated -- the frontend polls this in a tight
+    loop right through the middle of a restart to detect the new process
+    coming up (see `_BOOT_ID`'s own docstring), and a lapsed/invalidated
+    session cookie during that exact window must never be mistaken for "the
+    backend is still down." The value returned carries no sensitive
+    information (an opaque per-process UUID), same posture as the existing
+    unauthenticated `/health` endpoint in `app.main`.
+    """
+    return BootStatusOut(boot_id=_BOOT_ID)
 
 
 @router.post("/restart-backend")
@@ -372,4 +400,8 @@ def restart_backend(
     db.commit()
 
     _schedule_restart()
-    return {"ok": True, "message": f"Restart scheduled in ~{_RESTART_DELAY_SECONDS:.0f}s."}
+    return {
+        "ok": True,
+        "message": f"Restart scheduled in ~{_RESTART_DELAY_SECONDS:.0f}s.",
+        "boot_id": _BOOT_ID,
+    }

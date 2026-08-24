@@ -667,3 +667,33 @@ def test_restart_backend_allowed_with_no_open_positions(
 
     assert response.status_code == 200
     assert called == [True]
+
+
+def test_restart_backend_response_includes_boot_id(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-24: the frontend needs `boot_id` from this response to know
+    which boot it's waiting to see change on `/boot-status` -- this is the
+    fix for the "Restart scheduled..." message that never updated to confirm
+    the new process actually came back up.
+    """
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(system_settings_module, "_schedule_restart", lambda: None)
+    _login(api_client, seeded_admin)
+
+    response = api_client.post(
+        "/api/v1/system-settings/restart-backend", json={"reason": "test"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["boot_id"] == system_settings_module._BOOT_ID
+
+
+def test_boot_status_returns_current_process_boot_id(api_client: TestClient):
+    """Deliberately unauthenticated (see the endpoint's own docstring) --
+    checked here without logging in at all.
+    """
+    response = api_client.get("/api/v1/system-settings/boot-status")
+
+    assert response.status_code == 200
+    assert response.json()["boot_id"] == system_settings_module._BOOT_ID
