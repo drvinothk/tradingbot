@@ -120,9 +120,11 @@ wired in later via a credentials file.
   `OrderBook` by idempotency key before concluding a genuinely-ambiguous
   `PlaceOrder` failure means the order never went through — avoiding a real
   duplicate-order risk) is unit-tested but not yet live-verified. All of
-  this sits on branch `fix/shoonya-option-chain-expiry-anchor`, not yet
-  committed or merged to `main` — deliberately, since it's Shoonya-specific
-  work kept isolated per the build plan's own branch note.
+  this originated on branch `fix/shoonya-option-chain-expiry-anchor`,
+  deliberately kept isolated from `main` per the build plan's own branch
+  note while in progress — **merged into `main` 2026-08-24** (86 commits,
+  fast-forward, no conflicts) once the Shoonya-specific work had settled
+  enough to fold back in; both branches now point at the same commit.
   **Still open, per the build plan's actual "done when" bar**: a real
   multi-session paper soak (today produced no live signal — market closed
   minutes after the REST-fallback work finished), a reconciliation
