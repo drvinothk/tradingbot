@@ -30,7 +30,7 @@ from app.domain.execution.models import (
     TrailPlanStatus,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import Instrument, OptionContract, OptionType, PriceBar
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
@@ -60,6 +60,7 @@ from app.modules.scheduler.eod_square_off import (
     run_eod_square_off,
     run_single_position_square_off,
 )
+from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME
 
 EXPIRY = date(2026, 7, 30)
 
@@ -222,6 +223,23 @@ def _make_trade_intent(
     db.add(trade_intent)
     db.flush()
     return trade_intent
+
+
+def _seed_price_bar(db: Session, instrument: Instrument, *, close: float) -> PriceBar:
+    """A single completed 60s bar for `instrument`, close-only matters for
+    the structure-break bar-close confirmation gate -- open/high/low are
+    filler values around close."""
+    bar = PriceBar(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        timeframe=BAR_TIMEFRAME,
+        bucket_start=datetime.now(UTC),
+        open=close, high=close + 1, low=close - 1, close=close,
+        volume=1000,
+    )
+    db.add(bar)
+    db.flush()
+    return bar
 
 
 # -- dispatch_trade_intent ----------------------------------------------------
@@ -1661,10 +1679,11 @@ def test_evaluate_open_position_noisy_breach_then_reclaim_stays_open(
 
 
 def test_evaluate_open_position_confirms_structure_break_once_persisted(
-    db: Session, broker, trading_session, strategy_run, option_contract
+    db: Session, broker, trading_session, strategy_run, option_contract, instrument
 ):
-    """A breach that clears the buffer and holds past the persistence
-    window confirms as a real STRUCTURE_BREAK exit.
+    """A breach that clears the buffer, holds past the persistence window,
+    AND is confirmed by the latest completed bar's own close (not just a
+    live tick) confirms as a real STRUCTURE_BREAK exit.
     """
     trade_intent = _make_trade_intent(
         db, trading_session, strategy_run, option_contract,
@@ -1688,6 +1707,10 @@ def test_evaluate_open_position_confirms_structure_break_once_persisted(
     db.add(stop_plan)
     db.flush()
 
+    # The latest completed bar also closed beyond the buffered level
+    # (21980) -- real bar evidence, not just a live tick.
+    _seed_price_bar(db, instrument, close=21970.0)
+
     outcome = evaluate_open_position(
         db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
     )
@@ -1696,6 +1719,109 @@ def test_evaluate_open_position_confirms_structure_break_once_persisted(
     assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
     db.refresh(position)
     assert position.status == PositionStatus.CLOSED
+
+
+def test_evaluate_open_position_does_not_confirm_structure_break_without_a_bar_close(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Persistence elapsed on a live-tick breach, but no completed bar
+    exists yet to confirm it actually closed beyond the level -- the exact
+    live-observed gap this gate closes (2026-08-24: a 120s-persistence
+    trade still confirmed on tick noise alone). Must stay a candidate, not
+    exit, until real bar evidence exists.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+        structure_break_buffer=20.0, structure_break_persistence_seconds=6.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None
+    stop_plan.structure_break_candidate_since -= timedelta(seconds=7)
+    db.add(stop_plan)
+    db.flush()
+
+    # No PriceBar seeded at all -- fail-safe: no bar evidence means no confirm.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None  # still an active candidate
+
+
+def test_evaluate_open_position_does_not_confirm_structure_break_if_bar_recovered(
+    db: Session, broker, trading_session, strategy_run, option_contract, instrument
+):
+    """The core new-behavior case: persistence elapsed on a live-tick
+    breach, but the latest COMPLETED bar closed back inside the buffered
+    level (price recovered by bar-close time even though a tick dipped
+    below mid-bar) -- must not confirm, must stay a candidate.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+        structure_break_buffer=20.0, structure_break_persistence_seconds=6.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None
+    stop_plan.structure_break_candidate_since -= timedelta(seconds=7)
+    db.add(stop_plan)
+    db.flush()
+
+    # Buffered level is 21980 (22000 - 20 buffer) -- this bar's close
+    # (21985) is back INSIDE it, even though the live tick dipped to 21975.
+    _seed_price_bar(db, instrument, close=21985.0)
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None  # still an active candidate
+
+
+def test_evaluate_open_position_zero_persistence_skips_bar_close_gate(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Backward-compat guard: a strategy that never opted into persistence
+    (unset, defaults to 0) must keep the exact original single-tick
+    instant-exit behavior -- the new bar-close gate must not apply here,
+    even with zero PriceBar rows seeded.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21990.0
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
 
 
 def test_evaluate_open_position_exits_on_spread_blowout(

@@ -134,6 +134,47 @@ def _dec(value: object) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
+def _structure_break_confirmed_by_bar_close(
+    db: Session, instrument_id: uuid.UUID, buffered_level: Decimal, favorable: bool
+) -> bool:
+    """The persistence timer alone can still confirm on pure intra-bar noise
+    that fully recovers by the time the bar closes -- live-observed
+    2026-08-24 (a 120s-persistence VWAP Pullback trade still confirmed
+    structure_break on a live tick, PnL still positive, consistent with the
+    breach never actually being real). Requires the latest COMPLETED
+    underlying bar (`BAR_TIMEFRAME` -- the one timeframe every strategy's
+    own entry logic already confirms against via `touch_and_confirm`) to
+    have actually closed beyond `buffered_level`, not just touched it
+    mid-bar -- the same close-not-wick discipline entries already use,
+    applied symmetrically to exits. No completed bar yet returns False
+    (fail-safe: don't confirm without real bar evidence, keep the candidate
+    active and re-check next poll).
+
+    No staleness check on the bar itself — trusts whatever `price_bars`'
+    latest row is. If underlying ingestion ever stalled, a stale bar's old
+    close could wrongly gate the decision either way; `market_data.
+    freshness` already has the tooling for this elsewhere
+    (`classify_latest_tick`) but wiring it into this specific check is
+    separate, not-yet-done scope, flagged here rather than silently assumed
+    fine.
+
+    Local import, not module-level: `strategy_engine/__init__.py` eagerly
+    imports `strategy_engine.service`, which imports `dispatch_trade_intent`
+    from *this* module at its own top level -- a module-level import of
+    `strategy_engine.common_rules` here would be a real circular import at
+    app startup (surfaces immediately across the whole test suite, not just
+    a style choice), same shape `api.v1.sessions.py`'s own local import of
+    `session.bootstrapper` already documents.
+    """
+    from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME, get_recent_completed_bars
+
+    bars = get_recent_completed_bars(db, instrument_id, BAR_TIMEFRAME, limit=1)
+    if not bars:
+        return False
+    close = _dec(bars[0].close)
+    return close < buffered_level if favorable else close > buffered_level
+
+
 def _opposite(side: SignalSide) -> SignalSide:
     return SignalSide.SELL if side == SignalSide.BUY else SignalSide.BUY
 
@@ -1622,6 +1663,16 @@ def evaluate_open_position(
     today's exact prior instant-exit behavior — this is deliberately
     byte-identical for anything not opted in, so the fix is safe to ship
     even with positions already open.
+
+    Once persistence elapses (only when `structure_break_persistence_
+    seconds > 0`, i.e. a strategy that opted in), `_structure_break_
+    confirmed_by_bar_close` additionally requires the latest *completed*
+    underlying bar to have actually closed beyond the buffered level before
+    confirming — a live-tick timer alone can still fire on pure intra-bar
+    noise that recovers by the time the bar closes (live-observed
+    2026-08-24: a 120s-persistence trade still confirmed this way, exit PnL
+    still positive). If the latest bar closed back inside the level, the
+    candidate stays active and is re-checked next poll rather than firing.
     """
     if position.status != PositionStatus.OPEN:
         return None
@@ -1698,14 +1749,26 @@ def evaluate_open_position(
 
             elapsed = (_utcnow() - stop_plan.structure_break_candidate_since).total_seconds()
             if elapsed >= persistence_seconds:
-                return close_position(
-                    db,
-                    trading_session,
-                    position,
-                    ExitReason.STRUCTURE_BREAK,
-                    float(price),
-                    broker=broker,
-                )
+                if persistence_seconds > 0:
+                    option_contract = db.get(OptionContract, position.option_contract_id)
+                    confirmed = option_contract is not None and (
+                        _structure_break_confirmed_by_bar_close(
+                            db, option_contract.instrument_id, buffered_level, favorable
+                        )
+                    )
+                else:
+                    # Not opted in (persistence unset) -- preserve the exact
+                    # original single-tick instant-exit behavior.
+                    confirmed = True
+                if confirmed:
+                    return close_position(
+                        db,
+                        trading_session,
+                        position,
+                        ExitReason.STRUCTURE_BREAK,
+                        float(price),
+                        broker=broker,
+                    )
         elif stop_plan.structure_break_candidate_since is not None:
             # Reclaimed — price came back inside the buffered level before
             # persistence was satisfied. Cancel the candidate rather than
