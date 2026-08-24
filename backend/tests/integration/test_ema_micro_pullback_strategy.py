@@ -237,6 +237,14 @@ def _seed_expansion(
     db.flush()
 
 
+def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
+    db.add(IndicatorSnapshot(
+        id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="ATR14",
+        timeframe=BAR_TIMEFRAME, value=value, ts=datetime.now(IST),
+    ))
+    db.flush()
+
+
 def _seed_filler_bars(
     db: Session, instrument: Instrument, *, count: int, start: datetime,
     open_: float, close_: float,
@@ -312,6 +320,24 @@ class TestEMAMicroPullbackStrategy:
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(float(setup_bar.low))
         assert strategy.trades_fired_count == 1
+        assert proposal.structure_break_buffer == pytest.approx(0.0)
+
+    def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _setup_bar, entry_bar = _seed_bullish_baseline(db, instrument)
+        _seed_atr(db, instrument, value=10.0)
+
+        strategy = EMAMicroPullbackStrategy(
+            instrument.id, EXPIRY,
+            structure_break_atr_multiplier=0.2, structure_break_persistence_seconds=20.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, entry_bar)
+
+        assert proposal is not None
+        assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
+        assert proposal.structure_break_persistence_seconds == pytest.approx(20.0)
 
     def test_bearish_setup_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,

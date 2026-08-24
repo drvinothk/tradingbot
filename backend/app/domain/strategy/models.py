@@ -183,6 +183,16 @@ class Signal(Base, UUIDPkMixin):
     # pullback-bar extreme / EMA9 value) — independent of stop_price/
     # target_price, which are on the option premium. See StopPlan.structure_level.
     structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # ATR-scaled minimum-breach margin (underlying index points) and minimum
+    # persistence window (seconds) a structure_level breach must hold before
+    # counting as a confirmed break, rather than a single noisy tick — frozen
+    # at signal time, same as structure_level itself. Null on either means
+    # "no buffer / confirm immediately" (today's exact prior behavior). See
+    # StopPlan's identical pair and evaluate_open_position's own docstring.
+    structure_break_buffer: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
 
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -215,6 +225,11 @@ class TradeIntent(Base, UUIDPkMixin):
     )
     trail_lock_fraction: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
     structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # See Signal's identical pair above.
+    structure_break_buffer: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
     status: Mapped[TradeIntentStatus] = mapped_column(
         String(20), default=TradeIntentStatus.PENDING_RISK
     )

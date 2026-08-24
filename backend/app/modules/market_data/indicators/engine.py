@@ -1,4 +1,4 @@
-"""Per-instrument indicator state: VWAP updates every tick, EMA9/EMA20
+"""Per-instrument indicator state: VWAP updates every tick, EMA9/EMA20/ATR14
 update only when a bar completes. Pure logic — no DB/broker dependency, so
 it's fully testable against synthetic ticks; the ingestion service is what
 wires this to persistence.
@@ -9,12 +9,14 @@ from __future__ import annotations
 import uuid
 
 from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
+from app.modules.market_data.indicators.atr import ATRCalculator
 from app.modules.market_data.indicators.bar_aggregator import Bar, BarAggregator
 from app.modules.market_data.indicators.ema import EMACalculator
 from app.modules.market_data.indicators.vwap import VWAPCalculator
 
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 20
+ATR_PERIOD = 14
 
 
 class IndicatorEngine:
@@ -24,6 +26,7 @@ class IndicatorEngine:
         self._ema9: dict[uuid.UUID, EMACalculator] = {}
         self._ema20: dict[uuid.UUID, EMACalculator] = {}
         self._vwap: dict[uuid.UUID, VWAPCalculator] = {}
+        self._atr: dict[uuid.UUID, ATRCalculator] = {}
 
     def on_tick(self, instrument_id: uuid.UUID, tick: Tick) -> tuple[dict[str, float], Bar | None]:
         """Feeds one tick for `instrument_id`. Returns the indicator values
@@ -57,14 +60,20 @@ class IndicatorEngine:
             if ema20_value is not None:
                 results["EMA20"] = ema20_value
 
+            atr_calc = self._atr.setdefault(instrument_id, ATRCalculator(ATR_PERIOD))
+            atr_value = atr_calc.update(completed_bar.high, completed_bar.low, completed_bar.close)
+            if atr_value is not None:
+                results["ATR14"] = atr_value
+
         return results, completed_bar
 
     def on_completed_bar(self, instrument_id: uuid.UUID, candle: PriceCandle) -> dict[str, float]:
         """For a REST-polled `PriceCandle` (already a complete, broker-
         supplied bar) rather than a raw tick — the WS-fallback path in
         `market_data.ingestion` uses this instead of `on_tick`. Updates
-        EMA9/EMA20 from the candle's own close, same as `on_tick` does the
-        moment `BarAggregator` completes a bar — but skips `BarAggregator`
+        EMA9/EMA20/ATR14 from the candle's own close (and, for ATR, its real
+        high/low too), same as `on_tick` does the moment `BarAggregator`
+        completes a bar — but skips `BarAggregator`
         entirely (there's nothing left to aggregate; the candle already is
         the finished bar, with real broker-side high/low `BarAggregator`
         has no way to reconstruct from a single point) and skips VWAP
@@ -80,11 +89,16 @@ class IndicatorEngine:
         ema9_value = ema9_calc.update(candle.close)
         ema20_value = ema20_calc.update(candle.close)
 
+        atr_calc = self._atr.setdefault(instrument_id, ATRCalculator(ATR_PERIOD))
+        atr_value = atr_calc.update(candle.high, candle.low, candle.close)
+
         results: dict[str, float] = {}
         if ema9_value is not None:
             results["EMA9"] = ema9_value
         if ema20_value is not None:
             results["EMA20"] = ema20_value
+        if atr_value is not None:
+            results["ATR14"] = atr_value
         return results
 
     def reset_session(self, instrument_id: uuid.UUID | None = None) -> None:

@@ -85,6 +85,8 @@ def submit_signal(
         trail_activation_fraction=proposal.trail_activation_fraction,
         trail_lock_fraction=proposal.trail_lock_fraction,
         structure_level=proposal.structure_level,
+        structure_break_buffer=proposal.structure_break_buffer,
+        structure_break_persistence_seconds=proposal.structure_break_persistence_seconds,
         payload=proposal.payload,
         generated_at=now,
     )
@@ -133,6 +135,8 @@ def submit_signal(
         trail_activation_fraction=proposal.trail_activation_fraction,
         trail_lock_fraction=proposal.trail_lock_fraction,
         structure_level=proposal.structure_level,
+        structure_break_buffer=proposal.structure_break_buffer,
+        structure_break_persistence_seconds=proposal.structure_break_persistence_seconds,
         status=TradeIntentStatus.PENDING_RISK,
         created_at=now,
     )

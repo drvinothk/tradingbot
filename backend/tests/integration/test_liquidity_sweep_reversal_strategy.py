@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.clock import IST
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import (
+    IndicatorSnapshot,
     Instrument,
     OptionChainSnapshot,
     OptionContract,
@@ -272,6 +273,14 @@ def _seed_bullish_sweep(
     )
 
 
+def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
+    db.add(IndicatorSnapshot(
+        id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="ATR14",
+        timeframe=BAR_TIMEFRAME, value=value, ts=datetime.now(IST),
+    ))
+    db.flush()
+
+
 def _seed_bullish_confirmation(
     db: Session, instrument: Instrument, sweep_bar: PriceBar, *, base: datetime = BASE,
 ) -> PriceBar:
@@ -387,6 +396,26 @@ class TestLiquiditySweepReversalStrategy:
         assert proposal.structure_level == pytest.approx(WINDOW_LOW)
         assert proposal.stop_price < proposal.entry_price < proposal.target_price
         assert strategy.trades_fired_count == 1
+        assert proposal.structure_break_buffer == pytest.approx(0.0)
+
+    def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        sweep_bar = _seed_bullish_sweep(db, instrument)
+        _seed_atr(db, instrument, value=10.0)
+
+        strategy = LiquiditySweepReversalStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS,
+            structure_break_atr_multiplier=0.2, structure_break_persistence_seconds=8.0,
+        )
+        assert strategy.check_setup(db, strategy_run, sweep_bar) is None
+        confirmation_bar = _seed_bullish_confirmation(db, instrument, sweep_bar)
+        proposal = strategy.check_setup(db, strategy_run, confirmation_bar)
+
+        assert proposal is not None
+        assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
+        assert proposal.structure_break_persistence_seconds == pytest.approx(8.0)
 
     def test_swept_high_confirmed_next_bar_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,

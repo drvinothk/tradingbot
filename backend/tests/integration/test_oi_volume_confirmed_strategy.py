@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.clock import IST
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import (
+    IndicatorSnapshot,
     Instrument,
     OptionChainSnapshot,
     OptionContract,
@@ -259,6 +260,14 @@ def _seed_window_and_filler(
         )
 
 
+def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
+    db.add(IndicatorSnapshot(
+        id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="ATR14",
+        timeframe=BAR_TIMEFRAME, value=value, ts=datetime.now(IST),
+    ))
+    db.flush()
+
+
 class TestOIVolumeConfirmedStrategy:
     def test_no_signal_with_insufficient_bars(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
@@ -299,6 +308,28 @@ class TestOIVolumeConfirmedStrategy:
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(WINDOW_LOW)
         assert proposal.stop_price < proposal.entry_price < proposal.target_price
+        assert proposal.structure_break_buffer == pytest.approx(0.0)
+
+    def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        _seed_atr(db, instrument, value=10.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS,
+            structure_break_atr_multiplier=0.2, structure_break_persistence_seconds=2.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
+        assert proposal.structure_break_persistence_seconds == pytest.approx(2.0)
         assert strategy.trades_fired_count == 1
 
     def test_bearish_breakout_fires_buy_pe(

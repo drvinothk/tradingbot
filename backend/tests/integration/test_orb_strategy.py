@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.core.clock import IST
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import (
+    IndicatorSnapshot,
     Instrument,
     OptionChainSnapshot,
     OptionContract,
@@ -233,6 +234,20 @@ def _seed_opening_range(
         )
 
 
+def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
+    db.add(
+        IndicatorSnapshot(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            indicator_name="ATR14",
+            timeframe=BAR_TIMEFRAME,
+            value=value,
+            ts=datetime.now(UTC),
+        )
+    )
+    db.flush()
+
+
 class TestORBStrategy:
     def test_no_signal_within_opening_range_window(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
@@ -273,6 +288,33 @@ class TestORBStrategy:
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(21990.0)
         assert proposal.stop_price < proposal.entry_price < proposal.target_price
+        # No ATR14 seeded -- buffer degrades to 0.0, not an error.
+        assert proposal.structure_break_buffer == pytest.approx(0.0)
+
+    def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+        _seed_atr(db, instrument, value=10.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            structure_break_atr_multiplier=0.2, structure_break_persistence_seconds=15.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
+        assert proposal.structure_break_persistence_seconds == pytest.approx(15.0)
 
     def test_bearish_breakout_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,

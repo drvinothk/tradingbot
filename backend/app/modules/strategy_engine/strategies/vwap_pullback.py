@@ -20,10 +20,13 @@ from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
+    DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+    DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ConfirmationFilterStrategy,
     compute_stop_target,
     get_latest_indicator_value,
     get_recent_completed_bars,
+    resolve_structure_break_buffer,
     touch_and_confirm,
 )
 from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
@@ -54,6 +57,8 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         trend_lookback_bars: int = 20,
         max_vwap_crosses_in_lookback: int = 3,
         min_trend_side_fraction: float = 0.70,
+        structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+        structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -66,6 +71,8 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         self.trend_lookback_bars = trend_lookback_bars
         self.max_vwap_crosses_in_lookback = max_vwap_crosses_in_lookback
         self.min_trend_side_fraction = min_trend_side_fraction
+        self.structure_break_atr_multiplier = structure_break_atr_multiplier
+        self.structure_break_persistence_seconds = structure_break_persistence_seconds
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -122,6 +129,10 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
             trail_activation_fraction=self.trail_activation_fraction,
             trail_lock_fraction=self.trail_lock_fraction,
             structure_level=structure_level,
+            structure_break_buffer=resolve_structure_break_buffer(
+                db, self.instrument_id, self.structure_break_atr_multiplier, self.timeframe
+            ),
+            structure_break_persistence_seconds=self.structure_break_persistence_seconds,
             payload={
                 "strategy": "vwap_pullback",
                 "vwap": vwap,

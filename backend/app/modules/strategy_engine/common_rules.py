@@ -138,6 +138,33 @@ def get_latest_indicator_value(
     return float(row.value) if row is not None else None
 
 
+# Placeholder starting values for the structure-break confirmation fix
+# (see project memory `project_structure_break_confirmation_fix_plan_2026_08_24`)
+# — the mid-point of the research doc's own suggested starting ranges
+# (0.10-0.30x ATR, 5-10s for VWAP specifically). Deliberately NOT yet
+# backtest-tuned per strategy; every one of the 5 real strategies uses these
+# until a walk-forward pass against real historical data picks real
+# per-strategy values into that strategy's own `strategy_configs.params`.
+DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER = 0.15
+DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS = 6.0
+
+
+def resolve_structure_break_buffer(
+    db: Session,
+    instrument_id: uuid.UUID,
+    atr_multiplier: float,
+    timeframe: str = BAR_TIMEFRAME,
+) -> float:
+    """`atr_multiplier * ATR14(instrument)`, or `0.0` if ATR hasn't warmed up
+    yet (first ~15 completed bars of a session — see `ATRCalculator`). Zero
+    buffer during warm-up is a documented degraded mode, not a bug: the
+    persistence-window check in `evaluate_open_position` still applies, so a
+    breach isn't fully unprotected, just less buffered than once ATR exists.
+    """
+    atr = get_latest_indicator_value(db, instrument_id, "ATR14", timeframe)
+    return atr_multiplier * atr if atr is not None else 0.0
+
+
 def get_recent_indicator_values(
     db: Session,
     instrument_id: uuid.UUID,

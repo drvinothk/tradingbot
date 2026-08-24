@@ -49,12 +49,15 @@ from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
+    DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+    DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ConfirmationFilterStrategy,
     _parse_hhmm,
     compute_range_high_low,
     compute_stop_target,
     get_recent_completed_bars,
     pick_by_underlying,
+    resolve_structure_break_buffer,
 )
 from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
@@ -90,6 +93,8 @@ class ORBStrategy(ConfirmationFilterStrategy):
         max_or_range_nifty_points: float = 80.0,
         min_or_range_banknifty_points: float = 75.0,
         max_or_range_banknifty_points: float = 250.0,
+        structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+        structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -104,6 +109,8 @@ class ORBStrategy(ConfirmationFilterStrategy):
         self.max_or_range_nifty_points = max_or_range_nifty_points
         self.min_or_range_banknifty_points = min_or_range_banknifty_points
         self.max_or_range_banknifty_points = max_or_range_banknifty_points
+        self.structure_break_atr_multiplier = structure_break_atr_multiplier
+        self.structure_break_persistence_seconds = structure_break_persistence_seconds
         self._fired_directions: set[OptionType] = set()
 
     def _range_thresholds(self, symbol: str) -> tuple[float, float]:
@@ -204,6 +211,10 @@ class ORBStrategy(ConfirmationFilterStrategy):
             trail_activation_fraction=self.trail_activation_fraction,
             trail_lock_fraction=self.trail_lock_fraction,
             structure_level=structure_level,
+            structure_break_buffer=resolve_structure_break_buffer(
+                db, self.instrument_id, self.structure_break_atr_multiplier, self.timeframe
+            ),
+            structure_break_persistence_seconds=self.structure_break_persistence_seconds,
             payload={
                 "strategy": "orb",
                 "or_high": or_high,

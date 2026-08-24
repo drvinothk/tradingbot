@@ -10,7 +10,7 @@ fully under the test's control instead of depending on global state.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -171,6 +171,8 @@ def _make_trade_intent(
     trail_activation_fraction: float | None = None,
     trail_lock_fraction: float | None = None,
     structure_level: float | None = None,
+    structure_break_buffer: float | None = None,
+    structure_break_persistence_seconds: float | None = None,
 ) -> TradeIntent:
     now = datetime.now(UTC)
     signal = Signal(
@@ -188,6 +190,8 @@ def _make_trade_intent(
         trail_activation_fraction=trail_activation_fraction,
         trail_lock_fraction=trail_lock_fraction,
         structure_level=structure_level,
+        structure_break_buffer=structure_break_buffer,
+        structure_break_persistence_seconds=structure_break_persistence_seconds,
         generated_at=now,
     )
     db.add(signal)
@@ -209,6 +213,8 @@ def _make_trade_intent(
         trail_activation_fraction=trail_activation_fraction,
         trail_lock_fraction=trail_lock_fraction,
         structure_level=structure_level,
+        structure_break_buffer=structure_break_buffer,
+        structure_break_persistence_seconds=structure_break_persistence_seconds,
         status=TradeIntentStatus.DISPATCHED,
         created_at=now,
         dispatched_at=now,
@@ -1587,6 +1593,109 @@ def test_evaluate_open_position_no_structure_break_exit_without_underlying_price
     outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
 
     assert outcome is None
+
+
+def test_evaluate_open_position_breach_within_buffer_does_not_start_a_candidate(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A breach that doesn't clear the buffer isn't noise-confirmation
+    material at all — no candidate should even start, distinct from a
+    breach that starts a candidate but doesn't yet persist.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+        structure_break_buffer=20.0, structure_break_persistence_seconds=6.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    # 21990 is below structure_level (22000) but within the 20-point buffer
+    # (buffered_level = 21980) — not a breach at all.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21990.0
+    )
+
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is None
+
+
+def test_evaluate_open_position_noisy_breach_then_reclaim_stays_open(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The exact bug scenario this fix targets: a single tick pierces the
+    buffered level, then the very next tick reclaims it — must not exit,
+    and the candidate state must clear so it doesn't silently confirm on a
+    later, unrelated breach.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+        structure_break_buffer=20.0, structure_break_persistence_seconds=6.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    # 21975 is beyond the buffered level (21980) — a genuine candidate breach.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None
+    assert _price(stop_plan.structure_break_candidate_extreme) == pytest.approx(21975.0)
+
+    # Reclaims back above the buffered level on the very next tick.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21995.0
+    )
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is None
+    assert stop_plan.structure_break_candidate_extreme is None
+
+
+def test_evaluate_open_position_confirms_structure_break_once_persisted(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A breach that clears the buffer and holds past the persistence
+    window confirms as a real STRUCTURE_BREAK exit.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+        structure_break_buffer=20.0, structure_break_persistence_seconds=6.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+    assert outcome is None
+    db.refresh(stop_plan)
+    assert stop_plan.structure_break_candidate_since is not None
+
+    # Simulate the persistence window having elapsed since the first
+    # breaching tick, rather than sleeping in the test.
+    stop_plan.structure_break_candidate_since -= timedelta(seconds=7)
+    db.add(stop_plan)
+    db.flush()
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21975.0
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
 
 
 def test_evaluate_open_position_exits_on_spread_blowout(

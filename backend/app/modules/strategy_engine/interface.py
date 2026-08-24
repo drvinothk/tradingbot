@@ -80,6 +80,15 @@ class TradeProposal:
     # target_price, which are on the option premium. None means no
     # structure-break exit is tracked for this position.
     structure_level: float | None = None
+    # ATR-scaled minimum-breach margin (underlying index points) and minimum
+    # persistence window (seconds) required before a structure_level breach
+    # is confirmed rather than fired on a single noisy tick — see
+    # execution_engine.paper.service.evaluate_open_position. None on either
+    # means no buffer / confirm immediately (unbuffered instant-exit,
+    # matching pre-fix behavior) — the default for any strategy that doesn't
+    # set them.
+    structure_break_buffer: float | None = None
+    structure_break_persistence_seconds: float | None = None
     payload: TradePayload = field(default_factory=lambda: TradePayload())
 
 

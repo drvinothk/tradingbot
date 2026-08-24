@@ -86,6 +86,8 @@ ORB_PARAM_KEYS = {
     "max_or_range_nifty_points",
     "min_or_range_banknifty_points",
     "max_or_range_banknifty_points",
+    "structure_break_atr_multiplier",
+    "structure_break_persistence_seconds",
 }
 # Deliberately NOT in the allowlist above: enabled_on_expiry_day,
 # expiry_orb_entry_cutoff_time, expiry_strike_bias. Phase 2 stores these in
@@ -102,6 +104,8 @@ VWAP_PULLBACK_PARAM_KEYS = {
     "trend_lookback_bars",
     "max_vwap_crosses_in_lookback",
     "min_trend_side_fraction",
+    "structure_break_atr_multiplier",
+    "structure_break_persistence_seconds",
 }
 # Its own explicit literal, not `= VWAP_PULLBACK_PARAM_KEYS` — that alias
 # was only ever safe because both strategies happened to accept an
@@ -124,6 +128,8 @@ EMA_MICRO_PULLBACK_PARAM_KEYS = {
     "ema_afternoon_window_start",
     "ema_afternoon_window_end",
     "ema_max_trades_per_session",
+    "structure_break_atr_multiplier",
+    "structure_break_persistence_seconds",
 }
 # Deliberately NOT in the allowlist above: ema_expiry_time_decay_exit,
 # ema_expiry_time_decay_bars, ema_expiry_quick_exit_rr -- stored in
@@ -149,6 +155,8 @@ OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "oi_afternoon_window_start",
     "oi_afternoon_window_end",
     "oi_max_trades_per_session",
+    "structure_break_atr_multiplier",
+    "structure_break_persistence_seconds",
 }
 # Its own explicit literal, not `= OI_VOLUME_CONFIRMED_PARAM_KEYS` -- that
 # alias was only ever safe because both strategies happened to accept an
@@ -178,6 +186,8 @@ LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
     "sweep_afternoon_window_start",
     "sweep_afternoon_window_end",
     "sweep_max_trades_per_session",
+    "structure_break_atr_multiplier",
+    "structure_break_persistence_seconds",
 }
 # Deliberately NOT in the allowlist above: any sweep_expiry_* hooks a
 # future phase adds -- same "inert JSON, no matching constructor kwarg"

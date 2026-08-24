@@ -200,6 +200,20 @@ def _seed_vwap(db: Session, instrument: Instrument, value: float = VWAP) -> None
     db.flush()
 
 
+def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
+    db.add(
+        IndicatorSnapshot(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            indicator_name="ATR14",
+            timeframe=BAR_TIMEFRAME,
+            value=value,
+            ts=datetime.now(UTC),
+        )
+    )
+    db.flush()
+
+
 def _seed_bar(
     db: Session, instrument: Instrument, bucket_start: datetime, *,
     open: float, high: float, low: float, close: float,  # noqa: A002
@@ -269,6 +283,34 @@ class TestVWAPPullbackStrategy:
         assert proposal is not None
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(VWAP)
+        # No ATR14 seeded -- buffer degrades to 0.0, not an error (see
+        # resolve_structure_break_buffer's own docstring).
+        assert proposal.structure_break_buffer == pytest.approx(0.0)
+
+    def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_vwap(db, instrument, VWAP)
+        _seed_atr(db, instrument, value=10.0)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bullish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(
+            instrument.id, EXPIRY,
+            structure_break_atr_multiplier=0.2,
+            structure_break_persistence_seconds=9.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, confirmation)
+
+        assert proposal is not None
+        assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
+        assert proposal.structure_break_persistence_seconds == pytest.approx(9.0)
 
     def test_bearish_pullback_confirmation_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,

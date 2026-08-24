@@ -69,6 +69,8 @@ from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
+    DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+    DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ConfirmationFilterStrategy,
     _parse_hhmm,
     compute_body_ratio,
@@ -76,6 +78,7 @@ from app.modules.strategy_engine.common_rules import (
     compute_stop_target,
     get_recent_completed_bars,
     pick_by_underlying,
+    resolve_structure_break_buffer,
 )
 from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
@@ -134,6 +137,8 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         oi_afternoon_window_start: str = "13:00",
         oi_afternoon_window_end: str = "15:00",
         oi_max_trades_per_session: int = 3,
+        structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
+        structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -156,6 +161,8 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         self.oi_afternoon_window_start = _parse_hhmm(oi_afternoon_window_start)
         self.oi_afternoon_window_end = _parse_hhmm(oi_afternoon_window_end)
         self.oi_max_trades_per_session = oi_max_trades_per_session
+        self.structure_break_atr_multiplier = structure_break_atr_multiplier
+        self.structure_break_persistence_seconds = structure_break_persistence_seconds
         self.trades_fired_count = 0
         self.bar_count = 0
         self._fired_directions: set[OptionType] = set()
@@ -304,6 +311,10 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
             trail_activation_fraction=self.trail_activation_fraction,
             trail_lock_fraction=self.trail_lock_fraction,
             structure_level=structure_level,
+            structure_break_buffer=resolve_structure_break_buffer(
+                db, self.instrument_id, self.structure_break_atr_multiplier, self.timeframe
+            ),
+            structure_break_persistence_seconds=self.structure_break_persistence_seconds,
             payload={
                 "strategy": "oi_volume_confirmed",
                 "window_high": window_high,

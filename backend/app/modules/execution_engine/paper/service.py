@@ -413,6 +413,8 @@ def _open_position_from_fill(
         stop_price=float(trade_intent.stop_price),
         qty=position.qty,
         structure_level=trade_intent.structure_level,
+        structure_break_buffer=trade_intent.structure_break_buffer,
+        structure_break_persistence_seconds=trade_intent.structure_break_persistence_seconds,
         status=StopPlanStatus.CONFIRMED,
         created_at=now,
         updated_at=now,
@@ -1603,6 +1605,23 @@ def evaluate_open_position(
     e.g. SyntheticStrategy) simply never triggers the structure-break check
     regardless, and callers that don't pass bid/ask (existing tests) just
     skip the spread-blowout check the same way.
+
+    Structure-break confirmation (candidate/confirm/reclaim): a bare
+    `underlying < structure_level` on a single raw tick, with zero debounce,
+    was confirmed live to kill ~65%+ of trades within seconds across every
+    real strategy on pure tick noise, not genuine reversals (see project
+    memory `project_structure_break_noise_bug_2026_08_21`). The breach must
+    now clear `structure_level` by more than `stop_plan.structure_break_
+    buffer` (an ATR-scaled margin, frozen at signal time) *and* persist for
+    at least `stop_plan.structure_break_persistence_seconds`
+    (`structure_break_candidate_since`, stamped on the first breaching tick
+    and cleared the instant price reclaims the level, is what measures
+    persistence across `PositionManager`'s ~3s poll cycle — not a literal
+    timer/thread). Either field being null (old rows, any strategy that
+    doesn't opt in) falls back to a zero buffer and zero persistence, i.e.
+    today's exact prior instant-exit behavior — this is deliberately
+    byte-identical for anything not opted in, so the fix is safe to ship
+    even with positions already open.
     """
     if position.status != PositionStatus.OPEN:
         return None
@@ -1652,22 +1671,50 @@ def evaluate_open_position(
     # / pullback extreme / EMA9) that justified this setup has been crossed
     # unfavorably — exit even though the option premium hasn't hit its own
     # stop yet. Skipped when either side of the comparison is unavailable
-    # (no structure_level set, or no underlying_price supplied).
+    # (no structure_level set, or no underlying_price supplied). See this
+    # function's own docstring for the candidate/confirm/reclaim design.
     if stop_plan.structure_level is not None and underlying_price is not None:
         structure_level = _dec(stop_plan.structure_level)
         underlying = _dec(underlying_price)
-        structure_broken = (
-            underlying < structure_level if favorable else underlying > structure_level
-        )
-        if structure_broken:
-            return close_position(
-                db,
-                trading_session,
-                position,
-                ExitReason.STRUCTURE_BREAK,
-                float(price),
-                broker=broker,
-            )
+        buffer = _dec(stop_plan.structure_break_buffer or 0)
+        persistence_seconds = float(stop_plan.structure_break_persistence_seconds or 0)
+
+        buffered_level = structure_level - buffer if favorable else structure_level + buffer
+        breached = underlying < buffered_level if favorable else underlying > buffered_level
+
+        if breached:
+            if stop_plan.structure_break_candidate_since is None:
+                stop_plan.structure_break_candidate_since = _utcnow()
+                stop_plan.structure_break_candidate_extreme = underlying_price
+            else:
+                prior_extreme = _dec(stop_plan.structure_break_candidate_extreme)
+                worse = (
+                    underlying < prior_extreme if favorable else underlying > prior_extreme
+                )
+                if worse:
+                    stop_plan.structure_break_candidate_extreme = underlying_price
+            db.add(stop_plan)
+            db.flush()
+
+            elapsed = (_utcnow() - stop_plan.structure_break_candidate_since).total_seconds()
+            if elapsed >= persistence_seconds:
+                return close_position(
+                    db,
+                    trading_session,
+                    position,
+                    ExitReason.STRUCTURE_BREAK,
+                    float(price),
+                    broker=broker,
+                )
+        elif stop_plan.structure_break_candidate_since is not None:
+            # Reclaimed — price came back inside the buffered level before
+            # persistence was satisfied. Cancel the candidate rather than
+            # let a stale timestamp confirm a break on some later, unrelated
+            # breach.
+            stop_plan.structure_break_candidate_since = None
+            stop_plan.structure_break_candidate_extreme = None
+            db.add(stop_plan)
+            db.flush()
 
     # 4. Spread blowout: the option's own liquidity has dried up past a
     # tradeable width — exit at the current price rather than risk being

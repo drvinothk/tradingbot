@@ -223,6 +223,30 @@ class StopPlan(Base, UUIDPkMixin):
     # strategy that doesn't supply one (e.g. SyntheticStrategy); see
     # execution_engine.paper.service.evaluate_open_position.
     structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # ATR-scaled minimum-breach margin (underlying index points) and minimum
+    # persistence window (seconds) a structure_level breach must hold before
+    # counting as a confirmed break -- frozen at signal time (copied from
+    # TradeIntent), never recomputed live. Null on either means "no buffer /
+    # confirm immediately", i.e. today's exact prior instant-exit behavior --
+    # see evaluate_open_position's own docstring for the full state machine.
+    structure_break_buffer: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    # Mutable, unlike everything else on this row: set to the tick timestamp
+    # the moment price first breaches structure_level by more than the
+    # buffer, cleared back to None the instant price reclaims the level.
+    # `evaluate_open_position` confirms the break only once
+    # `now - structure_break_candidate_since >= structure_break_persistence_
+    # seconds`. `structure_break_candidate_extreme` tracks the worst
+    # excursion seen during the current candidate window, for diagnostics/
+    # reporting only -- never read by the confirm decision itself.
+    structure_break_candidate_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    structure_break_candidate_extreme: Mapped[float | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
     status: Mapped[StopPlanStatus] = mapped_column(String(20), default=StopPlanStatus.CONFIRMED)
     # The broker's own order id for this position's currently-resting,
     # LIVE-only protective SL-LMT order -- `None` means there isn't one

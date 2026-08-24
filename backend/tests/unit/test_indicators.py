@@ -7,6 +7,7 @@ import pytest
 
 from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.market_data.indicators import (
+    ATRCalculator,
     BarAggregator,
     EMACalculator,
     IndicatorEngine,
@@ -50,6 +51,44 @@ class TestEMACalculator:
     def test_rejects_invalid_period(self):
         with pytest.raises(ValueError):
             EMACalculator(period=0)
+
+
+class TestATRCalculator:
+    def test_returns_none_until_warmed_up(self):
+        atr = ATRCalculator(period=3)
+        assert atr.update(high=10, low=8, close=9) is None  # TR=2 (no prior close)
+        assert atr.update(high=12, low=9, close=11) is None  # TR=max(3,3,0)=3
+        seed = atr.update(high=11, low=10, close=10.5)  # TR=max(1,0,1)=1
+        assert seed == pytest.approx((2 + 3 + 1) / 3)
+        assert atr.is_warmed_up
+
+    def test_matches_hand_computed_sequence(self):
+        atr = ATRCalculator(period=3)
+        atr.update(high=10, low=8, close=9)
+        atr.update(high=12, low=9, close=11)
+        seed = atr.update(high=11, low=10, close=10.5)
+        assert seed == pytest.approx(2.0)
+
+        # Bar 4: prev_close=10.5 -> TR=max(13-10, |13-10.5|, |10-10.5|)=3
+        value = atr.update(high=13, low=10, close=12)
+        expected = (seed * (3 - 1) + 3) / 3
+        assert value == pytest.approx(expected)
+        assert value == pytest.approx(7 / 3)
+
+    def test_first_bar_true_range_is_just_high_minus_low(self):
+        atr = ATRCalculator(period=1)
+        assert atr.update(high=105, low=95, close=100) == pytest.approx(10)
+
+    def test_constant_bars_converge_to_that_true_range(self):
+        atr = ATRCalculator(period=14)
+        value = None
+        for _ in range(30):
+            value = atr.update(high=101.0, low=99.0, close=100.0)
+        assert value == pytest.approx(2.0)
+
+    def test_rejects_invalid_period(self):
+        with pytest.raises(ValueError):
+            ATRCalculator(period=0)
 
 
 class TestVWAPCalculator:
@@ -176,6 +215,39 @@ class TestIndicatorEngine:
 
         assert results["EMA9"] == pytest.approx(100.0)
         assert "EMA20" not in results  # not warmed up yet at 9 candles
+        assert "ATR14" not in results  # not warmed up yet at 9 candles either
+
+    def test_on_completed_bar_warms_up_atr14_from_candle_high_low_close(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        results: dict[str, float] = {}
+        for i in range(1, 15):
+            candle = PriceCandle(
+                bucket_start=_ts(i * 60),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0,
+                volume=0,
+            )
+            results = engine.on_completed_bar(instrument_id, candle)
+
+        assert results["ATR14"] == pytest.approx(2.0)
+
+    def test_on_tick_warms_up_atr14_alongside_ema_on_bar_completion(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        values: dict[str, float] = {}
+        for i in range(15):
+            values, _ = engine.on_tick(
+                instrument_id,
+                Tick(
+                    "NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(i * 60)
+                ),
+            )
+        assert "ATR14" in values
 
     def test_on_completed_bar_never_produces_or_touches_vwap(self):
         """A completed candle has no per-trade volume to weight — VWAP is a
