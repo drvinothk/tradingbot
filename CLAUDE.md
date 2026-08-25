@@ -957,6 +957,76 @@ check, then exercise it live).
   `_RECOGNIZED_FAILOVER_BACKUPS` for now, per this file's own 2026-08-22
   note — promote it once a real multi-hour live run exists (only a ~20s
   connectivity proof exists today), not before.
+- **2026-08-25 (later the same day): Alice Blue promoted to Shoonya's real
+  failover backup, plus hardening before ever enabling it live — code
+  done, NOT yet deployed/enabled on OCI.** The "real multi-hour live run"
+  bar the entry above was waiting for was cleared the same day (see the
+  Alice-Blue-vs-Shoonya head-to-head noted elsewhere in this file's
+  2026-08-25 entries — Alice Blue clean for 18min then a sustained partial
+  rate drop with zero reconnects, vs. Shoonya's 86 drops/71×502/13 outage
+  clusters over a comparable day). `alice_blue` added to
+  `provider_composition._RECOGNIZED_FAILOVER_BACKUPS` and
+  `api.v1.market_data.RECOGNIZED_OVERRIDE_PROVIDERS`; `AdvancedPage.tsx`'s
+  `FAILOVER_PROVIDERS` now `['shoonya', 'alice_blue']`;
+  `MarketDataSettings.failover_backup_provider` default changed
+  `"angel_one"` -> `"alice_blue"`. Angel One/TrueData stay archived,
+  untouched, per the entries above and below.
+
+  **Two explicit-user-requested hardening changes before ever flipping
+  `MARKET_DATA_FAILOVER_ENABLED=true` live**, since both Shoonya and Alice
+  Blue are brokers first, not dedicated data vendors, and the trip must not
+  be twitchy or fire onto a backup that isn't actually connected:
+  1. `failover_threshold_seconds` raised 5.0 -> **10.0s** — rides out
+     routine broker-side reconnect blips (the 86-drops-in-a-day figure
+     above) without flapping, while staying far below any timescale a
+     strategy actually acts on.
+  2. New `BaseMarketDataProvider.is_ready()` (`providers/base.py`) —
+     concrete, defaults `True`, zero change needed for Angel One/TrueData
+     (self-authenticate) or Shoonya/mock (always-on shared connection).
+     `AliceBlueMarketDataProvider.is_ready()` overrides it with the real
+     check (`get_alice_blue_session() is not None`), since Alice Blue's
+     auth is a one-time human browser login with no backend-triggerable
+     retry. `FailoverMarketDataProvider._ensure_backup_subscribed`
+     (`providers/failover.py`) now checks this *before* ever attempting
+     `subscribe_ticks()` — an unready backup is never attempted; Shoonya
+     just stays the active leg (still unhealthy, still retried every 1s
+     watchdog cycle) until a human connects Alice Blue, rather than
+     "tripping" to a leg that can't take over. Reuses the existing 30s
+     backup-retry backoff for the readiness recheck too — no new
+     scheduler needed, since `is_ready()` is a cheap in-memory check with
+     no network call. Same gate covers the manual-override dropdown.
+
+  A real test-isolation bug was found and fixed along the way:
+  `test_api_market_data.py`'s diagnostic tests assumed "no Alice Blue
+  session," which broke once the default backup became `alice_blue`,
+  because this dev machine has a genuine cached session on disk
+  (`.alice_blue_session_cache.json`) that `get_alice_blue_session()` reads
+  by default — fixed via `alice_blue_session.reset_for_tests()` (clears
+  the in-memory singleton only, never the real disk cache), same
+  "never let real local/dev state leak into test determinism" discipline
+  this file documents elsewhere.
+
+  1112/1112 backend tests pass (up from 1104), ruff/mypy clean, frontend
+  `npm run build` clean. **A deferred latency optimization was discussed
+  and deliberately not built**: pre-warming Alice Blue's connection at the
+  5s mark (half the threshold) so its ~2-5s WS connect+auth handshake
+  overlaps the back half of the 10s detection window instead of running
+  serially after it, targeting a ~10-11s total trip instead of today's
+  ~10-15s. Declined for now — it adds a third state ("warming, not yet
+  decided") to the failover state machine, including a genuinely new edge
+  case (cleanly cancel/re-dormant the pre-warmed connection if Shoonya's
+  data resumes between 5s and 10s, without flipping to backup) — real
+  complexity added to the least-battle-tested part of this system, which
+  has never tripped live even once as of this entry. Recommendation: ship
+  the simple version, let it actually trip live at least once, revisit
+  only if the extra few seconds provably matters.
+
+  **NOT yet deployed to OCI or enabled** — needs `MARKET_DATA_FAILOVER_
+  ENABLED=true` and `MARKET_DATA_FAILOVER_BACKUP_PROVIDER=alice_blue` set
+  on the OCI `.env` (provider is already `shoonya` there) plus a backend
+  restart, and a live Alice Blue session connected there before it can
+  actually take over. No live end-to-end failover trip (a real Shoonya
+  outage triggering an actual switch to Alice Blue) has been run yet.
 - **2026-08-21: Angel One archived — settings/code preserved, hidden from
   UI-driven activation.** Kept aside pending an IP/proxy fix, per explicit
   user decision ("keep angel one aside... local only... not in the list of

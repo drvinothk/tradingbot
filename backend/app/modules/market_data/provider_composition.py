@@ -62,13 +62,18 @@ _RECOGNIZED_PROVIDERS = ("angel_one", "shoonya", "truedata", "alice_blue", "mock
 # allowlist gate. "truedata" itself is deliberately still excluded as a
 # *backup* value -- nothing in this codebase configures it that way yet, and
 # adding it speculatively would just be one more untested combination.
-_RECOGNIZED_FAILOVER_BACKUPS = ("angel_one", "shoonya")
-# alice_blue deliberately excluded from failover-backup scope for now (added
-# 2026-08-21, not yet live-verified past an isolated WS-tick diagnostic) --
-# same "don't let an unproven provider quietly become a live leg" reasoning
-# TrueData's own exclusion comment above already gives. Promote it here once
-# a real multi-hour live tick comparison exists, matching how angel_one/
-# shoonya themselves earned this list.
+_RECOGNIZED_FAILOVER_BACKUPS = ("angel_one", "shoonya", "alice_blue")
+# alice_blue promoted 2026-08-25: the real multi-hour live comparison this
+# list's own prior exclusion comment asked for now exists (a full-day
+# Alice-Blue-vs-Shoonya head-to-head via the "WS Quality Test" feature --
+# see CLAUDE.md's 2026-08-25 entry) and came out in Alice Blue's favor
+# (clean for 18min then a sustained partial rate drop, zero reconnects, vs.
+# Shoonya's own 86 drops/71 HTTP 502s/13 outage clusters over the same kind
+# of day). Shoonya stays primary (the standing default, still the more
+# battle-tested execution+data leg) with Alice Blue as its failback --
+# angel_one/truedata stay archived per CLAUDE.md, kept in this allowlist
+# only so reactivating either later is a config change, not a code change,
+# same convention this list already followed for angel_one.
 
 _provider: BaseMarketDataProvider | None = None
 _scrip_master: ScripMasterService | None = None

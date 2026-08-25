@@ -92,6 +92,19 @@ class AliceBlueMarketDataProvider(BaseMarketDataProvider):
             self._ws.stop()
             self._ws = None
 
+    def is_ready(self) -> bool:
+        """`FailoverMarketDataProvider`'s pre-trip readiness gate (2026-08-25)
+        -- this is the one real override of `BaseMarketDataProvider.is_ready`'s
+        `True` default in this codebase, since Alice Blue is the one provider
+        whose auth can't self-recover (see this module's own docstring: only
+        a human browser login via `api.v1.alice_blue.oauth_callback` can ever
+        produce a session). Same underlying check `connect()`/
+        `subscribe_ticks()` already make, and the identical one
+        `diagnostic_session._validate_can_run` uses for the "Test Failback"
+        button's own precondition.
+        """
+        return get_alice_blue_session() is not None
+
     def close(self) -> None:
         self.disconnect()
         self._scrip_master.close()

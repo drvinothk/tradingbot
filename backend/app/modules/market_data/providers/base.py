@@ -96,3 +96,21 @@ class BaseMarketDataProvider(ABC):
         forming" caveat as `BrokerPort.get_price_history` — callers must not
         assume every returned row's bucket has actually closed.
         """
+
+    def is_ready(self) -> bool:
+        """Cheap, synchronous, no-network-call readiness probe — added
+        2026-08-25 so `FailoverMarketDataProvider` can check *before*
+        attempting to subscribe a backup leg whether it even has live
+        credentials, rather than only discovering that via a failed
+        `subscribe_ticks()` call (see that class's own `_ensure_backup_
+        subscribed` docstring). Deliberately a concrete method with a
+        `True` default, not abstract -- every provider that can
+        self-authenticate (Angel One, TrueData) or shares an
+        already-managed connection (Shoonya/mock via
+        `BrokerPortMarketDataAdapter`) is "always ready" by construction,
+        so adding this as abstract would force a no-op override onto every
+        existing provider for zero behavioral gain. Only a provider whose
+        auth is a one-time human browser action with no backend-triggerable
+        retry (Alice Blue) needs to override this with a real check.
+        """
+        return True

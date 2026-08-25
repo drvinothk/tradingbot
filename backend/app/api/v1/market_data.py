@@ -40,8 +40,12 @@ router = APIRouter(prefix="/market-data", tags=["market-data"])
 # only from this UI-driven override list, so reactivating it later is a
 # one-line env-var change (MARKET_DATA_FAILOVER_BACKUP_PROVIDER=angel_one),
 # not a code change -- same "explicit config, not a casual dropdown click"
-# reasoning as MARKET_DATA_ALLOW_OFFHOURS_TESTING.
-RECOGNIZED_OVERRIDE_PROVIDERS = ("shoonya",)
+# reasoning as MARKET_DATA_ALLOW_OFFHOURS_TESTING. "alice_blue" added
+# 2026-08-25 once promoted to the real failover backup for Shoonya (see
+# provider_composition._RECOGNIZED_FAILOVER_BACKUPS's own comment) --
+# "shoonya" stays listed too so a user can force back to primary manually
+# without waiting out the automatic recovery stabilization window.
+RECOGNIZED_OVERRIDE_PROVIDERS = ("shoonya", "alice_blue")
 
 
 class ProviderPreferenceOut(BaseModel):

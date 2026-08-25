@@ -24,6 +24,25 @@ from app.modules.market_data.providers.failover import FailoverMarketDataProvide
 ADMIN_PASSWORD = "correct horse battery staple 123!"
 
 
+@pytest.fixture(autouse=True)
+def _reset_alice_blue_session() -> Generator[None, None, None]:
+    """`failover_backup_provider` defaults to `"alice_blue"` as of
+    2026-08-25 -- without this, `get_alice_blue_session()`'s own disk-cache
+    (`alice_blue_session.py`'s own docstring) would leak whatever real
+    session happens to be cached on the machine running the suite into
+    tests that assume "no Alice Blue session" (e.g. the failback-diagnostic
+    409 tests below), making them pass or fail depending on unrelated local
+    dev state instead of deterministically. `reset_for_tests()` is built
+    exactly for this -- it clears only the in-memory singleton, never the
+    real on-disk cache file.
+    """
+    from app.modules.market_data.providers import alice_blue_session
+
+    alice_blue_session.reset_for_tests()
+    yield
+    alice_blue_session.reset_for_tests()
+
+
 class _FakeProvider(BaseMarketDataProvider):
     def __init__(self) -> None:
         self.subscribe_calls: list[list[str]] = []
@@ -174,6 +193,20 @@ def test_patch_sets_a_preference(api_client: TestClient, seeded_admin):
 
     get_response = api_client.get("/api/v1/market-data/provider-preference")
     assert get_response.json()["active_provider"] == "shoonya"
+
+
+def test_patch_accepts_alice_blue(api_client: TestClient, seeded_admin):
+    """alice_blue promoted 2026-08-25 to a UI-selectable failover override,
+    same as shoonya -- see RECOGNIZED_OVERRIDE_PROVIDERS's own comment.
+    """
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/market-data/provider-preference", json={"active_provider": "alice_blue"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_provider"] == "alice_blue"
 
 
 def test_patch_rejects_an_unrecognized_provider(api_client: TestClient, seeded_admin):
@@ -369,14 +402,20 @@ def test_diagnostic_default_role_start_is_idempotent(api_client: TestClient, see
 
 
 def test_diagnostic_failback_role_rejects_unsupported_provider_synchronously(
-    api_client: TestClient, seeded_admin
+    api_client: TestClient, seeded_admin, monkeypatch
 ):
-    """Test settings default `failover_backup_provider` is `"angel_one"` --
-    not a broker `diagnostic_session` knows how to run an isolated/shared
-    test against, so this must fail synchronously (409), not silently start
-    a thread that only errors out later -- see `_validate_can_run`'s own
-    docstring for why this distinction was worth a dedicated fix.
+    """`_validate_can_run` must fail synchronously (409), not silently start
+    a thread that only errors out later, for a `failover_backup_provider`
+    diagnostic_session has no isolated/shared test for -- see that
+    function's own docstring for why this distinction was worth a dedicated
+    fix. Test settings default `failover_backup_provider` is now
+    `"alice_blue"` (promoted 2026-08-25, a genuinely supported failback
+    role), so this test forces an unsupported name explicitly rather than
+    relying on the default to exercise that branch.
     """
+    from app.config.settings import get_settings
+
+    monkeypatch.setattr(get_settings().market_data, "failover_backup_provider", "truedata")
     _login(api_client, seeded_admin)
     response = api_client.post("/api/v1/market-data/diagnostic/start", json={"mode": "failback"})
     assert response.status_code == 409
@@ -402,9 +441,10 @@ def test_diagnostic_both_mode_is_atomic_when_one_role_fails_validation(
     api_client: TestClient, seeded_admin
 ):
     """"both" validates every role before starting any of them -- a
-    rejection (failback: unsupported "angel_one" in test settings) must
-    leave *nothing* running, including the otherwise-always-safe "default"
-    role. See `diagnostic_session.start_many`'s own docstring for why this
+    rejection (failback: no live Alice Blue session in test settings, the
+    default `failover_backup_provider` as of 2026-08-25) must leave
+    *nothing* running, including the otherwise-always-safe "default" role.
+    See `diagnostic_session.start_many`'s own docstring for why this
     atomicity was a deliberate design choice, not incidental.
     """
     _login(api_client, seeded_admin)

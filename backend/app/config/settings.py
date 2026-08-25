@@ -162,17 +162,26 @@ class MarketDataSettings(BaseSettings):
     # every other flag in this class. Ignored entirely when provider ==
     # "mock" (matches every other gate's mock exclusion).
     failover_enabled: bool = False
-    # Only "angel_one" is supported today -- TrueData is a deliberately
-    # deferred scope call, not yet live-tested as a failover backup.
-    # get_market_data_provider validates this is recognized, not "mock", and
-    # not equal to `provider` itself; a bad value fails loud rather than
-    # silently resolving to a single-provider setup with failover quietly
-    # inert.
-    failover_backup_provider: str = "angel_one"
-    # How long the primary may go without a tick before failing over --
-    # matches the externally-reviewed proposal's own number, evaluated and
-    # kept as sound (see provider_composition's failover section).
-    failover_threshold_seconds: float = 5.0
+    # "alice_blue" is the standing default as of 2026-08-25 -- promoted as
+    # Shoonya's failover backup after a real multi-hour live comparison (see
+    # provider_composition._RECOGNIZED_FAILOVER_BACKUPS's own comment).
+    # "angel_one" also remains a recognized value (archived, not removed --
+    # see CLAUDE.md's Angel One section) for whoever reactivates it later.
+    # TrueData is a deliberately deferred scope call, not yet live-tested as
+    # a failover backup. get_market_data_provider validates this is
+    # recognized, not "mock", and not equal to `provider` itself; a bad
+    # value fails loud rather than silently resolving to a single-provider
+    # setup with failover quietly inert.
+    failover_backup_provider: str = "alice_blue"
+    # How long the primary may go without a tick before failing over. Raised
+    # 5.0 -> 10.0 on 2026-08-25, before ever enabling failover live, per
+    # explicit user judgment: both Shoonya and Alice Blue are brokers first,
+    # not dedicated market-data vendors, and the real comparison data
+    # (CLAUDE.md's 2026-08-25 entry -- Shoonya alone saw 86 short drops in a
+    # single day) shows brief broker-side reconnect blips are routine, not
+    # exceptional. 10s rides those out without flapping while staying far
+    # below the seconds-to-minutes cadence any strategy actually acts on.
+    failover_threshold_seconds: float = 10.0
     # How long the primary must stream continuously-healthy ticks again
     # before failover switches back -- anti-flap, same reasoning as above.
     failover_recovery_stabilization_seconds: float = 90.0

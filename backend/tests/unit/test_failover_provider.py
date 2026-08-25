@@ -51,7 +51,7 @@ class _FakeProvider(BaseMarketDataProvider):
     treated as Any.
     """
 
-    def __init__(self, *, subscribe_error: Exception | None = None) -> None:
+    def __init__(self, *, subscribe_error: Exception | None = None, ready: bool = True) -> None:
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.close_calls = 0
@@ -61,8 +61,14 @@ class _FakeProvider(BaseMarketDataProvider):
         self.latest_tick_calls: list[str] = []
         self.history_calls: list[str] = []
         self.subscribe_error = subscribe_error
+        self.ready = ready
+        self.is_ready_calls = 0
         self.on_tick = None
         self.on_depth = None
+
+    def is_ready(self) -> bool:
+        self.is_ready_calls += 1
+        return self.ready
 
     def connect(self) -> None:
         self.connect_calls += 1
@@ -221,6 +227,87 @@ def test_backup_subscribe_failure_retries_on_backoff_without_flipping_active(mak
     clock.advance(30.0)  # now past the backoff window
     provider.run_once()
     assert backup.subscribe_attempts == 2
+
+
+def test_backup_not_ready_never_attempts_subscribe_and_stays_on_primary(make_provider):
+    """2026-08-25: a backup with no live session (e.g. Alice Blue before a
+    human completes the browser login) must never even attempt
+    subscribe_ticks() -- see is_ready's own docstring on
+    BaseMarketDataProvider for why that call would always fail the same way
+    anyway. Primary stays "active" (still unhealthy, still retried every
+    cycle) rather than being marked "tripped" to a leg that can't actually
+    take over.
+    """
+    primary = _FakeProvider()
+    backup = _FakeProvider(ready=False)
+    clock = _FakeClock()
+    provider = make_provider(primary, backup, clock)
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+
+    assert provider.active_provider_name == "shoonya"
+    assert backup.is_ready_calls == 1
+    assert backup.subscribe_attempts == 0
+
+
+def test_backup_not_ready_rechecks_on_backoff_not_every_cycle(make_provider):
+    primary = _FakeProvider()
+    backup = _FakeProvider(ready=False)
+    clock = _FakeClock()
+    provider = make_provider(primary, backup, clock, backup_retry_seconds=30.0)
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert backup.is_ready_calls == 1
+
+    clock.advance(5.0)  # still within the 30s backoff window
+    provider.run_once()
+    assert backup.is_ready_calls == 1  # not rechecked yet
+
+    clock.advance(30.0)  # now past the backoff window
+    provider.run_once()
+    assert backup.is_ready_calls == 2
+
+
+def test_backup_becoming_ready_allows_a_later_trip(make_provider):
+    """The readiness gate must not permanently latch "unready" -- once the
+    backoff window passes and the backup has since become ready (a human
+    connected it), the next recheck must actually subscribe and trip.
+    """
+    primary = _FakeProvider()
+    backup = _FakeProvider(ready=False)
+    clock = _FakeClock()
+    provider = make_provider(primary, backup, clock, backup_retry_seconds=30.0)
+
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+
+    backup.ready = True
+    clock.advance(30.0)
+    provider.run_once()
+
+    assert provider.active_provider_name == "angel_one"
+    assert backup.subscribe_calls == [["NIFTY"]]
+
+
+def test_manual_override_to_a_not_ready_backup_raises_and_does_not_apply(make_provider):
+    primary = _FakeProvider()
+    backup = _FakeProvider(ready=False)
+    clock = _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+
+    with pytest.raises(RuntimeError):
+        provider.set_manual_override("angel_one")
+
+    assert provider.active_provider_name == "shoonya"
+    assert provider.manual_override is None
+    assert backup.subscribe_attempts == 0
 
 
 def _subscribe_and_trip_to_backup(

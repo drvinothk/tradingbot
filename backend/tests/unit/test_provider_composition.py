@@ -32,6 +32,7 @@ class _FakeSettings:
     # attribute access in get_market_data_provider's "truedata" branch.
     truedata: object = None
     angel_one: object = None
+    alice_blue: object = None
 
 
 def _settings_with_provider(name: str) -> _FakeSettings:
@@ -199,6 +200,29 @@ def test_failover_shoonya_backup_is_recognized(monkeypatch):
         provider_composition,
         "get_settings",
         lambda: _settings_with_failover("truedata", "shoonya"),
+    )
+
+    provider = provider_composition.get_market_data_provider()
+
+    inner = provider._inner  # noqa: SLF001 - intentionally reaching in to assert composition
+    assert isinstance(inner, FailoverMarketDataProvider)
+    assert inner.active_provider_name == "truedata"
+
+
+def test_failover_alice_blue_backup_is_recognized(monkeypatch):
+    """2026-08-25: Alice Blue promoted to a real, supported failover backup
+    (Shoonya-primary/Alice-Blue-backup being the actual live configuration
+    this unblocks) -- see `_RECOGNIZED_FAILOVER_BACKUPS`'s own comment.
+    "truedata" as primary here for the same reason the shoonya-backup test
+    above uses it: import-safe, no real network/singleton touched at
+    construction time.
+    """
+    from app.modules.market_data.providers.failover import FailoverMarketDataProvider
+
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "alice_blue"),
     )
 
     provider = provider_composition.get_market_data_provider()

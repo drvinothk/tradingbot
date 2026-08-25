@@ -46,6 +46,18 @@ Only the active leg's ticks are ever forwarded to the caller's `on_tick` —
 the inactive leg's ticks still update its own health timestamp (needed to
 detect backup failing) but are dropped, since two feeds writing the same
 `price_bars` bucket would violate `uq_price_bar_bucket`.
+
+**Readiness-gated trip (2026-08-25).** `_ensure_backup_subscribed` checks
+`backup.is_ready()` (`BaseMarketDataProvider.is_ready`'s own docstring)
+*before* ever calling `subscribe_ticks()` — added for the Shoonya-primary/
+Alice-Blue-backup configuration, where backup's auth is a one-time human
+browser login with no backend-triggerable retry. Without this, every trip
+attempt against a disconnected Alice Blue would burn a doomed
+`subscribe_ticks()` call before failing the exact same way; with it, an
+unready backup is never even attempted — primary simply stays the active
+leg (still unhealthy, still being retried every watchdog cycle for its own
+recovery) until a human connects the backup, rather than "tripping" to a
+leg that can't actually take over.
 """
 
 from __future__ import annotations
@@ -238,13 +250,15 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         already (reusing `_ensure_backup_subscribed`) -- a forced switch
         must actually be live now, not deferred to whenever the automatic
         watchdog would have gotten around to it. Raises `RuntimeError` if
-        that subscribe fails, rather than silently marking the backup
-        "active" while it's actually not receiving anything -- unlike the
-        automatic failover path (which just retries next cycle, appropriate
-        for an unattended background loop), this is a synchronous,
-        user-initiated call and the caller (the PATCH endpoint) needs to
-        surface the failure immediately, not have it discovered later as a
-        silent data gap.
+        that subscribe fails *or the backup isn't ready* (2026-08-25 --
+        `_ensure_backup_subscribed`'s own `is_ready()` gate applies here
+        too, e.g. forcing to a disconnected Alice Blue), rather than
+        silently marking the backup "active" while it's actually not
+        receiving anything -- unlike the automatic failover path (which
+        just retries next cycle, appropriate for an unattended background
+        loop), this is a synchronous, user-initiated call and the caller
+        (the PATCH endpoint) needs to surface the failure immediately, not
+        have it discovered later as a silent data gap.
 
         While an override is set, `run_once` skips its own automatic
         switching entirely (health tracking in `_make_tick_handler` is
@@ -574,6 +588,44 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             next_attempt = self._next_backup_attempt_at
         if next_attempt is not None and now < next_attempt:
             return False
+
+        if not self._backup.is_ready():
+            # 2026-08-25: gate added specifically for Shoonya-primary/
+            # Alice-Blue-backup -- Alice Blue's auth is a one-time human
+            # browser login with no backend-triggerable retry (see
+            # AliceBlueMarketDataProvider.is_ready's own docstring), so
+            # attempting subscribe_ticks() here would always fail the exact
+            # same way subscribe_error handling below already does, just
+            # after paying for a doomed call. Checking first means an
+            # unconnected backup never even attempts the call, and the primary
+            # keeps being retried every watchdog cycle for its own recovery
+            # rather than this leg being marked "tripped" to a backup that
+            # can't actually take over -- i.e. keep waiting for the primary
+            # to recover on its own, exactly as if no failover were
+            # configured at all, until a human connects the backup.
+            logger.warning(
+                "Failover backup provider %r is not ready (no live session) -- "
+                "%r stays the active leg despite being unhealthy; rechecking "
+                "readiness in %.0fs",
+                self._backup_name,
+                self._primary_name,
+                self._backup_retry_seconds,
+            )
+            self._alert(
+                category="market_data_failover_switch",
+                severity=AlertSeverity.CRITICAL,
+                message=(
+                    f"{self._primary_name!r} is unhealthy and backup "
+                    f"{self._backup_name!r} isn't connected — no automatic failover "
+                    f"is possible until it is. Connect {self._backup_name!r} "
+                    "(Market Terminal) to enable it."
+                ),
+                dedup_suffix="backup_not_ready",
+            )
+            with self._lock:
+                self._next_backup_attempt_at = now + self._backup_retry_seconds
+            return False
+
         try:
             self._backup.subscribe_ticks(
                 sorted(self._symbols),

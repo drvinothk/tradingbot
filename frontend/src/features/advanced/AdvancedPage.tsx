@@ -26,8 +26,9 @@ import type {
 
 const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
 // "angel_one" archived 2026-08-21 -- see CLAUDE.md's Angel One section.
+// "alice_blue" promoted 2026-08-25 as Shoonya's failover backup.
 // Must match backend RECOGNIZED_OVERRIDE_PROVIDERS (app/api/v1/market_data.py).
-const FAILOVER_PROVIDERS = ['shoonya'] as const
+const FAILOVER_PROVIDERS = ['shoonya', 'alice_blue'] as const
 
 // The user's real current 5 strategy types plus Synthetic, folded at the
 // bottom — see the plan's "Advanced" section. Order matters: it's the

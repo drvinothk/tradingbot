@@ -3,13 +3,13 @@ user-designed): a dropdown with three choices — "Test Default", "Test
 Failback", "Both" — that deliberately never names a broker. "Default"
 always means whatever `Settings.market_data.provider` currently resolves
 to; "Failback" always means whatever `Settings.market_data.
-failover_backup_provider` currently is. Today that's TrueData/Shoonya;
-once Alice Blue is promoted to the real failover backup (planned, not yet
-done — see `provider_composition.py`'s own `_RECOGNIZED_FAILOVER_BACKUPS`
-comment), the exact same "Test Failback" button starts testing Alice Blue
-instead, with zero code change — this is the whole reason Alice Blue's own
-name is never hardcoded into the UI or this module, the same lesson learned
-from the Angel One archiving bug (a hardcoded provider list drifting out of
+failover_backup_provider` currently is. As of 2026-08-25 that's Shoonya
+(primary)/Alice Blue (backup) — see `provider_composition.py`'s own
+`_RECOGNIZED_FAILOVER_BACKUPS` comment for the promotion writeup — but the
+exact same "Test Failback" button would start testing whatever provider is
+configured next with zero code change here, since Alice Blue's own name is
+never hardcoded into the UI or this module, the same lesson learned from
+the Angel One archiving bug (a hardcoded provider list drifting out of
 sync with the real config).
 
 **Two fundamentally different mechanisms per role, decided at start time**:
