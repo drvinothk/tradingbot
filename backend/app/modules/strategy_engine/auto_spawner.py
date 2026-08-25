@@ -115,6 +115,18 @@ SPAWN_INTERVAL_SECONDS = 30.0
 # `ignore_stopped_today`.
 AUTO_SPAWN_EARLIEST_TIME = dt_time(8, 0)
 
+# 2026-08-25: a third ambient trigger closes a real gap the other two never
+# covered -- `spawn_enabled_strategies` failing at 09:00 (NO_EXPIRY because
+# `option_contracts` wasn't synced yet, or BROKER_ERROR because the option-
+# chain snapshot call genuinely failed) both trace back to Shoonya not being
+# connected/valid *at that exact moment*. Neither the 09:00 scheduler nor an
+# app login retries automatically once a human does the real browser OAuth
+# login afterward -- `api.v1.shoonya.oauth_callback` now also calls
+# `session.bootstrapper.run_daily_bootstrap()` right after a successful
+# login, which is safe to call as often as this because of the exact same
+# per-strategy-per-day idempotency (`_has_active_run`/`_has_run_today`) this
+# module already relies on for the login trigger.
+
 
 class SpawnStatus(StrEnum):
     SPAWNED = "spawned"

@@ -957,6 +957,42 @@ check, then exercise it live).
   `_RECOGNIZED_FAILOVER_BACKUPS` for now, per this file's own 2026-08-22
   note — promote it once a real multi-hour live run exists (only a ~20s
   connectivity proof exists today), not before.
+- **2026-08-25 (later the same day): auto-spawner "doesn't self-retry after
+  a same-morning broker reconnect" gap (flagged in the entry above) —
+  fixed, tested, NOT yet deployed to OCI.** Root cause confirmed by tracing
+  the call chain, not guessed: `auto_spawner._spawn_one`'s `NO_EXPIRY` skip
+  (no synced `option_contracts` yet) and `BROKER_ERROR` skip (a real
+  option-chain snapshot call failing) both trace back to Shoonya not being
+  connected *at the exact moment* `spawn_enabled_strategies` runs — and
+  the only two triggers for that (`DailyBootstrapScheduler`, 09:00 IST
+  once daily; `POST /sessions/bootstrap-now`, on app login) are both
+  unrelated to when a human actually completes the real Shoonya browser
+  OAuth login. Fixed with a third ambient trigger: `api.v1.shoonya
+  .oauth_callback` now also calls `session.bootstrapper
+  .run_daily_bootstrap()` right after a successful login (after
+  `sync_instrument_master`/`set_broker` — the two things `NO_EXPIRY`/
+  `BROKER_ERROR` were actually waiting on), local-imported and wrapped in
+  try/except for the same two reasons `bootstrap_now`/`reset_for_reconnect`
+  already established there: a circular import (`session.bootstrapper`
+  imports `app.main` at module level) and "a retry failing must never turn
+  a successful login into a failed-looking one." Safe to call this often
+  because of the same per-strategy-per-day idempotency
+  (`_has_active_run`/`_has_run_today`) the login trigger already relies on
+  — a no-op for anything already spawned, a real retry for anything that
+  wasn't. Evaluated and confirmed with the user first: tagged to the real
+  Shoonya-connect moment specifically, not app login (already covered) and
+  not a new poller — three ambient triggers now converge on the same
+  idempotent sweep, no new spawn logic. A real test-safety gap was caught
+  during implementation: `run_daily_bootstrap`'s default `session_factory`
+  is the *production* `session_scope`, not any test's isolated engine —
+  same trap `test_bootstrap_now_calls_run_daily_bootstrap` already
+  documents for the sibling endpoint — so every existing test in
+  `test_api_shoonya.py` needed an autouse stub (`stub_run_daily_bootstrap`)
+  added before this could land safely, matching that file's own
+  `stub_product_capabilities` precedent. Three new dedicated tests added
+  (calls-on-success, survives-exception, not-called-on-failed-login).
+  1113/1113 backend tests pass (up from 1112), ruff/mypy clean. **Not yet
+  deployed to OCI.**
 - **2026-08-25 (later the same day): Alice Blue promoted to Shoonya's real
   failover backup, plus hardening before ever enabling it live — code
   done, NOT yet deployed/enabled on OCI.** The "real multi-hour live run"

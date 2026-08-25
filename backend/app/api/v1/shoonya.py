@@ -497,4 +497,36 @@ def oauth_callback(
         payload={"account_id": session.auth_result.account_id},
     )
     db.commit()
+
+    # 2026-08-25: closes a real, previously-recorded gap (see CLAUDE.md's
+    # "TrueData archived..." entry) -- a real Shoonya connect is exactly the
+    # moment `auto_spawner`'s earlier NO_EXPIRY/BROKER_ERROR skips (see that
+    # module's own docstring) become fixable, since `sync_instrument_master`
+    # just above and `set_broker(adapter)` earlier in this function are
+    # precisely what those two skip reasons were waiting on. Before this,
+    # nothing re-attempted a failed spawn until the next 09:00 IST scheduler
+    # tick or the next app login (`sessions.bootstrap_now`) -- neither of
+    # which is guaranteed to land soon after a same-morning reconnect.
+    # `spawn_enabled_strategies`/`_has_run_today` are already idempotent per
+    # strategy-config-per-day (the same property `bootstrap_now` itself
+    # already relies on to be callable on every login), so re-running the
+    # whole daily bootstrap sweep here is cheap and safe -- a no-op for
+    # anything already spawned, a real retry for anything that wasn't.
+    # Local import (same circular-import reason `bootstrap_now`'s own
+    # docstring documents -- `session.bootstrapper` imports `app.main` at
+    # module level) + exception-safe, same discipline as
+    # `reset_for_reconnect`/`reset_shoonya_backup_leg` above: a retry
+    # failing here must never turn a successful login into a failed-looking
+    # one.
+    from app.modules.session.bootstrapper import run_daily_bootstrap
+
+    try:
+        run_daily_bootstrap()
+    except Exception:
+        logger.exception(
+            "run_daily_bootstrap failed after a successful Shoonya login -- any "
+            "strategy that previously failed to auto-spawn will retry at the next "
+            "09:00 IST cycle or app login instead"
+        )
+
     return "<h1>Shoonya connected</h1><p>You can close this tab and return to the app.</p>"

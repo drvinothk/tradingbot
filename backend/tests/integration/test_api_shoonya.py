@@ -81,6 +81,24 @@ def stub_product_capabilities(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def stub_run_daily_bootstrap(monkeypatch):
+    """2026-08-25: `oauth_callback` now also calls `session.bootstrapper.
+    run_daily_bootstrap()` on every successful login (closes the "auto-spawn
+    doesn't self-retry after a same-morning reconnect" gap). That function's
+    own default `session_factory` is the *production* `session_scope`, not
+    this suite's isolated engine — same reasoning
+    `test_bootstrap_now_calls_run_daily_bootstrap`
+    (test_api_auth_and_sessions.py) already documents for the sibling
+    login-triggered endpoint. Stubbed here, autouse, so every test in this
+    file gets this for free rather than each one having to remember it
+    individually — same shape as `stub_product_capabilities` above.
+    """
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: None)
+
+
 @pytest.fixture
 def api_client(engine) -> Generator[TestClient, None, None]:
     session_factory = sessionmaker(bind=engine, future=True)
@@ -496,6 +514,91 @@ def test_callback_does_not_reset_market_data_registry_for_a_non_shoonya_provider
 
     assert response.status_code == 200
     assert reset_calls == []
+
+
+def test_callback_retries_auto_spawn_via_run_daily_bootstrap(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-25: a successful Shoonya connect must re-attempt the daily
+    auto-spawn sweep, closing the gap where a strategy that failed to spawn
+    at 09:00 (Shoonya not connected yet) never retried until the next day.
+    """
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    calls: list[None] = []
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: calls.append(None))
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert "connected" in response.text.lower()
+    assert len(calls) == 1
+
+
+def test_callback_survives_run_daily_bootstrap_raising(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """A retry failure must never turn a successful login into a 500 -- same
+    discipline already proven for `reset_for_reconnect` above.
+    """
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    def _raise():
+        raise RuntimeError("simulated bootstrap failure")
+
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", _raise)
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert "connected" in response.text.lower()
+    assert composition.is_shoonya_configured() is True
+
+
+def test_callback_does_not_retry_auto_spawn_on_failed_login(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    _login(api_client, seeded_admin)
+
+    def _raise(settings, code):
+        raise ShoonyaAuthError("bad checksum")
+
+    monkeypatch.setattr(shoonya_module, "exchange_code_for_token", _raise)
+
+    calls: list[None] = []
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: calls.append(None))
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert "failed" in response.text.lower()
+    assert calls == []
 
 
 def test_callback_failure_returns_html_error_without_installing_broker(
