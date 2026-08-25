@@ -80,7 +80,6 @@ from app.modules.strategy_engine.strike_ranking.engine import (
     rank_from_latest_snapshot,
 )
 
-QTY_LOTS = 1
 BODY_RATIO_LOOKBACK_BARS = 10
 
 logger = logging.getLogger("app.strategy_engine.ema_micro_pullback")
@@ -109,6 +108,7 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         instrument_id: uuid.UUID,
         expiry_date: date,
         ranking_config: StrikeRankingConfig = StrikeRankingConfig(),
+        qty_lots: int = 1,
         stop_pct: float = 0.08,
         target_pct: float = 0.12,
         trail_activation_fraction: float = 0.5,
@@ -127,6 +127,7 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
+        self.qty_lots = qty_lots
         self.stop_pct = stop_pct
         self.target_pct = target_pct
         self.trail_activation_fraction = trail_activation_fraction
@@ -261,7 +262,7 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         return TradeProposal(
             option_contract_id=top.option_contract_id,
             side=SignalSide.BUY,
-            qty_lots=QTY_LOTS,
+            qty_lots=self.qty_lots,
             entry_price=entry_price,
             stop_price=stop_price,
             target_price=target_price,

@@ -30,7 +30,6 @@ from app.modules.strategy_engine.strike_ranking.engine import (
 
 STOP_PCT = 0.10
 TARGET_PCT = 0.15
-QTY_LOTS = 1
 
 
 class SyntheticStrategy(Strategy):
@@ -39,10 +38,12 @@ class SyntheticStrategy(Strategy):
         instrument_id: uuid.UUID,
         expiry_date: date,
         ranking_config: StrikeRankingConfig = StrikeRankingConfig(),
+        qty_lots: int = 1,
     ) -> None:
         self.instrument_id = instrument_id
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
+        self.qty_lots = qty_lots
 
     def evaluate(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar | None = None
@@ -62,7 +63,7 @@ class SyntheticStrategy(Strategy):
         return TradeProposal(
             option_contract_id=top.option_contract_id,
             side=SignalSide.BUY,
-            qty_lots=QTY_LOTS,
+            qty_lots=self.qty_lots,
             entry_price=entry_price,
             stop_price=stop_price,
             target_price=target_price,

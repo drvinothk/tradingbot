@@ -34,6 +34,7 @@ from app.domain.strategy.models import (
     StrategyRun,
     StrategyRunStatus,
     StrategyRuntimeMode,
+    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -76,6 +77,7 @@ def _utcnow() -> datetime:
 
 
 ORB_PARAM_KEYS = {
+    "qty_lots",
     "or_minutes",
     "stop_pct",
     "target_pct",
@@ -96,6 +98,7 @@ ORB_PARAM_KEYS = {
 # raise a TypeError at start_strategy time instead of leaving them as inert
 # config, defeating the point.
 VWAP_PULLBACK_PARAM_KEYS = {
+    "qty_lots",
     "pullback_tolerance_frac",
     "stop_pct",
     "target_pct",
@@ -117,6 +120,7 @@ VWAP_PULLBACK_PARAM_KEYS = {
 # touch_and_confirm-based entry logic, and there's no tolerance band left
 # to configure.
 EMA_MICRO_PULLBACK_PARAM_KEYS = {
+    "qty_lots",
     "stop_pct",
     "target_pct",
     "trail_activation_fraction",
@@ -137,6 +141,7 @@ EMA_MICRO_PULLBACK_PARAM_KEYS = {
 # "no matching constructor kwarg, so don't forward it" reasoning as ORB's
 # own expiry-day-only config hooks above.
 OI_VOLUME_CONFIRMED_PARAM_KEYS = {
+    "qty_lots",
     "lookback_bars",
     "stop_pct",
     "target_pct",
@@ -169,6 +174,7 @@ OI_VOLUME_CONFIRMED_PARAM_KEYS = {
 # either strategy's key set to the other's would leak keys the other
 # constructor doesn't accept and raise a TypeError at start_strategy time.
 LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
+    "qty_lots",
     "lookback_bars",
     "stop_pct",
     "target_pct",
@@ -194,15 +200,46 @@ LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
 # reasoning as ORB's own expiry-day-only config hooks.
 
 
+# 2026-08-24: qty_lots was a hardcoded `QTY_LOTS = 1` module constant in
+# every strategy file -- no config surface at all, unlike every other
+# tunable (stop_pct, target_pct, ...) which already flows through
+# `strategy_config.params`. Removed in favor of a real, per-strategy
+# `qty_lots` param (added to each *_PARAM_KEYS allowlist above) with a
+# mode-aware default so an operator who never touches it keeps today's
+# conservative live behavior automatically -- explicit user request:
+# "default will be 1 lot for live trading, and 10 lots for paper trading...
+# if I dont edit, 1 lot stays as default, hence the risk is also managed
+# there." Mirrors the "overrides only ever restrict, never expand"
+# philosophy `StrategyRuntimeMode`/`SafeMode` already use elsewhere in this
+# codebase: err toward the paper (larger-lot, but risk-service-exempt --
+# see risk_engine.service's mode-aware rule) default whenever a strategy
+# isn't unambiguously graduated to real-money LIVE status, rather than try
+# to perfectly resolve live-ness from the session's own mode machinery too.
+_DEFAULT_QTY_LOTS_LIVE = 1
+_DEFAULT_QTY_LOTS_PAPER = 10
+
+
+def _default_qty_lots(strategy_config: StrategyConfig) -> int:
+    is_paper = (
+        strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
+        or strategy_config.status != StrategyStatus.LIVE
+    )
+    return _DEFAULT_QTY_LOTS_PAPER if is_paper else _DEFAULT_QTY_LOTS_LIVE
+
+
 def _build_strategy(
     strategy_config: StrategyConfig, instrument_id: uuid.UUID, expiry_date: date
 ) -> Strategy:
     """Maps `strategy_config.strategy_type` to its `Strategy` class, reading
     that strategy's own tunables from `strategy_config.params` (missing keys
-    fall back to each strategy's own constructor defaults) — the only place
-    in the codebase that needs to know all six concrete strategy types.
+    fall back to each strategy's own constructor defaults, except
+    `qty_lots` which falls back to `_default_qty_lots` instead of each
+    strategy class's own conservative `1` -- see that function's own
+    docstring) — the only place in the codebase that needs to know all six
+    concrete strategy types.
     """
-    params = strategy_config.params or {}
+    params = dict(strategy_config.params or {})
+    params.setdefault("qty_lots", _default_qty_lots(strategy_config))
     strategy_type = strategy_config.strategy_type
 
     if strategy_type == "synthetic":

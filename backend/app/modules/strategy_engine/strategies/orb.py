@@ -67,8 +67,6 @@ from app.modules.strategy_engine.strike_ranking.engine import (
     rank_from_latest_snapshot,
 )
 
-QTY_LOTS = 1
-
 # NSE cash/index session open. Fixed regardless of when the StrategyRunner
 # process starts or restarts -- see module docstring.
 ORB_SESSION_OPEN_IST = time(9, 15)
@@ -82,6 +80,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         instrument_id: uuid.UUID,
         expiry_date: date,
         ranking_config: StrikeRankingConfig = StrikeRankingConfig(),
+        qty_lots: int = 1,
         or_minutes: int = 15,
         stop_pct: float = 0.12,
         target_pct: float = 0.20,
@@ -99,6 +98,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
+        self.qty_lots = qty_lots
         self.or_minutes = or_minutes
         self.stop_pct = stop_pct
         self.target_pct = target_pct
@@ -204,7 +204,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         return TradeProposal(
             option_contract_id=top.option_contract_id,
             side=SignalSide.BUY,
-            qty_lots=QTY_LOTS,
+            qty_lots=self.qty_lots,
             entry_price=entry_price,
             stop_price=stop_price,
             target_price=target_price,

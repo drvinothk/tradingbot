@@ -88,7 +88,6 @@ from app.modules.strategy_engine.strike_ranking.engine import (
     rank_from_latest_snapshot,
 )
 
-QTY_LOTS = 1
 BODY_RATIO_LOOKBACK_BARS = 10
 FALSE_BREAKOUT_GRACE_BARS = 3
 
@@ -118,6 +117,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         instrument_id: uuid.UUID,
         expiry_date: date,
         ranking_config: StrikeRankingConfig = OI_VOLUME_RANKING_CONFIG,
+        qty_lots: int = 1,
         lookback_bars: int = 5,
         stop_pct: float = 0.11,
         target_pct: float = 0.18,
@@ -143,6 +143,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
         self.ranking_config = ranking_config
+        self.qty_lots = qty_lots
         self.lookback_bars = lookback_bars
         self.stop_pct = stop_pct
         self.target_pct = target_pct
@@ -304,7 +305,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         return TradeProposal(
             option_contract_id=top.option_contract_id,
             side=SignalSide.BUY,
-            qty_lots=QTY_LOTS,
+            qty_lots=self.qty_lots,
             entry_price=entry_price,
             stop_price=stop_price,
             target_price=target_price,
