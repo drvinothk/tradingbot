@@ -458,7 +458,19 @@ function TradeBucketCard({
         (visibleRows.length === 0 ? (
           <p className="muted">{session ? 'No trades yet today.' : emptyHint}</p>
         ) : (
-          <table>
+          <table className="trade-table">
+            <colgroup>
+              <col style={{ width: '18%' }} />
+              <col style={{ width: '6%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '13%' }} />
+              <col style={{ width: '9%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '9%' }} />
+              <col style={{ width: '10%' }} />
+              <col style={{ width: '11%' }} />
+            </colgroup>
             <thead>
               <tr>
                 <th>Trade</th>
@@ -555,10 +567,10 @@ function TradeRowView({
       </td>
       <td>
         {row.targetPrice !== null || slTsl !== null ? (
-          <span style={{ whiteSpace: 'nowrap' }}>
+          <>
             {row.targetPrice !== null ? row.targetPrice.toFixed(2) : '—'} /{' '}
             {slTsl !== null ? `${slTsl.toFixed(2)} (${slTslLabel})` : '—'}
-          </span>
+          </>
         ) : (
           '—'
         )}

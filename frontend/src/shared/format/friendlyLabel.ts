@@ -32,12 +32,18 @@ export function friendlyTradeLabel(
   instrumentSymbol: string | null | undefined,
   timestamp: string | Date,
 ): string {
-  const time = new Date(timestamp)
-  const timeText = Number.isNaN(time.getTime()) ? '' : time.toLocaleTimeString()
-  const parts = [strategyTypeLabel(strategyType), instrumentSymbol ?? null, timeText].filter(
-    (part): part is string => Boolean(part),
-  )
-  return parts.join(' · ')
+  const parts: (string | null)[] = [strategyTypeLabel(strategyType), instrumentSymbol ?? null]
+  // The trade table has its own dedicated Entry/Exit time column, so once a
+  // real contract is known (order/position rows) a trailing timestamp here
+  // is just a duplicate of that column. Only the pending-approval fallback
+  // (no contract yet, nothing else in the row carries a time) still needs
+  // one so the row isn't reduced to a bare, indistinguishable strategy name.
+  if (!instrumentSymbol) {
+    const time = new Date(timestamp)
+    const timeText = Number.isNaN(time.getTime()) ? '' : time.toLocaleTimeString()
+    if (timeText) parts.push(timeText)
+  }
+  return parts.filter((part): part is string => Boolean(part)).join(' · ')
 }
 
 export function shortId(id: string): string {

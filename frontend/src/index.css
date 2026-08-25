@@ -218,6 +218,26 @@ tbody tr:hover {
   background: rgba(139, 92, 246, 0.06);
 }
 
+/* Fixed column widths (see the <colgroup> in ControlRoomPage) so a status
+   badge changing text, an LTP switching between "—"/"no tick yet"/a real
+   price, or the action column's buttons changing (Approve/Reject ->
+   View more -> Square off) never reflows every other column -- previously
+   `table-layout: auto` re-measured all rows' content on every ~4s poll,
+   most visibly as a jump the instant a new position opened. Cells wrap
+   rather than ellipsis-truncate: column *widths* are what needed to stay
+   fixed, but silently clipping real data (a P&L's "(unrl.)" qualifier, a
+   long "Closing (exit sent)" status, the "no tick yet" badge) would trade
+   one bug for a worse one -- an occasional two-line row is a much smaller
+   visual jump than a resizing column, and still bounded/predictable. */
+.trade-table {
+  table-layout: fixed;
+}
+
+.trade-table td,
+.trade-table th {
+  overflow-wrap: break-word;
+}
+
 .error {
   color: var(--danger);
 }
