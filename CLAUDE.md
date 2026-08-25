@@ -606,7 +606,9 @@ check, then exercise it live).
 
 - **2026-08-25: Telegram alert notifications — real bot connected, gating
   rebuilt from scratch based on explicit user classification, LIVE-VERIFIED
-  locally, NOT yet deployed to OCI.** `backend/app/modules/alerting/
+  locally, DEPLOYED to OCI 2026-08-25** (`telegram.env` created on the box,
+  `chmod 600`, backend restarted clean via `journalctl` check — not yet
+  live-triggered against a real alert on that deployment). `backend/app/modules/alerting/
   manager.py`'s `send_alert` (Ops-Hardening Phase 2, built 2026-08-14) was
   wired end-to-end but had never had a real bot token configured — the
   user supplied one reused from an existing personal automation project
@@ -728,8 +730,10 @@ check, then exercise it live).
   committed — wrapped per-session in the scheduler's own `_run_cycle`, so
   one session's failure can't block another's. 1091/1091 backend tests
   pass (up from 1079), ruff/mypy clean, migration round-tripped locally.
-  **Not yet live-verified** — needs a real reconciliation-lock trigger
-  during a live session to confirm end-to-end.
+  **DEPLOYED to OCI 2026-08-25** (migration `0027` applied via `alembic
+  upgrade head` on the box, backend restarted clean) — still **not
+  live-verified**, needs a real reconciliation-lock trigger during a live
+  session to confirm end-to-end.
 
 - **2026-08-25: `exit_reason=reconciled` mislabeling fixed — implemented,
   tested, NOT yet live-verified.** A LIVE exit order that didn't fill
@@ -755,9 +759,11 @@ check, then exercise it live).
   late-discovered fill is unchanged — still honestly reported as 0, not
   fabricated, a separate and already-correct piece of behavior this fix
   doesn't touch. 1079/1079 backend tests pass (up from 1076), ruff/mypy
-  clean, migration tested both directions locally. **Not live-verified** —
-  needs a real LIVE exit order that genuinely doesn't fill synchronously to
-  confirm the recorded reason survives to reconciliation for real.
+  clean, migration tested both directions locally. **DEPLOYED to OCI
+  2026-08-25** (migration `0026` applied via `alembic upgrade head` on the
+  box, backend restarted clean) — still **not live-verified**, needs a real
+  LIVE exit order that genuinely doesn't fill synchronously to confirm the
+  recorded reason survives to reconciliation for real.
 
 - **2026-08-25: Shoonya session survives a backend restart — implemented,
   tested, NOT yet live-verified.** Before this, Shoonya's OAuth session
@@ -789,7 +795,11 @@ check, then exercise it live).
   goes through. WS-level intermittent drops needed no change — `ws_client
   .py`'s `_run` loop already reconnects with backoff over the *same* still-
   valid REST token, no fresh OAuth involved. 1076/1076 backend tests pass
-  (up from 1062), ruff/mypy clean. **Not live-verified** — needs a real
+  (up from 1062), ruff/mypy clean. **DEPLOYED to OCI 2026-08-25** (backend
+  restarted clean, no cached session existed yet at that first restart so
+  `_attempt_shoonya_reconnect_from_cache` correctly no-op'd — the real
+  round-trip test needs a login on this box followed by a *second*
+  restart). **Not live-verified** — needs a real
   Shoonya account + an actual backend restart during a live session to
   confirm the cache survives and reconnects for real, same caveat every
   other not-yet-live-tested Shoonya piece in this file already carries.
