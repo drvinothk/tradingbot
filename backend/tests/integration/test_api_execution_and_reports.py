@@ -459,6 +459,7 @@ def test_square_off_position_closes_a_single_open_paper_position_and_audits_it(
             "/api/v1/positions", params={"trading_session_id": session_id}
         ).json()
         assert positions_after[0]["status"] == "closed"
+        assert positions_after[0]["exit_reason"] == "manual"
 
         session_factory = sessionmaker(bind=engine, future=True)
         with session_factory() as db:

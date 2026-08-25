@@ -43,3 +43,25 @@ export function friendlyTradeLabel(
 export function shortId(id: string): string {
   return id.slice(0, 8)
 }
+
+// `ExitReason` (backend `app.domain.execution.models.ExitReason`) values,
+// mapped to a short label for the "Exit Via" column -- target/stop/trail are
+// the common cases and get the plain labels the user actually asked for;
+// everything else still gets a readable label rather than the raw enum
+// string leaking into the UI.
+const EXIT_REASON_LABELS: Record<string, string> = {
+  target: 'Target',
+  stop: 'SL',
+  trail: 'TSL',
+  eod_square_off: 'EOD',
+  manual: 'Manual',
+  structure_break: 'Structure break',
+  spread_blowout: 'Spread blowout',
+  margin_breach: 'Margin breach',
+  reconciled: 'Reconciled',
+}
+
+export function exitReasonLabel(exitReason: string | null): string {
+  if (!exitReason) return '—'
+  return EXIT_REASON_LABELS[exitReason] ?? exitReason
+}

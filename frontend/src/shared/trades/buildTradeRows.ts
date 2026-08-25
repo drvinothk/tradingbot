@@ -34,6 +34,10 @@ export interface TradeRow {
   trailStopPrice: number | null
   pnl: number | null
   isPnlRealized: boolean
+  // How the position actually closed (target/stop/trail/manual/eod/...) --
+  // `null` until the position closes (or for row types that never carry a
+  // TradeOutcome at all, e.g. pending approvals/orders).
+  exitReason: string | null
   openedAt: string | null
   closedAt: string | null
   timestamp: string
@@ -159,6 +163,7 @@ export function buildTradeRows(
         trailStopPrice: null,
         pnl: null,
         isPnlRealized: false,
+        exitReason: null,
         openedAt: null,
         closedAt: null,
         timestamp: approval.expires_at,
@@ -213,6 +218,7 @@ export function buildTradeRows(
         trailStopPrice: null,
         pnl: null,
         isPnlRealized: false,
+        exitReason: null,
         openedAt: null,
         closedAt: null,
         timestamp: order.submitted_at,
@@ -245,6 +251,7 @@ export function buildTradeRows(
       trailStopPrice: null,
       pnl: null,
       isPnlRealized: false,
+      exitReason: null,
       openedAt: null,
       closedAt: null,
       timestamp: order.submitted_at,
@@ -278,6 +285,7 @@ export function buildTradeRows(
       trailStopPrice: position.trail_stop_price,
       pnl: isOpen ? position.unrealized_pnl : position.realized_pnl,
       isPnlRealized: !isOpen,
+      exitReason: isOpen ? null : position.exit_reason,
       openedAt: position.opened_at,
       closedAt: position.closed_at,
       timestamp: position.closed_at ?? position.opened_at,

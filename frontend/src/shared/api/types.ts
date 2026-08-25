@@ -177,6 +177,9 @@ export interface PositionOut {
   unrealized_pnl: number | null
   exit_price: number | null
   realized_pnl: number | null
+  // How the position actually closed (target/stop/trail/manual/eod/...) --
+  // `null` for an open position or one with no recorded outcome yet.
+  exit_reason: string | null
   // The entry order's mode ('live'/'paper') -- what actually fired to the
   // broker when this position opened, not the session's/strategy's current
   // config (which can drift after the fact). Ground truth for Live vs

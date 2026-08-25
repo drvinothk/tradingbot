@@ -159,6 +159,10 @@ class PositionOut(BaseModel):
     unrealized_pnl: float | None = None
     exit_price: float | None = None
     realized_pnl: float | None = None
+    # How the position actually closed (target/stop/trail/manual/eod/...) --
+    # `TradeOutcome.exit_reason`, `None` for an open position (nothing has
+    # closed it yet) or one with no `TradeOutcome` row at all.
+    exit_reason: str | None = None
     # The entry (opening) order's mode -- what actually got fired to the
     # broker when this position was opened, not the session's or strategy's
     # *current* config, which can drift after the fact (a strategy's
@@ -293,6 +297,11 @@ def list_positions(
         elif outcome is not None:
             out.exit_price = float(outcome.exit_price)
             out.realized_pnl = float(outcome.realized_pnl)
+            out.exit_reason = (
+                outcome.exit_reason.value
+                if hasattr(outcome.exit_reason, "value")
+                else outcome.exit_reason
+            )
 
         result.append(out)
     return result

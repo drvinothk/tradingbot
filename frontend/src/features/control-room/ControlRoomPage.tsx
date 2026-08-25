@@ -7,6 +7,7 @@ import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPosition
 import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useActiveSessionMode } from '../../shared/hooks/useActiveSessionMode'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
+import { exitReasonLabel } from '../../shared/format/friendlyLabel'
 import type { RunningStrategyOut, SessionOut, SquareOffPositionOut } from '../../shared/api/types'
 
 const STATUS_LABELS: Record<TradeRowStatus, string> = {
@@ -466,6 +467,7 @@ function TradeBucketCard({
                 <th>LTP</th>
                 <th>Target / SL-TSL</th>
                 <th>P&amp;L</th>
+                <th>Exit Via</th>
                 <th>Entry / Exit</th>
                 <th>Status</th>
                 <th></th>
@@ -572,6 +574,7 @@ function TradeRowView({
           '—'
         )}
       </td>
+      <td>{exitReasonLabel(row.exitReason)}</td>
       <td style={{ fontSize: '0.8rem' }}>
         <div>{row.openedAt ? new Date(row.openedAt).toLocaleTimeString() : '—'}</div>
         <div className="muted">{row.closedAt ? new Date(row.closedAt).toLocaleTimeString() : '—'}</div>
