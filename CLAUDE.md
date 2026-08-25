@@ -604,6 +604,330 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-25: Telegram alert notifications — real bot connected, gating
+  rebuilt from scratch based on explicit user classification, LIVE-VERIFIED
+  locally, NOT yet deployed to OCI.** `backend/app/modules/alerting/
+  manager.py`'s `send_alert` (Ops-Hardening Phase 2, built 2026-08-14) was
+  wired end-to-end but had never had a real bot token configured — the
+  user supplied one reused from an existing personal automation project
+  (same Telegram chat), written to `backend/app/config/credentials/
+  telegram.env` (gitignored, `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`).
+  Real delivery confirmed live via a direct `_send_telegram` call, and the
+  new 09:00-15:30 IST window gate confirmed correctly blocking a push
+  outside it (checked live at 20:33 IST the same evening). Before this
+  session, only 3 of 14 real alert categories ever reached Telegram at
+  all (the rest wrote a `SystemAlert` DB row directly, bypassing
+  `send_alert` entirely) — and those 3 included the 5 `auto_spawn_*`
+  sub-categories, which can each fire once per misconfigured
+  `strategy_config` every single morning, the most likely source of a
+  real noise complaint that started this work.
+  **Five independent gates**, all in `_should_push_to_telegram`: (1) a
+  category allowlist (`TELEGRAM_ALLOWED_CATEGORIES`) — `auto_spawn_*`
+  demoted off it, 8 previously-DB-only CRITICAL categories promoted onto
+  it, plus 4 newly-built categories (below); (2) severity must be
+  CRITICAL — the one thing that lets `health_check_failed`'s WARNING
+  (NTP-drift-only) and CRITICAL (disk-failure) cases share one category
+  without a second allowlist; (3) `mode` (an `OrderMode | None` param
+  threaded through every call site) must not be `PAPER` — explicit user
+  instruction, "no notification for paper trade at all"; `None` is for
+  alerts with no specific position/order behind them (health checks,
+  instrument-master sync, market-data staleness) and is never
+  paper-suppressed; (4) a 09:00-15:30 IST window — off-hours, the broker
+  itself force-squares-off a stuck live position, so there's nothing left
+  to act on outside it, per explicit user reasoning; (5) a 15-minute
+  in-memory dedup keyed by `(category, dedup_key)` — a still-unresolved
+  issue re-notifies after the cooldown, a genuinely different
+  position/order/workspace hitting the same category pushes immediately
+  (two real cross-entity dedup-key bugs, caught during this session's own
+  QC pass and fixed before landing: `_check_market_data_staleness` and
+  `FailoverMarketDataProvider._alert` both originally built a dedup key
+  that omitted `workspace_id`, which would have silently swallowed every
+  workspace's alert after the first one in the same loop). The `SystemAlert`
+  DB row is written unconditionally regardless of all five gates — this
+  section can only suppress the Telegram push, never the dashboard/audit
+  record. Static, hand-written one-line "suggested fix" tips
+  (`TELEGRAM_SUGGESTED_ACTIONS`, one per pushable category) are appended to
+  the Telegram text — deliberately not LLM-generated, per explicit user
+  discussion: this execution core is deliberately non-AI/deterministic, and
+  the alert path is synchronous background-thread code with a hard 3s
+  Telegram timeout, so a live LLM call there would add latency/cost/a new
+  external failure mode to a path whose entire job is telling the user
+  something is already wrong.
+  **Four real, previously-nonexistent gaps closed** (all explicitly named
+  by the user): order rejection (the broker's actual rejection reason,
+  `OrderResult.raw_message`, was already being returned from every adapter
+  but silently discarded — never stored, never alerted; now both stored on
+  the `OrderEvent.raw_payload` and alerted as `order_rejected`); broker
+  disconnect (`PositionManager._handle_broker_auth_error` previously only
+  logged a live/guarded session losing its broker connection — now also
+  alerts `broker_disconnected`, committed immediately so it survives even
+  if the following `transition_mode` call raises); market-data staleness
+  with no open position (`market_data.freshness` classified tick
+  staleness but nothing ever alerted on it — a new
+  `HealthCheckScheduler._check_market_data_staleness`, on its existing
+  5-minute loop, checks the fixed `TRADABLE_UNDERLYINGS` universe against a
+  dedicated 10-minute threshold, gated on `is_within_market_hours()`);
+  market-data failover switch (`FailoverMarketDataProvider` only ever
+  logged a primary→backup trip, backup-subscribe failure, or recovery back
+  to primary — now optionally alerts via a new constructor-injected
+  `alert_session_factory` param, defaulting to `None` so every existing
+  direct-instantiation test is unaffected, with the real `session_scope`
+  passed only at `provider_composition.py`'s own production composition
+  root, matching that file's own existing "module-level, patchable
+  session_scope" convention and its own documented incident precedent for
+  why a hardcoded default here would be wrong).
+  1104/1104 backend tests pass, ruff/mypy clean. **Not yet deployed to
+  OCI** — `telegram.env` needs to be created there too
+  (`/home/ubuntu/trading-bot/backend/app/config/credentials/
+  telegram.env`, `chmod 600`) and the service restarted before any of this
+  fires against the live deployment; deploy only when explicitly asked,
+  per this file's own established convention.
+
+- **2026-08-25: reconciliation_lock unattended auto-recovery — implemented,
+  tested, deploying.** Two real gaps closed together, both raised by the
+  user: (1) the manual recovery endpoint always hardcoded the target to
+  `paper_only`, even when the session was `live_enabled`/`paper_plus_
+  guarded_live` before the lock fired — `prior_mode` was captured on entry
+  to `degraded_mode` but never `reconciliation_lock`; (2) recovery only
+  ever happened via a manual click, with nothing re-checking a locked
+  session on its own, so a purely technical, since-resolved mismatch
+  stayed locked (blocking all new live entries) until a human opened the
+  app. Fixed with: `prior_mode` now captured on entry to
+  `RECONCILIATION_LOCK` too (`state_machine._write_transition`); a new
+  dynamic-target `recover_from_reconciliation_lock` (mirrors `recover_from_
+  degraded`'s shape, replacing the old static `RECONCILIATION_LOCK ->
+  PAPER_ONLY` table edge, same as `degraded_mode`'s recovery already has no
+  static edge); a new `TradingSession.reconciliation_lock_clean_streak`
+  column (migration `0027`) and `ReconciliationLockRecoveryScheduler`
+  (`scheduler/reconciliation_lock_recovery.py`, 60s cadence) that re-runs
+  the existing `run_full_reconciliation` per locked session and
+  auto-recovers once 3 consecutive checks come back clean.
+
+  **Deliberate, scoped exception to Rule 4** (confirmed explicitly with the
+  user via AskUserQuestion, not assumed): unlike `degraded_mode`/
+  `kill_switch`, which always require a manual, permissioned tap to resume
+  above `paper_only`, `reconciliation_lock` may now auto-recover all the
+  way back to a live `prior_mode` unattended — but *only* via
+  `TransitionTriggerType.RECONCILIATION` (reserved exclusively for the new
+  scheduler, after a real multi-check clean streak), never a bare `SYSTEM`
+  trigger. `degraded_mode`/`kill_switch` recovery are completely untouched.
+  The manual endpoint (`POST /sessions/{id}/recover-from-reconciliation-
+  lock`) now also correctly restores live via the same dynamic function
+  instead of its own old hardcoded `paper_only`.
+
+  Reuse audit done first, per explicit user request: `run_full_
+  reconciliation` (no new reconciliation logic), `HealthCheckScheduler`'s
+  background-thread shape (not literally shared — kept as its own
+  scheduler, matching this codebase's one-concern-per-scheduler
+  precedent), the already-existing `TransitionTriggerType.RECONCILIATION`
+  and `ReconciliationTrigger.POLL` enum values (no new ones needed).
+
+  QC catch during implementation: a broker error while checking one locked
+  session (e.g. a transient `get_positions()` connectivity blip) would have
+  aborted the whole cycle before other locked sessions got checked/
+  committed — wrapped per-session in the scheduler's own `_run_cycle`, so
+  one session's failure can't block another's. 1091/1091 backend tests
+  pass (up from 1079), ruff/mypy clean, migration round-tripped locally.
+  **Not yet live-verified** — needs a real reconciliation-lock trigger
+  during a live session to confirm end-to-end.
+
+- **2026-08-25: `exit_reason=reconciled` mislabeling fixed — implemented,
+  tested, NOT yet live-verified.** A LIVE exit order that didn't fill
+  synchronously (left OPEN, later discovered filled by
+  `reconcile_pending_live_exit_orders`) always got tagged the generic
+  `ExitReason.RECONCILED` in the Control Room trade table and the Excel
+  export, even when the real reason was a genuine TARGET hit, TRAIL exit,
+  EOD square-off, etc. — misleading, since the caller
+  (`evaluate_open_position`/`eod_square_off`/manual square-off) already
+  knows exactly why it's closing the position at the moment it calls
+  `close_position`; that reason was just never written down before the
+  async-fill uncertainty window began. Fixed with a new nullable
+  `Order.intended_exit_reason` column (migration `0026`), set by
+  `close_position` at the moment it places the `exit:{position_id}` order —
+  `reconcile_pending_live_exit_orders` → `_apply_resolved_pending_exit_
+  order` now reports that real reason instead of defaulting to RECONCILED.
+  `RECONCILED` itself isn't removed — it's now the honest fallback only for
+  an order that genuinely never had an intended reason recorded (e.g. any
+  row from before this migration). One free correctness side-effect: a
+  late-discovered TRAIL exit's `TrailPlan.status` now correctly flips to
+  `TRIGGERED` (previously unreachable, since the reason was always
+  mislabeled RECONCILED before this fix). Slippage measurement for a
+  late-discovered fill is unchanged — still honestly reported as 0, not
+  fabricated, a separate and already-correct piece of behavior this fix
+  doesn't touch. 1079/1079 backend tests pass (up from 1076), ruff/mypy
+  clean, migration tested both directions locally. **Not live-verified** —
+  needs a real LIVE exit order that genuinely doesn't fill synchronously to
+  confirm the recorded reason survives to reconciliation for real.
+
+- **2026-08-25: Shoonya session survives a backend restart — implemented,
+  tested, NOT yet live-verified.** Before this, Shoonya's OAuth session
+  lived only in an in-process global
+  ([composition.py](backend/app/modules/broker_adapter/composition.py)'s
+  `_broker`), so every restart (routine redeploy, crash, the `Restart
+  backend` button) forced a fresh manual browser OAuth login even when the
+  morning's token was still genuinely valid — the exact gap Alice Blue's
+  own disk session cache
+  ([alice_blue_session.py](backend/app/modules/market_data/providers/alice_blue_session.py))
+  had already fixed for market data. Ported the identical pattern to
+  execution: `oauth_callback`
+  ([shoonya.py](backend/app/api/v1/shoonya.py)) now disk-caches every
+  successful login to `config/credentials/.shoonya_session_cache.json`
+  (`chmod 600`, gitignored) via a new
+  [session_cache.py](backend/app/modules/broker_adapter/shoonya/session_cache.py);
+  a new `app.main._attempt_shoonya_reconnect_from_cache`, run early in
+  `lifespan` before the mock-instrument-universe sync, restores it on the
+  next startup. Deliberately validates the cached token with one real
+  `get_margin()` call before trusting it, and distinguishes *why* that call
+  failed — matching `rest_client.py`'s own `BrokerAuthError`/
+  `BrokerConnectivityError` split: a genuinely dead token
+  (`ShoonyaSessionExpiredError`) discards the cache entry (human gets a
+  normal "Connect Shoonya" prompt, no worse than before this existed); any
+  other failure (a transient network blip during boot) installs the
+  adapter anyway without touching the cache, relying on `_AuthAwareBroker`
+  (already wrapping every real adapter) to self-heal via the same
+  `BrokerAuthError`-catch path every other Shoonya auth failure already
+  goes through. WS-level intermittent drops needed no change — `ws_client
+  .py`'s `_run` loop already reconnects with backoff over the *same* still-
+  valid REST token, no fresh OAuth involved. 1076/1076 backend tests pass
+  (up from 1062), ruff/mypy clean. **Not live-verified** — needs a real
+  Shoonya account + an actual backend restart during a live session to
+  confirm the cache survives and reconnects for real, same caveat every
+  other not-yet-live-tested Shoonya piece in this file already carries.
+
+- **2026-08-25: Live SL/TSL engine's first real market test — found and
+  fixed 4 real, live-only bugs, all in broker-resolution/response-parsing
+  code paths that had genuinely never been exercised against a real
+  account before.** Full incident, in chronological order:
+  1. **Broker misresolution in `reconcile_pending_live_orders`**
+     ([service.py](backend/app/modules/execution_engine/paper/service.py),
+     [composition.py](backend/app/modules/broker_adapter/composition.py)) —
+     resolved broker by *current session mode*, not the pending order's own
+     `mode=LIVE`. The moment the (correctly-working) reconciliation service
+     detected a real fill not yet reflected locally and flipped the session
+     to `reconciliation_lock`, this function started resolving the *mock*
+     adapter for a real Shoonya `broker_order_id`, raising an uncaught
+     `KeyError` every ~3s and permanently blocking that fill from ever
+     becoming a protected `Position` (`_place_protective_stop` never ran).
+     Fixed with the same live-order escape hatch positions already have
+     (`get_execution_broker(..., order=order)`), plus broadened the whole
+     block from `except BrokerError` to `except Exception`.
+  2. **Same bug class, worse consequence, in the manual bulk square-off
+     endpoint** (`POST /sessions/{id}/square-off`,
+     [sessions.py](backend/app/api/v1/sessions.py)) — the actual panic
+     button for `kill_switch`/`degraded_mode`/`reconciliation_lock` passed
+     a single pre-resolved broker instead of `None`, bypassing the
+     per-position resolution every other square-off path already got
+     fixed on 2026-08-19. In any mode but `live_enabled` — precisely the
+     modes this button exists for — it would have resolved mock and marked
+     a real live position CLOSED locally while never touching the broker.
+     Found via systematic audit, not a live trigger. Fixed to match the
+     established `None`-passing convention.
+  3. **`ModifyOrder`/`CancelOrder` response-parsing bug**
+     ([normalizer.py](backend/app/modules/broker_adapter/shoonya/normalizer.py))
+     — `parse_order_result` only ever recognized `norenordno`/`nOrdNo` as
+     the broker-order-id key, but Shoonya's real Modify/Cancel response
+     shape is `{"stat": "Ok", "result": "<id>"}` — genuinely different from
+     `PlaceOrder`/`OrderBook`'s shape, and neither endpoint had ever run
+     against a real account before this session (`modify_order`'s own
+     docstring already flagged "zero production callers" from an earlier
+     phase). Caused a live TSL-tightening call and a live cancel-before-exit
+     call to both raise `NormalizationError` — safely caught by the
+     already-correct "never leave the position worse off" fallbacks, and
+     both self-healed within seconds via the WS-push cache path on retry,
+     but fragile (depends entirely on WS staying connected). Fixed by
+     accepting `result` as a third broker-order-id key; deliberately did
+     *not* try to also infer a real status from this ack-only shape (still
+     `PENDING` by default — Noren's own async model means `stat: Ok` here
+     only means "request accepted," not "confirmed done").
+  4. **Two more unwrapped broker-resolution call sites in `PositionManager`
+     itself**
+     ([position_manager.py](backend/app/modules/execution_engine/paper/position_manager.py)),
+     found via the exact same crash recurring immediately after deploying
+     fix #1 — right after a restart, with Shoonya not yet reconnected: (a)
+     the main per-position stop/target/trail loop had zero try/except
+     around `resolve_broker_for_position` at all (already flagged as a
+     known gap in this file's own 2026-08-22 QC docstring, never actually
+     closed until now) — fixed by wrapping the whole per-position body,
+     with an explicit `except BrokerAuthError: raise` *before* the general
+     catch so the existing `degraded_mode`-on-auth-failure safety response
+     (`_handle_broker_auth_error`) still works — a first version without
+     that reraise silently broke an existing passing test, caught by the
+     full suite before deploy, not live; (b) `session_broker` (used only
+     for margin-breach detection) resolved *unconditionally* at the very
+     top of `_run_cycle`, before the per-position loop or even the
+     mode/open-positions guard — so it crashed every cycle regardless of
+     fix (a). Fixed by resolving it lazily, only inside the margin-breach
+     guard, in its own try/except.
+
+  **Real, live-confirmed proof this all works now**: a genuine live entry
+  (NIFTY25AUG26C24200, 65 qty @ 9.70) got its resting SL-LMT protective
+  stop placed automatically and correctly. Right after a restart deploying
+  fix #4, with Shoonya disconnected, that stop fired for real at the
+  broker — capital protection held with zero dependency on the app being
+  connected, exactly per this file's own long-standing design reasoning.
+  The moment Shoonya reconnected, reconciliation caught up within one
+  second and correctly recorded `exit_reason=stop`, exit 8.90, realized
+  P&L −₹52.00. A second real trade (04ebe4b8, entry 9.65) also closed
+  cleanly via a live exit fill at 15.00 (+₹347.75), self-healing through
+  the exact `NormalizationError` friction fix #3 exists for. One earlier
+  stuck order from the very start of this incident (before any fix was
+  deployed) was reconciled directly via a database transaction — not a
+  code path, a one-off correction reflecting a trade the user had already
+  manually closed in the Shoonya app before the fix landed — entry 18.20 /
+  exit 19.80, `exit_reason=reconciled`.
+
+  Every fix has a dedicated regression test that reproduces the real
+  failure first (confirmed failing without the fix, passing with it, via
+  `git stash`), not just written after the fact — see
+  `test_execution_broker_gating.py` (3 new tests for fix #1's `order`
+  param), `test_shoonya_normalizer.py` (fix #3, using the exact raw
+  payload captured live), and `test_position_manager.py` (2 new tests for
+  fix #4's both call sites). 1062/1062 backend tests pass, ruff/mypy clean.
+- **2026-08-25: TrueData archived (trial expired), Shoonya is now the
+  standing default market-data provider; Alice Blue is the intended future
+  failback once it clears the same live-run bar Angel One/Shoonya
+  themselves had to clear.** Live-confirmed the same morning: TrueData's
+  trial (expired 2026-08-24, per this file's own 2026-08-17 note) was
+  spamming `User Subscription Expired` in a tight ~1s reconnect loop across
+  4 threads with zero backoff — the SDK's own internal reconnect logic, not
+  this codebase's, so nothing here could throttle it short of stopping the
+  provider outright. The Shoonya failover-backup watchdog never tripped to
+  cover the gap, and for a real, non-obvious reason worth remembering: the
+  watchdog only arms on `subscribe_ticks` (which is what a strategy's
+  ingestion triggers), while `MarketDataScheduler`'s own pre-market
+  `connect()` only ever touches the primary leg — so a dead primary with no
+  strategy running yet gets zero automatic mitigation. Separately, and
+  unrelated to the TrueData issue itself: auto-spawn silently doesn't
+  self-retry — it only runs from `DailyBootstrapScheduler` (once daily,
+  09:00 IST) or a manual `POST /sessions/bootstrap-now`; a same-morning
+  Shoonya reconnect that lands *after* that one daily attempt has already
+  failed (session-expired at spawn time, common right after a fresh login)
+  leaves every strategy config un-spawned for the rest of the day with no
+  further automatic attempt — worth a real fix (retry-on-reconnect) if this
+  recurs.
+  **Fix applied**: OCI `.env` set `MARKET_DATA_PROVIDER=shoonya`,
+  `MARKET_DATA_FAILOVER_ENABLED=false` (no valid backup exists today —
+  Angel One's creds are archived off this box per the entry below, Alice
+  Blue isn't yet a recognized failover leg, and a provider can't be its own
+  backup) — old `.env` preserved as a dated `.bak` alongside it on the box.
+  Restarting on the new config both stopped the TrueData spam and
+  (incidentally) re-ran the daily bootstrap, which spawned all 5 strategy
+  configs for the day now that Shoonya's session was valid again.
+  `truedata.env` credentials removed from the OCI deployment (byte-identical
+  copy confirmed preserved locally first, exact same discipline as the
+  Angel One archiving below) — `TrueDataSettings`/`TrueDataMarketDataProvider`
+  and `"truedata"` in `provider_composition._RECOGNIZED_PROVIDERS` are fully
+  untouched, so reactivating is a `MARKET_DATA_PROVIDER=truedata` env-var
+  change plus restoring the credentials file (and a real subscription),
+  no code changes needed. TrueData was never in
+  `_RECOGNIZED_FAILOVER_BACKUPS`/`RECOGNIZED_OVERRIDE_PROVIDERS`/
+  `AdvancedPage.tsx`'s `FAILOVER_PROVIDERS` to begin with (only ever used as
+  primary), so no list edits were needed there the way Angel One's archiving
+  needed. **Alice Blue as failback is explicit user intent, not yet
+  built**: `alice_blue` deliberately stays out of
+  `_RECOGNIZED_FAILOVER_BACKUPS` for now, per this file's own 2026-08-22
+  note — promote it once a real multi-hour live run exists (only a ~20s
+  connectivity proof exists today), not before.
 - **2026-08-21: Angel One archived — settings/code preserved, hidden from
   UI-driven activation.** Kept aside pending an IP/proxy fix, per explicit
   user decision ("keep angel one aside... local only... not in the list of
