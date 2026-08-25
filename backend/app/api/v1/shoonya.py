@@ -31,6 +31,7 @@ from app.domain.market.models import Instrument, OptionContract
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured, set_broker
 from app.modules.broker_adapter.shoonya.auth import build_authorize_url, exchange_code_for_token
+from app.modules.broker_adapter.shoonya.session_cache import set_cached_shoonya_session
 from app.modules.scheduler.instrument_sync import sync_instrument_master
 
 logger = logging.getLogger("app.api.shoonya")
@@ -380,6 +381,12 @@ def oauth_callback(
 
     adapter = ShoonyaBrokerAdapter(settings, session.auth_result)
     set_broker(adapter)
+    # 2026-08-25: disk-cache this session so a later backend restart can
+    # reconnect automatically without a fresh browser login — see
+    # `session_cache.py`'s own docstring and `main._attempt_shoonya_reconnect
+    # _from_cache`, which validates it with a real API call before trusting
+    # it on the next startup.
+    set_cached_shoonya_session(session.auth_result)
 
     # 2026-08-21: bracket-order research Phase A — read-only, no order
     # placed/modified/cancelled anywhere in this block. Logs this account's

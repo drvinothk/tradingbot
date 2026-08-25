@@ -38,6 +38,28 @@ def reset_broker_singleton():
 
 
 @pytest.fixture(autouse=True)
+def isolate_shoonya_session_cache(tmp_path, monkeypatch):
+    """2026-08-25: `oauth_callback` now disk-caches every successful login
+    (`session_cache.set_cached_shoonya_session`, so a later backend restart
+    can reconnect automatically — see `session_cache.py`'s own docstring).
+    Without this, every one of this file's successful-callback tests would
+    write a real `tok-123` entry to this machine's actual
+    `config/credentials/.shoonya_session_cache.json` — autouse so no test
+    below has to remember it individually.
+    """
+    from app.modules.broker_adapter.shoonya import session_cache as session_cache_module
+
+    monkeypatch.setattr(
+        session_cache_module, "_CACHE_PATH", tmp_path / ".shoonya_session_cache.json"
+    )
+    session_cache_module._session = None
+    session_cache_module._loaded_from_disk = True
+    yield
+    session_cache_module._session = None
+    session_cache_module._loaded_from_disk = True
+
+
+@pytest.fixture(autouse=True)
 def stub_product_capabilities(monkeypatch):
     """2026-08-21: bracket-order research Phase A added
     `ShoonyaBrokerAdapter.get_product_capabilities`, called unconditionally
@@ -242,6 +264,51 @@ def test_callback_success_installs_broker_and_audits(
             .all()
         )
         assert len(events) == 1
+
+
+def test_callback_success_caches_the_session_to_disk(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """2026-08-25: a successful login must persist its `AuthResult` via
+    `session_cache.set_cached_shoonya_session`, so `app.main._attempt_
+    shoonya_reconnect_from_cache` can restore it on a later backend restart
+    without a fresh manual browser login.
+    """
+    _login(api_client, seeded_admin)
+
+    fake_auth_result = AuthResult(session_token="tok-123", account_id="FA1")
+    fake_session = OAuthSession(auth_result=fake_auth_result, refresh_token=None)
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+    monkeypatch.setattr(
+        shoonya_module, "sync_instrument_master", lambda db, broker, exchanges: None
+    )
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+    assert response.status_code == 200
+
+    from app.modules.broker_adapter.shoonya.session_cache import get_cached_shoonya_session
+
+    assert get_cached_shoonya_session() == fake_auth_result
+
+
+def test_callback_failure_does_not_cache_a_session(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    _login(api_client, seeded_admin)
+
+    def _raise(settings, code):
+        raise ShoonyaAuthError("bad checksum")
+
+    monkeypatch.setattr(shoonya_module, "exchange_code_for_token", _raise)
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+    assert response.status_code == 200
+
+    from app.modules.broker_adapter.shoonya.session_cache import get_cached_shoonya_session
+
+    assert get_cached_shoonya_session() is None
 
 
 def test_callback_invokes_product_capabilities_diagnostic(

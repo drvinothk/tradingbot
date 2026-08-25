@@ -26,6 +26,9 @@ from app.modules.execution_engine.paper import registry as position_manager_regi
 from app.modules.market_data import market_data_scheduler, provider_composition
 from app.modules.market_data import scrip_master_scheduler as scrip_master_scheduler_module
 from app.modules.scheduler import health_check as health_check_module
+from app.modules.scheduler import (
+    reconciliation_lock_recovery as reconciliation_lock_recovery_module,
+)
 
 
 class _FakeSingletonConnection:
@@ -57,6 +60,7 @@ def _patched_lifespan_dependencies(monkeypatch):
     monkeypatch.setattr(
         main_module, "_acquire_process_singleton_lock", lambda: fake_singleton_connection
     )
+    monkeypatch.setattr(main_module, "_attempt_shoonya_reconnect_from_cache", lambda: None)
     monkeypatch.setattr(main_module, "_sync_mock_instrument_universe", lambda: None)
     monkeypatch.setattr(main_module, "_sync_angel_one_scrip_master", lambda: None)
     monkeypatch.setattr(main_module, "_run_startup_recovery_check", lambda: None)
@@ -70,6 +74,16 @@ def _patched_lifespan_dependencies(monkeypatch):
         health_check_module, "ensure_health_check_scheduler_running", lambda: None
     )
     monkeypatch.setattr(health_check_module, "stop_health_check_scheduler", lambda: None)
+    monkeypatch.setattr(
+        reconciliation_lock_recovery_module,
+        "ensure_reconciliation_lock_recovery_scheduler_running",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        reconciliation_lock_recovery_module,
+        "stop_reconciliation_lock_recovery_scheduler",
+        lambda: None,
+    )
     monkeypatch.setattr(
         market_data_scheduler, "ensure_market_data_scheduler_running", lambda: None
     )

@@ -7,36 +7,53 @@
    entire lifetime via a dedicated connection, so a second instance of this
    backend can never run alongside the first believing it's also the engine.
    This is fatal: refuse to start rather than risk two execution writers.
-3. Mock instrument universe sync — only when `get_broker()` resolves to
+3. Shoonya reconnect-from-cache — if a real Shoonya session was disk-cached
+   by a prior `oauth_callback` login (`shoonya/session_cache.py`), attempts
+   to restore it here, *before* the mock-universe sync below, so a routine
+   restart during the trading day doesn't force a fresh manual browser
+   OAuth login when the morning's token is still genuinely valid. Validates
+   the cached token with a real API call first — a dead/expired one is
+   dropped and this falls through to the mock, exactly as if no cache
+   existed at all.
+4. Mock instrument universe sync — only when `get_broker()` resolves to
    `MockBrokerAdapter` (a no-op once Phase 5's real Shoonya adapter is wired
-   in): syncs `instruments`/`option_contracts` DB rows from the same seeded
-   universe the broker singleton itself quotes against, so
-   `get_option_chain()`/strike ranking have something real to find against
-   the live server, not just in tests (which always construct their own
-   explicitly seeded adapter). See `broker_adapter.composition.get_broker`'s
-   own docstring for why this was missing until Phase 4's manual QC caught it.
-4. Startup-recovery check — looks for any trading_session left ACTIVE with
+   in, including one just restored from cache by step 3): syncs
+   `instruments`/`option_contracts` DB rows from the same seeded universe
+   the broker singleton itself quotes against, so `get_option_chain()`/
+   strike ranking have something real to find against the live server, not
+   just in tests (which always construct their own explicitly seeded
+   adapter). See `broker_adapter.composition.get_broker`'s own docstring for
+   why this was missing until Phase 4's manual QC caught it.
+5. Startup-recovery check — looks for any trading_session left ACTIVE with
    open positions from a previous run (crash/reboot), resumes each one's
    `PositionManager` (so stop/trail management picks back up instead of the
    process coming back up idle) and runs an immediate reconciliation pass
    against the broker's own book, per Phase 3.
-5. Health-check scheduler — starts `HealthCheckScheduler`
+6. Health-check scheduler — starts `HealthCheckScheduler`
    (`scheduler/health_check.py`), the repeating version of step 1's one-shot
    boot check: on a 5-minute timer, a failing NTP/disk check now writes
    `metric_series` rows and moves any `paper_plus_guarded_live`/
    `live_enabled` session to `degraded_mode`, not just a log line. Addendum
    hardening batch, promoted from "known open item" to a Phase 6
    prerequisite — see the build plan.
-6. Trade-log export scheduler — starts `TradeLogExportScheduler`
+7. Reconciliation-lock recovery scheduler — starts
+   `ReconciliationLockRecoveryScheduler`
+   (`scheduler/reconciliation_lock_recovery.py`, 2026-08-25): every 60s,
+   re-checks any session stuck in `reconciliation_lock` and auto-recovers
+   it (including back to a live `prior_mode`, a deliberate scoped exception
+   to Rule 4) once `run_full_reconciliation` comes back clean 3 checks in a
+   row — see that module's own docstring and `core.modes.state_machine
+   .recover_from_reconciliation_lock`'s for the full design.
+8. Trade-log export scheduler — starts `TradeLogExportScheduler`
    (`reporting/export_scheduler.py`, Ops-Hardening Phase 3): once daily at
    15:35 IST, exports the day's completed trades to a per-workspace Excel
    workbook under `reports/`, one tab per (underlying, expiry) cycle.
-7. Contract sync scheduler — starts `ContractSyncScheduler`
+9. Contract sync scheduler — starts `ContractSyncScheduler`
    (`scheduler/contract_sync_scheduler.py`, Ops-Hardening Phase 7): once
    daily at 08:30 IST, re-syncs `instruments`/`option_contracts` from
    Shoonya (skipped, not failed, if Shoonya isn't connected yet) so the
    09:00 auto-spawner below has fresh local expiry data to query.
-8. Daily bootstrap scheduler — starts `DailyBootstrapScheduler`
+10. Daily bootstrap scheduler — starts `DailyBootstrapScheduler`
    (`session/bootstrapper.py`, Ops-Hardening Phase 4): once daily at 09:00
    IST, safely closes any prior-day session left ACTIVE with no open
    positions/live runs (alerts instead of closing if it isn't empty),
@@ -130,6 +147,89 @@ def _acquire_process_singleton_lock():
             "refusing to start a second execution engine."
         )
     return connection
+
+
+def _attempt_shoonya_reconnect_from_cache() -> None:
+    """2026-08-25 addition — closes the gap `shoonya/session_cache.py`'s own
+    docstring describes: before this, every backend restart forced a fresh
+    manual browser OAuth login even when the morning's Shoonya token was
+    still genuinely valid. Mirrors Alice Blue's own established "cache is
+    harmless if stale, the next real call just fails" philosophy
+    (`market_data/providers/alice_blue_session.py`), but validates the
+    cached token with one real API call *here*, at startup, rather than
+    waiting for the first real call from deep inside `PositionManager`/
+    market-data ingestion — the point is precisely to make
+    `is_shoonya_configured()` and `GET /shoonya/status` correctly report
+    "connected" right away on a successful restore, not several seconds
+    later after some other call site happens to notice.
+
+    No-ops (leaves the mock broker in place, exactly as before this existed)
+    if Shoonya credentials aren't configured, or nothing is cached.
+    Validation deliberately distinguishes *why* the check call failed,
+    matching `rest_client.py`'s own `BrokerAuthError`/`BrokerConnectivityError`
+    split: a genuinely dead/expired token (`ShoonyaSessionExpiredError`, a
+    `BrokerAuthError`) drops the cache entry so it doesn't linger — the
+    human gets a completely normal "Connect Shoonya" prompt, identical to
+    today's behavior, never worse. Any other failure (a transient network
+    blip during boot, say) does **not** discard the cache — the token itself
+    is probably still fine, we just couldn't confirm it this instant — and
+    still installs the adapter optimistically; if it truly is dead,
+    `_AuthAwareBroker` (already wrapping every real adapter `set_broker`
+    installs) catches the `BrokerAuthError` from whichever real call site
+    hits it first and flips `is_shoonya_configured()` back off, the same
+    self-healing path every other Shoonya auth failure already goes
+    through. Deliberately does not
+    replicate `api.v1.shoonya.oauth_callback`'s `sync_instrument_master`/
+    `_seed_option_anchors`/`reset_for_reconnect` steps — those handle
+    *first-time-this-session* instrument/market-data wiring; on a restart,
+    those DB rows already exist from the prior session and the periodic
+    `ContractSyncScheduler` (started later in `lifespan`) keeps them fresh.
+    Because this runs before any market-data provider singleton is built,
+    `get_broker()` already resolves to the real adapter by the time
+    `provider_composition.get_market_data_provider()` is first constructed
+    later in `lifespan` — no explicit `reset_for_reconnect()` call is needed
+    here the way `oauth_callback`'s *mid-session* reconnect case needs one.
+    """
+    from app.config.settings import get_settings
+    from app.modules.broker_adapter.composition import set_broker
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+    from app.modules.broker_adapter.shoonya.session_cache import (
+        get_cached_shoonya_session,
+        set_cached_shoonya_session,
+    )
+
+    settings = get_settings().shoonya
+    if settings.missing_required_fields():
+        return
+
+    cached = get_cached_shoonya_session()
+    if cached is None:
+        return
+
+    from app.modules.broker_adapter.base.errors import BrokerAuthError
+
+    adapter = ShoonyaBrokerAdapter(settings, cached)
+    try:
+        adapter.get_margin()
+    except BrokerAuthError:
+        logger.warning(
+            "Cached Shoonya session is dead (auth failure on validation) — discarding it; "
+            "a fresh manual login via /shoonya/login-url will be needed.",
+            exc_info=True,
+        )
+        adapter.close()
+        set_cached_shoonya_session(None)
+        return
+    except Exception:
+        logger.warning(
+            "Could not validate the cached Shoonya session on startup (non-auth failure, "
+            "likely transient) — installing it anyway; a later auth failure will still be "
+            "caught and reported normally.",
+            exc_info=True,
+        )
+
+    set_broker(adapter)
+    logger.info("Shoonya session restored from disk cache — reconnected without a fresh login.")
 
 
 def _sync_mock_instrument_universe() -> None:
@@ -451,6 +551,7 @@ async def lifespan(app: FastAPI):
     # try/except makes the failure path do the same clean shutdown as the
     # success path instead.
     try:
+        _attempt_shoonya_reconnect_from_cache()
         _sync_mock_instrument_universe()
         _sync_angel_one_scrip_master()
         _run_startup_recovery_check()
@@ -466,9 +567,13 @@ async def lifespan(app: FastAPI):
             ensure_contract_sync_scheduler_running,
         )
         from app.modules.scheduler.health_check import ensure_health_check_scheduler_running
+        from app.modules.scheduler.reconciliation_lock_recovery import (
+            ensure_reconciliation_lock_recovery_scheduler_running,
+        )
         from app.modules.session.bootstrapper import ensure_daily_bootstrap_scheduler_running
 
         ensure_health_check_scheduler_running()
+        ensure_reconciliation_lock_recovery_scheduler_running()
         ensure_market_data_scheduler_running()
         ensure_trade_log_export_scheduler_running()
         ensure_contract_sync_scheduler_running()
@@ -494,10 +599,14 @@ async def lifespan(app: FastAPI):
     from app.modules.reporting.export_scheduler import stop_trade_log_export_scheduler
     from app.modules.scheduler.contract_sync_scheduler import stop_contract_sync_scheduler
     from app.modules.scheduler.health_check import stop_health_check_scheduler
+    from app.modules.scheduler.reconciliation_lock_recovery import (
+        stop_reconciliation_lock_recovery_scheduler,
+    )
     from app.modules.session.bootstrapper import stop_daily_bootstrap_scheduler
 
     stop_all_position_managers()
     stop_health_check_scheduler()
+    stop_reconciliation_lock_recovery_scheduler()
     stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
     stop_trade_log_export_scheduler()
