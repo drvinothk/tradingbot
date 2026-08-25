@@ -39,13 +39,21 @@ from sqlalchemy.orm import Session
 from app.core.clock import check_disk_space, check_ntp_drift
 from app.core.db.session import session_scope
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.market.models import Instrument
+from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import (
     SafeMode,
     TradingSession,
     TradingSessionStatus,
     TransitionTriggerType,
 )
+from app.modules.alerting.manager import send_alert
+from app.modules.market_data.freshness import (
+    FreshnessState,
+    FreshnessThresholds,
+    classify_latest_tick,
+)
+from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_within_market_hours
 from app.modules.ops.metrics_service import record_metric
 
 logger = logging.getLogger("app.scheduler.health_check")
@@ -55,6 +63,17 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 300.0
 
 _DEGRADABLE_MODES = (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED)
+
+# 2026-08-25: dedicated "worth alerting a human" threshold for
+# _check_market_data_staleness -- deliberately its own tier, not a reuse of
+# market_data.freshness's TICK_THRESHOLDS (60s stale) or
+# OPTION_CHAIN_THRESHOLDS (600s stale but a different signal entirely,
+# option-chain snapshots rather than underlying ticks). "degraded" isn't
+# meaningfully used here (only STALE/DEAD trigger an alert), so its value
+# just needs to sit below stale_after_seconds.
+_MARKET_DATA_STALE_THRESHOLDS = FreshnessThresholds(
+    degraded_after_seconds=300.0, stale_after_seconds=600.0
+)
 
 
 class HealthCheckScheduler:
@@ -96,6 +115,11 @@ class HealthCheckScheduler:
         )
         workspace_ids = {s.workspace_id for s in active_sessions}
         recorded_at = datetime.now(UTC)
+
+        # Independent of the ntp/disk checks below (which early-return the
+        # whole cycle when both are ok) -- always runs.
+        self._check_market_data_staleness(db, workspace_ids)
+
         for workspace_id in workspace_ids:
             record_metric(
                 db,
@@ -143,19 +167,70 @@ class HealthCheckScheduler:
 
             if trading_session.workspace_id not in alerted_workspaces:
                 alerted_workspaces.add(trading_session.workspace_id)
-                db.add(
-                    SystemAlert(
-                        id=uuid.uuid4(),
-                        workspace_id=trading_session.workspace_id,
-                        trading_session_id=None,
-                        severity=AlertSeverity.CRITICAL if not disk.ok else AlertSeverity.WARNING,
-                        category="health_check_failed",
-                        message=reason,
-                        created_at=recorded_at,
-                    )
+                send_alert(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    severity=AlertSeverity.CRITICAL if not disk.ok else AlertSeverity.WARNING,
+                    category="health_check_failed",
+                    message=reason,
+                    # No specific position/order behind this -- infra-level,
+                    # not paper-suppressed (mode left at its None default).
+                    # Severity gates the Telegram push on its own: only the
+                    # disk-failure (CRITICAL) case reaches Telegram, never
+                    # the NTP-drift-only (WARNING) case.
                 )
 
         db.commit()
+
+    def _check_market_data_staleness(self, db: Session, workspace_ids: set[uuid.UUID]) -> None:
+        """2026-08-25: real gap closed -- `market_data.freshness` classifies
+        tick staleness (`classify_latest_tick`) but until now nothing ever
+        alerted on it; a strategy just silently skipped its cycle
+        (`market_data.freshness`'s own callers), and an underlying with a
+        dead feed but no strategy currently in a position produced zero
+        signal anywhere. Checks the fixed `TRADABLE_UNDERLYINGS` universe
+        (same convention `MarketDataScheduler`'s own pre-market subscribe
+        already uses) against a dedicated 10-minute threshold — deliberately
+        its own `FreshnessThresholds`, not a reuse of `TICK_THRESHOLDS`
+        (60s) or `OPTION_CHAIN_THRESHOLDS`, since "worth alerting a human"
+        is a coarser granularity than either of those existing tiers.
+
+        Gated on `is_within_market_hours()` — no ticks are expected outside
+        it at all, so checking then would just alert on nothing new every
+        5 minutes overnight. No specific position/order behind this (an
+        underlying-level feed check, not a trade), so `mode` is left at its
+        `None` default — infra-level, not paper-suppressed, same reasoning
+        as `health_check_failed` above.
+        """
+        if not workspace_ids or not is_within_market_hours():
+            return
+
+        for symbol in TRADABLE_UNDERLYINGS:
+            instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+            if instrument is None:
+                continue
+
+            state = classify_latest_tick(
+                db, instrument.id, thresholds=_MARKET_DATA_STALE_THRESHOLDS
+            )
+            if state not in (FreshnessState.STALE, FreshnessState.DEAD):
+                continue
+
+            message = f"No fresh {symbol} tick for over 10 minutes (state={state.value})."
+            logger.warning("Health check: %s", message)
+            for workspace_id in workspace_ids:
+                # dedup_key includes workspace_id -- a shared key here would
+                # mean only the first workspace in this loop ever actually
+                # pushes, silently swallowing every other workspace's own
+                # genuinely separate alert for the same cycle.
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="market_data_stale",
+                    message=message,
+                    dedup_key=f"market_data_stale:{symbol}:{workspace_id}",
+                )
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

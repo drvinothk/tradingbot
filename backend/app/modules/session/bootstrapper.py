@@ -52,7 +52,7 @@ from app.config.settings import get_settings
 from app.core.clock import now_ist, to_ist
 from app.core.db.session import session_scope
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import Workspace
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import SafeMode, TradingSession, TradingSessionStatus
@@ -98,6 +98,22 @@ def _close_if_safe(db: Session, stale_session: TradingSession) -> None:
             "reconciliation."
         )
         logger.critical("Daily bootstrap: %s", message)
+        # 2026-08-25: "no notification for paper trade at all" -- the open
+        # risk left behind here could be entirely paper, entirely live, or
+        # a mix (per-strategy graduation lets one session hold both). Only
+        # push if at least one of the still-open positions is genuinely
+        # LIVE; a paper-only stale session stays DB-only.
+        has_live_open_position = (
+            db.query(Position)
+            .join(Order, Order.id == Position.opening_order_id)
+            .filter(
+                Position.trading_session_id == stale_session.id,
+                Position.status == PositionStatus.OPEN,
+                Order.mode == OrderMode.LIVE,
+            )
+            .count()
+            > 0
+        )
         send_alert(
             db,
             workspace_id=stale_session.workspace_id,
@@ -105,6 +121,7 @@ def _close_if_safe(db: Session, stale_session: TradingSession) -> None:
             category="stale_session_not_closed",
             message=message,
             trading_session_id=stale_session.id,
+            mode=OrderMode.LIVE if has_live_open_position else OrderMode.PAPER,
         )
         return
 

@@ -28,6 +28,7 @@ from app.core.clock import is_past_eod_scanning_stop, is_within_global_trading_w
 from app.core.db.session import session_scope
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
+from app.domain.execution.models import Order, OrderMode
 from app.domain.market.models import Instrument, PriceBar
 from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision
@@ -82,6 +83,7 @@ def _check_runner_watchdog(
     trading_session: TradingSession,
     latest_bar: PriceBar | None,
     has_open_position: bool,
+    position_mode: OrderMode | None = None,
     *,
     session_factory: SessionFactory = session_scope,
 ) -> None:
@@ -122,6 +124,12 @@ def _check_runner_watchdog(
     for exactly this reason — same "never let a background write default to
     the production DB inside a test" discipline as `ensure_ingestion_running`/
     `record_option_chain_snapshot`'s own `session_factory` parameters).
+
+    `position_mode`: the open position's `Order.mode` (`run_cycle` resolves
+    this from the same `Position` it already fetched to compute
+    `has_open_position`) — passed through to `send_alert` so a stalled
+    *paper* run never reaches Telegram, per the 2026-08-25 "no notification
+    for paper trade at all" rule.
     """
     if not has_open_position or not is_within_market_hours():
         return
@@ -160,6 +168,8 @@ def _check_runner_watchdog(
             category="strategy_run_stalled",
             message=f"strategy_run {strategy_run.id}: open position but stalled feed ({age_desc})",
             trading_session_id=trading_session.id,
+            mode=position_mode,
+            dedup_key=f"strategy_run_stalled:{strategy_run.id}",
         )
 
 
@@ -354,7 +364,12 @@ def run_cycle(
             decision = submit_signal(db, strategy_run, trading_session, strategy_config, proposal)
 
     if strategy_run.status != StrategyRunStatus.STOPPED:
-        has_position = get_open_position_for_run(db, strategy_run) is not None
+        open_position = get_open_position_for_run(db, strategy_run)
+        has_position = open_position is not None
+        position_mode: OrderMode | None = None
+        if open_position is not None:
+            opening_order = db.get(Order, open_position.opening_order_id)
+            position_mode = opening_order.mode if opening_order is not None else None
         new_status = StrategyRunStatus.IN_POSITION if has_position else StrategyRunStatus.SCANNING
         if strategy_run.status != new_status:
             strategy_run.status = new_status
@@ -366,6 +381,7 @@ def run_cycle(
             trading_session,
             latest_bar,
             has_position,
+            position_mode,
             session_factory=alert_session_factory,
         )
 

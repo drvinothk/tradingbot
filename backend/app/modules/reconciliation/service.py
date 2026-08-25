@@ -36,8 +36,9 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
 from app.domain.execution.models import Order, OrderMode, OrderSide, Position, PositionStatus
 from app.domain.market.models import OptionContract
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import SafeMode, TradingSession, TransitionTriggerType
+from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.composition import (
@@ -157,17 +158,20 @@ def run_reconciliation(
     action_taken = "none"
 
     if mismatches:
-        db.add(
-            SystemAlert(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                severity=AlertSeverity.CRITICAL,
-                category="reconciliation_mismatch",
-                message=f"Reconciliation found {len(mismatches)} local-vs-broker mismatch(es).",
-                payload={"mismatches": mismatches},
-                created_at=finished_at,
-            )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="reconciliation_mismatch",
+            message=f"Reconciliation found {len(mismatches)} local-vs-broker mismatch(es).",
+            payload={"mismatches": mismatches},
+            # order_mode (computed above) is which book this pass actually
+            # reconciled -- a paper-book mismatch stays DB-only (no live
+            # money at risk, per this module's own docstring), only a
+            # live-book mismatch pushes to Telegram.
+            mode=order_mode,
+            dedup_key=f"reconciliation_mismatch:{trading_session.id}:{order_mode.value}",
         )
 
         current_mode = SafeMode(trading_session.mode)

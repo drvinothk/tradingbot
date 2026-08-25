@@ -210,6 +210,11 @@ def get_market_data_provider() -> BaseMarketDataProvider:
                 settings.market_data.failover_recovery_stabilization_seconds
             ),
             backup_retry_seconds=settings.market_data.failover_backup_retry_seconds,
+            # Module-level reference, same reasoning as this file's own
+            # session_scope usage elsewhere (see get_market_data_provider's
+            # docstring) -- tests already monkeypatch
+            # provider_composition.session_scope to a no-DB-touching stub.
+            alert_session_factory=session_scope,
         )
         _seed_manual_override(inner)
 

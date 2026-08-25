@@ -65,6 +65,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
+from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_execution_broker, is_strategy_routed_live
@@ -833,20 +834,21 @@ def record_trade_outcome_effects(
                 TransitionTriggerType.RISK,
                 reason=f"daily loss cap breached: cumulative_realized_pnl={new_cumulative}",
             )
-            db.add(
-                SystemAlert(
-                    id=uuid.uuid4(),
-                    workspace_id=trading_session.workspace_id,
-                    trading_session_id=trading_session.id,
-                    severity=AlertSeverity.CRITICAL,
-                    category="daily_loss_cap_breached",
-                    message=(
-                        "Daily loss cap breached — kill_switch engaged. "
-                        f"cumulative_realized_pnl={new_cumulative}"
-                    ),
-                    payload={"cumulative_realized_pnl": float(new_cumulative)},
-                    created_at=_utcnow(),
-                )
+            send_alert(
+                db,
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="daily_loss_cap_breached",
+                message=(
+                    "Daily loss cap breached — kill_switch engaged. "
+                    f"cumulative_realized_pnl={new_cumulative}"
+                ),
+                payload={"cumulative_realized_pnl": float(new_cumulative)},
+                # This whole function returns early unless is_live (see its
+                # own docstring) -- paper trades never reach here at all.
+                mode=OrderMode.LIVE,
+                dedup_key=f"daily_loss_cap_breached:{trading_session.id}",
             )
         elif (
             trading_session.entries_paused_reason is None

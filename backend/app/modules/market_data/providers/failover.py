@@ -54,8 +54,14 @@ import logging
 import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import datetime
 
+from sqlalchemy.orm import Session
+
+from app.domain.ops.models import AlertSeverity
+from app.domain.session.models import TradingSession, TradingSessionStatus
+from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
@@ -63,6 +69,7 @@ logger = logging.getLogger("app.market_data.failover")
 
 TickCallback = Callable[[Tick], None]
 DepthCallback = Callable[[DepthSnapshot], None]
+SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 
@@ -80,6 +87,7 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         backup_retry_seconds: float,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        alert_session_factory: SessionFactory | None = None,
     ) -> None:
         self._primary = primary
         self._backup = backup
@@ -90,6 +98,17 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._backup_retry_seconds = backup_retry_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._clock = clock
+        # 2026-08-25: opt-in only, defaulting to None -- this class has zero
+        # DB/session context otherwise, and it's directly instantiated by
+        # several existing tests with no session_factory of any kind. A
+        # hardcoded default here would repeat the exact "background write
+        # defaults to the production DB inside a test" trap CLAUDE.md
+        # already documents for PositionManager/StrategyRunner (fixed the
+        # same way there: constructor-injected, defaulting to None/a
+        # no-DB-touching stub, never a bare `session_scope` default).
+        # provider_composition.py's own production composition root is the
+        # one real call site that passes the actual `session_scope`.
+        self._alert_session_factory = alert_session_factory
 
         self._lock = threading.Lock()
         self._active: str = primary_name
@@ -143,6 +162,54 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def _alert(
+        self, *, category: str, severity: AlertSeverity, message: str, dedup_suffix: str
+    ) -> None:
+        """No-op when `alert_session_factory` wasn't provided (every direct
+        test instantiation, by default). Alerts every currently-ACTIVE
+        workspace, same "no per-instrument/session context available here"
+        shape `scheduler.health_check.HealthCheckScheduler` already uses —
+        this is an underlying-agnostic, account-wide feed event, not tied to
+        one trading_session. `mode` is left at `send_alert`'s own `None`
+        default (infra-level, never paper-suppressed, same reasoning as
+        `health_check_failed`/`market_data_stale`).
+
+        `dedup_suffix`: distinguishes the two real call sites of this method
+        (a successful switch to backup vs. backup itself failing to
+        subscribe) so a "both feeds down" alert can never suppress a later,
+        genuinely different "switched to backup" success message within the
+        same 15-minute dedup window, or vice versa.
+        """
+        if self._alert_session_factory is None:
+            return
+        try:
+            with self._alert_session_factory() as db:
+                workspace_ids = {
+                    s.workspace_id
+                    for s in db.query(TradingSession)
+                    .filter(TradingSession.status == TradingSessionStatus.ACTIVE)
+                    .all()
+                }
+                for workspace_id in workspace_ids:
+                    # dedup_key includes workspace_id -- a shared key here
+                    # would mean only the first workspace in this loop ever
+                    # actually pushes, silently swallowing every other
+                    # workspace's own genuinely separate alert.
+                    send_alert(
+                        db,
+                        workspace_id=workspace_id,
+                        severity=severity,
+                        category=category,
+                        message=message,
+                        dedup_key=(
+                            f"{category}:{self._primary_name}:{self._backup_name}:"
+                            f"{dedup_suffix}:{workspace_id}"
+                        ),
+                    )
+                db.commit()
+        except Exception:  # noqa: BLE001 - an alerting failure must never break failover itself
+            logger.exception("failed to raise market-data failover alert")
 
     @property
     def active_provider_name(self) -> str:
@@ -488,12 +555,16 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         with self._lock:
             self._active = self._backup_name
             self._recovery_started_at = None
-        logger.warning(
-            "FAILOVER: no tick from %r for > %.1fs — switched active market-data "
-            "provider to %r",
-            self._primary_name,
-            self._failover_threshold_seconds,
-            self._backup_name,
+        message = (
+            f"No tick from {self._primary_name!r} for > {self._failover_threshold_seconds:.0f}s "
+            f"— switched active market-data provider to {self._backup_name!r}."
+        )
+        logger.warning("FAILOVER: %s", message)
+        self._alert(
+            category="market_data_failover_switch",
+            severity=AlertSeverity.CRITICAL,
+            message=message,
+            dedup_suffix="switched",
         )
 
     def _ensure_backup_subscribed(self, now: float) -> bool:
@@ -516,6 +587,16 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
                 self._backup_name,
                 self._backup_retry_seconds,
                 exc_info=True,
+            )
+            self._alert(
+                category="market_data_failover_switch",
+                severity=AlertSeverity.CRITICAL,
+                message=(
+                    f"Backup provider {self._backup_name!r} failed to subscribe — both "
+                    f"market-data feeds are now unavailable; retrying in "
+                    f"{self._backup_retry_seconds:.0f}s."
+                ),
+                dedup_suffix="both_down",
             )
             with self._lock:
                 self._next_backup_attempt_at = now + self._backup_retry_seconds
@@ -555,12 +636,20 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             self._active = self._primary_name
             self._recovery_started_at = None
 
-        logger.warning(
-            "FAILOVER RECOVERY: %r stable for %.0fs — switching active market-data "
-            "provider back to %r",
-            self._primary_name,
-            self._recovery_stabilization_seconds,
-            self._primary_name,
+        recovery_message = (
+            f"{self._primary_name!r} stable for {self._recovery_stabilization_seconds:.0f}s "
+            f"— switching active market-data provider back to {self._primary_name!r}."
+        )
+        logger.warning("FAILOVER RECOVERY: %s", recovery_message)
+        # WARNING, not CRITICAL -- good news (the earlier disconnection
+        # resolved itself), stays DB-only per send_alert's own
+        # CRITICAL-only Telegram gate; the outage itself already pushed via
+        # the "switched"/"both_down" alerts above.
+        self._alert(
+            category="market_data_failover_switch",
+            severity=AlertSeverity.WARNING,
+            message=recovery_message,
+            dedup_suffix="recovered",
         )
         try:
             self._backup.unsubscribe_ticks(sorted(self._symbols))

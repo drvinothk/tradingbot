@@ -1,0 +1,42 @@
+{
+  "autoMode": {
+    "allow": [
+      "$defaults"
+    ],
+    "soft_deny": [
+      "$defaults",
+      "Bash(taskkill:*) on the OCI deployment host or against production-mode processes",
+      "Writes to backend/app/config/credentials/*.env or session cache files outside the local dev flow described in CLAUDE.md"
+    ],
+    "hard_deny": [
+      "$defaults"
+    ],
+    "environment": [
+      "$defaults",
+      "### Org-wide",
+      "**Organization**: None configured",
+      "**Cloud provider(s)**: Oracle Cloud Infrastructure (OCI) — live deployment VM at 68.233.110.76 / 68-233-110-76.sslip.io",
+      "**Repository visibility**: not queryable here via gh — assume private per shipped default (github.com/drvinothk/tradingbot; no public-visibility evidence found)",
+      "**Internal sharing / snippet hosting**: None configured — treat public paste/gist services as outside the trust boundary",
+      "**Secrets management**: local gitignored env files under backend/app/config/credentials/ (*.env, .shoonya_session_cache.json, .alice_blue_session_cache.json), file mode 600; only *.example variants are tracked",
+      "**Default / protected branches**: main (default branch; protection status not queryable here via gh — treat as protected by convention, commit/push only when explicitly asked per CLAUDE.md)",
+      "**CI/CD deploy targets**: OCI VM 68.233.110.76 (68-233-110-76.sslip.io) — deployed via tarball over SSH, not git pull; live nginx site at /var/www/trading-bot/dist on that VM",
+      "**Network posture**: None configured",
+      "**Source control**: github.com/drvinothk/tradingbot (origin), main branch — this repo and its remote only",
+      "**Trusted internal domains**: None configured",
+      "**Trusted cloud buckets**: None configured",
+      "**Key internal services**: api.shoonya.com (Shoonya/Finvasia broker REST+WS), v2api.aliceblueonline.com / ws1.aliceblueonline.com (Alice Blue broker), apiconnect.angelone.in / smartapisocket.angelone.in (Angel One, currently archived), 68.233.110.76 / 68-233-110-76.sslip.io (OCI live deployment VM)",
+      "**Internal package registry**: None configured",
+      "**Sensitive data locations & audiences**: backend/app/config/credentials/ (broker API keys, session cache files), backend/.env, .env files generally — broker credentials and trading account secrets; audience limited to this project's operator only",
+      "**Data retention / declassification**: None configured",
+      "**Sensitive remote targets**: any namespace/host with prod or production as a whole word/segment; also treat the live OCI trading VM (68.233.110.76 / 68-233-110-76.sslip.io) and real-money live broker endpoints (api.shoonya.com, v2api.aliceblueonline.com, apiconnect.angelone.in when active) as sensitive real-money execution targets",
+      "**Protected deployment namespaces / environments**: the OCI live deployment VM (68.233.110.76) and its running services (systemd-managed trading-bot backend, nginx site) — real-money trading system",
+      "**Protected IaC scopes**: IAM, RBAC, networking, quota, and node-pool resources; anything whose name or tag carries prod or production as a whole word or name segment",
+      "### User-specific",
+      "**Primary use of Claude Code**: personal algorithmic trading platform development (software development)",
+      "**Trusted repo**: github.com/drvinothk/tradingbot (origin) and this local checkout at C:\\Users\\drvin\\Trading Bot — assumed private; commit/push only when explicitly asked per CLAUDE.md's own stated convention",
+      "**Org-specific CLIs**: None configured",
+      "routine under C:\\Users\\drvin\\Trading Bot\\ prefix for backend/frontend build, test, and migration commands (pytest, alembic, ruff, mypy, npm)"
+    ]
+  }
+}
