@@ -92,10 +92,13 @@ ALLOWED_TRANSITIONS: dict[SafeMode, dict[SafeMode, TransitionRule]] = {
         ),
     },
     SafeMode.RECONCILIATION_LOCK: {
-        SafeMode.PAPER_ONLY: TransitionRule(
-            allowed_triggers=frozenset({Trigger.MANUAL}),
-            required_permission="risk.override",
-        ),
+        # reconciliation_lock -> prior_mode is handled by state_machine
+        # .recover_from_reconciliation_lock, not this table, because the
+        # target is dynamic (same reasoning as degraded_mode's own recovery
+        # above) -- including a deliberate, scoped exception to rule 4 that
+        # lets a reconciliation-verified auto-recovery restore all the way
+        # to a live prior_mode. Only reconciliation_lock -> kill_switch is a
+        # static edge.
         SafeMode.KILL_SWITCH: TransitionRule(
             allowed_triggers=frozenset({Trigger.MANUAL, Trigger.SYSTEM}),
             required_permission="risk.override",

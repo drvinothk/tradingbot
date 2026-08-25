@@ -448,6 +448,148 @@ def _position(
     return position
 
 
+def _pending_order(
+    db: Session, *, workspace, trading_session, option_contract, user, order_mode: OrderMode
+) -> Order:
+    """A LIVE/PAPER `Order` that hasn't resolved into a `Position` yet --
+    the exact `reconcile_pending_live_orders` scenario (a real broker fill
+    still PENDING locally) that the `order`-aware escape hatch below exists
+    for. Deliberately stops one step short of `_position`'s own chain (no
+    `Position` row at all), matching that a `Position` genuinely doesn't
+    exist yet at this point in the real flow.
+    """
+    run = _strategy_run(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        status=StrategyStatus.LIVE,
+    )
+    signal = Signal(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        strategy_config_id=run.strategy_config_id,
+        strategy_run_id=run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        side=SignalSide.BUY,
+        entry_price=80.0,
+        stop_price=60.0,
+        target_price=120.0,
+        qty_lots=1,
+        generated_at=trading_session.started_at,
+    )
+    db.add(signal)
+    db.flush()
+    intent = TradeIntent(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        signal_id=signal.id,
+        strategy_run_id=run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        idempotency_key=f"intent-{uuid.uuid4()}",
+        side=SignalSide.BUY,
+        qty_lots=1,
+        entry_price=80.0,
+        stop_price=60.0,
+        target_price=120.0,
+        status=TradeIntentStatus.DISPATCHED,
+        created_at=trading_session.started_at,
+        dispatched_at=trading_session.started_at,
+    )
+    db.add(intent)
+    db.flush()
+
+    order = Order(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        trade_intent_id=intent.id,
+        idempotency_key=f"open-{uuid.uuid4()}",
+        mode=order_mode,
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        qty=25,
+        status=OrderStatus.PENDING,
+        broker_order_id="26082500242002",
+        submitted_at=trading_session.started_at,
+        updated_at=trading_session.started_at,
+    )
+    db.add(order)
+    db.flush()
+    return order
+
+
+def test_reconciliation_lock_still_returns_real_for_a_live_dispatched_order(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    """The 2026-08-25 live incident, reproduced directly: a real Shoonya fill
+    landed while the session was `live_enabled`, but by the time
+    `reconcile_pending_live_orders` got to it the session had already
+    transitioned to `reconciliation_lock` (the reconciliation service's own
+    correct response to the very same fill not yet being reflected
+    locally). Without the `order`-aware escape hatch, this would resolve
+    the *mock* adapter for a real `broker_order_id`, raising `KeyError` and
+    permanently blocking the fill from ever finalizing into a `Position`
+    with a protective stop.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    trading_session.mode = SafeMode.RECONCILIATION_LOCK
+    order = _pending_order(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.LIVE,
+    )
+
+    broker = composition.get_execution_broker(trading_session, order=order)
+
+    assert not isinstance(broker, MockBrokerAdapter)
+
+
+def test_reconciliation_lock_still_returns_mock_for_a_paper_dispatched_order(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    trading_session.mode = SafeMode.RECONCILIATION_LOCK
+    order = _pending_order(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.PAPER,
+    )
+
+    broker = composition.get_execution_broker(trading_session, order=order)
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
+def test_live_dispatched_order_without_flag_raises_not_silently_mocked(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    _allow_real_money(monkeypatch, False)
+    trading_session.mode = SafeMode.RECONCILIATION_LOCK
+    order = _pending_order(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.LIVE,
+    )
+
+    with pytest.raises(ConfigurationError):
+        composition.get_execution_broker(trading_session, order=order)
+
+
 def test_kill_switch_still_returns_mock_for_a_paper_opened_position(
     db: Session, workspace, trading_session, option_contract, user, monkeypatch
 ):

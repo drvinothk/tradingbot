@@ -379,6 +379,7 @@ def get_execution_broker(
     strategy_run: StrategyRun | None = None,
     *,
     position: PositionRow | None = None,
+    order: OrderRow | None = None,
 ) -> BrokerPort:
     """Broker resolution for anything that places or reads orders/positions
     for a specific session — `dispatch_trade_intent`, `close_position`,
@@ -397,6 +398,25 @@ def get_execution_broker(
        positions with no path to close them. Still requires
        `allow_real_money_dispatch` (raises `ConfigurationError`, not a
        silent paper fallback, if it's off).
+    1b. `order` given (no `position` yet — it hasn't resolved into one) and
+       it was itself dispatched with `mode == LIVE` → same unconditional
+       real-broker resolution as the `position` case, same reasoning
+       (`Order.mode` is fixed at dispatch time and must never be
+       reinterpreted by whatever `trading_session.mode` happens to be
+       later). Real, live-found gap this closes:
+       `reconcile_pending_live_orders` polls/peeks a LIVE order that hasn't
+       resolved into a `Position` yet — there is no `position` to pass, so
+       without this check step 2 below would silently resolve a genuinely
+       live, real-broker-order-id order to the *mock* adapter the moment
+       the session entered `reconciliation_lock` (the exact mode this
+       function's own reconciliation is trying to recover from), raising
+       `KeyError: Unknown mock order` from `MockBrokerAdapter` and
+       crash-looping `PositionManager` every cycle — which in turn meant
+       the real fill could never be reconciled into a `Position` at all,
+       leaving a real, already-filled option completely unprotected (no
+       `_place_protective_stop` resting order) for as long as the crash
+       loop continued. Live-confirmed 2026-08-25 on a real Test 1
+       (ema_micro_pullback) live-mode entry.
     2. `mode` in `(paper_only, degraded_mode, kill_switch,
        reconciliation_lock)` → mock, unconditionally, regardless of
        `strategy_run`.
@@ -436,6 +456,9 @@ def get_execution_broker(
     """
     if position is not None and _position_opened_live(position):
         return _real_broker_or_raise(f"position {position.id} was opened live")
+
+    if order is not None and order.mode == OrderMode.LIVE:
+        return _real_broker_or_raise(f"order {order.id} was dispatched live")
 
     if not is_strategy_routed_live(trading_session, strategy_run):
         return get_execution_mock()

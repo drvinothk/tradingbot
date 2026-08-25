@@ -42,7 +42,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
-from app.modules.broker_adapter.base.errors import BrokerAuthError
+from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.position_manager import PositionManager
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
@@ -562,6 +562,44 @@ def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_se
     )
 
 
+def test_run_once_survives_margin_broker_resolution_failure(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-08-25 live incident, reproduced directly: `session_broker` (used
+    only for margin-breach detection) used to resolve unconditionally at
+    the very top of `_run_cycle`, before the open_positions loop, before
+    even this mode/positions guard. Right after a restart, with Shoonya not
+    yet reconnected, `get_execution_broker`'s `_real_broker_or_raise` raised
+    `ConfigurationError` here on *every* cycle -- crash-looping
+    `PositionManager` regardless of the same day's other fix to the
+    per-position loop, since this line ran before that loop ever got a
+    chance to execute. Deliberately does *not* pass `broker=` to
+    `PositionManager` (unlike every other test in this file) so this
+    exercises the real `get_execution_broker` resolution path instead of
+    short-circuiting past it via `self._broker_override`.
+    """
+    from app.config.settings import get_settings
+
+    monkeypatch.setattr(get_settings().app, "allow_real_money_dispatch", True)
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - keep it between stop/target
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.flush()
+
+    manager = PositionManager(
+        trading_session.id,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()  # must not raise, despite no real Shoonya connection
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
 def test_run_once_does_not_check_margin_for_paper_only_session(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -774,6 +812,62 @@ def test_run_cycle_resolves_broker_per_position_when_strategies_differ(
     assert f"exit:{position_paper.id}" not in live_broker._orders  # noqa: SLF001
     assert f"exit:{position_live.id}" in live_broker._orders  # noqa: SLF001
     assert f"exit:{position_live.id}" not in paper_broker._orders  # noqa: SLF001
+
+
+def test_run_cycle_continues_past_one_positions_broker_resolution_failure(
+    db: Session, workspace, user, trading_session, option_contract, strategy_run, monkeypatch
+):
+    """2026-08-25 live incident: right after a backend restart, Shoonya
+    isn't reconnected yet, so `resolve_broker_for_position` raises
+    `ConfigurationError` for a genuinely-live position -- this loop had
+    zero try/except before this fix (already flagged as a known gap in
+    this file's own 2026-08-22 QC docstring, never actually closed), so
+    that single exception crashed the *entire* cycle every ~3s, blocking
+    every other open position's stop/target/trail check too. The broker-
+    side resting protective stop stays live at the broker regardless (this
+    test only covers the local-monitoring side, not capital protection,
+    which never depended on this loop running at all).
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    healthy_broker = MockBrokerAdapter()
+
+    position_broken = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, MockBrokerAdapter(),
+        stop_price=1.0, target_price=100_000.0,
+    )
+    position_healthy = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, healthy_broker,
+        stop_price=1.0, target_price=100_000.0,
+    )
+
+    def _fake_resolve(db_arg, session_arg, position):
+        if position.id == position_broken.id:
+            raise ConfigurationError("Shoonya not connected")
+        return healthy_broker
+
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.position_manager.resolve_broker_for_position",
+        _fake_resolve,
+    )
+    # Healthy position's price is below its stop -- should close this cycle,
+    # proving the loop reached and processed it despite the other position's
+    # broker-resolution failure raising first.
+    healthy_broker._prices[option_contract.symbol] = 0.5  # noqa: SLF001
+
+    manager = PositionManager(
+        trading_session.id,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()  # must not raise
+
+    db.refresh(position_broken)
+    db.refresh(position_healthy)
+    assert position_broken.status == PositionStatus.OPEN  # skipped, not crashed on
+    assert position_healthy.status == PositionStatus.CLOSED
 
 
 def test_eod_square_off_resolves_broker_per_position_when_strategies_differ(

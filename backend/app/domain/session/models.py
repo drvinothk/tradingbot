@@ -60,8 +60,18 @@ class TradingSession(Base, UUIDPkMixin, TimestampMixin):
         String(20), default=TradingSessionStatus.ACTIVE
     )
     prior_mode: Mapped[SafeMode | None] = mapped_column(
-        String(30), nullable=True, doc="Remembered for degraded_mode recovery"
+        String(30),
+        nullable=True,
+        doc="Remembered for degraded_mode/reconciliation_lock recovery",
     )
+    # 2026-08-25: consecutive clean `run_full_reconciliation` checks while
+    # in RECONCILIATION_LOCK, driven only by ReconciliationLockRecoveryScheduler
+    # (never by any other reconciliation call site) -- reaching the
+    # scheduler's own threshold triggers unattended auto-recovery, including
+    # back to a live prior_mode (a deliberate, scoped exception to Rule 4 --
+    # see app.core.modes.state_machine.recover_from_reconciliation_lock's own
+    # docstring). Reset to 0 on every fresh entry into RECONCILIATION_LOCK.
+    reconciliation_lock_clean_streak: Mapped[int] = mapped_column(Integer, default=0)
 
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

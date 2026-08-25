@@ -392,16 +392,43 @@ def _exchange_from_symbol(contract_symbol: str) -> str:
 
 
 def parse_order_result(raw: dict, *, idempotency_key: str) -> OrderResult:
-    """`PlaceOrder`'s immediate response, or one row of `OrderBook`/
-    `SingleOrderHistory`. `norenordno` is Shoonya's broker-side order id;
-    `s`/`stat` carries a bare `"Ok"`/`"Not_Ok"` on the immediate PlaceOrder
-    ack rather than a real order status — callers needing the actual
-    lifecycle status should follow up with `get_order_status` (which reads
-    `OrderBook`'s per-row `status` field instead).
+    """`PlaceOrder`'s immediate response, one row of `OrderBook`/
+    `SingleOrderHistory`, or a WS order-update push -- all three carry the
+    order id as `norenordno` (`nOrdNo` in some SDKs' own field-name
+    convention). `s`/`stat` carries a bare `"Ok"`/`"Not_Ok"` on the
+    immediate PlaceOrder ack rather than a real order status — callers
+    needing the actual lifecycle status should follow up with
+    `get_order_status` (which reads `OrderBook`'s per-row `status` field
+    instead).
+
+    **`ModifyOrder`/`CancelOrder` real bug, live-confirmed 2026-08-25 on
+    this system's first-ever real SL/TSL test**: those two endpoints'
+    responses are a genuinely different, narrower shape --
+    `{"stat": "Ok", "result": "<broker_order_id>"}`, no `status`/
+    `fillshares`/`avgprc` at all (Noren's ack model: a `stat: Ok` here only
+    means "the modify/cancel *request* was accepted for processing," not
+    that it has actually taken effect yet -- the real outcome only arrives
+    later via a WS order-update push, exactly the two-step flow this
+    codebase's own `_sync_resting_protective_stop`/
+    `_cancel_resting_protective_stop` already correctly wait for). Neither
+    call had ever run against a real account before that session (see
+    `ShoonyaBrokerAdapter.modify_order`'s own docstring: "Phase B found zero
+    production callers"), so this response shape was untested, not just
+    unimplemented. `result` is accepted here as a third broker-order-id key
+    for exactly that shape -- safe to add unconditionally since Shoonya's
+    `PlaceOrder`/`OrderBook`/`SingleOrdHist`/WS-push shapes never define an
+    unrelated `result` field of their own to collide with. Deliberately
+    NOT trying to also infer a real `status` from this ack alone (still
+    defaults to `PENDING` below, same as before) -- `stat: Ok` genuinely
+    isn't "cancelled"/"modified" yet, and guessing otherwise would be
+    exactly the premature inference `_cancel_resting_protective_stop`'s own
+    "never guess" contract exists to avoid.
     """
-    broker_order_id = str(raw.get("norenordno") or raw.get("nOrdNo") or "")
+    broker_order_id = str(raw.get("norenordno") or raw.get("nOrdNo") or raw.get("result") or "")
     if not broker_order_id:
-        raise NormalizationError("missing broker order id ('norenordno'/'nOrdNo')", raw)
+        raise NormalizationError(
+            "missing broker order id ('norenordno'/'nOrdNo'/'result')", raw
+        )
 
     status_raw = raw.get("status")
     status = map_order_status(status_raw) if status_raw else BrokerOrderStatus.PENDING

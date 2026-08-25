@@ -1165,7 +1165,13 @@ def _open_live_position(
 
 
 def _make_pending_live_exit_order(
-    db: Session, trading_session: TradingSession, position: Position, *, broker_order_id: str
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    *,
+    broker_order_id: str,
+    idempotency_key: str | None = None,
+    intended_exit_reason: ExitReason | None = None,
 ) -> Order:
     now = datetime.now(UTC)
     order = Order(
@@ -1174,7 +1180,7 @@ def _make_pending_live_exit_order(
         trading_session_id=trading_session.id,
         option_contract_id=position.option_contract_id,
         position_id=position.id,
-        idempotency_key=f"exit:{position.id}",
+        idempotency_key=idempotency_key or f"exit:{position.id}",
         mode=OrderMode.LIVE,
         side=OrderSide.SELL,
         order_type=OrderType.LIMIT,
@@ -1183,6 +1189,7 @@ def _make_pending_live_exit_order(
         filled_qty=0,
         avg_fill_price=None,
         broker_order_id=broker_order_id,
+        intended_exit_reason=intended_exit_reason,
         submitted_at=now,
         updated_at=now,
     )
@@ -1228,6 +1235,116 @@ def test_reconcile_pending_live_exit_orders_closes_position_on_ws_cached_fill(
 
     stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
     assert stop_plan.status == "cancelled"
+
+
+def test_close_position_records_the_intended_exit_reason_when_not_filled_synchronously(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-08-25 fix: the real reason `close_position` was called for must
+    survive onto the `exit:` `Order` row even when the broker doesn't fill
+    it synchronously — this is what lets a later
+    `reconcile_pending_live_exit_orders` report the true TARGET/TRAIL/etc.
+    reason instead of defaulting to the generic RECONCILED. `queue_fill_
+    scenario` is the existing fault-injection hook `mock/adapter.py`'s own
+    docstring says exists exactly for this: exercising a non-terminal exit
+    fill without contriving a real fill price.
+    """
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    broker.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.TARGET, 95.0, broker=broker
+    )
+
+    assert outcome is None  # left OPEN -- the order didn't fill synchronously
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+    exit_order = (
+        db.query(Order).filter(Order.idempotency_key == f"exit:{position.id}").one()
+    )
+    assert exit_order.status != OrderStatus.FILLED
+    assert exit_order.intended_exit_reason == ExitReason.TARGET
+
+
+def test_reconcile_pending_live_exit_orders_uses_the_recorded_intended_reason(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The real fix: a late-discovered fill for an order that recorded its
+    intended reason must report that reason, not the generic RECONCILED —
+    and the TRAIL case's own `trail_plan.status` side effect (previously
+    unreachable for a late-discovered exit, since it was always mislabeled
+    RECONCILED) must fire correctly too.
+    """
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order = _make_pending_live_exit_order(
+        db,
+        trading_session,
+        position,
+        broker_order_id="EXIT-TRAIL-1",
+        intended_exit_reason=ExitReason.TRAIL,
+    )
+    fake_broker = _FakeOrderStatusBroker(
+        cached_result=OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id=exit_order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position.qty,
+            avg_fill_price=95.0,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.TRAIL
+
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one()
+    assert trail_plan.status == TrailPlanStatus.TRIGGERED
+
+
+def test_reconcile_pending_live_exit_orders_protective_stop_wins_over_intended_reason(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Defensive: `is_protective_stop` (from the `stop:` idempotency-key
+    prefix) must take priority over `intended_exit_reason` even in this
+    contrived combination that shouldn't occur in practice (`_place_
+    protective_stop` never sets `intended_exit_reason`) — a resting
+    protective stop's own fill is always a genuine STOP exit by
+    construction, regardless of what any other field says.
+    """
+    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order = _make_pending_live_exit_order(
+        db,
+        trading_session,
+        position,
+        broker_order_id="STOP-1",
+        idempotency_key=f"stop:{position.id}",
+        intended_exit_reason=ExitReason.TARGET,
+    )
+    fake_broker = _FakeOrderStatusBroker(
+        cached_result=OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id=exit_order.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position.qty,
+            avg_fill_price=80.0,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.STOP
 
 
 def test_reconcile_pending_live_exit_orders_falls_back_to_rest_when_allowed(

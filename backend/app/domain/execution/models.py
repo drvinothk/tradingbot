@@ -117,12 +117,24 @@ class ExitReason(enum.StrEnum):
     # 2026-08-20: an exit order that didn't fill synchronously in
     # close_position (left the position OPEN, per that function's own
     # comment) and was only discovered filled later by
-    # reconcile_pending_live_exit_orders -- the original stop/target/
-    # trail/EOD trigger price is gone by then (never persisted on the
-    # Order itself), so slippage can't be measured against it the normal
-    # way. Distinct from every other reason so reports can tell "this
-    # exit's timing/slippage numbers are approximate, discovered late"
-    # apart from a normal exit.
+    # reconcile_pending_live_exit_orders. The original *trigger price* is
+    # still gone by then (never persisted on the Order itself), so slippage
+    # can't be measured against it the normal way and is reported as 0, not
+    # fabricated -- that part is unchanged, deliberate design.
+    #
+    # 2026-08-25 correction: the *reason* itself is a different question
+    # from the price, and unlike the price, it was always knowable --
+    # close_position's caller (evaluate_open_position/eod_square_off/manual
+    # square-off) already knows exactly why it's closing the position, it
+    # just wasn't being written down before the async-fill uncertainty
+    # window began. `Order.intended_exit_reason` now captures it at
+    # placement time, so `_apply_resolved_pending_exit_order` reports the
+    # *real* STOP/TARGET/TRAIL/etc. reason for a late-discovered exit
+    # whenever it's known. RECONCILED is now the honest fallback only for
+    # the case where no intended reason was ever recorded at all (e.g. an
+    # `Order` row from before this field existed) -- not, as before, the
+    # default for every late-discovered exit regardless of whether the real
+    # reason was knowable.
     RECONCILED = "reconciled"
 
 
@@ -159,6 +171,19 @@ class Order(Base, UUIDPkMixin):
     filled_qty: Mapped[int] = mapped_column(Integer, default=0)
     avg_fill_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
     broker_order_id: Mapped[str] = mapped_column(String(60), default="")
+
+    # 2026-08-25: the *caller's* real reason for placing this exit order --
+    # set only by close_position, only for the `exit:{position_id}` order it
+    # creates, at the moment of placement (before it's known whether the
+    # order will fill synchronously or not). Exists specifically so
+    # `reconcile_pending_live_exit_orders` -> `_apply_resolved_pending_exit_
+    # order` can recover the true STOP/TARGET/TRAIL/etc. reason for a LIVE
+    # exit order that didn't fill synchronously, instead of defaulting every
+    # late-discovered exit to the generic `ExitReason.RECONCILED` -- see
+    # that enum member's own docstring for the full incident this closes.
+    # `None` for entry orders and for pre-migration exit orders (honestly
+    # unknown, correctly falls back to RECONCILED).
+    intended_exit_reason: Mapped[ExitReason | None] = mapped_column(String(20), nullable=True)
 
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

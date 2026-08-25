@@ -16,6 +16,7 @@ from app.core.modes import (
     ModeTransitionError,
     enter_kill_switch,
     recover_from_degraded,
+    recover_from_reconciliation_lock,
     set_master_trading_mode,
     transition_mode,
 )
@@ -137,6 +138,108 @@ def test_degraded_mode_remembers_prior_mode_and_recovers(db, trading_session, au
         reason="health ok, admin confirmed",
     )
     assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+
+
+def _lock_session_from_guarded_live(db, trading_session, authorized_user) -> None:
+    transition_mode(
+        db,
+        trading_session,
+        SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        TransitionTriggerType.MANUAL,
+        actor_user=authorized_user,
+    )
+    transition_mode(
+        db,
+        trading_session,
+        SafeMode.RECONCILIATION_LOCK,
+        TransitionTriggerType.RECONCILIATION,
+        reason="simulated broker mismatch",
+    )
+    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+    assert trading_session.prior_mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+
+
+def test_reconciliation_lock_remembers_prior_mode_and_recovers_manually(
+    db, trading_session, authorized_user
+):
+    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+
+    recover_from_reconciliation_lock(
+        db,
+        trading_session,
+        TransitionTriggerType.MANUAL,
+        actor_user=authorized_user,
+        reason="fresh reconciliation confirmed clean",
+    )
+    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+
+
+def test_reconciliation_lock_recovery_via_manual_trigger_without_permission_rejected(
+    db, trading_session, authorized_user, user
+):
+    # `user` has no roles/permissions at all (see test_promotion_requires_
+    # livetrade_permission above) -- resuming to a live-adjacent prior_mode
+    # must reject it exactly like recover_from_degraded already does.
+    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+
+    with pytest.raises(ModeTransitionError, match="livetrade.execute"):
+        recover_from_reconciliation_lock(
+            db, trading_session, TransitionTriggerType.MANUAL, actor_user=user
+        )
+    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+
+
+def test_reconciliation_lock_recovery_via_reconciliation_trigger_succeeds_to_live(
+    db, trading_session, authorized_user
+):
+    """The one deliberate, scoped exception to rule 4 in this codebase: a
+    RECONCILIATION-triggered recovery may restore a live-adjacent prior_mode
+    with zero manual actor involved — reserved for
+    ReconciliationLockRecoveryScheduler after N consecutive clean checks.
+    """
+    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+
+    recover_from_reconciliation_lock(
+        db,
+        trading_session,
+        TransitionTriggerType.RECONCILIATION,
+        reason="auto-recovered after 3 consecutive clean reconciliation checks",
+    )
+    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+
+
+def test_reconciliation_lock_recovery_via_bare_system_trigger_to_live_rejected(
+    db, trading_session, authorized_user
+):
+    """Pins the exception's narrowness: only RECONCILIATION (never a bare
+    SYSTEM trigger) may resume a locked session to a live-adjacent
+    prior_mode unattended."""
+    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+
+    with pytest.raises(ModeTransitionError):
+        recover_from_reconciliation_lock(db, trading_session, TransitionTriggerType.SYSTEM)
+    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+
+
+def test_reconciliation_lock_recovery_to_paper_only_needs_no_permission(
+    db, trading_session, authorized_user
+):
+    """Unlike a live-adjacent target, recovering to paper_only (no
+    prior_mode recorded) works via any trigger, even a bare SYSTEM one with
+    no actor -- matches recover_from_degraded's own "resuming to paper_only
+    can be automatic" rule. `RECONCILIATION_LOCK` is only reachable from
+    `paper_plus_guarded_live`/`live_enabled` (never directly from
+    `paper_only`), so this locks the session via the real reachable path
+    (same helper every other test above uses) and then manually clears
+    `prior_mode` to isolate the no-recorded-prior-mode fallback itself.
+    """
+    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    trading_session.prior_mode = None
+    db.add(trading_session)
+    db.flush()
+
+    recover_from_reconciliation_lock(db, trading_session, TransitionTriggerType.SYSTEM)
+    assert trading_session.mode == SafeMode.PAPER_ONLY
 
 
 def test_every_transition_is_captured_in_the_audit_chain(db, trading_session, authorized_user):

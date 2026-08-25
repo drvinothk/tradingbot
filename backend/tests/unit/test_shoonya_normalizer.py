@@ -189,6 +189,27 @@ def test_parse_order_result_defaults_to_pending_without_status():
     assert result.broker_order_id == "123"
 
 
+def test_parse_order_result_accepts_modify_cancel_ack_shape():
+    """2026-08-25 live incident: `ModifyOrder`/`CancelOrder`'s real response
+    shape (`{"stat": "Ok", "result": "<id>"}`) is genuinely different from
+    `PlaceOrder`/`OrderBook`'s (`norenordno`) -- the exact raw payload
+    captured live from a real TSL-tightening call during this system's
+    first-ever live SL/TSL test, which previously raised
+    `NormalizationError` and left the resting stop untouched (safe, but
+    only by falling through to the two-step WS-confirmation path this
+    codebase already had as a fallback -- not by this call succeeding).
+    """
+    raw = {"request_time": "13:53:51 25-08-2026", "stat": "Ok", "result": "26082500312117"}
+
+    result = normalizer.parse_order_result(raw, idempotency_key="k")
+
+    assert result.broker_order_id == "26082500312117"
+    # No `status` field in this shape at all -- must stay PENDING (unknown),
+    # never inferred as CANCELLED/modified from the bare ack alone. See
+    # this function's own docstring for why guessing here would be wrong.
+    assert result.status == BrokerOrderStatus.PENDING
+
+
 def test_parse_position_signed_qty():
     position = normalizer.parse_position(
         {"tsym": "NIFTY30JUL26C24000", "netqty": "-25", "netavgprc": "119.5"}

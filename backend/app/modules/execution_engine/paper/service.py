@@ -77,6 +77,7 @@ from app.domain.market.models import Instrument, OptionContract
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent, TradeIntentStatus
+from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import (
@@ -372,6 +373,7 @@ def dispatch_trade_intent(
                     "status": order_result.status.value,
                     "filled_qty": order_result.filled_qty,
                     "avg_fill_price": order_result.avg_fill_price,
+                    "raw_message": order_result.raw_message,
                 },
                 ts=now,
             )
@@ -409,6 +411,28 @@ def dispatch_trade_intent(
             # new status.
             trade_intent.status = TradeIntentStatus.EXPIRED
             db.add(trade_intent)
+
+            if order.status == OrderStatus.REJECTED:
+                # 2026-08-25: the broker's real rejection reason
+                # (order_result.raw_message, e.g. "margin insufficient")
+                # was already being returned here but silently discarded --
+                # never stored, never surfaced. Alerted (not just an
+                # OrderEvent row, per this file's own newly-added
+                # raw_message field above) since a rejection is something
+                # the user explicitly wants to know about, not just audit.
+                send_alert(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    trading_session_id=trading_session.id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="order_rejected",
+                    message=(
+                        f"Order for {option_contract.symbol} rejected by broker: "
+                        f"{order_result.raw_message or 'no reason given'}"
+                    ),
+                    mode=order.mode,
+                    dedup_key=f"order_rejected:{trade_intent.id}",
+                )
 
         db.flush()
         run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
@@ -627,21 +651,19 @@ def _place_protective_stop(
             "local-only stop/target/trail monitoring for this position",
             position.id,
         )
-        db.add(
-            SystemAlert(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                severity=AlertSeverity.CRITICAL,
-                category="protective_stop_placement_failed",
-                message=(
-                    f"Protective SL-LMT placement failed for position {position.id}; "
-                    "using local-only monitoring."
-                ),
-                created_at=_utcnow(),
-            )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="protective_stop_placement_failed",
+            message=(
+                f"Protective SL-LMT placement failed for position {position.id}; "
+                "using local-only monitoring."
+            ),
+            mode=OrderMode.LIVE,
+            dedup_key=f"protective_stop_placement_failed:{position.id}",
         )
-        db.flush()
         return
 
     now = _utcnow()
@@ -771,24 +793,38 @@ def reconcile_pending_live_orders(
         trade_intent = db.get(TradeIntent, order.trade_intent_id)
         if trade_intent is None:
             continue
-        if broker is not None:
-            resolved_broker = broker
-        else:
-            strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
-            resolved_broker = get_execution_broker(trading_session, strategy_run)
+        try:
+            if broker is not None:
+                resolved_broker = broker
+            else:
+                strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+                resolved_broker = get_execution_broker(trading_session, strategy_run, order=order)
 
-        result = _peek_order_update(resolved_broker, order.broker_order_id)
-        if result is None and allow_rest_fallback:
-            try:
+            result = _peek_order_update(resolved_broker, order.broker_order_id)
+            if result is None and allow_rest_fallback:
                 result = resolved_broker.get_order_status(order.broker_order_id)
-            except BrokerError:
-                logger.exception(
-                    "get_order_status failed while reconciling pending order %s "
-                    "(broker_order_id=%s)",
-                    order.id,
-                    order.broker_order_id,
-                )
-                continue
+        except Exception:  # noqa: BLE001 - a PositionManager cycle must never die
+            # crash-looped here on a real live order 2026-08-25: the only
+            # exception ever expected from a real broker call is
+            # BrokerError, but a resolution bug meant this could receive
+            # the *mock* adapter for a real order and raise a bare
+            # KeyError instead -- uncaught, that took down every other
+            # position's handling for the rest of this cycle too, not
+            # just this one order's reconciliation. The resolution bug is
+            # fixed (see get_execution_broker's `order` param), but this
+            # whole block -- resolution included, not just the REST call --
+            # is still real-money-adjacent I/O and deserves the same
+            # "never raises" discipline as _place_protective_stop/
+            # _cancel_resting_protective_stop/_sync_resting_protective_stop
+            # already have. Resolution itself can legitimately raise too
+            # (e.g. `ConfigurationError` if Shoonya isn't connected yet
+            # right after a restart) and must not crash the cycle either.
+            logger.exception(
+                "reconciling pending order %s (broker_order_id=%s) failed",
+                order.id,
+                order.broker_order_id,
+            )
+            continue
 
         if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
             continue
@@ -953,21 +989,19 @@ def _cancel_resting_protective_stop(
             resting_order_id,
             position.id,
         )
-        db.add(
-            SystemAlert(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                severity=AlertSeverity.CRITICAL,
-                category="protective_stop_cancel_failed",
-                message=(
-                    f"Failed to cancel resting protective stop for position "
-                    f"{position.id}; exit deferred."
-                ),
-                created_at=now,
-            )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="protective_stop_cancel_failed",
+            message=(
+                f"Failed to cancel resting protective stop for position "
+                f"{position.id}; exit deferred."
+            ),
+            mode=OrderMode.LIVE,
+            dedup_key=f"protective_stop_cancel_failed:{position.id}",
         )
-        db.flush()
         return _CancelOutcome.FAILED
 
     if result.status == BrokerOrderStatus.FILLED:
@@ -1008,21 +1042,19 @@ def _cancel_resting_protective_stop(
         position.id,
         result.status,
     )
-    db.add(
-        SystemAlert(
-            id=uuid.uuid4(),
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            severity=AlertSeverity.CRITICAL,
-            category="protective_stop_cancel_unresolved",
-            message=(
-                f"Cancelling resting protective stop for position {position.id} "
-                f"returned unexpected status {result.status.value}; exit deferred."
-            ),
-            created_at=now,
-        )
+    send_alert(
+        db,
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        severity=AlertSeverity.CRITICAL,
+        category="protective_stop_cancel_unresolved",
+        message=(
+            f"Cancelling resting protective stop for position {position.id} "
+            f"returned unexpected status {result.status.value}; exit deferred."
+        ),
+        mode=OrderMode.LIVE,
+        dedup_key=f"protective_stop_cancel_unresolved:{position.id}",
     )
-    db.flush()
     return _CancelOutcome.FAILED
 
 
@@ -1296,6 +1328,12 @@ def close_position(
                 filled_qty=order_result.filled_qty,
                 avg_fill_price=order_result.avg_fill_price,
                 broker_order_id=order_result.broker_order_id,
+                # The caller's real reason for this exit, captured now --
+                # before it's known whether this order will fill
+                # synchronously below or needs to be picked up later by
+                # reconcile_pending_live_exit_orders. See this column's own
+                # docstring on Order for why.
+                intended_exit_reason=exit_reason,
                 submitted_at=now,
                 updated_at=now,
             )
@@ -1332,21 +1370,19 @@ def close_position(
                 position.id,
                 exit_order.status,
             )
-            db.add(
-                SystemAlert(
-                    id=uuid.uuid4(),
-                    workspace_id=trading_session.workspace_id,
-                    trading_session_id=trading_session.id,
-                    severity=AlertSeverity.CRITICAL,
-                    category="exit_order_unfilled",
-                    message=(
-                        f"Exit order for position {position.id} did not fill "
-                        f"(status={exit_order.status}); position left OPEN."
-                    ),
-                    created_at=now,
-                )
+            send_alert(
+                db,
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="exit_order_unfilled",
+                message=(
+                    f"Exit order for position {position.id} did not fill "
+                    f"(status={exit_order.status}); position left OPEN."
+                ),
+                mode=order_mode,
+                dedup_key=f"exit_order_unfilled:{position.id}",
             )
-            db.flush()
             return None
 
         outcome = _finalize_position_close(
@@ -1576,11 +1612,24 @@ def _apply_resolved_pending_exit_order(
     # `stop:` orders are this position's own resting protective SL-LMT
     # (see `_place_protective_stop`) -- distinct idempotency-key prefix
     # from the `exit:` orders `close_position` places, so its own fill is
-    # a genuine STOP exit, not a late-discovered RECONCILED one.
+    # always a genuine STOP exit regardless of anything else. Otherwise,
+    # `close_position` already recorded the caller's real reason on
+    # `intended_exit_reason` at placement time (2026-08-25) -- use it
+    # instead of defaulting to the generic `RECONCILED`, which is now only
+    # the honest answer for an order that genuinely never had one recorded
+    # (e.g. a row from before this field existed). See `ExitReason
+    # .RECONCILED`'s own docstring for the full incident this closes.
     is_protective_stop = order.idempotency_key.startswith("stop:")
+    resolved_exit_reason: ExitReason | None = None
 
     if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
-        exit_reason = ExitReason.STOP if is_protective_stop else ExitReason.RECONCILED
+        if is_protective_stop:
+            exit_reason = ExitReason.STOP
+        elif order.intended_exit_reason is not None:
+            exit_reason = ExitReason(order.intended_exit_reason)
+        else:
+            exit_reason = ExitReason.RECONCILED
+        resolved_exit_reason = exit_reason
         _finalize_position_close(
             db,
             trading_session,
@@ -1619,7 +1668,15 @@ def _apply_resolved_pending_exit_order(
         entity_type="order",
         entity_id=order.id,
         trading_session_id=trading_session.id,
-        payload={"status": order.status.value, "filled_qty": order.filled_qty},
+        payload={
+            "status": order.status.value,
+            "filled_qty": order.filled_qty,
+            **(
+                {"exit_reason": resolved_exit_reason.value}
+                if resolved_exit_reason is not None
+                else {}
+            ),
+        },
     )
 
 

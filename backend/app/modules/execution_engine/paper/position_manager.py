@@ -42,15 +42,16 @@ from app.core.db.session import session_scope
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import OrderMode, Position, PositionStatus
 from app.domain.market.models import Instrument, OptionContract
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import (
     SafeMode,
     TradingSession,
     TradingSessionStatus,
     TransitionTriggerType,
 )
+from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import Tick
@@ -179,6 +180,24 @@ class PositionManager:
         from_mode = SafeMode(trading_session.mode)
         if from_mode not in (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED):
             return
+
+        # 2026-08-25: this path previously only logged -- a live/guarded
+        # session losing its broker connection got zero notification
+        # anywhere outside the log file. Alerted (and committed
+        # immediately, not left riding on the transition below) so the
+        # alert survives even if the transition_mode call that follows
+        # raises ModeTransitionError.
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="broker_disconnected",
+            message=f"Broker auth failure for session {self.trading_session_id}: {exc}"[:500],
+            mode=OrderMode.LIVE,
+            dedup_key=f"broker_disconnected:{trading_session.id}",
+        )
+        db.commit()
         try:
             transition_mode(
                 db,
@@ -244,16 +263,18 @@ class PositionManager:
         )
 
         reason = f"margin breach: available_margin={margin.available_margin:.2f}"[:500]
-        db.add(
-            SystemAlert(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                severity=AlertSeverity.CRITICAL,
-                category="margin_breach_square_off",
-                message=reason,
-                created_at=datetime.now(UTC),
-            )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="margin_breach_square_off",
+            message=reason,
+            # Only ever called for paper_plus_guarded_live/live_enabled
+            # sessions (see this method's own docstring) -- margin itself
+            # is a real-broker-account concept, never a paper simulation.
+            mode=OrderMode.LIVE,
+            dedup_key=f"margin_breach_square_off:{trading_session.id}",
         )
         record_event(
             db,
@@ -336,12 +357,6 @@ class PositionManager:
         return broker.get_quote(symbol)
 
     def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
-        # Session-level/account-wide broker -- used only for checks that are
-        # inherently account-wide (margin-breach detection, reconciliation
-        # against the broker's own position book), never for evaluating or
-        # closing any *specific* position -- see resolve_broker_for_position's
-        # own docstring for the 2026-08-19 incident this split fixes.
-        session_broker = self._broker_override or get_execution_broker(trading_session)
         market_data_provider = self._market_data_provider_override or get_market_data_provider()
         open_positions = (
             db.query(Position)
@@ -373,66 +388,123 @@ class PositionManager:
             yield db
 
         for position in open_positions:
-            # Resolved per-position, not once for the whole cycle -- see
-            # resolve_broker_for_position's own docstring for why a shared
-            # cycle-wide broker is unsafe once different open positions can
-            # belong to differently-configured strategies.
-            broker = self._broker_override or resolve_broker_for_position(
-                db, trading_session, position
-            )
-            option_contract = db.get(OptionContract, position.option_contract_id)
-            if option_contract is None:
+            try:
+                # Resolved per-position, not once for the whole cycle -- see
+                # resolve_broker_for_position's own docstring for why a
+                # shared cycle-wide broker is unsafe once different open
+                # positions can belong to differently-configured strategies.
+                broker = self._broker_override or resolve_broker_for_position(
+                    db, trading_session, position
+                )
+                option_contract = db.get(OptionContract, position.option_contract_id)
+                if option_contract is None:
+                    continue
+                # Still subscribe (idempotent, tracked in self._subscribed_symbols)
+                # even though this deployment's per-contract WS never actually
+                # delivers anything today — current_contract_price only *reads*
+                # the provider's cache, it doesn't subscribe, so without this the
+                # "try live tick first" branch could never succeed even after a
+                # future WS-for-contracts fix landed.
+                self._ensure_symbol_subscribed(market_data_provider, option_contract.symbol)
+                # Option-contract pricing: prefers a live WS tick (works today
+                # for free if a future per-contract WS fix lands), otherwise
+                # falls back to the same REST OptionChainSnapshot the strategy
+                # itself proposed this trade from — not broker.get_quote()
+                # directly, which (get_execution_broker() always being the
+                # mock) would price this contract from the mock's own
+                # synthetic, strategy-independent seed. See
+                # current_contract_price's own docstring.
+                tick = current_contract_price(
+                    db,
+                    option_contract,
+                    broker,
+                    market_data_provider=market_data_provider,
+                    session_factory=_same_session,
+                )
+
+                cache_key = (option_contract.instrument_id, id(broker))
+                underlying_price = underlying_price_cache.get(cache_key)
+                if underlying_price is None:
+                    instrument = db.get(Instrument, option_contract.instrument_id)
+                    if instrument is not None:
+                        # Underlyings are unaffected by this change -- WS
+                        # ticks for NIFTY/BANKNIFTY are reliable, unlike
+                        # per-contract ticks, so this stays on the existing
+                        # live-feed -> broker.get_quote fallback.
+                        underlying_price = self._live_tick(
+                            market_data_provider, instrument.symbol, broker
+                        ).ltp
+                        underlying_price_cache[cache_key] = underlying_price
+
+                evaluate_open_position(
+                    db,
+                    trading_session,
+                    position,
+                    tick.ltp,
+                    broker=broker,
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    underlying_price=underlying_price,
+                )
+            except BrokerAuthError:
+                # Must propagate to run_once's own except BrokerAuthError,
+                # not be swallowed here -- that's what moves a guarded-live/
+                # live session to degraded_mode (_handle_broker_auth_error).
+                # A per-position try/except that caught this too would
+                # silently defeat that existing safety response for every
+                # position after the first one to hit it.
+                raise
+            except Exception:  # noqa: BLE001 - one position's failure must
+                # never block every other open position's stop/target/trail
+                # check in the same cycle, nor the reconciliation/EOD-
+                # square-off steps later in _run_cycle. Real, live incident
+                # 2026-08-25: right after a restart, Shoonya isn't
+                # reconnected yet, so resolve_broker_for_position's
+                # `_real_broker_or_raise` raises `ConfigurationError` for a
+                # genuinely-live position -- uncaught (this loop had zero
+                # try/except before this fix, already flagged as a known
+                # gap in this file's own 2026-08-22 QC docstring but never
+                # closed), that crashed the *entire* cycle every ~3s,
+                # identical in shape to the same day's
+                # reconcile_pending_live_orders incident. The broker-side
+                # resting protective stop, once placed, stays live at
+                # Shoonya independent of this loop running at all, so a
+                # skipped cycle here degrades local monitoring/TSL only,
+                # never the capital-protection floor itself.
+                logger.exception(
+                    "evaluating open position %s failed -- skipping it this cycle, "
+                    "continuing with the rest",
+                    position.id,
+                )
                 continue
-            # Still subscribe (idempotent, tracked in self._subscribed_symbols)
-            # even though this deployment's per-contract WS never actually
-            # delivers anything today — current_contract_price only *reads*
-            # the provider's cache, it doesn't subscribe, so without this the
-            # "try live tick first" branch could never succeed even after a
-            # future WS-for-contracts fix landed.
-            self._ensure_symbol_subscribed(market_data_provider, option_contract.symbol)
-            # Option-contract pricing: prefers a live WS tick (works today
-            # for free if a future per-contract WS fix lands), otherwise
-            # falls back to the same REST OptionChainSnapshot the strategy
-            # itself proposed this trade from — not broker.get_quote()
-            # directly, which (get_execution_broker() always being the
-            # mock) would price this contract from the mock's own
-            # synthetic, strategy-independent seed. See
-            # current_contract_price's own docstring.
-            tick = current_contract_price(
-                db,
-                option_contract,
-                broker,
-                market_data_provider=market_data_provider,
-                session_factory=_same_session,
-            )
-
-            cache_key = (option_contract.instrument_id, id(broker))
-            underlying_price = underlying_price_cache.get(cache_key)
-            if underlying_price is None:
-                instrument = db.get(Instrument, option_contract.instrument_id)
-                if instrument is not None:
-                    # Underlyings are unaffected by this change -- WS ticks
-                    # for NIFTY/BANKNIFTY are reliable, unlike per-contract
-                    # ticks, so this stays on the existing live-feed ->
-                    # broker.get_quote fallback.
-                    underlying_price = self._live_tick(
-                        market_data_provider, instrument.symbol, broker
-                    ).ltp
-                    underlying_price_cache[cache_key] = underlying_price
-
-            evaluate_open_position(
-                db,
-                trading_session,
-                position,
-                tick.ltp,
-                broker=broker,
-                bid=tick.bid,
-                ask=tick.ask,
-                underlying_price=underlying_price,
-            )
 
         if open_positions and SafeMode(trading_session.mode) in _MARGIN_BREACH_MODES:
-            self._check_margin_breach(db, trading_session, session_broker, market_data_provider)
+            # Session-level/account-wide broker -- used only here (margin-
+            # breach detection), never for evaluating or closing any
+            # *specific* position -- see resolve_broker_for_position's own
+            # docstring for the 2026-08-19 incident that split fixed.
+            # Resolved lazily, right where it's used, and inside its own
+            # try/except -- real, live incident 2026-08-25: this used to
+            # resolve unconditionally at the top of _run_cycle, before the
+            # open_positions loop even ran (let alone this mode/positions
+            # guard) -- so right after a restart, with Shoonya not yet
+            # reconnected, `get_execution_broker`'s `_real_broker_or_raise`
+            # raised `ConfigurationError` on *every* cycle before the loop's
+            # own now-fixed try/except ever got a chance to run, crash-
+            # looping `PositionManager` regardless of that fix. A skipped
+            # margin-breach check for one cycle is an acceptable, bounded
+            # degradation (existing open positions' own resting protective
+            # stops stay live at the broker either way); silently never
+            # running the rest of this cycle every ~3s was not.
+            try:
+                session_broker = self._broker_override or get_execution_broker(trading_session)
+            except Exception:  # noqa: BLE001 - see the per-position loop's identical reasoning
+                logger.exception(
+                    "resolving the account-wide broker for margin-breach detection failed "
+                    "-- skipping that check this cycle",
+                )
+            else:
+                self._check_margin_breach(db, trading_session, session_broker, market_data_provider)
 
         # Local import: same load-time-cycle reasoning as
         # run_eod_square_off's import just below —

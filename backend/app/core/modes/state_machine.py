@@ -50,8 +50,14 @@ def _write_transition(
     reason: str,
 ) -> TradingSession:
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
-        if to_mode == SafeMode.DEGRADED_MODE:
+        if to_mode in (SafeMode.DEGRADED_MODE, SafeMode.RECONCILIATION_LOCK):
             trading_session.prior_mode = from_mode
+
+        if to_mode == SafeMode.RECONCILIATION_LOCK:
+            # A fresh lock always starts a fresh streak -- see
+            # ReconciliationLockRecoveryScheduler / recover_from_
+            # reconciliation_lock's own docstrings for what drives this.
+            trading_session.reconciliation_lock_clean_streak = 0
 
         trading_session.mode = to_mode
         db.add(trading_session)
@@ -190,6 +196,65 @@ def recover_from_degraded(
             )
         if "livetrade.execute" not in get_user_permissions(db, actor_user):
             raise ModeTransitionError("actor is missing required permission: livetrade.execute")
+
+    return _write_transition(
+        db,
+        trading_session,
+        from_mode=from_mode,
+        to_mode=target,
+        trigger_type=trigger_type,
+        actor_user=actor_user,
+        reason=reason,
+    )
+
+
+def recover_from_reconciliation_lock(
+    db: Session,
+    trading_session: TradingSession,
+    trigger_type: TransitionTriggerType,
+    *,
+    actor_user: User | None = None,
+    reason: str = "",
+) -> TradingSession:
+    """reconciliation_lock -> prior_mode. Same dynamic-target shape as
+    `recover_from_degraded`, with one deliberate, scoped exception to rule 4
+    (automatic transitions only ever move down in privilege) -- confirmed
+    explicitly with the user, 2026-08-25: unlike degraded_mode/kill_switch,
+    which always require a manual, permissioned confirm to resume above
+    paper_only, reconciliation_lock may also auto-recover all the way back
+    to a live prior_mode via `TransitionTriggerType.RECONCILIATION` --
+    reserved exclusively for `ReconciliationLockRecoveryScheduler`, which
+    only fires this after N consecutive clean `run_full_reconciliation`
+    checks (never a bare timer, never a single check). The reasoning: this
+    lock exists to catch a *technical* local-vs-broker divergence, not a
+    judgment call the way a loss-cap breach or a degraded health check is --
+    once the broker's own book is repeatedly confirmed to match local state
+    again, the thing that justified the lock is gone. A bare `SYSTEM`
+    trigger still may not resume above paper_only -- only `MANUAL` (with
+    `livetrade.execute`) or `RECONCILIATION` can, keeping the exception as
+    narrow as what actually verifies the lock's own root cause is cleared.
+    """
+    from_mode = SafeMode(trading_session.mode)
+    if from_mode != SafeMode.RECONCILIATION_LOCK:
+        raise ModeTransitionError("session is not in reconciliation_lock")
+
+    target = (
+        SafeMode(trading_session.prior_mode) if trading_session.prior_mode else SafeMode.PAPER_ONLY
+    )
+
+    if target != SafeMode.PAPER_ONLY:
+        if trigger_type == TransitionTriggerType.MANUAL:
+            if actor_user is None:
+                raise ModeTransitionError("manual transitions require an authenticated actor")
+            if "livetrade.execute" not in get_user_permissions(db, actor_user):
+                raise ModeTransitionError(
+                    "actor is missing required permission: livetrade.execute"
+                )
+        elif trigger_type != TransitionTriggerType.RECONCILIATION:
+            raise ModeTransitionError(
+                f"resuming to {target.value} requires a manual, permissioned "
+                "confirmation or a reconciliation-verified auto-recovery"
+            )
 
     return _write_transition(
         db,

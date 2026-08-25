@@ -57,14 +57,17 @@ def test_promotions_require_livetrade_execute_permission():
         assert rule.allowed_triggers == frozenset({Trigger.MANUAL})
 
 
-def test_kill_switch_and_reconciliation_lock_recovery_requires_permission():
+def test_kill_switch_recovery_requires_permission():
     assert (
         ALLOWED_TRANSITIONS[SafeMode.KILL_SWITCH][SafeMode.PAPER_ONLY].required_permission
         == "risk.override"
     )
-    assert (
-        ALLOWED_TRANSITIONS[SafeMode.RECONCILIATION_LOCK][
-            SafeMode.PAPER_ONLY
-        ].required_permission
-        == "risk.override"
-    )
+
+
+def test_reconciliation_lock_has_no_static_recovery_edge():
+    """reconciliation_lock -> prior_mode is dynamic (state_machine.recover_
+    from_reconciliation_lock), same reasoning degraded_mode's own recovery
+    already has no static table entry — only reconciliation_lock ->
+    kill_switch remains a static edge."""
+    edges = ALLOWED_TRANSITIONS.get(SafeMode.RECONCILIATION_LOCK, {})
+    assert set(edges.keys()) == {SafeMode.KILL_SWITCH}

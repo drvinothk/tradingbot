@@ -894,9 +894,15 @@ def _drop_session_into_reconciliation_lock(engine, session_id: str) -> None:
         db.commit()
 
 
-def test_recover_from_reconciliation_lock_restores_paper_only_when_clean(
+def test_recover_from_reconciliation_lock_restores_live_when_that_was_prior_mode_and_clean(
     api_client: TestClient, seeded_admin, engine
 ):
+    """2026-08-25 fix: this used to hardcode `paper_only` regardless of
+    what the session actually was before the lock -- now it restores the
+    real `prior_mode` (here `live_enabled`, since the session went live
+    before the lock fired), gated on `seeded_admin`'s own `livetrade.execute`
+    permission (the "every permission" admin fixture has it).
+    """
     session_id = _login_and_create_session(api_client, seeded_admin)
     api_client.post(f"/api/v1/sessions/{session_id}/go-live")
     _drop_session_into_reconciliation_lock(engine, session_id)
@@ -908,10 +914,93 @@ def test_recover_from_reconciliation_lock_restores_paper_only_when_clean(
     assert response.status_code == 200
     body = response.json()
     assert body["recovered"] is True
-    assert body["session"]["mode"] == "paper_only"
+    assert body["session"]["mode"] == "live_enabled"
 
     get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
-    assert get_resp.json()["mode"] == "paper_only"
+    assert get_resp.json()["mode"] == "live_enabled"
+
+
+def test_recover_from_reconciliation_lock_requires_livetrade_execute_for_a_live_prior_mode(
+    api_client: TestClient, seeded_admin, engine
+):
+    """A user with only `risk.override` (this endpoint's own outer gate,
+    unlike `recover_from_degraded`'s endpoint which requires `livetrade
+    .execute` at that same outer layer) can reach the function body but
+    must not be able to silently resume live trading -- the state-machine
+    function's own internal permission check must reject it with a 409
+    (not the 403 a missing outer-gate permission would give), and must not
+    have moved the session at all on the way to rejecting.
+    """
+    session_id = _login_and_create_session(api_client, seeded_admin)
+    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    _drop_session_into_reconciliation_lock(engine, session_id)
+    api_client.post("/api/v1/auth/logout")
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    limited_user_id = uuid.uuid4()
+    limited_role_id = uuid.uuid4()
+    limited_email = f"limited-recon-{uuid.uuid4().hex[:8]}@example.com"
+    try:
+        with session_factory() as db:
+            limited_user = User(
+                id=limited_user_id,
+                workspace_id=seeded_admin["workspace_id"],
+                email=limited_email,
+                password_hash=hash_password(ADMIN_PASSWORD),
+                display_name="Limited Recon User",
+                is_active=True,
+            )
+            db.add(limited_user)
+            db.flush()
+
+            role = Role(id=limited_role_id, name=f"limited-recon-role-{uuid.uuid4().hex[:8]}")
+            db.add(role)
+            db.flush()
+
+            # risk.override only -- deliberately not livetrade.execute.
+            risk_override_permission = (
+                db.query(Permission).filter(Permission.code == "risk.override").one()
+            )
+            db.add(RolePermission(role_id=role.id, permission_id=risk_override_permission.id))
+            db.add(
+                UserRole(
+                    user_id=limited_user.id,
+                    role_id=role.id,
+                    workspace_id=seeded_admin["workspace_id"],
+                )
+            )
+            db.commit()
+
+        api_client.post(
+            "/api/v1/auth/login", json={"email": limited_email, "password": ADMIN_PASSWORD}
+        )
+        response = api_client.post(
+            f"/api/v1/sessions/{session_id}/recover-from-reconciliation-lock"
+        )
+
+        assert response.status_code == 409
+
+        # Must not have silently recovered the session on the way to
+        # rejecting.
+        api_client.post("/api/v1/auth/logout")
+        api_client.post(
+            "/api/v1/auth/login",
+            json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+        )
+        get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
+        assert get_resp.json()["mode"] == "reconciliation_lock"
+    finally:
+        with session_factory() as cleanup_db:
+            from app.domain.identity.models import LoginSession
+
+            cleanup_db.query(LoginSession).filter(LoginSession.user_id == limited_user_id).delete()
+            cleanup_db.query(UserRole).filter(UserRole.user_id == limited_user_id).delete()
+            cleanup_db.query(RolePermission).filter(
+                RolePermission.role_id == limited_role_id
+            ).delete()
+            cleanup_db.query(Role).filter(Role.id == limited_role_id).delete()
+            cleanup_db.query(User).filter(User.id == limited_user_id).delete()
+            cleanup_db.commit()
 
 
 def test_recover_from_reconciliation_lock_refuses_when_still_mismatched(

@@ -23,6 +23,9 @@ from app.core.modes import (
     set_master_trading_mode,
     transition_mode,
 )
+from app.core.modes import (
+    recover_from_reconciliation_lock as sm_recover_from_reconciliation_lock,
+)
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
@@ -37,7 +40,6 @@ from app.domain.session.models import (
 )
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.audit_service.service import record_event
-from app.modules.broker_adapter.composition import get_execution_broker
 from app.modules.reconciliation.service import run_full_reconciliation
 from app.modules.scheduler.eod_square_off import run_eod_square_off
 
@@ -454,13 +456,11 @@ def recover_from_reconciliation_lock(
     """2026-08-20 addition, closing the same class of gap `recover_from_
     kill_switch`/`recover_from_degraded_mode` closed for their own modes --
     `reconciliation_lock` has been cleared at least once this session via a
-    raw `psql` UPDATE, with nothing in the app itself to do it.
-    `RECONCILIATION_LOCK -> PAPER_ONLY` is already a legal static edge in
-    `ALLOWED_TRANSITIONS` (`risk.override`, matching this endpoint's own
-    gate) -- the only real work here is not trusting a stale assumption
-    that the mismatch is actually resolved. Re-runs `run_full_reconciliation`
-    first (the mode-scoped, dual-pass function built earlier tonight) and
-    only transitions if that fresh check comes back clean; a still-mismatched
+    raw `psql` UPDATE, with nothing in the app itself to do it. The only
+    real work here is not trusting a stale assumption that the mismatch is
+    actually resolved. Re-runs `run_full_reconciliation` first (the
+    mode-scoped, dual-pass function built earlier tonight) and only
+    transitions if that fresh check comes back clean; a still-mismatched
     result is a normal, expected outcome (not a client error), same
     "reflect it, don't except on it" contract `manual_reconcile` already
     uses -- so this returns 200 either way, with `recovered: false` and the
@@ -471,6 +471,18 @@ def recover_from_reconciliation_lock(
     (`_RECONCILIATION_LOCK_ELIGIBLE_MODES`) only fires from
     `paper_plus_guarded_live`/`live_enabled`, so re-checking from inside the
     lock can't recurse into trying to re-enter it.
+
+    2026-08-25: the actual transition now goes through `state_machine
+    .recover_from_reconciliation_lock` (dynamic `prior_mode` target) instead
+    of a hardcoded `PAPER_ONLY` -- this manual button now correctly restores
+    live trading if that's what the lock interrupted, not just paper. That
+    function's own internal `livetrade.execute` check is what actually gates
+    a live-adjacent target; this endpoint's own `risk.override` requirement
+    is the outer gate for attempting recovery at all (same layering
+    `recover_from_kill_switch`'s endpoint already has, just not previously
+    exercised here since this endpoint could only ever reach `PAPER_ONLY`
+    before today). See also `ReconciliationLockRecoveryScheduler` for the
+    new *unattended* counterpart to this same manual endpoint.
     """
     trading_session = _get_session_or_404(db, user, session_id)
     if trading_session.mode != SafeMode.RECONCILIATION_LOCK:
@@ -487,10 +499,9 @@ def recover_from_reconciliation_lock(
         return {"recovered": False, "mismatches_found": len(mismatches), "mismatches": mismatches}
 
     try:
-        transition_mode(
+        sm_recover_from_reconciliation_lock(
             db,
             trading_session,
-            SafeMode.PAPER_ONLY,
             TransitionTriggerType.MANUAL,
             actor_user=user,
             reason="manual recovery from reconciliation_lock, fresh reconciliation confirmed clean",
@@ -599,9 +610,24 @@ def manual_square_off(
     is callable-function-plus-test, same pattern here), so this is what
     makes the phase's "done when" EOD criterion exercisable on demand
     instead of waiting for real wall-clock IST to cross cutoff_time.
+
+    **Real bug fixed 2026-08-25**: this used to pass a single, pre-resolved
+    `get_execution_broker(trading_session)` broker for the whole sweep —
+    the exact single-broker-for-a-batch shape `resolve_broker_for_position`'s
+    own docstring already documents fixing everywhere else on 2026-08-19
+    (`PositionManager`'s EOD/margin-breach square-off, the single-position
+    manual square-off). This endpoint alone never got that fix. In any mode
+    other than `live_enabled` — i.e. precisely the emergency modes
+    (`kill_switch`/`degraded_mode`/`reconciliation_lock`) an operator would
+    reach for this button during — `get_execution_broker` with no
+    `strategy_run`/`position` resolves to the mock adapter, so "square off
+    all" would have marked a real live position CLOSED locally while never
+    sending a real exit order to the broker at all. Passing `None` now lets
+    `run_eod_square_off` resolve each position's own broker via
+    `resolve_broker_for_position`, same as every other square-off call site.
     """
     trading_session = _get_session_or_404(db, user, session_id)
-    outcomes = run_eod_square_off(db, get_execution_broker(trading_session), trading_session)
+    outcomes = run_eod_square_off(db, None, trading_session)
     db.commit()
     return {"closed_count": len(outcomes)}
 
