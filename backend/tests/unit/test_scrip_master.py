@@ -94,17 +94,6 @@ def test_futures_row_is_indexed_with_no_strike_or_option_type():
     assert parsed.option_type is None
 
 
-def test_finnifty_is_recognized_as_a_tracked_underlying():
-    """FINNIFTY is indexed/mapped for future-proofing (per this task's
-    explicit scope) even though nothing else in the codebase enables it for
-    strategies yet.
-    """
-    row = {**NIFTY_CE_ROW, "name": "FINNIFTY", "symbol": "FINNIFTY28OCT2524400CE"}
-    parsed = parse_scrip_row(row)
-    assert parsed is not None
-    assert parsed.underlying == "FINNIFTY"
-
-
 def test_index_row_on_nse_segment_with_no_strike_is_recognized():
     row = {
         "token": "99926000",

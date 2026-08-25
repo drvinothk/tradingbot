@@ -149,40 +149,6 @@ def test_sync_also_writes_a_shoonya_passthrough_mapping(db: Session, monkeypatch
     assert service.get_shoonya_tsym(contract.symbol) == contract.symbol
 
 
-def test_finnifty_rows_are_parsed_but_produce_no_mapping_yet(db: Session, monkeypatch):
-    """FINNIFTY is indexed/mapped in the parser for future-proofing (this
-    task's explicit scope) but there's no local Instrument/OptionContract
-    for it yet — sync_to_db must not crash, and must map zero FINNIFTY rows,
-    since there's nothing in our DB to match them against.
-    """
-    _seed_instruments_and_contracts(db)
-    finnifty_row = {
-        "token": "77001",
-        "symbol": "FINNIFTY28OCT2524400CE",
-        "name": "FINNIFTY",
-        "expiry": "28OCT2025",
-        "strike": "2440000.000000",
-        "lotsize": "40",
-        "instrumenttype": "OPTIDX",
-        "exch_seg": "NFO",
-        "tick_size": "0.05",
-    }
-    service = ScripMasterService()
-    monkeypatch.setattr(service, "_download", lambda: [finnifty_row])
-    parsed_count = service.fetch_and_parse()
-    assert parsed_count == 1  # parsed and indexed...
-
-    log = service.sync_to_db(db)
-
-    assert log.status == SyncStatus.SUCCESS
-    assert (
-        db.query(BrokerSymbolMap)
-        .filter(BrokerSymbolMap.external_token == "77001")
-        .count()
-        == 0
-    )  # ...but never matched against our DB, since no FINNIFTY row exists there
-
-
 def test_rerunning_sync_is_a_clean_upsert_no_duplicate_key_errors(db: Session, monkeypatch):
     _seed_instruments_and_contracts(db)
     nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()

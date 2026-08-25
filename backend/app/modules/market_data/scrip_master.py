@@ -24,7 +24,7 @@ suffix check, not a parse of the whole composite symbol, and reliable per
 Angel's own documented tradingsymbol convention, but worth re-confirming
 against a real download before trusting it blindly.
 
-**The underlying index token itself (NIFTY/BANKNIFTY/FINNIFTY spot) is not
+**The underlying index token itself (NIFTY/BANKNIFTY spot) is not
 in the `NFO` segment** (NFO is derivatives-only) — this module also accepts
 `NSE`-segment rows matching a tracked underlying name with no strike, on the
 same "index it, don't guess a broker's undocumented behavior" caution as the
@@ -64,8 +64,8 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 # NFO is options+futures; these are indexed even though this system doesn't
 # trade futures today (see module docstring's "index it, don't have to use
-# it yet" reasoning, matching FINNIFTY's own treatment).
-_TRACKED_UNDERLYINGS = frozenset({"NIFTY", "BANKNIFTY", "FINNIFTY"})
+# it yet" reasoning).
+_TRACKED_UNDERLYINGS = frozenset({"NIFTY", "BANKNIFTY"})
 _NFO_OPTION_TYPES = frozenset({"OPTIDX"})
 _NFO_FUTURE_TYPES = frozenset({"FUTIDX"})
 
@@ -253,7 +253,7 @@ class ScripMasterService:
     def fetch_and_parse(self) -> int:
         """Downloads + parses the master file, rebuilding the in-memory
         structural index used by `sync_to_db`. Returns the count of rows
-        recognized (NIFTY/BANKNIFTY/FINNIFTY NFO+index rows) — everything
+        recognized (NIFTY/BANKNIFTY NFO+index rows) — everything
         else in the file is discarded immediately, not retained, to keep
         memory bounded against a file listing every NSE/BSE/MCX instrument.
         """
