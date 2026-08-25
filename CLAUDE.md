@@ -730,10 +730,26 @@ check, then exercise it live).
   committed — wrapped per-session in the scheduler's own `_run_cycle`, so
   one session's failure can't block another's. 1091/1091 backend tests
   pass (up from 1079), ruff/mypy clean, migration round-tripped locally.
-  **DEPLOYED to OCI 2026-08-25** (migration `0027` applied via `alembic
-  upgrade head` on the box, backend restarted clean) — still **not
-  live-verified**, needs a real reconciliation-lock trigger during a live
-  session to confirm end-to-end.
+  **DEPLOYED to OCI 2026-08-25, LIVE-VERIFIED the same day** (off-hours,
+  market closed, zero open positions, session manually flipped to
+  `reconciliation_lock` via a direct `psql` UPDATE to simulate the lock
+  state, since a `paper_only` session can't naturally reach it): the
+  scheduler picked it up on its very next 60s cycle, ran 3 consecutive
+  clean `run_full_reconciliation` checks (real Shoonya connected, zero
+  positions on both sides so every check came back clean), and
+  auto-recovered the session back to `paper_only` unattended — confirmed
+  via the exact expected log line
+  (`app.scheduler.reconciliation_lock_recovery: session ... auto-recovered
+  from reconciliation_lock after 3 consecutive clean checks`), the DB row
+  itself (`mode=paper_only`, `reconciliation_lock_clean_streak=3`), and a
+  correctly hash-chained `audit_events` row
+  (`mode_transition.reconciliation_lock_to_paper_only`,
+  `trigger_type=reconciliation`, not a bare `SYSTEM` trigger — exactly the
+  scoped exception this feature was built to allow). Restoring a live
+  `prior_mode` specifically wasn't exercised (the live session that day was
+  `paper_only`, not `live_enabled`/`paper_plus_guarded_live`) — only the
+  `paper_only` recovery path has real evidence; the dynamic-`prior_mode`
+  half still rests on unit/integration test coverage alone.
 
 - **2026-08-25: `exit_reason=reconciled` mislabeling fixed — implemented,
   tested, NOT yet live-verified.** A LIVE exit order that didn't fill
@@ -766,7 +782,7 @@ check, then exercise it live).
   recorded reason survives to reconciliation for real.
 
 - **2026-08-25: Shoonya session survives a backend restart — implemented,
-  tested, NOT yet live-verified.** Before this, Shoonya's OAuth session
+  tested, LIVE-VERIFIED the same day.** Before this, Shoonya's OAuth session
   lived only in an in-process global
   ([composition.py](backend/app/modules/broker_adapter/composition.py)'s
   `_broker`), so every restart (routine redeploy, crash, the `Restart
@@ -795,14 +811,17 @@ check, then exercise it live).
   goes through. WS-level intermittent drops needed no change — `ws_client
   .py`'s `_run` loop already reconnects with backoff over the *same* still-
   valid REST token, no fresh OAuth involved. 1076/1076 backend tests pass
-  (up from 1062), ruff/mypy clean. **DEPLOYED to OCI 2026-08-25** (backend
-  restarted clean, no cached session existed yet at that first restart so
-  `_attempt_shoonya_reconnect_from_cache` correctly no-op'd — the real
-  round-trip test needs a login on this box followed by a *second*
-  restart). **Not live-verified** — needs a real
-  Shoonya account + an actual backend restart during a live session to
-  confirm the cache survives and reconnects for real, same caveat every
-  other not-yet-live-tested Shoonya piece in this file already carries.
+  (up from 1062), ruff/mypy clean. **DEPLOYED to OCI 2026-08-25**; the real
+  round-trip (login, then a *second* restart) was completed the same
+  evening, off-hours, market closed, zero open positions: user logged in
+  fresh via the real browser OAuth flow, confirmed `.shoonya_session_cache
+  .json` was written on the box, then the backend was restarted — startup
+  log showed a real `POST .../Limits` (i.e. `get_margin()`) call
+  succeeding followed by `Shoonya session restored from disk cache —
+  reconnected without a fresh login`, with no `/shoonya/login-url` hit
+  anywhere in that restart's logs. **Live-confirmed**: a genuine backend
+  restart no longer requires a fresh manual OAuth login when the cached
+  token is still valid.
 
 - **2026-08-25: Live SL/TSL engine's first real market test — found and
   fixed 4 real, live-only bugs, all in broker-resolution/response-parsing
