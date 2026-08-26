@@ -215,3 +215,80 @@ API actually did. None of these were discoverable without a real account:
 - No real multi-session paper soak has completed yet, so no real signal →
   risk → order → position lifecycle has been proven end-to-end against live
   data — see `CLAUDE.md`'s Phase 5 status for the current bar.
+
+## 7. Backtesting (`backend/scripts/run_backtest.py`)
+
+See `docs/ops/backtest_vm_runbook.md` for the operational how-to (VM access,
+deploying code/data, running a sharded overnight sweep). This section is the
+"what bit us and why" for the harness itself — read before trusting a
+backtest report's numbers at face value, and especially before comparing one
+against real paper/live trading results.
+
+- **The harness reuses the real production pipeline** (`strategy_engine
+  .runner.run_cycle`, the real `Strategy` subclasses, `risk_engine.service
+  .evaluate_trade_intent`) — it is not a reimplementation of any strategy's
+  entry logic. That's exactly why it's trustworthy for strategy/execution
+  logic, and exactly why it's blind to anything that lives *outside* that
+  pipeline (see the risk-config point below).
+- **A same-day replay against production's real paper-trading record
+  (2026-08-26) found a real 26x PnL-scale bug**: `legacy`/`target_mult` exit
+  modes always seed the stub strategy config with `params={"qty_lots": 1}`
+  and use `UNDERLYING_META`'s illustrative `lot_size=25` for NIFTY (real
+  NSE lot size is 65, and production's own paper default is 10 lots) —
+  so every `legacy`-mode PnL figure this harness has ever produced needs
+  `real_equivalent_pnl = raw_pnl × (real_qty_lots × real_lot_size) / (1 ×
+  25)` to read as real ₹. Trade selection, timing, and exit reason are
+  completely unaffected (stop/target/trail math is price-based, not
+  lot-size-based) — only the PnL *magnitude* was ever wrong. Not yet fixed
+  in the script itself; rescale by hand until it is.
+- **Close-only, once-per-completed-bar pricing structurally under-fires any
+  strategy whose entry pattern is an intrabar phenomenon.** Confirmed via
+  the same same-day comparison: production (which evaluates every 30s off
+  continuously-updating live ticks) fired ema_micro_pullback 10 times in one
+  day; the identical strategy/underlying/expiry replayed through the
+  backtest fired only once. A micro-pullback can trigger and resolve within
+  a single 1-min candle, which close-only bar data can never see. This means
+  every backtest run's numbers for an intrabar-sensitive strategy are a real
+  *undercount* of actual opportunity, not just a generically-flagged
+  limitation — weight ema_micro_pullback-style strategies' backtest results
+  accordingly, and don't conclude "this strategy rarely fires" from a
+  backtest report alone.
+- **Strike selection typically lands within 1 strike-step of what production
+  actually picked at the same nominal signal moment, not exactly on it.**
+  Two compounding, already-documented causes: close-only bar pricing feeds a
+  slightly different underlying spot into the ATM calculation than the
+  continuous live tick production saw at that instant, and the backtest's
+  bid/ask/depth are *synthetic* (derived from OI/volume as a liquidity
+  proxy, since the historical REST source has no real order book) rather
+  than the real broker depth production's strike-ranking actually scores
+  against. Expect this drift; don't treat a 1-2 strike mismatch against a
+  real trade as evidence the replay is broken.
+- **The backtest's own seeded `RiskLimitConfig` is fully decoupled from
+  whatever value production's real config row actually holds** — it
+  hardcodes generous limits (e.g. `per_trade_lot_cap=10`) so real risk
+  checks (tick-size, same-strike locking, margin) still execute without
+  being gated by arbitrary limits. This means the harness can validate that
+  the *risk-check logic* runs correctly, but can never reproduce a bug that
+  only exists because production's actual config value was wrong (a real
+  example: a `per_trade_lot_cap_exceeded` check that was misapplied to paper
+  trades in production for several hours one morning — the backtest's own
+  config never had a value low enough to trigger the same rejection,
+  regardless of which commit it ran). Don't expect a backtest to catch a
+  production config/environment bug; it only validates strategy and
+  execution logic against whatever config it's told to seed.
+- **Smoke-test every strategy (single expiry, seconds each) before
+  committing to a full/overnight sharded run.** This is what caught a real
+  filename mismatch (`fetch_truedata_futures_underlying_history.py` writes
+  `underlyings/<u>_FUT_1min.csv`; `--underlying-source futures_proxy` reads
+  `underlyings/<u>_underlying_proxy_1min.csv`) before it could waste hours
+  of overnight compute — 4/5 strategies passed immediately, VWAP Pullback
+  failed with a clear "missing file" error instead of silently producing
+  zero trades. Still not fixed in code as of this writing (worked around by
+  copying the file under the expected name); check both scripts agree on
+  the filename before assuming this is resolved.
+- **TrueData's underlying-index bars (NIFTY/BANKNIFTY) always carry
+  `volume=0`** (a real index has no traded volume of its own) — VWAP
+  Pullback will structurally never fire against this data, confirmed to
+  also be true in live production (same `volume=0` on index ticks), not a
+  backtest-only artifact. A zero-signal day for this strategy in either
+  system is expected, not a bug to chase.
