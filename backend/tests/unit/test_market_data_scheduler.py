@@ -251,6 +251,100 @@ def test_pre_market_to_active_market_transition_has_no_action(monkeypatch):
     assert subscribe_calls == []
 
 
+def test_subscribe_known_underlyings_isolates_first_symbol_failure(monkeypatch, caplog):
+    """2026-08-26 live incident: NIFTY (first in TRADABLE_UNDERLYINGS) raised
+    during a session-expiry window, which used to propagate straight out of
+    the whole subscribe loop and leave `_last_phase` unset (see the
+    CLOSED->ACTIVE_MARKET test below for the consequence of that). One
+    symbol failing must never block the rest of either loop.
+    """
+    provider = _FakeProvider()
+    subscribe_calls: list[str] = []
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch, [MarketPhase.ACTIVE_MARKET], provider, subscribe_calls
+    )
+    failing_symbol = TRADABLE_UNDERLYINGS[0]
+
+    def _flaky_ensure_ingestion_running(symbol: str) -> None:
+        if symbol == failing_symbol:
+            raise RuntimeError("broker session expired")
+        subscribe_calls.append(symbol)
+
+    monkeypatch.setattr(
+        registry_module, "ensure_ingestion_running", _flaky_ensure_ingestion_running
+    )
+
+    with caplog.at_level("ERROR"):
+        sched.run_once()
+
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS[1:]) + list(ENV_METRIC_SYMBOLS)
+    assert sched._last_phase == MarketPhase.ACTIVE_MARKET  # noqa: SLF001
+    assert any(failing_symbol in record.message for record in caplog.records)
+
+
+def test_subscribe_known_underlyings_isolates_env_metric_symbol_failure(monkeypatch, caplog):
+    """Mirrors the real INDIA VIX incident: a failure in the *second* loop
+    (ENV_METRIC_SYMBOLS) must not affect TRADABLE_UNDERLYINGS, which is
+    attempted first and already succeeded by the time this one raises.
+    """
+    provider = _FakeProvider()
+    subscribe_calls: list[str] = []
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch, [MarketPhase.ACTIVE_MARKET], provider, subscribe_calls
+    )
+    failing_symbol = ENV_METRIC_SYMBOLS[0]
+
+    def _flaky_ensure_ingestion_running(symbol: str) -> None:
+        if symbol == failing_symbol:
+            raise RuntimeError("no cached broker token")
+        subscribe_calls.append(symbol)
+
+    monkeypatch.setattr(
+        registry_module, "ensure_ingestion_running", _flaky_ensure_ingestion_running
+    )
+
+    with caplog.at_level("ERROR"):
+        sched.run_once()
+
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + [
+        s for s in ENV_METRIC_SYMBOLS if s != failing_symbol
+    ]
+    assert sched._last_phase == MarketPhase.ACTIVE_MARKET  # noqa: SLF001
+    assert any(failing_symbol in record.message for record in caplog.records)
+
+
+def test_closed_to_active_market_transition_connects_and_subscribes(monkeypatch):
+    """2026-08-26 live incident: if the scheduler's own PRE_MARKET handling
+    never got recorded (from_phase stuck at CLOSED -- previously possible
+    when a symbol's subscribe raised uncaught, before the isolation fix
+    above), the 09:00 IST transition into ACTIVE_MARKET used to match no
+    branch at all and silently subscribed nothing for the rest of the day.
+    `from_phase=CLOSED` must be handled the same as `from_phase=None`, plus
+    the once-per-day resets PRE_MARKET's own entry would have run.
+    """
+    provider = _FakeProvider()
+    subscribe_calls: list[str] = []
+    reset_calls: list[None] = []
+    resubscribe_calls: list[None] = []
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch,
+        [MarketPhase.CLOSED, MarketPhase.ACTIVE_MARKET],
+        provider,
+        subscribe_calls,
+        reset_calls,
+        resubscribe_calls,
+    )
+    sched.run_once()  # startup -> closed: disconnect only
+    provider.calls.clear()
+
+    sched.run_once()  # closed -> active_market: the transition under test
+
+    assert provider.calls == ["connect"]
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + list(ENV_METRIC_SYMBOLS)
+    assert len(reset_calls) == 1
+    assert len(resubscribe_calls) == 1
+
+
 def test_pre_market_health_check_fires_after_interval(monkeypatch):
     """The first run_once() call both transitions (disconnect+connect) *and*
     accumulates its own tick (1.0s) toward the health-check interval, so
@@ -275,13 +369,40 @@ def test_pre_market_health_check_fires_after_interval(monkeypatch):
     assert provider.calls == ["connect"]  # the health check itself
 
 
-def test_pre_market_health_check_does_not_fire_during_active_market(monkeypatch):
+def test_health_check_fires_and_retries_subscription_during_active_market(monkeypatch):
+    """2026-08-26: broadened from PRE_MARKET-only -- a symbol that failed to
+    subscribe during PRE_MARKET previously had no real retry path once the
+    day reached ACTIVE_MARKET. The health check now also re-attempts
+    subscription, not just `provider.connect()`.
+    """
     provider = _FakeProvider()
-    phases = [MarketPhase.ACTIVE_MARKET] * 20
+    subscribe_calls: list[str] = []
+    tick_seconds = 1.0
+    ticks_needed = int(PRE_MARKET_HEALTH_CHECK_SECONDS / tick_seconds)
+    phases = [MarketPhase.ACTIVE_MARKET] * (ticks_needed + 1)
+    sched = _scheduler_with_phase_sequence(monkeypatch, phases, provider, subscribe_calls)
+    sched._tick_seconds = tick_seconds  # noqa: SLF001
+
+    sched.run_once()  # the initial from_phase=None -> active_market transition itself
+    provider.calls.clear()
+    subscribe_calls.clear()
+
+    for _ in range(ticks_needed - 2):
+        sched.run_once()
+    assert provider.calls == []  # one tick short of due
+
+    sched.run_once()
+    assert provider.calls == ["connect"]  # the health check itself
+    assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + list(ENV_METRIC_SYMBOLS)
+
+
+def test_health_check_still_does_not_fire_during_closed(monkeypatch):
+    provider = _FakeProvider()
+    phases = [MarketPhase.CLOSED] * 20
     sched = _scheduler_with_phase_sequence(monkeypatch, phases, provider)
     sched._tick_seconds = 1.0  # noqa: SLF001
 
-    sched.run_once()  # the initial from_phase=None -> active_market transition itself
+    sched.run_once()  # the initial startup -> closed transition itself
     provider.calls.clear()
 
     for _ in range(19):

@@ -7,6 +7,7 @@ shoonya/auth.py`'s own "researched, not live-verified" caveat).
 
 from __future__ import annotations
 
+import threading
 import uuid
 from collections.abc import Generator
 
@@ -24,6 +25,11 @@ from app.modules.broker_adapter.base.contracts import AuthResult
 from app.modules.broker_adapter.shoonya.auth import OAuthSession, ShoonyaAuthError
 
 ADMIN_PASSWORD = "correct horse battery staple 123!"
+
+# Captured before any fixture below can monkeypatch it, so the two tests that
+# want to exercise real thread-spawning (below) can restore the real
+# implementation on top of `synchronous_background_work`'s autouse patch.
+_REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK = shoonya_module._spawn_post_login_background_work
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +103,35 @@ def stub_run_daily_bootstrap(monkeypatch):
     import app.modules.session.bootstrapper as bootstrapper_module
 
     monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def synchronous_background_work(monkeypatch, engine):
+    """2026-08-26: `oauth_callback` now defers instrument-master sync,
+    market-data reset, and the daily-bootstrap retry to a background thread
+    (see `_run_post_login_background_work`'s own docstring — this closes a
+    real nginx-504 incident). Every test below that asserts on those side
+    effects right after the HTTP response returns implicitly assumes
+    synchronous completion, same as before this change — so run the
+    background work inline instead of spawning a real thread, using this
+    suite's own isolated `engine` (not `_run_post_login_background_work`'s
+    default `session_factory=session_scope`, which would touch the real
+    production DB — same trap `stub_run_daily_bootstrap` above already
+    documents for the sibling function it wraps).
+
+    The two tests that specifically want to prove real threading behavior
+    restore `_REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK` on top of this.
+    """
+    test_session_factory = sessionmaker(bind=engine, future=True)
+
+    def _sync_spawn(adapter, *, market_data_provider: str) -> None:
+        shoonya_module._run_post_login_background_work(
+            adapter,
+            market_data_provider=market_data_provider,
+            session_factory=test_session_factory,
+        )
+
+    monkeypatch.setattr(shoonya_module, "_spawn_post_login_background_work", _sync_spawn)
 
 
 @pytest.fixture
@@ -577,6 +612,155 @@ def test_callback_survives_run_daily_bootstrap_raising(
     assert response.status_code == 200
     assert "connected" in response.text.lower()
     assert composition.is_shoonya_configured() is True
+
+
+def test_callback_response_does_not_wait_for_background_work(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """Core proof of the 2026-08-26 fix: the HTTP response must return
+    before the background work finishes, not after -- that's the whole
+    point of backgrounding it (see `_run_post_login_background_work`'s own
+    docstring for the nginx-504 incident this closes). Restores the real
+    `_spawn_post_login_background_work` (the `synchronous_background_work`
+    autouse fixture replaces it for every other test in this file) so a
+    real thread actually gets spawned here, with a fake background body
+    (no real DB session concerns to worry about) so the test controls
+    exactly when it "finishes".
+    """
+    monkeypatch.setattr(
+        shoonya_module,
+        "_spawn_post_login_background_work",
+        _REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK,
+    )
+
+    _login(api_client, seeded_admin)
+
+    fake_session = OAuthSession(
+        auth_result=AuthResult(session_token="tok-123", account_id="FA1"), refresh_token=None
+    )
+    monkeypatch.setattr(
+        shoonya_module, "exchange_code_for_token", lambda settings, code: fake_session
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _fake_background_work(adapter, *, market_data_provider, session_factory=None):
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(shoonya_module, "_run_post_login_background_work", _fake_background_work)
+
+    response = api_client.get("/shoonya/callback", params={"code": "auth-code"})
+
+    assert response.status_code == 200
+    assert "connected" in response.text.lower()
+    # The response above already returned -- if backgrounding didn't work,
+    # this would have blocked for up to 5s inside the request itself.
+    assert started.wait(timeout=2), "background work was never started"
+    release.set()  # let the background thread finish so it doesn't leak past the test
+
+
+def test_spawn_post_login_background_work_skips_when_already_running(monkeypatch):
+    """A second reconnect landing while the first's background work is
+    still in flight must not race a duplicate `sync_instrument_master`/
+    `run_daily_bootstrap` pass -- it should log and skip instead.
+    """
+    started = threading.Event()
+    release = threading.Event()
+    call_count = 0
+
+    def _fake_background_work(adapter, *, market_data_provider, session_factory=None):
+        nonlocal call_count
+        call_count += 1
+        started.set()
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(shoonya_module, "_run_post_login_background_work", _fake_background_work)
+
+    _REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK(object(), market_data_provider="mock")
+    assert started.wait(timeout=2)
+
+    # A second spawn while the first is still running must be a no-op.
+    _REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK(object(), market_data_provider="mock")
+
+    release.set()
+    # Give the first thread a moment to fully release the lock before
+    # asserting the total call count and trying a third spawn.
+    import time
+
+    time.sleep(0.1)
+    assert call_count == 1
+
+    release.clear()
+    _REAL_SPAWN_POST_LOGIN_BACKGROUND_WORK(object(), market_data_provider="mock")
+    assert started.wait(timeout=2)
+    release.set()
+    time.sleep(0.1)
+    assert call_count == 2
+
+
+def test_run_post_login_background_work_isolates_step_failures(monkeypatch, engine):
+    """`sync_instrument_master` raising must not prevent `reset_for_
+    reconnect`/`run_daily_bootstrap` from still running afterward -- an
+    uncaught exception in a background thread has no request left to fail
+    loudly, so each step must be isolated.
+    """
+
+    def _raise(db, broker, exchanges):
+        raise RuntimeError("simulated instrument-master sync failure")
+
+    monkeypatch.setattr(shoonya_module, "sync_instrument_master", _raise)
+
+    reset_calls: list[None] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.registry.reset_for_reconnect",
+        lambda: reset_calls.append(None),
+    )
+    bootstrap_calls: list[None] = []
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    monkeypatch.setattr(
+        bootstrapper_module, "run_daily_bootstrap", lambda: bootstrap_calls.append(None)
+    )
+
+    test_session_factory = sessionmaker(bind=engine, future=True)
+    shoonya_module._run_post_login_background_work(
+        object(), market_data_provider="shoonya", session_factory=test_session_factory
+    )
+
+    assert reset_calls == [None]
+    assert bootstrap_calls == [None]
+
+
+def test_run_post_login_background_work_uses_its_own_session_not_the_request_session(
+    monkeypatch, engine
+):
+    """The session passed into `sync_instrument_master`/`_seed_option_
+    anchors` must come from the explicit `session_factory`, never a
+    request-scoped session -- proven here by asserting it's a distinct
+    `Session` instance bound to the test's own isolated engine.
+    """
+    test_session_factory = sessionmaker(bind=engine, future=True)
+    seen_sessions: list[object] = []
+
+    def _spy_sync_instrument_master(db, broker, exchanges):
+        seen_sessions.append(db)
+
+    monkeypatch.setattr(shoonya_module, "sync_instrument_master", _spy_sync_instrument_master)
+    monkeypatch.setattr(
+        "app.modules.market_data.registry.reset_for_reconnect", lambda: None
+    )
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: None)
+
+    shoonya_module._run_post_login_background_work(
+        object(), market_data_provider="shoonya", session_factory=test_session_factory
+    )
+
+    assert len(seen_sessions) == 1
+    assert seen_sessions[0].bind is engine
 
 
 def test_callback_does_not_retry_auto_spawn_on_failed_login(

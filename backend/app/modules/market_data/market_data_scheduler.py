@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 
 from app.modules.market_data.market_hours import (
     ENV_METRIC_SYMBOLS,
@@ -82,7 +83,13 @@ class MarketDataScheduler:
             self._last_phase = phase
             self._seconds_since_health_check = 0.0
 
-        if phase is MarketPhase.PRE_MARKET:
+        if phase in (MarketPhase.PRE_MARKET, MarketPhase.ACTIVE_MARKET):
+            # 2026-08-26: broadened from PRE_MARKET-only -- a symbol that
+            # failed to subscribe (see `_subscribe_one`) previously had no
+            # real retry path once the day reached ACTIVE_MARKET (the next
+            # phase transition wouldn't happen again until CLOSED tomorrow).
+            # This tick now also gives it a real, low-frequency retry
+            # during active market hours -- see `_pre_market_health_check`.
             self._seconds_since_health_check += self._tick_seconds
             if self._seconds_since_health_check >= PRE_MARKET_HEALTH_CHECK_SECONDS:
                 self._seconds_since_health_check = 0.0
@@ -112,12 +119,27 @@ class MarketDataScheduler:
             provider.connect()
             self._subscribe_known_underlyings_if_ready()
             self._reset_daily_indicators()
-        elif to_phase is MarketPhase.ACTIVE_MARKET and from_phase is None:
-            # Process started (or restarted) mid-day, already past
-            # pre_market -- pre_market's own connect+subscribe never ran
-            # this process lifetime, so do it here instead. The normal
-            # daily pre_market -> active_market transition (from_phase is
-            # already PRE_MARKET) stays a genuine no-op, unchanged.
+        elif to_phase is MarketPhase.ACTIVE_MARKET and from_phase is not MarketPhase.PRE_MARKET:
+            # Any path into ACTIVE_MARKET that did NOT come through
+            # PRE_MARKET's own connect+subscribe: a mid-day process
+            # (re)start (from_phase is None -- this branch's original,
+            # still-handled case), or a scheduler whose PRE_MARKET handling
+            # never got recorded (from_phase is still CLOSED) -- confirmed
+            # live 2026-08-26: a per-symbol subscribe failure during
+            # PRE_MARKET used to leave `_last_phase` stuck at CLOSED (see
+            # `_subscribe_known_underlyings`'s per-symbol try/except below,
+            # which now prevents that), so the 09:00 IST transition landed
+            # here with `from_phase=CLOSED` and matched no branch at all --
+            # neither NIFTY nor BANKNIFTY got subscribed for the rest of
+            # that day. The normal daily pre_market -> active_market
+            # transition (from_phase is already PRE_MARKET) stays a genuine
+            # no-op, unchanged.
+            if from_phase is MarketPhase.CLOSED:
+                # A real day boundary was skipped, not just a same-day
+                # process restart -- run the same once-per-day resets
+                # PRE_MARKET's own entry would have.
+                self._reset_subscriptions_for_new_day()
+                self._reset_daily_indicators()
             provider.connect()
             self._subscribe_known_underlyings_if_ready()
         elif to_phase is MarketPhase.CLOSED:
@@ -166,14 +188,39 @@ class MarketDataScheduler:
         from app.modules.market_data.registry import ensure_ingestion_running
 
         for symbol in TRADABLE_UNDERLYINGS:
-            ensure_ingestion_running(symbol)
+            self._subscribe_one(ensure_ingestion_running, symbol)
         # VIX/PCR environment-metrics feed (2026-08-19) -- same
         # provider-agnostic subscription path as the tradable underlyings
         # above, just a separate loop so this symbol never touches
         # TRADABLE_UNDERLYINGS itself (see ENV_METRIC_SYMBOLS's own
         # docstring for why that separation matters).
         for symbol in ENV_METRIC_SYMBOLS:
+            self._subscribe_one(ensure_ingestion_running, symbol)
+
+    @staticmethod
+    def _subscribe_one(ensure_ingestion_running: Callable[[str], object], symbol: str) -> None:
+        # 2026-08-26: real live incident -- this loop used to have no
+        # per-symbol isolation at all. A single symbol's broker error (a
+        # not-yet-cached token, an expired session) raised straight out of
+        # this whole method, which propagated through `_handle_transition`
+        # and left `run_once`'s `self._last_phase` update unreached (see
+        # that method's own comment) -- so one bad symbol (confirmed live:
+        # NIFTY during a session-expiry window, and separately INDIA VIX
+        # after a restart) silently blocked every *other* symbol in both
+        # loops from ever being subscribed, not just itself. Isolating each
+        # symbol here means the rest of the day's known underlyings still
+        # get a real subscribe attempt even if one is broken; the broken
+        # one gets a fresh retry from the next phase transition or the
+        # periodic health-check tick (see `_pre_market_health_check`).
+        try:
             ensure_ingestion_running(symbol)
+        except Exception:  # noqa: BLE001 - one symbol's failure must never block the rest
+            logger.exception(
+                "Market-data subscribe failed for %s -- continuing with the remaining "
+                "known underlyings; this one retries at the next health-check tick or "
+                "phase transition",
+                symbol,
+            )
 
     def _reset_daily_indicators(self) -> None:
         # Local import, same convention as _subscribe_known_underlyings
@@ -187,12 +234,22 @@ class MarketDataScheduler:
         reset_daily_indicators()
 
     def _pre_market_health_check(self) -> None:
-        logger.warning("Pre-market health check: confirming provider connection is alive")
+        """Fires every `PRE_MARKET_HEALTH_CHECK_SECONDS` during PRE_MARKET
+        *and* ACTIVE_MARKET (see `run_once`) -- kept this name since it
+        still runs on the same interval/mechanism, just with a wider
+        trigger window. Also re-attempts `_subscribe_known_underlyings_if_
+        ready` (not just `provider.connect()`), so a symbol that failed to
+        subscribe earlier (see `_subscribe_one`'s own comment) gets a real
+        retry every few minutes without waiting for the next phase
+        transition or a full disconnect/reconnect.
+        """
+        logger.warning("Health check: confirming provider connection is alive")
         provider = get_market_data_provider()
         try:
             provider.connect()  # idempotent -- a no-op if already connected
         except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-            logger.exception("Pre-market health check failed")
+            logger.exception("Health check: provider connect failed")
+        self._subscribe_known_underlyings_if_ready()
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

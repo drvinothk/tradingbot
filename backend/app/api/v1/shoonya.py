@@ -16,6 +16,7 @@ code it never uses.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -23,12 +24,13 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
-from app.core.db.session import get_db
+from app.core.db.session import SessionFactory, get_db, session_scope
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.composition import (
     get_broker,
     is_shoonya_configured,
@@ -82,6 +84,110 @@ def _seed_option_anchors(db: Session, adapter: object) -> None:
         )
         for expiry_date, tsym in rows:
             seed(symbol, expiry_date, tsym)
+
+
+_post_login_background_lock = threading.Lock()
+
+
+def _run_post_login_background_work(
+    adapter: BrokerPort,
+    *,
+    market_data_provider: str,
+    session_factory: SessionFactory = session_scope,
+) -> None:
+    """The slow, non-auth-critical half of a successful Shoonya login —
+    instrument-master sync, option-anchor seeding, market-data registry
+    reset, daily-bootstrap retry — split out of `oauth_callback` and run in
+    a background thread (see `_spawn_post_login_background_work` below).
+
+    2026-08-26: this used to run inline in the request. With 10 strategy
+    configs now enabled (up from 5 when `run_daily_bootstrap` was added
+    here), the daily-bootstrap step alone can trigger hundreds of
+    serialized `GetQuotes` calls (see `core/rate_limiter.py`'s own
+    docstring) — confirmed live: nginx's `proxy_read_timeout` (already
+    raised once, to 90s) still wasn't enough, producing a real 504 to the
+    browser twice in one day even though the backend itself completed
+    successfully every time. Backgrounding this means the browser gets a
+    response in well under a second regardless of how long this takes.
+
+    Uses its own DB session (`session_factory`, real production
+    `session_scope` by default) — never the request-scoped session
+    `oauth_callback` was given, which FastAPI tears down the moment the
+    HTTP response returns, before this thread's work even starts.
+
+    Each step keeps its own try/except, same per-step granularity
+    `oauth_callback` already had for these calls when they were inline —
+    but now load-bearing in a new way: an uncaught exception in a
+    background thread has no request left to fail loudly, so every step
+    must guard itself explicitly rather than relying on "the request will
+    500 if this fails" the way the old synchronous code implicitly could
+    for `sync_instrument_master`/`_seed_option_anchors`.
+    """
+    try:
+        with session_factory() as db:
+            sync_instrument_master(db, adapter, ["NFO"])
+            _seed_option_anchors(db, adapter)
+            db.commit()
+    except Exception:
+        logger.exception(
+            "post-login background instrument-master sync / option-anchor seed failed "
+            "-- continuing with market-data reset and daily bootstrap regardless"
+        )
+
+    if market_data_provider == "shoonya":
+        from app.modules.market_data.registry import reset_for_reconnect
+
+        try:
+            reset_for_reconnect()
+        except Exception:
+            logger.exception("post-login background reset_for_reconnect failed")
+    else:
+        from app.modules.market_data.provider_composition import reset_shoonya_backup_leg
+
+        try:
+            reset_shoonya_backup_leg()
+        except Exception:
+            logger.exception("post-login background reset_shoonya_backup_leg failed")
+
+    from app.modules.session.bootstrapper import run_daily_bootstrap
+
+    try:
+        run_daily_bootstrap()
+    except Exception:
+        logger.exception(
+            "post-login background run_daily_bootstrap failed -- any strategy that "
+            "previously failed to auto-spawn will retry at the next 09:00 IST cycle "
+            "or app login instead"
+        )
+
+
+def _spawn_post_login_background_work(adapter: BrokerPort, *, market_data_provider: str) -> None:
+    """Non-blocking: if a previous reconnect's background work is still
+    running, logs and skips spawning a duplicate rather than racing two
+    concurrent `sync_instrument_master`/`run_daily_bootstrap` passes against
+    each other (the in-flight pass already covers essentially the same
+    work — the next login, or tomorrow's 09:00 IST scheduler tick,
+    reconciles anything this one would have refreshed). Split out from
+    `_run_post_login_background_work` so tests can monkeypatch just this
+    one call to run synchronously instead of a real thread firing under
+    pytest — same precedent `system_settings._schedule_restart` already
+    established for this exact "kick off background work from a request
+    handler" shape in this codebase.
+    """
+    if not _post_login_background_lock.acquire(blocking=False):
+        logger.warning(
+            "shoonya.oauth_callback: post-login background work already in progress "
+            "from a previous reconnect -- skipping a duplicate run"
+        )
+        return
+
+    def _run() -> None:
+        try:
+            _run_post_login_background_work(adapter, market_data_provider=market_data_provider)
+        finally:
+            _post_login_background_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @router.get("/status")
@@ -418,78 +524,6 @@ def oauth_callback(
     except Exception:
         logger.exception("shoonya.product_capabilities: UserDetails diagnostic failed")
 
-    # Live-found bug: `composition.py`'s own docstring claims "once Phase 5's
-    # real Shoonya adapter is configured, that adapter syncs its own
-    # instrument master from the exchange" — it never actually did.
-    # `_sync_mock_instrument_universe` (app.main's startup hook) only runs
-    # once, at process startup, and only against the mock adapter (Shoonya
-    # isn't connected yet at that point — login is a live, later, in-browser
-    # action). With nothing re-syncing after a real login, `instruments`/
-    # `option_contracts` stayed permanently stuck on the mock adapter's
-    # synthetic seed data (a fixed "nearest Thursday" expiry, identical for
-    # every underlying) — which is exactly what the frontend's expiry picker
-    # was showing, and exactly why every real start_strategy call was
-    # requesting an expiry that doesn't actually exist. Syncing here, right
-    # after a real login, is what actually makes real expiries reach the
-    # picker. `sync_instrument_master` never raises (failures are recorded
-    # in its own log row, not thrown) — safe to call unconditionally.
-    sync_instrument_master(db, adapter, ["NFO"])
-    _seed_option_anchors(db, adapter)
-
-    # 2026-08-12: when Shoonya is the configured market-data provider (not
-    # just execution), a fresh reconnect must also force market_data.
-    # registry's ingestion to rebuild against this new adapter — see
-    # reset_for_reconnect's own docstring for why: the market-data provider
-    # singleton is resolved once, at process startup, always against the
-    # startup-default mock (a real Shoonya session is process-memory-only
-    # and can't exist yet at that point) — without this, ingestion would
-    # silently keep quoting mock data forever under a real-looking
-    # MARKET_DATA_PROVIDER=shoonya configuration. Gated to shoonya only —
-    # Angel One/TrueData don't share this broker-reconnect coupling.
-    #
-    # 2026-08-12 QC finding, fixed: unlike sync_instrument_master/
-    # _seed_option_anchors above (both already exception-safe by
-    # construction), reset_for_reconnect makes a real WS subscribe call
-    # that can genuinely raise (a transient network hiccup, say) — left
-    # unguarded, that would 500 this entire request even though
-    # authentication and instrument sync both already succeeded, showing
-    # the user a failed-looking reconnect for a login that actually
-    # worked. A resubscribe hiccup here is real but recoverable (the next
-    # ensure_ingestion_running call, or the next reconnect, retries it) —
-    # log it and still return the success page, don't mask a real login.
-    if get_settings().market_data.provider == "shoonya":
-        from app.modules.market_data.registry import reset_for_reconnect
-
-        try:
-            reset_for_reconnect()
-        except Exception:
-            logger.exception(
-                "reset_for_reconnect failed after a successful Shoonya login — "
-                "market-data ingestion may still be on the previous provider"
-            )
-    else:
-        # 2026-08-20: the mirror-image gap found the same night as the
-        # missed-fill incident above -- when Shoonya is only the *backup*
-        # leg of a TrueData/Angel One-primary failover (today's actual
-        # config), reset_for_reconnect's own "== shoonya" gate never fires
-        # at all, leaving the backup's BrokerPortMarketDataAdapter pointed
-        # at a stale (often mock) broker reference forever. See
-        # reset_shoonya_backup_leg's own docstring for the full mechanism
-        # and why it's deliberately narrower than reset_for_reconnect
-        # (never touches a healthy primary connection). Exception-safe for
-        # the same reason as reset_for_reconnect above -- a resubscribe
-        # hiccup here is real but recoverable, not worth 500ing a login
-        # that otherwise succeeded.
-        from app.modules.market_data.provider_composition import reset_shoonya_backup_leg
-
-        try:
-            reset_shoonya_backup_leg()
-        except Exception:
-            logger.exception(
-                "reset_shoonya_backup_leg failed after a successful Shoonya login — "
-                "the failover backup leg may still reference the previous broker instance"
-            )
-
     record_event(
         db,
         workspace_id=user.workspace_id,
@@ -503,35 +537,19 @@ def oauth_callback(
     )
     db.commit()
 
-    # 2026-08-25: closes a real, previously-recorded gap (see CLAUDE.md's
-    # "TrueData archived..." entry) -- a real Shoonya connect is exactly the
-    # moment `auto_spawner`'s earlier NO_EXPIRY/BROKER_ERROR skips (see that
-    # module's own docstring) become fixable, since `sync_instrument_master`
-    # just above and `set_broker(adapter)` earlier in this function are
-    # precisely what those two skip reasons were waiting on. Before this,
-    # nothing re-attempted a failed spawn until the next 09:00 IST scheduler
-    # tick or the next app login (`sessions.bootstrap_now`) -- neither of
-    # which is guaranteed to land soon after a same-morning reconnect.
-    # `spawn_enabled_strategies`/`_has_run_today` are already idempotent per
-    # strategy-config-per-day (the same property `bootstrap_now` itself
-    # already relies on to be callable on every login), so re-running the
-    # whole daily bootstrap sweep here is cheap and safe -- a no-op for
-    # anything already spawned, a real retry for anything that wasn't.
-    # Local import (same circular-import reason `bootstrap_now`'s own
-    # docstring documents -- `session.bootstrapper` imports `app.main` at
-    # module level) + exception-safe, same discipline as
-    # `reset_for_reconnect`/`reset_shoonya_backup_leg` above: a retry
-    # failing here must never turn a successful login into a failed-looking
-    # one.
-    from app.modules.session.bootstrapper import run_daily_bootstrap
+    # 2026-08-26: the rest of this function -- instrument-master sync,
+    # option-anchor seeding, market-data registry reset, and the
+    # auto-spawn-retry daily bootstrap (see `_run_post_login_background_
+    # work`'s own docstring for the full history and why this moved off
+    # the request path) -- now runs in a background thread instead of
+    # inline, so the browser gets this response back immediately instead
+    # of risking an nginx 504 on a slow reconnect.
+    _spawn_post_login_background_work(
+        adapter, market_data_provider=get_settings().market_data.provider
+    )
 
-    try:
-        run_daily_bootstrap()
-    except Exception:
-        logger.exception(
-            "run_daily_bootstrap failed after a successful Shoonya login -- any "
-            "strategy that previously failed to auto-spawn will retry at the next "
-            "09:00 IST cycle or app login instead"
-        )
-
-    return "<h1>Shoonya connected</h1><p>You can close this tab and return to the app.</p>"
+    return (
+        "<h1>Shoonya connected</h1>"
+        "<p>You can close this tab and return to the app. Finishing option-data sync "
+        "and today's strategy setup in the background — this can take a minute.</p>"
+    )
