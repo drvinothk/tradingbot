@@ -583,7 +583,23 @@ def evaluate_trade_intent(
         ):
             reasons.append("consecutive_loss_pause_active")
 
-        if trade_intent.qty_lots > risk_config.per_trade_lot_cap:
+        # 2026-08-26: gated on is_strategy_routed_live, same as
+        # max_trades_per_day/consecutive_loss_pause_active above -- was
+        # unconditional, which meant every FORCE_PAPER strategy's new
+        # mode-aware default of 10 lots (`api.v1.strategies
+        # ._DEFAULT_QTY_LOTS_PAPER`, added 2026-08-24 specifically so paper
+        # strategies could run at a larger size than live's 1-lot default)
+        # was rejected outright against this cap's live-safety value of 1
+        # -- confirmed live: 100% of paper trade_intents across all 5
+        # running strategies on 2026-08-26 were risk_rejected for this
+        # exact reason, with zero trades ever reaching a paper position.
+        # The mode-aware default's own comment already says paper is
+        # "risk-service-exempt" for this cap; this was the missing half of
+        # that design.
+        if (
+            is_strategy_routed_live(trading_session, strategy_run)
+            and trade_intent.qty_lots > risk_config.per_trade_lot_cap
+        ):
             reasons.append("per_trade_lot_cap_exceeded")
 
         # Safe against every current test/live-paper path, not just

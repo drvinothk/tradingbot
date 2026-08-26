@@ -920,9 +920,24 @@ def test_consecutive_loss_pause_does_not_block_a_paper_routed_strategy(
 
 
 def test_evaluate_trade_intent_per_trade_lot_cap_exceeded(
-    db: Session, trading_session, strategy_run, option_contract
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
 ):
-    # RiskDefaults.per_trade_lot_cap is 1.
+    """2026-08-26: gated on is_strategy_routed_live -- see this check's own
+    comment in evaluate_trade_intent. Needs a genuinely live-routed
+    strategy, same setup as the other rescoped checks in this file.
+    RiskDefaults.per_trade_lot_cap is 1.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
     trade_intent = _make_trade_intent(
         db, trading_session, strategy_run, option_contract, qty_lots=2
     )
@@ -930,6 +945,34 @@ def test_evaluate_trade_intent_per_trade_lot_cap_exceeded(
 
     assert decision.decision == "rejected"
     assert "per_trade_lot_cap_exceeded" in decision.reasons
+
+
+def test_per_trade_lot_cap_does_not_block_a_paper_routed_strategy(
+    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
+    option_contract, monkeypatch,
+):
+    """The bug this gate fixes: a FORCE_PAPER strategy's mode-aware default
+    of 10 lots (`api.v1.strategies._DEFAULT_QTY_LOTS_PAPER`) must not be
+    rejected against the live-safety `per_trade_lot_cap` of 1 -- confirmed
+    live on 2026-08-26, every paper trade_intent across 5 running
+    strategies was risk_rejected for this exact reason before this fix.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.runtime_mode = "force_paper"
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: MockBrokerAdapter(),
+    )
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10
+    )
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "per_trade_lot_cap_exceeded" not in decision.reasons
 
 
 def test_evaluate_trade_intent_budget_exceeded(
