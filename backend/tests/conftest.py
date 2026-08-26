@@ -166,6 +166,27 @@ def _force_no_real_money_dispatch(monkeypatch) -> None:
     monkeypatch.setattr(get_settings().app, "allow_real_money_dispatch", False)
 
 
+@pytest.fixture(autouse=True)
+def _force_no_telegram_dispatch(monkeypatch) -> None:
+    """Forces `Settings.telegram.bot_token`/`chat_id` empty for every test,
+    unconditionally -- same rationale and pattern as
+    `_force_no_real_money_dispatch` above. Without this, any test that
+    exercises `alerting.manager.send_alert` (e.g. `test_runner_watchdog.py`,
+    `test_health_check_scheduler.py`) sends a real Telegram message to
+    whatever `config/credentials/telegram.env` is configured locally --
+    found 2026-08-26 after a batch of local test runs leaked real CRITICAL
+    alerts (stalled-feed, disk-failure) to the production chat. `_send_
+    telegram` already no-ops cleanly on empty credentials, so this is pure
+    test isolation with no production behavior change.
+    """
+    from pydantic import SecretStr
+
+    from app.config.settings import get_settings
+
+    monkeypatch.setattr(get_settings().telegram, "bot_token", SecretStr(""))
+    monkeypatch.setattr(get_settings().telegram, "chat_id", "")
+
+
 @pytest.fixture
 def workspace(db: Session) -> Workspace:
     ws = Workspace(id=uuid.uuid4(), name=f"test-{uuid.uuid4().hex[:8]}")
