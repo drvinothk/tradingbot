@@ -606,6 +606,96 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-26: Live deployment migrated from OCI E2 (`68.233.110.76`, ~1GB
+  RAM) to OCI A1.Flex ARM (`144.24.137.112`, 6GB RAM, Always Free) —
+  DONE, LIVE-VERIFIED, real bug found+fixed mid-migration.** A genuine
+  capacity upgrade (~1GB → 6GB RAM), not lateral. New box:
+  `144-24-137-112.sslip.io`, Ubuntu 24.04 aarch64, same stack versions as
+  the old box (Python 3.12.3, Postgres 16.15, nginx 1.24.0) — SSH key
+  unchanged (`ssh-key-2026-08-03...`), see
+  [[reference_oci_ssh_access]] for the current access details (updated
+  same day). All 17 backend deps resolved to prebuilt aarch64 wheels, zero
+  source builds, confirmed live by importing every C-extension dependency
+  after a real `pip install -e .` on the box.
+
+  **Migration mechanics**: DB via `pg_dump`/`pg_restore` (45 tables, 218
+  positions, 18 sessions — verified identical row-for-row on both sides
+  post-restore, already at Alembic head 0027, no migration needed); app
+  code via a tarball over SSH (old box has no `git`, deploys are always
+  tarball-based — this was already known, not new); credentials
+  (`shoonya.env`, `alice_blue.env`, `telegram.env`, `angel_one.env`
+  archived, `truedata.env` archived, both `.session_cache.json` files)
+  copied byte-for-byte, never printed to any terminal/log in the process.
+
+  **Real bug found and fixed mid-migration**: the frontend `dist/` first
+  copied over was stale (`~/trading-bot/frontend/dist`, dated 2026-08-03)
+  — the actually-live UI lives at `/var/www/trading-bot/dist` on the old
+  box (rebuilt/deployed there directly, a separate path from the repo
+  copy — this exact trap was already flagged in this file's own
+  2026-08-05 dark-mode-dropdown entry, "worth remembering next frontend
+  deploy," and it recurred here anyway). Caught because the user noticed
+  the new URL was missing recent UI features (the Alice Blue connect
+  button included). Fixed by tarring the real `/var/www/trading-bot/dist`
+  from the old box and redeploying that instead; old (stale) dist kept as
+  a timestamped `.bak` on the new box, not deleted.
+
+  **Real safety bug found and fixed via QC pass, before any live-money
+  exposure**: both boxes' `trading-bot.service` were briefly active
+  *simultaneously* against the same live Shoonya session, each with its
+  own separate, uncoordinated Postgres advisory locks (`LOCK_EXECUTION_
+  SINGLETON` etc. no longer span two independent databases) — precisely
+  the dual-execution-authority failure mode this codebase's locking layer
+  exists to prevent (see this file's own "Idempotency and single-writer
+  discipline" convention note above). Mode was `paper_only` throughout so
+  there was no real live-order risk, but the gap was real. Fixed by
+  stopping and disabling `trading-bot.service` on the old box (confirmed
+  via user go-ahead first) — VM, DB, and nginx left running for rollback,
+  only the app process stopped.
+
+  **Also found and fixed**: the new box's default OCI image only allowed
+  inbound tcp/22 in its own local `iptables` (separate from the OCI
+  Security List, which already had 80/443 open) — added and persisted
+  rules for 80/443, which is what let Certbot's HTTP-01 challenge succeed.
+  Added a 1GB swapfile (`/etc/fstab`-persisted) matching the old box's own
+  precedent, even though headroom is now much larger.
+
+  **Broker credential updates, all live-verified with real evidence, not
+  assumed**: Shoonya's `SHOONYA_REDIRECT_URL` and `SHOONYA_PRIMARY_IP`
+  updated to the new host/IP in `shoonya.env`, then a real fresh OAuth
+  login completed via the UI (`GET /shoonya/callback?code=... → 200 OK`);
+  Alice Blue got a brand-new App Code/API Secret (`ALICEBLUE_APP_CODE`/
+  `ALICEBLUE_API_SECRET` in `alice_blue.env`, redirect URL already
+  pointing at the new host) after the user recreated the app in Alice
+  Blue's own portal, then a real fresh OAuth login completed via the UI
+  (`GET /aliceblue/callback?authCode=...&userId=288866&appcode=... → 200
+  OK`) — both confirmed via `/shoonya/status`/`/aliceblue/status`
+  returning 200 from the user's own logged-in session afterward. Angel
+  One was **re-tested from the new box and is still blocked** — DNS
+  resolves fine, but a raw TCP connect to `apiconnect.angelone.in:443`
+  times out (packets never reach the server), while `api.shoonya.com`
+  from the same box responds in 61ms — real evidence this is a broader
+  OCI-datacenter IP-range block on Angel One's side, not specific to the
+  old box's IP, so a future OCI IP change likely wouldn't fix it either.
+  Stays archived exactly as before (see the 2026-08-21 Angel One archiving
+  entry below); its own portal redirect-URL field was updated by the user
+  to a placeholder (Angel's portal rejected the sslip.io value) since this
+  codebase's Angel One integration doesn't use an OAuth redirect at all
+  (`loginByPassword` + server-generated TOTP, no callback route exists).
+
+  **Local-machine changes**: desktop shortcut (`Trading Bot.url`, OneDrive
+  Desktop) repointed to the new host. Mobile home-screen icon needs no new
+  code — the app already ships a working PWA manifest
+  (`manifest.webmanifest`, `standalone` display, both icon sizes
+  confirmed loading) — "Add to Home Screen" in Chrome/Safari is enough.
+
+  **Old box (`68.233.110.76`) is still up, app service stopped/disabled,
+  kept only for rollback** — decommission only when explicitly asked, not
+  automatically. **Not yet re-verified**: real WS tick streaming for
+  either broker on the new box — migration happened after market close,
+  so `MarketHoursGatedProvider` had already gated ingestion off by the
+  time both logins completed; needs a real market-hours check (the app's
+  own "WS Quality Test" button) next trading day.
+
 - **2026-08-25: Telegram alert notifications — real bot connected, gating
   rebuilt from scratch based on explicit user classification, LIVE-VERIFIED
   locally, DEPLOYED to OCI 2026-08-25** (`telegram.env` created on the box,
