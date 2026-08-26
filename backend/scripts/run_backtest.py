@@ -53,17 +53,31 @@ Known, deliberate approximations/limitations (also called out at the end of
 the printed report — do not treat this backtest's numbers as more precise
 than they are):
 
-- **No structure-break or spread-blowout exits are modeled** (steps 3 and 4
-  of `evaluate_open_position`). A real run would exit some trades earlier
-  (or at a different price) than this reconstruction shows — PnL here reads
-  more optimistic than a real run's would.
-- **Close-only pricing, not intrabar high/low.** Every stop/target/trail
-  check below compares each subsequent option bar's `close` against the
-  relevant level — a real position could be stopped/targeted intrabar on a
-  wick this never sees. Both this and the point above carry forward the
-  exact same caveats the deleted prior harness's own docstring already
-  flagged, per the task's own instruction to preserve them rather than
-  silently claim they're solved.
+- **`legacy`/`near_only`/`far_only`/`no_target_only`/`split_30_30_40`/
+  `target_mult` still don't model structure-break/spread-blowout exits and
+  still use close-only pricing** (`_reconstruct_exit`/`_reconstruct_exit_
+  legs`, deliberately untouched — see `legacy`'s own promise below). Use
+  `--exit-mode current` for the faithful reconstruction; these other modes
+  exist specifically as deliberate what-if *target*-mechanism substitutions
+  (near/far pivot targets, no target, a split, a scaled target) layered on
+  top of `legacy`'s own baseline mechanics, not faithful simulations in
+  their own right — their PnL reads more optimistic than a real run's
+  would, for exactly the reasons below.
+- **`current` (2026-08-27, default) models all 5 real steps of
+  `evaluate_open_position`** — stop, target, structure-break,
+  spread-blowout, trail, in that exact production order — using each bar's
+  high/low, not just its close (`_reconstruct_exit_current`). Two genuine,
+  permanent limitations remain even here, since no historical source (this
+  script's own or any other) offers finer than 1-min OHLCV bars: (1) every
+  strategy's real `structure_break_persistence_seconds` default (6.0s) is
+  always exceeded by a single 1-min bar, so the persistence timer collapses
+  to "survives to the next completed bar" rather than production's real
+  "survives ~2 live 3s poll cycles"; (2) same-bar ties (a bar's range
+  satisfying more than one condition at once — impossible on a live tick,
+  common at 1-min resolution) are resolved via production's own fixed
+  check order (stop → target → structure-break → spread-blowout → trail),
+  the conservative/loss-first reading, confirmed with the user rather than
+  silently chosen.
 - **VWAP is computed from bar close+volume, one sample per completed bar**,
   not true tick-level cumulative VWAP. `IndicatorEngine.on_completed_bar`
   (the method this script uses for EMA9/EMA20, since historical rows are
@@ -103,13 +117,22 @@ than they are):
   unmodified — production ranking code itself is untouched, only this
   script's own data fabrication changed. A real spread/real order book
   would change which strike gets picked some of the time; this is a
-  best-effort stand-in, not a claim of precision.
-- `Instrument.lot_size`/`tick_size` (`UNDERLYING_META` below) reuse the same
-  illustrative test values `domain.market.mock_universe._UNDERLYINGS`
-  already uses (NIFTY 25, BANKNIFTY 15) — not independently re-verified
-  against a current NSE circular (see that module's own docstring for why:
-  "real NSE F&O ... quantities are periodically revised, never a fact to
-  hardcode"). `RiskLimitConfig`/`TradingSession`
+  best-effort stand-in, not a claim of precision. `--exit-mode current`'s
+  spread-blowout check (`_spread_pct_at`) reuses this exact same formula at
+  exit-walk timestamps too (2026-08-27) — a **permanent** ceiling, not a
+  temporary gap: no historical source available to this script (TrueData
+  archive, Shoonya TPSeries, Alice Blue) carries real bid/ask/depth at any
+  granularity. The only way to ever close this for real is a forward-only
+  live-tick/quote capture pipeline (recording from today onward — doesn't
+  help re-simulate any already-past day) — scoped as a distinct future
+  effort, not part of this script.
+- `Instrument.lot_size`/`tick_size` (`UNDERLYING_META` below) are real,
+  user-confirmed values (2026-08-27: NIFTY 65, BANKNIFTY 30 — replacing the
+  old illustrative `domain.market.mock_universe._UNDERLYINGS` test values,
+  which were off by ~2.6x for NIFTY). BANKNIFTY has never been traded live
+  by this system — backtest-only, no production `Instrument` row exists to
+  cross-check against — so its figure rests on the user's own confirmation,
+  not an independent re-derivation. `RiskLimitConfig`/`TradingSession`
   budget/loss-cap/profit-target values are set deliberately generous so the
   backtest exercises real risk checks (tick-size alignment, price-drift,
   same-strike locking, margin) without being gated by arbitrary limits.
@@ -136,6 +159,68 @@ than they are):
   forcing `ensure_fresh_option_chain` to always see "no snapshot" (DEAD) and
   fetch a new one from `HistoricalBrokerAdapter` at the current simulated
   time — not a threshold hack, an explicit, deterministic reset.
+
+Known pitfalls when doing a TARGETED rerun of only specific days from a
+prior baseline (2026-08-26, `--dates`/`--pairs` below) -- three real,
+non-obvious problems hit building this, each costing real wall-clock time
+to diagnose because they only surface partway through a long run, not at
+startup:
+
+- **A day can genuinely fall inside more than one expiry directory's data
+  range.** Real weekly-option contracts get listed weeks before their own
+  expiry, so `_expiry_data_range()`'s true min/max for one expiry directory
+  routinely reaches back 1-3 *other* expiry cycles' worth of calendar days.
+  A naive "find the nearest expiry directory by name" guess for a given day
+  (no data-range check) can pick a directory that is empty or simply
+  doesn't cover that day at all — confirmed live: the nearest-by-name
+  directory to 2025-08-19 was 2025-08-26, which had zero files, while the
+  real data for that day lived in the 2025-09-02 directory (it starts
+  2025-08-19, two weeks before its own expiry). `--dates` fixes this by
+  reusing `--all-expiries`'s own already-correct range-checked iteration as
+  a filter, never guessing.
+- **That same overlap means an isolated single-day replay can "find" trades
+  the original full sweep never actually recorded.** The original
+  `--all-expiries` sweep keeps ONE continuous database/StrategyRun per
+  expiry directory across that directory's *entire* multi-day range, and
+  since a dispatched trade's `Position` never actually closes during replay
+  (exits are reconstructed offline, afterward — see "No cross-trade P&L
+  feedback" above), an earlier day's still-technically-open position can
+  risk-reject (same-strike lock, concurrency) a later, overlapping day's
+  signal *within that same continuous run*. Replaying each target day in
+  total isolation (a fresh, empty database per day) removes that blocking
+  state entirely, so a day covered by 3-4 overlapping expiry directories
+  can independently "succeed" in every one of them, producing 2-3x more
+  candidate trades than the original baseline ever recorded for that day.
+  Confirmed live: 2025-09-23 and 2025-09-30 each produced 3 candidate
+  trades in isolation vs. the 1 the original baseline actually recorded for
+  each. Don't treat an isolated targeted rerun's own trade *count* as
+  ground truth for which trades were real -- it isn't.
+- **Seeding the same real expiry's option contracts twice in one process
+  collides on real, global uniqueness constraints**
+  (`uq_instrument_symbol_exchange`, `uq_option_contract_symbol` — the
+  latter is on the actual broker symbol string, e.g.
+  "NIFTY25093024350CE", which is NOT scoped to this script's own
+  per-expiry `Instrument` isolation trick). This *will* happen the moment
+  more than one requested day/pair maps to the same expiry directory
+  within a single process (the norm once the overlap above is accounted
+  for) unless the database is reset between calls — `--dates`/`--pairs`
+  both call `Base.metadata.drop_all`/`create_all` before every single-day
+  `_run_single_backtest` call for exactly this reason. Cheap per call (one
+  day's worth of data), but real DDL overhead multiplies fast if a naive
+  `--dates` filter processes every overlapping directory per day instead
+  of the one that's actually real.
+
+**The fix that sidesteps all three at once, when the exact answer is
+already known**: a real option-contract symbol encodes its own real expiry
+date (e.g. "NIFTY25093024350CE" -> 2025-09-30) — parsing that directly out
+of a prior baseline CSV's own rows gives the EXACT (day, expiry) pair each
+real trade actually came from, with zero ambiguity and zero redundant
+overlap. `--pairs 'YYYY-MM-DD:YYYY-MM-DD,...'` takes that directly (day and
+expiry directory both named explicitly, no scan, no guessing, no
+post-filtering needed) — strictly preferred over `--dates` whenever a
+baseline CSV to parse pairs from already exists; `--dates` is the fallback
+for when it doesn't (e.g. targeting days that never had a prior baseline
+run at all) and must therefore accept the overlap cost above.
 """
 
 from __future__ import annotations
@@ -156,10 +241,11 @@ from typing import NamedTuple, NoReturn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from backtest_pivots import PivotLevels, compute_floor_pivots, prior_day_ohlc  # noqa: E402
 from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
 
-from app.api.v1.strategies import _build_strategy  # noqa: E402
+from app.api.v1.strategies import _DEFAULT_QTY_LOTS_PAPER, _build_strategy  # noqa: E402
 from app.config.settings import get_settings  # noqa: E402
 from app.core.clock import IST, to_ist  # noqa: E402
 from app.core.db.base import Base  # noqa: E402
@@ -174,6 +260,7 @@ from app.domain import (  # noqa: E402,F401 - registers every domain model on Ba
     session,
     strategy,
 )
+from app.domain.execution.models import ExitReason  # noqa: E402
 from app.domain.identity.models import (  # noqa: E402
     BrokerAccount,
     BrokerAccountStatus,
@@ -230,6 +317,7 @@ from app.modules.broker_adapter.base.contracts import (
 )
 from app.modules.broker_adapter.composition import reset_for_tests, set_broker  # noqa: E402
 from app.modules.execution_engine.paper.service import (  # noqa: E402
+    SPREAD_BLOWOUT_PCT,
     TRAIL_ACTIVATION_FRACTION,
     TRAIL_LOCK_FRACTION,
 )
@@ -255,12 +343,17 @@ _runner_module.is_within_market_hours = lambda: False
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "historical"
 
-# Same "test value, not a verified current NSE-published figure" convention
-# `mock_universe._UNDERLYINGS` already uses — kept identical to that module's
-# values for internal consistency, not independently re-derived here.
+# Real, user-confirmed lot sizes (2026-08-27 fidelity fix — replacing the
+# old `mock_universe._UNDERLYINGS` illustrative test values, which were off
+# by ~2.6x for NIFTY). NIFTY's 65 is independently corroborated in-repo by
+# the real Shoonya scrip-master parse (see `tests/unit/test_shoonya_scrip_
+# master.py`). BANKNIFTY's 30 has no production `Instrument` row to
+# cross-check against — it's never been traded live, backtest-only — so the
+# user's own figure is the ground truth here, not something this script
+# re-derives.
 UNDERLYING_META: dict[str, tuple[int, float]] = {  # (lot_size, tick_size)
-    "NIFTY": (25, 0.05),
-    "BANKNIFTY": (15, 0.05),
+    "NIFTY": (65, 0.05),
+    "BANKNIFTY": (30, 0.05),
 }
 
 # Matches TradingSession.cutoff_time's own real default (see
@@ -285,6 +378,34 @@ STRATEGY_TYPES = (
 MIN_SYNTHETIC_SPREAD_PCT = 0.0015  # tightest spread, most-liquid strike
 MAX_SYNTHETIC_SPREAD_PCT = 0.025  # widest spread, least-liquid strike
 MAX_SYNTHETIC_DEPTH_QTY = 2000  # depth_score saturates at 1000 (see engine.py)
+
+
+def _liquidity_score(
+    oi: int, volume: int, oi_lo: int, oi_hi: int, vol_lo: int, vol_hi: int
+) -> float:
+    """OI/volume-derived liquidity proxy, 0..1, min-max normalized across
+    whatever cross-section the caller supplies (a single chain-snapshot
+    cycle's live contracts for `HistoricalBrokerAdapter.get_option_chain`;
+    every contract with a bar at-or-before a given exit-walk timestamp for
+    `_spread_pct_at`) — same convention `strike_ranking.engine._normalize`
+    already uses. Module-level (2026-08-27, extracted out of
+    `get_option_chain`'s own closure) so both the entry-side chain and the
+    exit-side spread-blowout check (`--exit-mode current`) share one
+    formula, not two independently-maintained copies.
+    """
+    oi_n = 1.0 if oi_hi == oi_lo else (oi - oi_lo) / (oi_hi - oi_lo)
+    vol_n = 1.0 if vol_hi == vol_lo else (volume - vol_lo) / (vol_hi - vol_lo)
+    return 0.5 * oi_n + 0.5 * vol_n
+
+
+def _synthetic_spread_pct(liquidity: float) -> float:
+    """`liquidity` (0..1, from `_liquidity_score`) -> a synthetic spread_pct
+    interpolated between `MAX_SYNTHETIC_SPREAD_PCT` (illiquid) and
+    `MIN_SYNTHETIC_SPREAD_PCT` (liquid) — see module docstring's synthetic
+    bid/ask/depth section for why this proxy exists at all (no historical
+    source here carries real bid/ask/depth)."""
+    spread_range = MAX_SYNTHETIC_SPREAD_PCT - MIN_SYNTHETIC_SPREAD_PCT
+    return MAX_SYNTHETIC_SPREAD_PCT - liquidity * spread_range
 
 
 class Bar(NamedTuple):
@@ -483,21 +604,13 @@ class HistoricalBrokerAdapter(BrokerPort):
         oi_lo, oi_hi = (min(ois), max(ois)) if ois else (0, 0)
         vol_lo, vol_hi = (min(volumes), max(volumes)) if volumes else (0, 0)
 
-        def _liquidity_score(oi: int, volume: int) -> float:
-            oi_n = 1.0 if oi_hi == oi_lo else (oi - oi_lo) / (oi_hi - oi_lo)
-            vol_n = 1.0 if vol_hi == vol_lo else (volume - vol_lo) / (vol_hi - vol_lo)
-            return 0.5 * oi_n + 0.5 * vol_n
-
         entries: list[OptionChainEntry] = []
         depth_by_symbol: dict[str, int] = {}
         total_ce_oi = 0
         total_pe_oi = 0
         for symbol, strike, option_type, bar in raw:
-            liquidity = _liquidity_score(bar.oi, bar.volume)
-            spread_pct = (
-                MAX_SYNTHETIC_SPREAD_PCT
-                - liquidity * (MAX_SYNTHETIC_SPREAD_PCT - MIN_SYNTHETIC_SPREAD_PCT)
-            )
+            liquidity = _liquidity_score(bar.oi, bar.volume, oi_lo, oi_hi, vol_lo, vol_hi)
+            spread_pct = _synthetic_spread_pct(liquidity)
             half_spread = bar.close * spread_pct / 2
             depth_by_symbol[symbol] = round(liquidity * MAX_SYNTHETIC_DEPTH_QTY)
             entries.append(
@@ -994,6 +1107,14 @@ class ReconstructedTrade:
     qty_lots: int
     lot_size: int
     pnl: float | None = field(default=None)
+    # Which exit-mode leg this row belongs to (2026-08-24, see
+    # backtest_pivots.py / --exit-mode) -- "legacy" for every row produced
+    # by the original `_reconstruct_exit` (single fixed-%-target leg, the
+    # only mode that existed before this field was added), or one of
+    # "near_target"/"far_target"/"no_target" for `_reconstruct_exit_legs`
+    # rows. A `split_30_30_40` entry produces up to 3 rows sharing the same
+    # entry_time/entry_price/symbol -- sum their pnl for that entry's total.
+    leg: str = "legacy"
     # Diagnostic-only barometers (2026-08-23, explicit user request): recorded
     # at entry/exit for post-hoc analysis, never fed into any strategy's own
     # entry/exit condition -- see module docstring. None wherever the
@@ -1051,19 +1172,6 @@ def _load_minute_series(path: Path) -> list[tuple[datetime, float]]:
     return series
 
 
-def _load_daily_series(path: Path) -> list[tuple[date, float]]:
-    if not path.is_file():
-        return []
-    import csv as _csv  # noqa: PLC0415
-
-    rows: list[tuple[date, float]] = []
-    with path.open(newline="") as f:
-        for row in _csv.DictReader(f):
-            rows.append((date.fromisoformat(row["timestamp"][:10]), float(row["close"])))
-    rows.sort(key=lambda pair: pair[0])
-    return rows
-
-
 def _lookup_nearest_minute(series: list[tuple[datetime, float]], ts: datetime) -> float | None:
     if not series:
         return None
@@ -1071,30 +1179,28 @@ def _lookup_nearest_minute(series: list[tuple[datetime, float]], ts: datetime) -
     return series[idx][1] if idx >= 0 else None
 
 
-def _lookup_nearest_daily(series: list[tuple[date, float]], on: date) -> float | None:
-    if not series:
-        return None
-    idx = bisect_right([s[0] for s in series], on) - 1
-    return series[idx][1] if idx >= 0 else None
-
-
 class DiagnosticsSource:
-    """VIX (1-min where available, else that day's EOD close) + PCR lookups
-    for the diagnostic-only barometers on `ReconstructedTrade` -- see that
-    class's own docstring. ATR is tracked separately (`ATRTracker`, a
-    sequential stream, not point-lookup) since it needs the full bar
-    history up to a point, not just one value at a timestamp.
+    """VIX + PCR lookups for the diagnostic-only barometers on
+    `ReconstructedTrade` -- see that class's own docstring. ATR is tracked
+    separately (`ATRTracker`, a sequential stream, not point-lookup) since
+    it needs the full bar history up to a point, not just one value at a
+    timestamp.
+
+    VIX source switched 2026-08-24 from TrueData (1-min only for the live
+    ~12-day window, EOD-only beyond that) to Alice Blue
+    (`fetch_alice_blue_underlying_history.py --underlyings INDIA_VIX`,
+    confirmed live: real, gap-free 1-min candles back ~2.6 years) -- real
+    1-min resolution across this whole script's actual backtest window now,
+    so the old EOD fallback tier is gone, not just unused.
     """
 
     def __init__(self, data_dir: Path) -> None:
-        self.vix_minute = _load_minute_series(data_dir / "underlyings" / "INDIA_VIX_1min.csv")
-        self.vix_daily = _load_daily_series(data_dir / "underlyings_eod" / "INDIA_VIX_eod.csv")
+        self.vix_minute = _load_minute_series(
+            data_dir / "underlyings" / "INDIA_VIX_alice_index_1min.csv"
+        )
 
     def vix_at(self, ts: datetime) -> float | None:
-        value = _lookup_nearest_minute(self.vix_minute, ts)
-        if value is not None:
-            return value
-        return _lookup_nearest_daily(self.vix_daily, ts.date())
+        return _lookup_nearest_minute(self.vix_minute, ts)
 
 
 def _pcr_at(
@@ -1136,6 +1242,66 @@ def _contract_oi_at(bars: list[Bar], ts: datetime) -> int | None:
     return bars[idx].oi if idx >= 0 else None
 
 
+def _spread_pct_at(
+    contracts: list[tuple[str, float, ContractOptionType]],
+    option_bars: dict[str, list[Bar]],
+    ts: datetime,
+    symbol: str,
+) -> float | None:
+    """`--exit-mode current`'s exit-time synthetic spread_pct for `symbol`
+    — the exact same OI/volume-derived liquidity proxy
+    `HistoricalBrokerAdapter.get_option_chain` uses at entry time
+    (`_liquidity_score`/`_synthetic_spread_pct`), cross-sectionally
+    normalized across every contract with a bar at-or-before `ts`, mirroring
+    `_pcr_at`'s own pattern exactly. Not a literal replay of a real
+    historical chain-snapshot moment — this backtest only ever snapshotted
+    the chain at real entry-evaluation cycles during the original replay,
+    not at every possible later exit-walk timestamp — but it's the same
+    formula applied consistently, not a second, independently-invented
+    approximation. Returns `None` if `symbol` has no bar at-or-before `ts`.
+    """
+    ois: list[int] = []
+    volumes: list[int] = []
+    target_bar: Bar | None = None
+    for c_symbol, _strike, _option_type in contracts:
+        bars = option_bars.get(c_symbol)
+        if not bars:
+            continue
+        ts_list = [b.ts for b in bars]
+        idx = bisect_right(ts_list, ts) - 1
+        if idx < 0:
+            continue
+        bar = bars[idx]
+        ois.append(bar.oi)
+        volumes.append(bar.volume)
+        if c_symbol == symbol:
+            target_bar = bar
+    if target_bar is None:
+        return None
+    oi_lo, oi_hi = (min(ois), max(ois)) if ois else (0, 0)
+    vol_lo, vol_hi = (min(volumes), max(volumes)) if volumes else (0, 0)
+    liquidity = _liquidity_score(target_bar.oi, target_bar.volume, oi_lo, oi_hi, vol_lo, vol_hi)
+    return _synthetic_spread_pct(liquidity)
+
+
+class _StructureBreakCandidate:
+    """Local, in-memory mirror of production's `StopPlan.structure_break_
+    candidate_since`/`_extreme` columns (`evaluate_open_position` step 3,
+    `execution_engine/paper/service.py`) — scoped to one trade's own
+    forward walk. This backtest's stray real `StopPlan` rows (created by
+    the real `dispatch_trade_intent` every approved intent already goes
+    through) are never read back by any reconstruction function — see
+    module docstring — so mirroring the math locally, not round-tripping
+    through the DB, is the correct and established pattern here (same as
+    how stop/target/trail already work in `_reconstruct_exit`)."""
+
+    __slots__ = ("since", "extreme")
+
+    def __init__(self) -> None:
+        self.since: datetime | None = None
+        self.extreme: float | None = None
+
+
 def _reconstruct_exit(
     trade_intent: TradeIntent,
     symbol: str,
@@ -1147,6 +1313,7 @@ def _reconstruct_exit(
     all_contracts: list[tuple[str, float, ContractOptionType]] | None = None,
     all_option_bars: dict[str, list[Bar]] | None = None,
     atr_series: list[tuple[datetime, float]] | None = None,
+    target_price_override: Decimal | None = None,
 ) -> ReconstructedTrade:
     """Walks `option_bars` forward from `trade_intent`'s (already
     timestamp-corrected) entry point, applying steps 1 (stop), 2 (target),
@@ -1159,11 +1326,24 @@ def _reconstruct_exit(
     bar (mirroring `scheduler.eod_square_off`'s own "unconditional, not
     routed through evaluate_open_position" behavior), not folded into the
     stop/target/trail priority order below it.
+
+    `target_price_override` (2026-08-26, default `None` -- every call site
+    before this date, and every call site today that doesn't pass it, is
+    completely unaffected): substitutes the trade's own fixed-%% target with
+    a caller-supplied one (e.g. `--exit-mode target_mult`'s "same stop, N x
+    the target distance" test) while leaving stop/trail untouched -- trail
+    activation/lock still anchors to this same substituted value, exactly
+    like it already anchors to the real target for the pivot-mode legs in
+    `_reconstruct_exit_legs` below.
     """
     entry_time = trade_intent.created_at
     entry_price = Decimal(str(trade_intent.entry_price))
     stop_price = Decimal(str(trade_intent.stop_price))
-    target_price = Decimal(str(trade_intent.target_price))
+    target_price = (
+        target_price_override
+        if target_price_override is not None
+        else Decimal(str(trade_intent.target_price))
+    )
     side = SignalSide(trade_intent.side)
     favorable = side == SignalSide.BUY
 
@@ -1253,6 +1433,511 @@ def _with_pnl(trade: ReconstructedTrade, side: SignalSide) -> ReconstructedTrade
     return trade
 
 
+def _reconstruct_exit_current(
+    trade_intent: TradeIntent,
+    symbol: str,
+    option_bars: list[Bar],
+    lot_size: int,
+    qty_lots: int,
+    *,
+    underlying_series: list[tuple[datetime, float]],
+    entry_diagnostics: dict[str, float | int | None] | None = None,
+    diagnostics: DiagnosticsSource | None = None,
+    all_contracts: list[tuple[str, float, ContractOptionType]] | None = None,
+    all_option_bars: dict[str, list[Bar]] | None = None,
+    atr_series: list[tuple[datetime, float]] | None = None,
+) -> ReconstructedTrade:
+    """`--exit-mode current` (2026-08-27) — the faithful default, replacing
+    `legacy` as `main()`'s own CLI default while `legacy` itself stays
+    completely untouched (frozen, byte-identical to every pre-2026-08-24
+    run — see `_reconstruct_exit`'s own docstring; this is a deliberately
+    SEPARATE function, not a refactor of it, for exactly the same
+    reproducibility reason `_reconstruct_exit_legs` already gives for its
+    own separateness).
+
+    Implements all 5 real steps of `execution_engine.paper.service
+    .evaluate_open_position` — stop, target, structure-break,
+    spread-blowout, trail, in that exact order — using each bar's high/low,
+    not just its close, since production checks live ticks continuously
+    rather than once a minute. See module docstring's "Known, deliberate
+    approximations" section for what's now modeled vs. what remains a
+    genuine, permanent ceiling of the historical data available (no source
+    offers real bid/ask or sub-minute bars).
+
+    `qty_lots` is an explicit caller-supplied value, not
+    `trade_intent.qty_lots` (which is always the pinned stub `1` regardless
+    of exit-mode — set once at signal-generation time before any exit-mode
+    branching runs, see `strategy_config_stub`'s own comment). The caller
+    passes `app.api.v1.strategies._DEFAULT_QTY_LOTS_PAPER` (today's real
+    paper default), so this mode's PnL is real-scale without any post-hoc
+    rescaling — the same established pattern `_reconstruct_exit_legs`'s own
+    `LegSpec.qty_lots` already uses for the identical reason.
+
+    Same-bar tie-break (confirmed with the user, 2026-08-27 fidelity plan):
+    a single bar's [low, high] range can plausibly satisfy more than one
+    condition at 1-min granularity — a real, common occurrence here even
+    though it's near-impossible on a live tick. Resolved by applying
+    production's own fixed check order (the loop below) and taking the
+    first condition, in that order, whose broadened intrabar test is true —
+    conservative/loss-first, matching both production's own stated
+    defense-in-depth reasoning (`evaluate_open_position`'s own docstring)
+    and this file's established "never read more optimistic than a real
+    run would" philosophy.
+
+    Known, permanent limitations kept honest here rather than glossed over:
+    the structure-break persistence timer (every strategy's real default is
+    6.0s, `common_rules.DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS`)
+    always collapses to "survives to the next completed 1-min bar" at this
+    granularity, not production's real "survives ~2 live 3s poll cycles" —
+    unavoidable at 1-min resolution. Spread-blowout still relies on the
+    same synthetic OI/volume-derived proxy used everywhere else in this
+    script (no historical source — TrueData, Shoonya TPSeries, Alice
+    Blue — offers real bid/ask/depth at any granularity). The trail's
+    same-bar tightening can't distinguish a genuine intra-minute
+    run-up-then-reversal from a last-second spike-then-reversal — both
+    produce identical OHLC.
+    """
+    entry_time = trade_intent.created_at
+    entry_price = Decimal(str(trade_intent.entry_price))
+    stop_price = Decimal(str(trade_intent.stop_price))
+    target_price = Decimal(str(trade_intent.target_price))
+    side = SignalSide(trade_intent.side)
+    favorable = side == SignalSide.BUY
+
+    activation_fraction = (
+        Decimal(str(trade_intent.trail_activation_fraction))
+        if trade_intent.trail_activation_fraction is not None
+        else TRAIL_ACTIVATION_FRACTION
+    )
+    lock_fraction = (
+        Decimal(str(trade_intent.trail_lock_fraction))
+        if trade_intent.trail_lock_fraction is not None
+        else TRAIL_LOCK_FRACTION
+    )
+    activation_distance = abs(target_price - entry_price) * activation_fraction
+    activation_price = (
+        entry_price + activation_distance if favorable else entry_price - activation_distance
+    )
+    trail_stop: Decimal | None = None
+
+    structure_level = (
+        Decimal(str(trade_intent.structure_level))
+        if trade_intent.structure_level is not None
+        else None
+    )
+    structure_buffer = Decimal(str(trade_intent.structure_break_buffer or 0))
+    structure_persistence = float(trade_intent.structure_break_persistence_seconds or 0)
+    candidate = _StructureBreakCandidate()
+
+    entry_diagnostics = entry_diagnostics or {}
+    base = ReconstructedTrade(
+        symbol=symbol,
+        side=side.value,
+        entry_time=entry_time,
+        entry_price=float(entry_price),
+        exit_time=None,
+        exit_price=None,
+        exit_reason="no_further_data",
+        qty_lots=qty_lots,
+        lot_size=lot_size,
+        leg="current",
+        vix_entry=entry_diagnostics.get("vix"),  # type: ignore[arg-type]
+        atr_entry=entry_diagnostics.get("atr"),  # type: ignore[arg-type]
+        pcr_entry=entry_diagnostics.get("pcr"),  # type: ignore[arg-type]
+        contract_oi_entry=entry_diagnostics.get("contract_oi"),  # type: ignore[arg-type]
+    )
+
+    def _exit(ts: datetime, price: Decimal, reason: str) -> ReconstructedTrade:
+        base.exit_time, base.exit_price, base.exit_reason = ts, float(price), str(reason)
+        if diagnostics is not None:
+            base.vix_exit = diagnostics.vix_at(ts)
+        if all_contracts is not None and all_option_bars is not None:
+            base.pcr_exit = _pcr_at(all_contracts, all_option_bars, ts)
+        if atr_series is not None:
+            base.atr_exit = _lookup_nearest_minute(atr_series, ts)
+        base.contract_oi_exit = _contract_oi_at(option_bars, ts)
+        return _with_pnl(base, side)
+
+    for bar in option_bars:
+        if bar.ts < entry_time:
+            continue
+        close = Decimal(str(bar.close))
+        high = Decimal(str(bar.high))
+        low = Decimal(str(bar.low))
+
+        if bar.ts.time() >= EOD_CUTOFF:
+            return _exit(bar.ts, close, ExitReason.EOD_SQUARE_OFF)
+
+        # Step 1: stop — intrabar (was close-only).
+        hit_stop = low <= stop_price if favorable else high >= stop_price
+        if hit_stop:
+            return _exit(bar.ts, stop_price, ExitReason.STOP)
+
+        # Step 2: target — intrabar (was close-only).
+        hit_target = high >= target_price if favorable else low <= target_price
+        if hit_target:
+            return _exit(bar.ts, target_price, ExitReason.TARGET)
+
+        # Step 3: structure-break (not modeled at all before this function).
+        if structure_level is not None:
+            underlying_price = _lookup_nearest_minute(underlying_series, bar.ts)
+            if underlying_price is not None:
+                underlying = Decimal(str(underlying_price))
+                buffered_level = (
+                    structure_level - structure_buffer
+                    if favorable
+                    else structure_level + structure_buffer
+                )
+                breached = (
+                    underlying < buffered_level if favorable else underlying > buffered_level
+                )
+                if breached:
+                    if candidate.since is None:
+                        candidate.since = bar.ts
+                        candidate.extreme = underlying_price
+                    else:
+                        assert candidate.extreme is not None
+                        worse = (
+                            underlying_price < candidate.extreme
+                            if favorable
+                            else underlying_price > candidate.extreme
+                        )
+                        if worse:
+                            candidate.extreme = underlying_price
+                    elapsed = (bar.ts - candidate.since).total_seconds()
+                    if elapsed >= structure_persistence:
+                        # Bar-close confirmation (production's own
+                        # `_structure_break_confirmed_by_bar_close`):
+                        # `underlying_price` above is already the latest
+                        # *completed* underlying bar's own close as of this
+                        # option bar's own evaluation moment (both are on
+                        # the same 1-min grid, and this whole walk already
+                        # treats each bar's close as "current price as of
+                        # that bar" — same convention `_reconstruct_exit`
+                        # and the pivot-leg underlying lookup already use).
+                        # So a breach that reaches this point has, by
+                        # construction, already closed beyond the buffered
+                        # level — no separate query needed. When
+                        # `structure_persistence == 0` (strategy hasn't
+                        # opted in), this reaches here on the very first
+                        # breaching bar, matching production's own instant-
+                        # confirm fallback exactly.
+                        return _exit(bar.ts, close, ExitReason.STRUCTURE_BREAK)
+                elif candidate.since is not None:
+                    candidate.since = None
+                    candidate.extreme = None
+
+        # Step 4: spread-blowout (not modeled at all before this function).
+        if all_contracts is not None and all_option_bars is not None:
+            spread_pct = _spread_pct_at(all_contracts, all_option_bars, bar.ts, symbol)
+            if spread_pct is not None and Decimal(str(spread_pct)) > SPREAD_BLOWOUT_PCT:
+                return _exit(bar.ts, close, ExitReason.SPREAD_BLOWOUT)
+
+        # Step 5: trail — intrabar tightening using this bar's own favorable
+        # extreme, then testing its unfavorable extreme for a same-bar hit.
+        # A per-bar lumped approximation — see this function's own
+        # docstring for the exact limitation.
+        favorable_extreme = high if favorable else low
+        unfavorable_extreme = low if favorable else high
+        activated = (
+            favorable_extreme >= activation_price
+            if favorable
+            else favorable_extreme <= activation_price
+        )
+        if activated:
+            gain_beyond = (
+                (favorable_extreme - activation_price)
+                if favorable
+                else (activation_price - favorable_extreme)
+            )
+            locked_gain = gain_beyond * lock_fraction
+            new_trail_stop = (
+                activation_price + locked_gain if favorable else activation_price - locked_gain
+            )
+            if trail_stop is None or (
+                new_trail_stop > trail_stop if favorable else new_trail_stop < trail_stop
+            ):
+                trail_stop = new_trail_stop
+            hit_trail = (
+                unfavorable_extreme < trail_stop
+                if favorable
+                else unfavorable_extreme > trail_stop
+            )
+            if hit_trail:
+                return _exit(bar.ts, trail_stop, ExitReason.TRAIL)
+
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Pivot-anchored split-leg exit reconstruction (2026-08-24)
+#
+# Generalizes `_reconstruct_exit` above to walk `option_bars` once while
+# evaluating N independently-managed "legs" of the same entry instead of
+# one -- each leg shares the same entry/stop, but can have its own target
+# rule: a classic-floor-pivot level on the *underlying* (near = R1/S1, far
+# = R2/S2 -- see backtest_pivots.py) or no target at all (a pure
+# trail-only runner). See project plan / memory for the full design
+# writeup ("Pivot-level split-leg exits for backtesting").
+#
+# Deliberately a SEPARATE function from `_reconstruct_exit`, not a
+# refactor of it -- `_reconstruct_exit` stays byte-for-byte unchanged so
+# `--exit-mode legacy` (the default) keeps reproducing every baseline CSV
+# already gathered this week, not just "should be equivalent."
+# ---------------------------------------------------------------------------
+
+EXIT_MODES = (
+    "legacy", "current", "near_only", "far_only", "no_target_only", "split_30_30_40",
+    "target_mult",
+)
+
+
+@dataclass
+class LegSpec:
+    label: str  # "near_target" | "far_target" | "no_target"
+    qty_lots: int
+    target_mode: str  # "pivot" | "none"
+    pivot_level: float | None = None  # underlying index level, only for target_mode="pivot"
+
+
+def _resolve_leg_specs(
+    exit_mode: str,
+    total_lots: int,
+    option_type: DomainOptionType,
+    pivots: PivotLevels | None,
+    underlying_spot_at_entry: float | None,
+) -> tuple[list[LegSpec], bool]:
+    """Turns `--exit-mode`/`--total-lots` into concrete `LegSpec`s for one
+    trade intent. Returns `(leg_specs, pivot_direction_up)` -- the latter
+    is shared across every leg of the same entry (CE/bullish wants the
+    underlying to rise toward resistance; PE/bearish wants it to fall
+    toward support), not a per-leg property.
+
+    A pivot level that isn't actually ahead of the underlying's own spot
+    price at entry time (can happen -- pivots are *prior*-day, price can
+    gap past them intraday) silently degrades that one leg to `no_target`
+    for this entry only, rather than exit instantly or crash -- logged once
+    per occurrence so it's visible in the run's own console output without
+    aborting anything.
+    """
+    is_ce = option_type == DomainOptionType.CE
+    pivot_direction_up = is_ce
+
+    def _level(*, near: bool) -> float | None:
+        if pivots is None or underlying_spot_at_entry is None:
+            return None
+        level = (pivots.r1 if near else pivots.r2) if is_ce else (pivots.s1 if near else pivots.s2)
+        ahead = level > underlying_spot_at_entry if is_ce else level < underlying_spot_at_entry
+        return level if ahead else None
+
+    near_level = _level(near=True)
+    far_level = _level(near=False)
+
+    def _leg(label: str, lots: int) -> LegSpec:
+        level = near_level if label == "near_target" else far_level
+        if level is None:
+            print(
+                f"  [pivot-fallback] {label} level not ahead of entry spot "
+                "-- degrading this leg to no_target for this entry"
+            )
+            return LegSpec("no_target", lots, "none")
+        return LegSpec(label, lots, "pivot", pivot_level=level)
+
+    if exit_mode == "near_only":
+        return [_leg("near_target", total_lots)], pivot_direction_up
+    if exit_mode == "far_only":
+        return [_leg("far_target", total_lots)], pivot_direction_up
+    if exit_mode == "no_target_only":
+        return [LegSpec("no_target", total_lots, "none")], pivot_direction_up
+    if exit_mode == "split_30_30_40":
+        near_lots = round(total_lots * 0.3)
+        far_lots = round(total_lots * 0.3)
+        runner_lots = total_lots - near_lots - far_lots
+        specs = [
+            _leg("near_target", near_lots),
+            _leg("far_target", far_lots),
+            LegSpec("no_target", runner_lots, "none"),
+        ]
+        return [s for s in specs if s.qty_lots > 0], pivot_direction_up
+    raise ValueError(f"unknown exit_mode for leg splitting: {exit_mode}")
+
+
+def _reconstruct_exit_legs(
+    trade_intent: TradeIntent,
+    symbol: str,
+    option_bars: list[Bar],
+    lot_size: int,
+    leg_specs: list[LegSpec],
+    *,
+    underlying_series: list[tuple[datetime, float]],
+    pivot_direction_up: bool,
+    entry_diagnostics: dict[str, float | int | None] | None = None,
+    diagnostics: DiagnosticsSource | None = None,
+    all_contracts: list[tuple[str, float, ContractOptionType]] | None = None,
+    all_option_bars: dict[str, list[Bar]] | None = None,
+    atr_series: list[tuple[datetime, float]] | None = None,
+) -> list[ReconstructedTrade]:
+    """Same steps 1 (stop), 2 (target), 5 (trail) priority order as
+    `_reconstruct_exit`, evaluated once per bar for every leg in
+    `leg_specs` instead of a single target/qty. Step 2 differs per leg:
+    `target_mode="pivot"` exits when the *underlying's* price (looked up
+    via `underlying_series`, same `_lookup_nearest_minute` pattern already
+    used for VIX/ATR) crosses `pivot_level` favorably, exiting at the
+    option bar's own current premium (mark-to-market -- there's no
+    reliable index-point-distance -> premium-distance conversion without
+    live delta/greeks data this system doesn't have, so this deliberately
+    mirrors how `structure_level`'s own stop check already works: compare
+    on the underlying, execute at the option's current price).
+    `target_mode="none"` never exits on target at all.
+
+    Trail activation/lock is anchored to `trade_intent.target_price` (the
+    strategy's own original fixed-% target) purely as a distance yardstick
+    for every leg, including pivot-target ones -- unchanged from
+    `_reconstruct_exit`, not each leg's own pivot level, per the same "no
+    reliable premium-distance conversion" reasoning above.
+    """
+    entry_time = trade_intent.created_at
+    entry_price = Decimal(str(trade_intent.entry_price))
+    stop_price = Decimal(str(trade_intent.stop_price))
+    side = SignalSide(trade_intent.side)
+    favorable = side == SignalSide.BUY
+
+    legacy_target = Decimal(str(trade_intent.target_price))
+    activation_fraction = (
+        Decimal(str(trade_intent.trail_activation_fraction))
+        if trade_intent.trail_activation_fraction is not None
+        else TRAIL_ACTIVATION_FRACTION
+    )
+    lock_fraction = (
+        Decimal(str(trade_intent.trail_lock_fraction))
+        if trade_intent.trail_lock_fraction is not None
+        else TRAIL_LOCK_FRACTION
+    )
+    activation_distance = abs(legacy_target - entry_price) * activation_fraction
+    activation_price = (
+        entry_price + activation_distance if favorable else entry_price - activation_distance
+    )
+
+    entry_diagnostics = entry_diagnostics or {}
+
+    class _LegState:
+        __slots__ = ("spec", "trail_stop", "result")
+
+        def __init__(self, spec: LegSpec) -> None:
+            self.spec = spec
+            self.trail_stop: Decimal | None = None
+            self.result: ReconstructedTrade | None = None
+
+    states = [_LegState(spec) for spec in leg_specs]
+
+    def _finalize(state: _LegState, ts: datetime, price: Decimal, reason: str) -> None:
+        trade = ReconstructedTrade(
+            symbol=symbol,
+            side=side.value,
+            entry_time=entry_time,
+            entry_price=float(entry_price),
+            exit_time=ts,
+            exit_price=float(price),
+            exit_reason=reason,
+            qty_lots=state.spec.qty_lots,
+            lot_size=lot_size,
+            leg=state.spec.label,
+            vix_entry=entry_diagnostics.get("vix"),  # type: ignore[arg-type]
+            atr_entry=entry_diagnostics.get("atr"),  # type: ignore[arg-type]
+            pcr_entry=entry_diagnostics.get("pcr"),  # type: ignore[arg-type]
+            contract_oi_entry=entry_diagnostics.get("contract_oi"),  # type: ignore[arg-type]
+        )
+        if diagnostics is not None:
+            trade.vix_exit = diagnostics.vix_at(ts)
+        if all_contracts is not None and all_option_bars is not None:
+            trade.pcr_exit = _pcr_at(all_contracts, all_option_bars, ts)
+        if atr_series is not None:
+            trade.atr_exit = _lookup_nearest_minute(atr_series, ts)
+        trade.contract_oi_exit = _contract_oi_at(option_bars, ts)
+        state.result = _with_pnl(trade, side)
+
+    for bar in option_bars:
+        if bar.ts < entry_time:
+            continue
+        if all(s.result is not None for s in states):
+            break
+        price = Decimal(str(bar.close))
+
+        if bar.ts.time() >= EOD_CUTOFF:
+            for s in states:
+                if s.result is None:
+                    _finalize(s, bar.ts, price, "eod_square_off")
+            break
+
+        underlying_price = _lookup_nearest_minute(underlying_series, bar.ts)
+
+        for s in states:
+            if s.result is not None:
+                continue
+
+            hit_stop = price <= stop_price if favorable else price >= stop_price
+            if hit_stop:
+                _finalize(s, bar.ts, stop_price, "stop")
+                continue
+
+            if (
+                s.spec.target_mode == "pivot"
+                and s.spec.pivot_level is not None
+                and underlying_price is not None
+            ):
+                level = s.spec.pivot_level
+                hit_target = (
+                    underlying_price >= level if pivot_direction_up else underlying_price <= level
+                )
+                if hit_target:
+                    _finalize(s, bar.ts, price, "target")
+                    continue
+
+            activated = price >= activation_price if favorable else price <= activation_price
+            if activated:
+                gain_beyond = (
+                    (price - activation_price) if favorable else (activation_price - price)
+                )
+                locked_gain = gain_beyond * lock_fraction
+                new_trail_stop = (
+                    activation_price + locked_gain
+                    if favorable
+                    else activation_price - locked_gain
+                )
+                if s.trail_stop is None or (
+                    new_trail_stop > s.trail_stop if favorable else new_trail_stop < s.trail_stop
+                ):
+                    s.trail_stop = new_trail_stop
+                hit_trail = price < s.trail_stop if favorable else price > s.trail_stop
+                if hit_trail:
+                    _finalize(s, bar.ts, s.trail_stop, "trail")
+
+    results: list[ReconstructedTrade] = []
+    for s in states:
+        if s.result is not None:
+            results.append(s.result)
+            continue
+        results.append(
+            ReconstructedTrade(
+                symbol=symbol,
+                side=side.value,
+                entry_time=entry_time,
+                entry_price=float(entry_price),
+                exit_time=None,
+                exit_price=None,
+                exit_reason="no_further_data",
+                qty_lots=s.spec.qty_lots,
+                lot_size=lot_size,
+                leg=s.spec.label,
+                vix_entry=entry_diagnostics.get("vix"),  # type: ignore[arg-type]
+                atr_entry=entry_diagnostics.get("atr"),  # type: ignore[arg-type]
+                pcr_entry=entry_diagnostics.get("pcr"),  # type: ignore[arg-type]
+                contract_oi_entry=entry_diagnostics.get("contract_oi"),  # type: ignore[arg-type]
+            )
+        )
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
@@ -1336,6 +2021,33 @@ def _print_report(
     for reason, count in Counter(t.exit_reason for t in resolved).most_common():
         print(f"  {reason}: {count}")
 
+    legs = {t.leg for t in resolved}
+    if legs != {"legacy"}:
+        print("\nPer-leg breakdown:")
+        for leg in sorted(legs):
+            leg_trades = [t for t in resolved if t.leg == leg]
+            leg_wins = [t for t in leg_trades if t.pnl and t.pnl > 0]
+            leg_pnl = sum(t.pnl for t in leg_trades if t.pnl is not None)
+            leg_win_rate = (len(leg_wins) / len(leg_trades) * 100) if leg_trades else 0.0
+            print(
+                f"  {leg:<12} {len(leg_trades):>4} trade(s)  "
+                f"win rate {leg_win_rate:5.1f}%  total pnl {leg_pnl:+.2f}"
+            )
+
+        # Per-entry (entry_time, symbol) summed PnL -- the number directly
+        # comparable to a `*_only` mode's own total PnL above, since a
+        # split entry's "real" result is the sum of its legs, not any one
+        # leg read in isolation.
+        by_entry: dict[tuple[datetime, str], float] = {}
+        for t in resolved:
+            key = (t.entry_time, t.symbol)
+            by_entry[key] = by_entry.get(key, 0.0) + (t.pnl or 0.0)
+        consolidated_pnl = sum(by_entry.values())
+        print(
+            f"\nConsolidated (per-entry summed) total PnL across all legs: "
+            f"{consolidated_pnl:+.2f} ({len(by_entry)} entries)"
+        )
+
 
 def _write_trade_csv(trades: list[ReconstructedTrade], out_path: Path) -> None:
     """Full trade log incl. diagnostic-only VIX/ATR/PCR/contract-OI columns
@@ -1351,7 +2063,7 @@ def _write_trade_csv(trades: list[ReconstructedTrade], out_path: Path) -> None:
         writer = _csv.writer(f)
         writer.writerow(
             [
-                "symbol", "side", "entry_time", "entry_price", "exit_time", "exit_price",
+                "symbol", "side", "leg", "entry_time", "entry_price", "exit_time", "exit_price",
                 "exit_reason", "qty_lots", "lot_size", "pnl",
                 "vix_entry", "vix_exit", "atr_entry", "atr_exit",
                 "pcr_entry", "pcr_exit", "contract_oi_entry", "contract_oi_exit",
@@ -1360,7 +2072,7 @@ def _write_trade_csv(trades: list[ReconstructedTrade], out_path: Path) -> None:
         for t in sorted(trades, key=lambda x: x.entry_time):
             writer.writerow(
                 [
-                    t.symbol, t.side, to_ist(t.entry_time).isoformat(), t.entry_price,
+                    t.symbol, t.side, t.leg, to_ist(t.entry_time).isoformat(), t.entry_price,
                     to_ist(t.exit_time).isoformat() if t.exit_time else "",
                     t.exit_price if t.exit_price is not None else "",
                     t.exit_reason, t.qty_lots, t.lot_size,
@@ -1379,7 +2091,7 @@ def _write_trade_csv(trades: list[ReconstructedTrade], out_path: Path) -> None:
 
 
 _TRADE_CSV_HEADER = [
-    "symbol", "side", "entry_time", "entry_price", "exit_time", "exit_price",
+    "symbol", "side", "leg", "entry_time", "entry_price", "exit_time", "exit_price",
     "exit_reason", "qty_lots", "lot_size", "pnl",
     "vix_entry", "vix_exit", "atr_entry", "atr_exit",
     "pcr_entry", "pcr_exit", "contract_oi_entry", "contract_oi_exit",
@@ -1413,7 +2125,7 @@ def _append_trade_csv_rows(
         for t in sorted(trades, key=lambda x: x.entry_time):
             writer.writerow(
                 [
-                    t.symbol, t.side, to_ist(t.entry_time).isoformat(), t.entry_price,
+                    t.symbol, t.side, t.leg, to_ist(t.entry_time).isoformat(), t.entry_price,
                     to_ist(t.exit_time).isoformat() if t.exit_time else "",
                     t.exit_price if t.exit_price is not None else "",
                     t.exit_reason, t.qty_lots, t.lot_size,
@@ -1473,12 +2185,26 @@ def _run_single_backtest(
     session_factory: sessionmaker,
     quiet: bool = False,
     fast: bool = False,
-) -> tuple[list[ReconstructedTrade], int, Counter[str], int]:
+    exit_modes: list[str] | None = None,
+    total_lots: int = 10,
+    underlying_series: list[tuple[datetime, float]] | None = None,
+    target_multiplier: float = 2.0,
+) -> tuple[dict[str, list[ReconstructedTrade]], int, Counter[str], int]:
     """One expiry's full seed -> replay -> risk-outcome -> exit-reconstruction
     pass — the exact single-run body `main()` used to run inline, now
     reusable so `--all-expiries` can call it once per discovered expiry
     directory and aggregate. Returns
-    (trades, risk_rejected_count, risk_rejected_reasons, total_signals).
+    (trades_by_exit_mode, risk_rejected_count, risk_rejected_reasons, total_signals).
+
+    `exit_modes` (2026-08-24, defaults to `["legacy"]` -- see `EXIT_MODES`):
+    the expensive part of this function is the bar-by-bar replay through the
+    real strategy/risk pipeline above, which produces an identical set of
+    approved `TradeIntent`s regardless of exit-mode -- exit-mode only
+    affects the final reconstruction step. Passing more than one mode here
+    reuses that single replay pass and reconstructs it N ways instead of
+    requiring N full separate invocations (each redoing the same expensive
+    replay for a difference that only shows up in the last few lines) --
+    the reason `--exit-mode all` exists on `main()`'s own CLI flag.
 
     `fast` (2026-08-24, off by default -- every run before this date, and
     every run today that doesn't pass `--fast`, is completely unaffected):
@@ -1508,12 +2234,14 @@ def _run_single_backtest(
     # replayed -- an uncapped warm-up would make each successive expiry in
     # a year-long --all-expiries loop replay the entire prior history again,
     # making runtime grow roughly quadratically with the number of expiries.
+    modes = exit_modes if exit_modes is not None else ["legacy"]
+
     warmup_bars = [b for b in all_underlying_bars if b.ts.date() < from_date][-1000:]
     main_bars = [b for b in all_underlying_bars if from_date <= b.ts.date() <= to_date]
     if not main_bars:
         if not quiet:
             print(f"  [{expiry_date.isoformat()}] no underlying bars in window, skipping")
-        return [], 0, Counter(), 0
+        return {m: [] for m in modes}, 0, Counter(), 0
 
     @contextmanager
     def db_scope():
@@ -1554,7 +2282,15 @@ def _run_single_backtest(
         workspace_id=ctx.workspace_id,
         name="backtest-stub",
         strategy_type=strategy_type,
-        params={},
+        # Pinned explicitly, not left to `_build_strategy`'s own mode-aware
+        # default (2026-08-24, see that function's docstring) -- this stub
+        # is never flushed to a session, so its unset `status`/`runtime_mode`
+        # would resolve as "paper" (default 10) rather than the `1` every
+        # baseline CSV gathered before this date was built against. This
+        # script's own `--total-lots` (default 10) is the deliberate,
+        # independent lever for exit-mode reconstruction sizing instead --
+        # see EXIT_MODES / `_resolve_leg_specs`.
+        params={"qty_lots": 1},
     )
     strategy_obj = _build_strategy(strategy_config_stub, ctx.instrument_id, expiry_date)
 
@@ -1567,6 +2303,8 @@ def _run_single_backtest(
     approved_trade_intent_ids: list[uuid.UUID] = []
     symbol_by_intent: dict[uuid.UUID, str] = {}
     entry_diagnostics_by_intent: dict[uuid.UUID, dict[str, float | int | None]] = {}
+    option_type_by_intent: dict[uuid.UUID, DomainOptionType] = {}
+    pivots_by_date: dict[date, PivotLevels | None] = {}
 
     all_bars = sorted(warmup_bars + main_bars, key=lambda b: b.ts)
     for i, bar in enumerate(all_bars):
@@ -1648,6 +2386,7 @@ def _run_single_backtest(
                     if option_contract is not None:
                         approved_trade_intent_ids.append(trade_intent.id)
                         symbol_by_intent[trade_intent.id] = option_contract.symbol
+                        option_type_by_intent[trade_intent.id] = option_contract.option_type
                         entry_diagnostics_by_intent[trade_intent.id] = {
                             "vix": diagnostics.vix_at(simulated_time),
                             "atr": atr_value,
@@ -1662,7 +2401,7 @@ def _run_single_backtest(
 
     risk_rejected_count = 0
     risk_rejected_reasons: Counter[str] = Counter()
-    trades: list[ReconstructedTrade] = []
+    trades_by_mode: dict[str, list[ReconstructedTrade]] = {m: [] for m in modes}
     with db_scope() as db:
         all_intents = (
             db.query(TradeIntent)
@@ -1684,26 +2423,138 @@ def _run_single_backtest(
                 continue
             symbol = symbol_by_intent[intent_id]
             bars = option_bars.get(symbol, [])
-            trades.append(
-                _reconstruct_exit(
-                    trade_intent,
-                    symbol,
-                    bars,
-                    ctx.lot_size,
-                    entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
-                    diagnostics=diagnostics,
-                    all_contracts=contracts,
-                    all_option_bars=option_bars,
-                    atr_series=atr_series,
+
+            for mode in modes:
+                if mode == "legacy":
+                    trades_by_mode[mode].append(
+                        _reconstruct_exit(
+                            trade_intent,
+                            symbol,
+                            bars,
+                            ctx.lot_size,
+                            entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
+                            diagnostics=diagnostics,
+                            all_contracts=contracts,
+                            all_option_bars=option_bars,
+                            atr_series=atr_series,
+                        )
+                    )
+                    continue
+
+                if mode == "current":
+                    assert underlying_series is not None  # guaranteed by main(), every call site
+                    trades_by_mode[mode].append(
+                        _reconstruct_exit_current(
+                            trade_intent,
+                            symbol,
+                            bars,
+                            ctx.lot_size,
+                            _DEFAULT_QTY_LOTS_PAPER,
+                            underlying_series=underlying_series,
+                            entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
+                            diagnostics=diagnostics,
+                            all_contracts=contracts,
+                            all_option_bars=option_bars,
+                            atr_series=atr_series,
+                        )
+                    )
+                    continue
+
+                if mode == "target_mult":
+                    entry_price = Decimal(str(trade_intent.entry_price))
+                    orig_target = Decimal(str(trade_intent.target_price))
+                    favorable = SignalSide(trade_intent.side) == SignalSide.BUY
+                    distance = abs(orig_target - entry_price) * Decimal(str(target_multiplier))
+                    new_target = entry_price + distance if favorable else entry_price - distance
+                    mult_trade = _reconstruct_exit(
+                        trade_intent,
+                        symbol,
+                        bars,
+                        ctx.lot_size,
+                        entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
+                        diagnostics=diagnostics,
+                        all_contracts=contracts,
+                        all_option_bars=option_bars,
+                        atr_series=atr_series,
+                        target_price_override=new_target,
+                    )
+                    mult_trade.leg = "target_mult"
+                    trades_by_mode[mode].append(mult_trade)
+                    continue
+
+                assert underlying_series is not None  # guaranteed by main() for non-legacy modes
+                entry_date = trade_intent.created_at.date()
+                if entry_date not in pivots_by_date:
+                    ohlc = prior_day_ohlc(all_underlying_bars, entry_date)
+                    pivots_by_date[entry_date] = (
+                        compute_floor_pivots(*ohlc) if ohlc is not None else None
+                    )
+                pivots = pivots_by_date[entry_date]
+                underlying_spot_at_entry = _lookup_nearest_minute(
+                    underlying_series, trade_intent.created_at
                 )
-            )
+                leg_specs, pivot_direction_up = _resolve_leg_specs(
+                    mode,
+                    total_lots,
+                    option_type_by_intent[intent_id],
+                    pivots,
+                    underlying_spot_at_entry,
+                )
+                trades_by_mode[mode].extend(
+                    _reconstruct_exit_legs(
+                        trade_intent,
+                        symbol,
+                        bars,
+                        ctx.lot_size,
+                        leg_specs,
+                        underlying_series=underlying_series,
+                        pivot_direction_up=pivot_direction_up,
+                        entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
+                        diagnostics=diagnostics,
+                        all_contracts=contracts,
+                        all_option_bars=option_bars,
+                        atr_series=atr_series,
+                    )
+                )
 
     if not quiet:
         print(
             f"  [{expiry_date.isoformat()}] {total_signals} signal(s), "
             f"{len(approved_trade_intent_ids)} risk-approved, {risk_rejected_count} rejected"
         )
-    return trades, risk_rejected_count, risk_rejected_reasons, total_signals
+    return trades_by_mode, risk_rejected_count, risk_rejected_reasons, total_signals
+
+
+def _current_mode_label(strategy_type: str) -> str:
+    """Bracketed label for `--exit-mode current`'s report header, e.g.
+    `current [stop 12% / target 20%]` — read live off the actual `Strategy`
+    subclass's own constructor defaults via the exact same `_build_strategy`
+    mapping `_run_single_backtest` itself uses to build `strategy_obj`, not
+    a second, hardcoded copy of these percentages. (2026-08-27, explicit
+    user request: since 'current' always means "whatever production's real
+    stop%/target% is today," and those constants can change later, the
+    report must say what they actually were at the time, not just print
+    the bare mode name — this function is what keeps that automatic rather
+    than something to remember to update by hand.)
+
+    Instrument/expiry/workspace ids are throwaway — `_build_strategy` only
+    reads `strategy_config.params`/`.strategy_type`, matching the same
+    minimal, never-flushed-to-a-session stub shape `_run_single_backtest`'s
+    own real `strategy_config_stub` already uses.
+    """
+    stub = StrategyConfig(
+        id=uuid.uuid4(),
+        workspace_id=uuid.uuid4(),
+        name="label-only",
+        strategy_type=strategy_type,
+        params={},
+    )
+    strategy_obj = _build_strategy(stub, uuid.uuid4(), date.today())
+    stop_pct = getattr(strategy_obj, "stop_pct", None)
+    target_pct = getattr(strategy_obj, "target_pct", None)
+    if stop_pct is None or target_pct is None:
+        return "current"
+    return f"current [stop {stop_pct:.0%} / target {target_pct:.0%}]"
 
 
 def main() -> None:
@@ -1720,16 +2571,19 @@ def main() -> None:
         "('options' = current near-term chain, 'options_1min_past' = past-year archive)",
     )
     parser.add_argument(
-        "--underlying-source", choices=("spot", "futures_proxy", "alice_index"), default="spot",
-        help="'spot' = underlyings/<u>_1min.csv (real but ~12-day cap); "
+        "--underlying-source", choices=("spot", "futures_proxy", "alice_index"),
+        default="alice_index",
+        help="'alice_index' (default) = underlyings/<u>_alice_index_1min.csv (real, "
+        "continuous NSE-index 1-min history via Alice Blue's historical chart API, "
+        "~2.6 years with zero gaps -- confirmed 2026-08-24, see "
+        "fetch_alice_blue_underlying_history.py); "
+        "'spot' = underlyings/<u>_1min.csv (TrueData, ~12-day cap); "
         "'futures_proxy' = underlyings/<u>_underlying_proxy_1min.csv "
         "(stitched real monthly-futures history, real data only ~1wk/month near each "
-        "contract's own expiry -- see fetch_truedata_futures_underlying_history.py); "
-        "'alice_index' = underlyings/<u>_alice_index_1min.csv (real, continuous NSE-index "
-        "1-min history via Alice Blue's historical chart API, ~3.2 years with zero gaps "
-        "over 4 calendar days -- confirmed 2026-08-24, see "
-        "fetch_alice_blue_underlying_history.py; the recommended source for any "
-        "--all-expiries run over the options_1min_past archive)",
+        "contract's own expiry -- see fetch_truedata_futures_underlying_history.py). "
+        "'spot'/'futures_proxy' files were deleted in the 2026-08-24 data cleanup as "
+        "redundant with alice_index -- re-run fetch_truedata_historical.py/"
+        "fetch_truedata_futures_underlying_history.py first if either is needed again.",
     )
     parser.add_argument(
         "--all-expiries", action="store_true",
@@ -1749,7 +2603,100 @@ def main() -> None:
         "writes/order, only fewer transaction boundaries -- verify with a single-expiry "
         "smoke test against a non-fast run before trusting on a full --all-expiries run.",
     )
+    parser.add_argument(
+        "--exit-mode", default="current",
+        help="Comma-separated list of exit modes, or 'all' for every mode. Choices: "
+        f"{', '.join(EXIT_MODES)}. 'current' (default, 2026-08-27) = the faithful mode: all 5 "
+        "real steps of execution_engine.paper.service.evaluate_open_position (stop, target, "
+        "structure-break, spread-blowout, trail, in that exact order), using each bar's "
+        "high/low (not just close), real qty_lots (api.v1.strategies._DEFAULT_QTY_LOTS_PAPER) "
+        "and real lot sizes (UNDERLYING_META). Always means 'whatever production's real "
+        "stop%%/target%% is today' -- see the printed report's own bracketed label (e.g. "
+        "'current [stop 12%% / target 20%%]', from _current_mode_label) for the exact values in "
+        "effect for this run, since those can change later without this mode's name changing. "
+        "'legacy' = today's fixed-%%-target/stop/trail, close-only pricing, no structure-break/"
+        "spread-blowout, pinned qty_lots=1 -- frozen, byte-identical to every pre-2026-08-24 "
+        "run (and every run before this date), kept exactly as-is for reproducing old baseline "
+        "CSVs; not the default any more. 'near_only'/'far_only' = 100%% of --total-lots exits "
+        "at the underlying's R1/S1 or R2/S2 classic floor-pivot level (see backtest_pivots.py), "
+        "computed off the prior trading day's OHLC. 'no_target_only' = 100%% of --total-lots, "
+        "no target at all, stop/trail/EOD only. 'split_30_30_40' = one entry split "
+        "30%%/30%%/40%% across near/far/no-target legs simultaneously (rounded to whole lots). "
+        "'target_mult' = same entry/stop as legacy, target distance from entry scaled by "
+        "--target-multiplier instead of the strategy's own fixed %%. near_only/far_only/"
+        "no_target_only/split_30_30_40/target_mult are all deliberate what-if target-mechanism "
+        "substitutions -- they still use legacy's own close-only/no-structure-break/"
+        "no-spread-blowout mechanics via _reconstruct_exit/_reconstruct_exit_legs (untouched by "
+        "this fidelity change), only their *target* logic deliberately deviates from real "
+        "production. Multiple modes (comma-separated) or 'all' reuse a single replay pass (see "
+        "_run_single_backtest's own docstring for why this is far cheaper than N separate "
+        "invocations), writing one <out-csv-stem>_<mode>.csv per mode and printing one report "
+        "per mode.",
+    )
+    parser.add_argument(
+        "--total-lots", type=int, default=10,
+        help="Total lot size the reconstruction scales to for every --exit-mode other than "
+        "'legacy'/'target_mult' (which always use the real risk-approved TradeIntent's own "
+        "qty_lots, for baseline reproducibility). Independent of production qty_lots defaults "
+        "-- see backtest_pivots.py / project plan for why. Default 10, per the '10 lot test' "
+        "this feature was built for.",
+    )
+    parser.add_argument(
+        "--target-multiplier", type=float, default=2.0,
+        help="Only used by --exit-mode target_mult: the target's distance from entry becomes "
+        "this multiple of the strategy's own fixed-%% target distance (same direction, same "
+        "stop price, same trail math anchored to the scaled target). Default 2.0.",
+    )
+    parser.add_argument(
+        "--pairs", default=None,
+        help="Comma-separated list of exact 'YYYY-MM-DD:YYYY-MM-DD' day:expiry pairs -- one "
+        "single-day _run_single_backtest call per pair, with the expiry directory given "
+        "directly (no --all-expiries scan, no nearest-expiry guess, no overlapping-directory "
+        "redundancy). For rerunning EXACTLY the (day, expiry) combinations a prior baseline "
+        "CSV's own rows already prove were real (parse each row's option symbol for its real "
+        "expiry date) -- the tightest, fastest targeted rerun when the exact answer is already "
+        "known, unlike --dates (which must try every directory whose data range could plausibly "
+        "cover a day, since a day can genuinely fall inside more than one). Mutually exclusive "
+        "with --all-expiries/--dates. Supports --shard-count/--shard-index (sharding the pair "
+        "list).",
+    )
+    parser.add_argument(
+        "--dates", default=None,
+        help="Comma-separated list of ISO dates (YYYY-MM-DD). Requires --all-expiries: every "
+        "expiry directory is still discovered and range-checked exactly as usual (a date can "
+        "legitimately fall inside more than one expiry's own listed-contract window, and each "
+        "one that does must still be replayed to reproduce every trade that date originally "
+        "produced), but instead of one _run_single_backtest call covering an expiry's *entire* "
+        "data range, one call is made per requested date that actually falls inside that "
+        "range -- every other day in the range is skipped. For rerunning only the specific "
+        "days a prior run's trades landed on, much cheaper than a full --all-expiries replay "
+        "when most days in each expiry's window never produced a trade. NOTE: a plain "
+        "nearest-expiry-by-name guess (no data-range check) is NOT equivalent -- an expiry "
+        "directory can be empty or have a range that doesn't include a nearby date at all, "
+        "which is exactly why this filters --all-expiries's own already-correct iteration "
+        "instead of re-implementing expiry discovery.",
+    )
+    parser.add_argument(
+        "--shard-count", type=int, default=1,
+        help="Split the --all-expiries expiry list into this many shards for parallel "
+        "invocations (round-robin by index, not contiguous ranges, so shards stay "
+        "balanced even if some expiries have no data). Each shard MUST be given its own "
+        "--db-suffix and --out-csv by the caller -- this script doesn't coordinate that "
+        "itself. Default 1 (no sharding, identical to every prior run).",
+    )
+    parser.add_argument(
+        "--shard-index", type=int, default=0,
+        help="Which shard (0-indexed, < --shard-count) this invocation processes.",
+    )
     args = parser.parse_args()
+    if args.shard_count < 1 or not (0 <= args.shard_index < args.shard_count):
+        raise SystemExit("--shard-index must be in [0, --shard-count)")
+    if args.dates and not args.all_expiries:
+        raise SystemExit("--dates requires --all-expiries (it filters which days within each "
+                          "discovered expiry's own data range actually get replayed)")
+    if args.pairs and (args.all_expiries or args.dates):
+        raise SystemExit("--pairs is mutually exclusive with --all-expiries/--dates (it already "
+                          "names the exact expiry directory per day, no scan needed)")
     db_suffix = args.db_suffix or f"{args.strategy}_{args.underlying}"
 
     data_dir: Path = args.data_dir
@@ -1771,6 +2718,15 @@ def main() -> None:
     all_underlying_bars = _load_csv_bars(underlying_path)
     print(f"{len(all_underlying_bars)} underlying bars loaded")
 
+    # Built once here, not per-expiry inside `_run_single_backtest` -- same
+    # "load once, thread through" pattern `diagnostics` below already uses.
+    # Only actually needed for pivot-mode exit reconstruction (see
+    # `_reconstruct_exit_legs`'s underlying-price lookups); harmless to
+    # build unconditionally, it's a cheap O(n) pass over already-loaded bars.
+    underlying_series: list[tuple[datetime, float]] = [
+        (b.ts, b.close) for b in all_underlying_bars
+    ]
+
     diagnostics = DiagnosticsSource(data_dir)
 
     _ensure_backtest_database_exists(db_suffix)
@@ -1779,15 +2735,36 @@ def main() -> None:
     Base.metadata.create_all(engine)
     session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
-    all_trades: list[ReconstructedTrade] = []
-    total_risk_rejected = 0
-    total_risk_rejected_reasons: Counter[str] = Counter()
-    total_signals_all = 0
+    if args.exit_mode == "all":
+        exit_modes = list(EXIT_MODES)
+    else:
+        exit_modes = [m.strip() for m in args.exit_mode.split(",") if m.strip()]
+        invalid_modes = [m for m in exit_modes if m not in EXIT_MODES]
+        if invalid_modes:
+            raise SystemExit(
+                f"Invalid --exit-mode value(s) {invalid_modes!r}; choices are "
+                f"{list(EXIT_MODES)!r} or 'all'"
+            )
+    multi_mode = len(exit_modes) > 1
 
-    out_csv = args.out_csv or (
+    out_csv_base = args.out_csv or (
         REPO_ROOT / "data" / "historical" / "backtest_reports"
         / f"{args.strategy}_{args.underlying}_trades.csv"
     )
+
+    def _out_csv_for(mode: str) -> Path:
+        # Single-mode runs keep the exact original filename (backward
+        # compatible with every script/analysis already pointed at it);
+        # multi-mode ('--exit-mode all') runs get one file per mode instead
+        # of clobbering each other.
+        if not multi_mode:
+            return out_csv_base
+        return out_csv_base.with_name(f"{out_csv_base.stem}_{mode}{out_csv_base.suffix}")
+
+    all_trades_by_mode: dict[str, list[ReconstructedTrade]] = {m: [] for m in exit_modes}
+    total_risk_rejected = 0
+    total_risk_rejected_reasons: Counter[str] = Counter()
+    total_signals_all = 0
 
     if args.all_expiries:
         options_base = data_dir / args.options_subdir / args.underlying
@@ -1796,36 +2773,183 @@ def main() -> None:
         expiry_dirs = sorted(
             (d for d in options_base.iterdir() if d.is_dir()), key=lambda d: d.name
         )
+        if args.shard_count > 1:
+            # 2026-08-24: the per-bar replay loop is Postgres-round-trip-
+            # bound (one commit per bar, even with --fast), not CPU-bound --
+            # each expiry is fully independent (its own seeded StrategyRun,
+            # own contracts) so N parallel processes, each on its OWN
+            # --db-suffix (a separate database -- no cross-shard locking at
+            # all) and its own --out-csv, scale close to linearly up to
+            # whatever the local Postgres/Docker setup can sustain. Caller
+            # is responsible for merging each shard's per-mode CSVs
+            # afterward (simple concatenation, header-once) -- this script
+            # only filters which expiries *this* invocation processes.
+            expiry_dirs = expiry_dirs[args.shard_index :: args.shard_count]
+            print(
+                f"Shard {args.shard_index}/{args.shard_count}: "
+                f"{len(expiry_dirs)} of the full expiry list assigned to this process."
+            )
+        requested_dates: set[date] | None = None
+        if args.dates:
+            requested_dates = {
+                date.fromisoformat(s.strip()) for s in args.dates.split(",") if s.strip()
+            }
+            print(
+                f"--dates filter active: {len(requested_dates)} requested day(s), only these "
+                "will actually be replayed within each expiry's own data range below."
+            )
         print(f"Replaying {len(expiry_dirs)} expiries for {args.strategy}/{args.underlying} ...")
-        wrote_header = False
+        wrote_header_by_mode = {m: False for m in exit_modes}
         for expiry_dir in expiry_dirs:
             expiry_date = date.fromisoformat(expiry_dir.name)
             date_range = _expiry_data_range(expiry_dir)
             if date_range is None:
                 print(f"  [{expiry_date.isoformat()}] no data in any contract file, skipping")
                 continue
-            from_date, to_date = date_range
-            trades, rejected, reasons, signals = _run_single_backtest(
+            range_from, range_to = date_range
+
+            # Default: one call for the whole range (unchanged from every
+            # prior --all-expiries run). With --dates: one call PER
+            # requested day that actually falls in this range -- every
+            # other day in the range is skipped entirely, saving the bulk
+            # of the per-bar replay cost for a targeted rerun (see --dates'
+            # own help text for why this can't be a plain nearest-expiry
+            # guess).
+            days_to_run: list[date | None]
+            if requested_dates is not None:
+                matching_days = sorted(
+                    d for d in requested_dates if range_from <= d <= range_to
+                )
+                if not matching_days:
+                    continue
+                days_to_run = []
+                days_to_run.extend(matching_days)
+            else:
+                days_to_run = [None]  # sentinel: run the whole [range_from, range_to] window once
+
+            for day in days_to_run:
+                from_date, to_date = (day, day) if day is not None else (range_from, range_to)
+                if requested_dates is not None:
+                    # Real option-contract symbols (e.g. "NIFTY25093024350CE")
+                    # encode their actual expiry date, so two --dates days
+                    # landing in the same expiry_dir would try to re-seed the
+                    # identical symbol string a second time -- collides on
+                    # `uq_option_contract_symbol`, a genuinely global
+                    # constraint this backtest DB shares with production
+                    # schema, not something to work around by mangling
+                    # symbols. Instead, each --dates day gets a fully fresh
+                    # database (this is already how separate --shard-count
+                    # processes stay isolated from each other; here it's the
+                    # same reset applied between sequential calls within one
+                    # process) -- cheap, since a single day's seed+replay is
+                    # small regardless.
+                    Base.metadata.drop_all(engine)
+                    Base.metadata.create_all(engine)
+                trades_by_mode, rejected, reasons, signals = _run_single_backtest(
+                    underlying=args.underlying,
+                    strategy_type=args.strategy,
+                    from_date=from_date,
+                    to_date=to_date,
+                    expiry_date=expiry_date,
+                    expiry_dir=expiry_dir,
+                    all_underlying_bars=all_underlying_bars,
+                    diagnostics=diagnostics,
+                    session_factory=session_factory,
+                    fast=args.fast,
+                    exit_modes=exit_modes,
+                    total_lots=args.total_lots,
+                    underlying_series=underlying_series,
+                    target_multiplier=args.target_multiplier,
+                )
+                total_risk_rejected += rejected
+                total_risk_rejected_reasons.update(reasons)
+                total_signals_all += signals
+                for mode in exit_modes:
+                    mode_trades = trades_by_mode[mode]
+                    all_trades_by_mode[mode].extend(mode_trades)
+                    mode_csv = _out_csv_for(mode)
+                    _append_trade_csv_rows(
+                        mode_trades, mode_csv, write_header=not wrote_header_by_mode[mode]
+                    )
+                    wrote_header_by_mode[mode] = True
+                label = f"{expiry_date.isoformat()}" if day is None else (
+                    f"{day.isoformat()} via expiry {expiry_date.isoformat()}"
+                )
+                totals_str = ", ".join(
+                    f"{mode}={len(all_trades_by_mode[mode])}" for mode in exit_modes
+                )
+                print(
+                    f"  [{label}] "
+                    + ", ".join(f"{mode}={len(trades_by_mode[mode])}" for mode in exit_modes)
+                    + f" trade(s) appended ({totals_str} total so far)"
+                )
+    elif args.pairs:
+        parsed_pairs: list[tuple[date, date]] = []
+        for chunk in args.pairs.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            day_str, expiry_str = chunk.split(":")
+            parsed_pairs.append(
+                (date.fromisoformat(day_str.strip()), date.fromisoformat(expiry_str.strip()))
+            )
+        if args.shard_count > 1:
+            parsed_pairs = parsed_pairs[args.shard_index :: args.shard_count]
+            print(
+                f"Shard {args.shard_index}/{args.shard_count}: "
+                f"{len(parsed_pairs)} of the full --pairs list assigned to this process."
+            )
+        print(
+            f"Replaying {len(parsed_pairs)} exact (day, expiry) pair(s) for "
+            f"{args.strategy}/{args.underlying} ..."
+        )
+        wrote_header_by_mode = {m: False for m in exit_modes}
+        for day, expiry in parsed_pairs:
+            expiry_date, expiry_dir = _discover_expiry_dir(
+                data_dir, args.underlying, day, expiry, args.options_subdir
+            )
+            # Each pair gets a fresh schema, same reasoning as --dates: real
+            # option-contract symbols are globally unique on their own
+            # broker string, so two pairs sharing an expiry (or the DB
+            # otherwise accumulating state across calls) would collide or
+            # silently carry state between what should be independent
+            # single-day replays.
+            Base.metadata.drop_all(engine)
+            Base.metadata.create_all(engine)
+            trades_by_mode, rejected, reasons, signals = _run_single_backtest(
                 underlying=args.underlying,
                 strategy_type=args.strategy,
-                from_date=from_date,
-                to_date=to_date,
+                from_date=day,
+                to_date=day,
                 expiry_date=expiry_date,
                 expiry_dir=expiry_dir,
                 all_underlying_bars=all_underlying_bars,
                 diagnostics=diagnostics,
                 session_factory=session_factory,
                 fast=args.fast,
+                exit_modes=exit_modes,
+                total_lots=args.total_lots,
+                underlying_series=underlying_series,
+                target_multiplier=args.target_multiplier,
             )
-            all_trades.extend(trades)
             total_risk_rejected += rejected
             total_risk_rejected_reasons.update(reasons)
             total_signals_all += signals
-            _append_trade_csv_rows(trades, out_csv, write_header=not wrote_header)
-            wrote_header = True
+            for mode in exit_modes:
+                mode_trades = trades_by_mode[mode]
+                all_trades_by_mode[mode].extend(mode_trades)
+                mode_csv = _out_csv_for(mode)
+                _append_trade_csv_rows(
+                    mode_trades, mode_csv, write_header=not wrote_header_by_mode[mode]
+                )
+                wrote_header_by_mode[mode] = True
+            totals_str = ", ".join(
+                f"{mode}={len(all_trades_by_mode[mode])}" for mode in exit_modes
+            )
             print(
-                f"  [{expiry_date.isoformat()}] {len(trades)} trade(s) appended to {out_csv} "
-                f"({len(all_trades)} total so far)"
+                f"  [{day.isoformat()} via expiry {expiry_date.isoformat()}] "
+                + ", ".join(f"{mode}={len(trades_by_mode[mode])}" for mode in exit_modes)
+                + f" trade(s) appended ({totals_str} total so far)"
             )
     else:
         if args.from_date is None or args.to_date is None:
@@ -1836,7 +2960,7 @@ def main() -> None:
             data_dir, args.underlying, args.from_date, args.expiry, args.options_subdir
         )
         print(f"Using expiry {expiry_date.isoformat()} ({expiry_dir})")
-        all_trades, total_risk_rejected, total_risk_rejected_reasons, total_signals_all = (
+        all_trades_by_mode, total_risk_rejected, total_risk_rejected_reasons, total_signals_all = (
             _run_single_backtest(
                 underlying=args.underlying,
                 strategy_type=args.strategy,
@@ -1849,12 +2973,24 @@ def main() -> None:
                 session_factory=session_factory,
                 quiet=False,
                 fast=args.fast,
+                exit_modes=exit_modes,
+                total_lots=args.total_lots,
+                underlying_series=underlying_series,
+                target_multiplier=args.target_multiplier,
             )
         )
 
-    _print_report(all_trades, total_risk_rejected, total_risk_rejected_reasons, total_signals_all)
-
-    _write_trade_csv(all_trades, out_csv)
+    for mode in exit_modes:
+        mode_label = _current_mode_label(args.strategy) if mode == "current" else mode
+        if multi_mode:
+            print(f"\n{'#' * 78}\n# exit-mode: {mode_label}\n{'#' * 78}")
+        elif mode == "current":
+            print(f"exit-mode: {mode_label}")
+        _print_report(
+            all_trades_by_mode[mode], total_risk_rejected, total_risk_rejected_reasons,
+            total_signals_all,
+        )
+        _write_trade_csv(all_trades_by_mode[mode], _out_csv_for(mode))
 
 
 if __name__ == "__main__":
