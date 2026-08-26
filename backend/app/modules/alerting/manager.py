@@ -114,8 +114,8 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
 # Deliberately narrower than market_data.market_hours' ~08:30-16:00
 # connectivity window or core.clock's 09:31-15:09 trade-entry window — this
 # is specifically "when is it worth interrupting the user," not a data or
-# risk gate. Matches TradingSession.cutoff_time's own default (15:20)
-# closely enough that EOD square-off is essentially always still inside it.
+# risk gate. TradingSession.cutoff_time's own default (15:09) sits well
+# inside this window, so EOD square-off is always still inside it.
 _ALERT_WINDOW_START = dt_time(9, 0)
 _ALERT_WINDOW_END = dt_time(15, 30)
 

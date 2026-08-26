@@ -66,11 +66,9 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from contextlib import AbstractContextManager
 from datetime import datetime
 
-from sqlalchemy.orm import Session
-
+from app.core.db.session import SessionFactory
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession, TradingSessionStatus
 from app.modules.alerting.manager import send_alert
@@ -81,7 +79,6 @@ logger = logging.getLogger("app.market_data.failover")
 
 TickCallback = Callable[[Tick], None]
 DepthCallback = Callable[[DepthSnapshot], None]
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 

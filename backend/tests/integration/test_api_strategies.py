@@ -516,7 +516,7 @@ def test_start_strategy_rejects_when_shoonya_not_connected(
     writes, same "validate first" shape as the zombie-run test above --
     proves both a clean 409 and zero StrategyRun rows left behind.
     """
-    monkeypatch.setattr(strategies_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(strategies_module, "is_market_data_ready", lambda: False)
 
     _login(api_client, seeded_admin)
     strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-not-connected"}).json()[
@@ -1096,13 +1096,13 @@ def _freeze_auto_spawner_clock(monkeypatch, *, hour: int = 11, minute: int = 0):
             tzinfo=IST,
         ),
     )
-    # is_shoonya_market_data_ready() is True by default for mock/angel_one
+    # is_market_data_ready() is True by default for mock/angel_one
     # providers (matches production), so _spawn_one would otherwise attempt
     # a real record_option_chain_snapshot/get_broker call here -- forcing
     # the "not ready" branch exercises the exact same idle-spawn path
     # test_auto_spawner.py's own test_shoonya_not_ready_still_spawns_idle...
     # already covers directly, without needing to also fake the snapshot.
-    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(auto_spawner_module, "is_market_data_ready", lambda: False)
 
 
 def test_power_on_starts_a_run_immediately(

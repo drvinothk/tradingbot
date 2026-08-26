@@ -11,14 +11,12 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.market.models import DepthSnapshot as DepthSnapshotRow
 from app.domain.market.models import IndicatorSnapshot as IndicatorSnapshotRow
 from app.domain.market.models import Instrument, OptionContract
@@ -128,7 +126,6 @@ _EMPTY_POLL_WARNING_THRESHOLD_SECONDS = 90.0
 _WS_RECOVERY_PROBE_EVERY_N_POLLS = 10
 
 _SymbolRef = tuple[str, uuid.UUID]  # ("instrument" | "option_contract", row id)
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 
 class MarketDataIngestionService:

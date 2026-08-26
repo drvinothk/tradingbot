@@ -73,12 +73,8 @@ class ShoonyaSettings(BaseSettings):
 
     client_id: str = ""
     secret_code: SecretStr = SecretStr("")
-    vendor_code: str = ""
     user_id: str = ""
     redirect_url: str = "http://127.0.0.1:5000/shoonya/callback"
-    primary_ip: str = ""
-    backup_ip: str = ""
-    totp_secret: SecretStr = SecretStr("")
     # **CONFIRMED, 2026-08-20** — the `NorenWClientTP`/`NorenWSTP` discrepancy
     # this comment used to flag (a Phase 5 research spike found the official
     # Shoonya-Dev GitHub org's own wrapper hardcoding those paths instead)
@@ -90,12 +86,11 @@ class ShoonyaSettings(BaseSettings):
     api_host: str = "https://api.shoonya.com/NorenWClientAPI"
     ws_host: str = "wss://api.shoonya.com/NorenWSAPI/"
     oauth_authorize_url: str = "https://api.shoonya.com/OAuthlogin/authorize/oauth"
-    # WS auth handshake has never once succeeded live (see ws_client.py's own
-    # docstring for the full ruled-out list) — "API" is the classic-QuickAuth
-    # convention and was never itself varied. Made configurable, not hardcoded,
-    # so the next live session can try "WEB"/"MOB" via env var alone, no
-    # redeploy needed, since this session's OAuth-issued token may register
-    # its origin differently than a direct API login would.
+    # 2026-08-11: WS auth handshake root-caused and fixed (see ws_client.py's
+    # own docstring) — the real bug was the connect-message shape, not this
+    # value; "API" (the classic-QuickAuth convention) was confirmed correct.
+    # Left configurable rather than hardcoded, so a future auth regression
+    # can still be worked around via env var alone, no redeploy needed.
     ws_auth_source: str = "API"
 
     def missing_required_fields(self) -> list[str]:
@@ -104,10 +99,7 @@ class ShoonyaSettings(BaseSettings):
         checked here instead of at `Settings()` construction time, since
         every test and every paper-only local run constructs `ShoonyaSettings()`
         regardless of whether Shoonya is ever used, and must not start failing
-        just because no `shoonya.env` exists yet. `vendor_code`/`primary_ip`/
-        `backup_ip`/`totp_secret` are deliberately not checked — none of them
-        are read by any code path yet (TOTP entry happens on Shoonya's own
-        login page in the user's browser, not in this backend).
+        just because no `shoonya.env` exists yet.
         """
         missing = []
         if not self.client_id:
@@ -200,9 +192,9 @@ class AngelOneSettings(BaseSettings):
     account yet — see AngelOneMarketDataProvider's own docstring for exactly
     what's confirmed vs. still an assumption.
 
-    Unlike ShoonyaSettings.totp_secret (dormant — Shoonya's login happens in
-    the user's own browser, never read by this backend), `totp_secret` here
-    is genuinely read and used: Angel's `loginByPassword` is a direct
+    Unlike Shoonya (whose TOTP entry happens on Shoonya's own login page in
+    the user's browser, never read by this backend at all), `totp_secret`
+    here is genuinely read and used: Angel's `loginByPassword` is a direct
     server-to-server REST call requiring a live TOTP code in the request
     body, so this backend generates it itself via `pyotp.TOTP(...).now()`.
     """
@@ -373,9 +365,12 @@ class AliceBlueSettings(BaseSettings):
 class TrueDataSettings(BaseSettings):
     """Loaded from config/credentials/truedata.env (gitignored, never the
     tracked .env — same secrets discipline as ShoonyaSettings/
-    AngelOneSettings). No credentials exist yet as of 2026-08-10 — nothing
-    here has been exercised against a live account. As of 2026-08-11, the
-    `TD_live(...)` constructor shape, `live_port`, and the
+    AngelOneSettings). Was live/subscribed and exercised against a real
+    account before the trial expired and it was archived 2026-08-25 (see
+    CLAUDE.md) — credentials removed from the deployment, this class and
+    `TrueDataMarketDataProvider` left fully intact, so reactivating is an
+    env-var change plus restoring the credentials file, no code changes
+    needed. The `TD_live(...)` constructor shape, `live_port`, and the
     `replay.truedata.in` aftermarket-replay switch are all sourced from
     directly reading the current official `truedata` PyPI package's own
     installed source (not a paraphrase, and not the now-superseded

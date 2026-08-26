@@ -31,11 +31,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 
 from sqlalchemy.orm import Session
 
+from app.core.db.session import reuse_session
 from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
 from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
@@ -103,14 +102,13 @@ def run_single_position_square_off(
     if option_contract is None:
         raise UnresolvableOptionContractError(position.option_contract_id)
 
-    @contextmanager
-    def _same_session() -> Iterator[Session]:
-        # Without this, current_contract_price's option-chain refresh would
-        # default to a brand new, independently-committing session_scope()
-        # -- a real, previously-documented trap in this codebase (a second
-        # connection can't see this transaction's own uncommitted rows,
-        # e.g. a test's own not-yet-committed Instrument/OptionContract).
-        yield db
+    # reuse_session: without this, current_contract_price's option-chain
+    # refresh would default to a brand new, independently-committing
+    # session_scope() -- a real, previously-documented trap in this
+    # codebase (a second connection can't see this transaction's own
+    # uncommitted rows, e.g. a test's own not-yet-committed
+    # Instrument/OptionContract).
+    same_session = reuse_session(db)
 
     # Same REST-option-chain-snapshot-preferring price source as every
     # other paper-execution price decision -- was broker.get_quote()
@@ -122,7 +120,7 @@ def run_single_position_square_off(
         option_contract,
         position_broker,
         market_data_provider=market_data_provider,
-        session_factory=_same_session,
+        session_factory=same_session,
     )
     return close_position(
         db, trading_session, position, exit_reason, tick.ltp, broker=position_broker

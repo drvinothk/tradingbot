@@ -40,7 +40,7 @@ def _fake_snapshot_and_broker(monkeypatch):
     `session_scope`-bound production DB/broker singleton -- same "never let
     a background write path touch prod inside a test" discipline as every
     other phase (see api.v1.strategies's own `fake_runner` fixture for the
-    identical pattern this mirrors). `is_shoonya_market_data_ready` defaults
+    identical pattern this mirrors). `is_market_data_ready` defaults
     True here (matches "always True for mock/angel_one" in production) so
     tests opt in to the not-ready branch explicitly.
     """
@@ -51,7 +51,7 @@ def _fake_snapshot_and_broker(monkeypatch):
 
     monkeypatch.setattr(auto_spawner_module, "record_option_chain_snapshot", _fake_record)
     monkeypatch.setattr(auto_spawner_module, "get_broker", lambda: object())
-    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: True)
+    monkeypatch.setattr(auto_spawner_module, "is_market_data_ready", lambda: True)
     # Dual-Trigger Model (2026-08-17): _spawn_one now refuses to spawn past
     # TRADE_WINDOW_END (15:09 IST) -- fixed to 11:00 IST on TODAY so this
     # file's tests stay deterministic regardless of when the suite actually
@@ -284,7 +284,7 @@ def test_broker_error_on_snapshot_alerts_and_creates_no_run(
 
     monkeypatch.setattr(auto_spawner_module, "record_option_chain_snapshot", _raise)
     monkeypatch.setattr(auto_spawner_module, "get_broker", lambda: object())
-    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: True)
+    monkeypatch.setattr(auto_spawner_module, "is_market_data_ready", lambda: True)
 
     spawn_enabled_strategies(db, trading_session, TODAY)
 
@@ -302,7 +302,7 @@ def test_shoonya_not_ready_still_spawns_idle_without_a_snapshot_call(
     monkeypatch.setattr(
         auto_spawner_module, "record_option_chain_snapshot", lambda *a, **kw: calls.append(a)
     )
-    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(auto_spawner_module, "is_market_data_ready", lambda: False)
 
     spawn_enabled_strategies(db, trading_session, TODAY)
 

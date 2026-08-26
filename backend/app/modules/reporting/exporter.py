@@ -40,8 +40,6 @@ import csv
 import logging
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -52,7 +50,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import BACKEND_ROOT_DIR
 from app.core.clock import IST, now_ist, to_ist
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.execution.models import Order, Position, TradeOutcome
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
@@ -64,8 +62,6 @@ from app.modules.strategy_engine.env_metrics import (
 )
 
 logger = logging.getLogger("app.reporting.exporter")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 REPORTS_DIR = BACKEND_ROOT_DIR / "reports"
 
@@ -229,10 +225,6 @@ def _sanitize_sheet_name(name: str) -> str:
     return name[:31]
 
 
-def _sheet_name_for(row: TradeLogRow) -> str:
-    return _sanitize_sheet_name(row.strategy_name)
-
-
 def _row_values(row: TradeLogRow) -> list:
     return [
         row.strategy_name,
@@ -322,7 +314,7 @@ def export_trade_log_for_workspace(
 
     by_sheet: dict[str, list[TradeLogRow]] = defaultdict(list)
     for row in rows:
-        by_sheet[_sheet_name_for(row)].append(row)
+        by_sheet[_sanitize_sheet_name(row.strategy_name)].append(row)
 
     appended = 0
     for sheet_name, sheet_rows in by_sheet.items():
@@ -356,7 +348,7 @@ def export_trade_log_for_workspace(
         )
         return fallback_path
 
-    logger.warning(
+    logger.info(
         "Exported %d new trade row(s) for workspace %s to %s", appended, workspace_id, path
     )
     return path

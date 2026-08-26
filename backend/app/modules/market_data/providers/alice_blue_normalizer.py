@@ -13,8 +13,7 @@ if genuinely absent — never fabricated.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
+from app.core.db.base import utcnow as _utcnow
 from app.modules.broker_adapter.base.contracts import Tick
 
 
@@ -40,10 +39,6 @@ def _int(raw: dict, key: str, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def parse_tick(raw: dict, contract_symbol: str) -> Tick:

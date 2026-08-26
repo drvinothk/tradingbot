@@ -15,15 +15,16 @@ periodically run a polling reconciliation pass.
 `market_data.provider_composition.get_market_data_provider()` first (works
 reliably for underlyings, unreliable-to-nonexistent for individual option
 contracts in this deployment — see `_live_tick`). For **underlyings**,
-falling back to `broker.get_quote()` (the execution broker, always the mock
-today) is still fine, since the live feed rarely misses there. For
-**option contracts** specifically, `_live_tick`/`broker.get_quote()` is
+falling back to `broker.get_quote()` (the per-position execution broker,
+mock for a paper-routed position, the real connected broker for a
+genuinely live one) is still fine, since the live feed rarely misses there.
+For **option contracts** specifically, `_live_tick`/`broker.get_quote()` is
 *not* used as the fallback — see `execution_engine.paper.service
 .current_contract_price`, which falls back to the same REST-based
-`OptionChainSnapshot` the strategy itself proposed the trade from, since
-`broker.get_quote()` would otherwise price the position from the mock's
-own synthetic, strategy-independent seed (the exact price-source mismatch
-this module's history had before this fix).
+`OptionChainSnapshot` the strategy itself proposed the trade from, since a
+paper position's `broker.get_quote()` would otherwise price it from the
+mock's own synthetic, strategy-independent seed (the exact price-source
+mismatch this module's history had before this fix).
 """
 
 from __future__ import annotations
@@ -31,14 +32,12 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, reuse_session, session_scope
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
@@ -68,12 +67,11 @@ from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, c
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.reconciliation.service import run_full_reconciliation
+from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
 logger = logging.getLogger("app.execution_engine.paper.position_manager")
 
 _MARGIN_BREACH_MODES = (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED)
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_RECONCILE_EVERY_N_CYCLES = 5
@@ -377,15 +375,13 @@ class PositionManager:
         # is not interchangeable with a real broker's quote.
         underlying_price_cache: dict[tuple[uuid.UUID, int], float] = {}
 
-        @contextmanager
-        def _same_session() -> Iterator[Session]:
-            # Reuses this cycle's already-open db/transaction for any
-            # option-chain refresh current_contract_price triggers, same
-            # reasoning as strategy_engine.runner.run_cycle's own
-            # _same_session — keeps the refresh atomic with the rest of
-            # this cycle rather than opening a second, independently-
-            # committing connection.
-            yield db
+        # Reuses this cycle's already-open db/transaction for any
+        # option-chain refresh current_contract_price triggers, same
+        # reasoning as strategy_engine.runner.run_cycle's own use of
+        # reuse_session — keeps the refresh atomic with the rest of this
+        # cycle rather than opening a second, independently-committing
+        # connection.
+        same_session = reuse_session(db)
 
         for position in open_positions:
             try:
@@ -419,7 +415,7 @@ class PositionManager:
                     option_contract,
                     broker,
                     market_data_provider=market_data_provider,
-                    session_factory=_same_session,
+                    session_factory=same_session,
                 )
 
                 cache_key = (option_contract.instrument_id, id(broker))
@@ -505,13 +501,6 @@ class PositionManager:
                 )
             else:
                 self._check_margin_breach(db, trading_session, session_broker, market_data_provider)
-
-        # Local import: same load-time-cycle reasoning as
-        # run_eod_square_off's import just below —
-        # strategy_engine.service imports execution_engine.paper.service,
-        # so importing it at module scope here would cycle back through
-        # this package's own __init__.py.
-        from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
         expire_stale_pending_approvals(db, trading_session)
 

@@ -20,12 +20,12 @@ refresh.
 from __future__ import annotations
 
 import logging
-import threading
-from datetime import date, time
+from datetime import time
 
-from app.core.clock import now_ist
 from app.core.db.session import session_scope
-from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured
+from app.domain.market.models import SyncStatus
+from app.modules.broker_adapter.composition import get_broker, is_execution_broker_connected
+from app.modules.scheduler.base import DailyAtTimeScheduler
 from app.modules.scheduler.instrument_sync import sync_instrument_master
 
 logger = logging.getLogger("app.scheduler.contract_sync_scheduler")
@@ -34,7 +34,7 @@ CONTRACT_SYNC_TIME = time(8, 30)
 
 
 def run_contract_sync() -> None:
-    if not is_shoonya_configured():
+    if not is_execution_broker_connected():
         logger.info(
             "Contract sync: Shoonya not connected -- skipping, existing local "
             "option_contracts data used as-is until the next reconnect/sync."
@@ -43,7 +43,11 @@ def run_contract_sync() -> None:
 
     with session_scope() as db:
         log = sync_instrument_master(db, get_broker(), ["NFO"])
-        logger.warning(
+        # .info for a normal success -- routine daily status, not something
+        # worth interrupting a WARNING+-only view of the logs for; a real
+        # PARTIAL/FAILED sync still logs at .warning so it stays visible.
+        log_fn = logger.info if log.status == SyncStatus.SUCCESS else logger.warning
+        log_fn(
             "Contract sync: status=%s instruments_updated=%d contracts_added=%d "
             "contracts_expired=%d",
             log.status,
@@ -53,40 +57,14 @@ def run_contract_sync() -> None:
         )
 
 
-class ContractSyncScheduler:
+class ContractSyncScheduler(DailyAtTimeScheduler):
+    _cycle_failed_log_message = "contract sync cycle failed"
+
     def __init__(self, tick_seconds: float = 60.0) -> None:
-        self._tick_seconds = tick_seconds
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._last_sync_date: date | None = None
+        super().__init__(logger, CONTRACT_SYNC_TIME, tick_seconds=tick_seconds)
 
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._tick_seconds + 5)
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def run_once(self) -> None:
-        now = now_ist()
-        if now.time() < CONTRACT_SYNC_TIME or self._last_sync_date == now.date():
-            return
+    def _do_run(self) -> None:
         run_contract_sync()
-        self._last_sync_date = now.date()
-
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception("contract sync cycle failed")
-            self._stop_event.wait(self._tick_seconds)
 
 
 _scheduler: ContractSyncScheduler | None = None

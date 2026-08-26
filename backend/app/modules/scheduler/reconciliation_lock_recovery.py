@@ -33,13 +33,10 @@ confirmed explicitly with the user, reserved exclusively for this scheduler.
 from __future__ import annotations
 
 import logging
-import threading
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 
 from sqlalchemy.orm import Session
 
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.core.modes.state_machine import ModeTransitionError, recover_from_reconciliation_lock
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.session.models import (
@@ -49,44 +46,25 @@ from app.domain.session.models import (
     TransitionTriggerType,
 )
 from app.modules.reconciliation.service import run_full_reconciliation
+from app.modules.scheduler.base import IntervalScheduler
 
 logger = logging.getLogger("app.scheduler.reconciliation_lock_recovery")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 DEFAULT_INTERVAL_SECONDS = 60.0
 DEFAULT_CLEAN_STREAK_THRESHOLD = 3
 
 
-class ReconciliationLockRecoveryScheduler:
+class ReconciliationLockRecoveryScheduler(IntervalScheduler):
+    _cycle_failed_log_message = "reconciliation-lock recovery cycle failed"
+
     def __init__(
         self,
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         clean_streak_threshold: int = DEFAULT_CLEAN_STREAK_THRESHOLD,
         session_factory: SessionFactory = session_scope,
     ) -> None:
-        self._interval_seconds = interval_seconds
+        super().__init__(logger, interval_seconds, session_factory=session_factory)
         self._clean_streak_threshold = clean_streak_threshold
-        self._session_factory = session_factory
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._interval_seconds + 5)
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def run_once(self) -> None:
-        with self._session_factory() as db:
-            self._run_cycle(db)
 
     def _run_cycle(self, db: Session) -> None:
         locked_sessions = (
@@ -136,7 +114,7 @@ class ReconciliationLockRecoveryScheduler:
                     "reconciliation checks"
                 ),
             )
-            logger.warning(
+            logger.info(
                 "session %s auto-recovered from reconciliation_lock after %d "
                 "consecutive clean checks (mode now %s)",
                 trading_session.id,
@@ -151,13 +129,6 @@ class ReconciliationLockRecoveryScheduler:
                 streak,
             )
 
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception("reconciliation-lock recovery cycle failed")
-            self._stop_event.wait(self._interval_seconds)
 
 
 _scheduler: ReconciliationLockRecoveryScheduler | None = None

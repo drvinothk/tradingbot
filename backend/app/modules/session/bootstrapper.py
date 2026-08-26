@@ -40,31 +40,27 @@ why it only creates `StrategyRun` rows and never starts a thread itself.
 from __future__ import annotations
 
 import logging
-import threading
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from datetime import UTC, date, datetime, time
 
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.clock import now_ist, to_ist
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import Workspace
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import SafeMode, TradingSession, TradingSessionStatus
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
-from app.main import _resume_strategy_runners
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
+from app.modules.scheduler.base import DailyAtTimeScheduler
 from app.modules.strategy_engine.auto_spawner import spawn_enabled_strategies
+from app.modules.strategy_engine.recovery import resume_strategy_runners
 
 logger = logging.getLogger("app.session.bootstrapper")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 BOOTSTRAP_TIME = time(9, 0)
 
@@ -141,7 +137,7 @@ def _close_if_safe(db: Session, stale_session: TradingSession) -> None:
         broker_account_id=stale_session.broker_account_id,
         payload={"started_at": stale_session.started_at.isoformat()},
     )
-    logger.warning(
+    logger.info(
         "Daily bootstrap: auto-closed stale, empty trading_session %s (started %s, no "
         "open positions or live runs)",
         stale_session.id,
@@ -183,12 +179,8 @@ def _bootstrap_workspace(
         )
         return todays_session
 
-    most_recent = (
-        db.query(TradingSession)
-        .filter(TradingSession.workspace_id == workspace_id)
-        .order_by(TradingSession.started_at.desc())
-        .first()
-    )
+    # Already loaded in all_sessions above -- no need to re-query.
+    most_recent = max(all_sessions, key=lambda s: s.started_at, default=None)
     if most_recent is None:
         logger.info(
             "Daily bootstrap: workspace %s has no prior trading_session to bootstrap "
@@ -224,7 +216,7 @@ def _bootstrap_workspace(
         broker_account_id=new_session.broker_account_id,
         payload={"broker_account_id": str(new_session.broker_account_id)},
     )
-    logger.warning(
+    logger.info(
         "Daily bootstrap: created today's trading_session %s for workspace %s "
         "(broker_account=%s, continued from trading_session %s)",
         new_session.id,
@@ -248,13 +240,13 @@ def run_daily_bootstrap(*, session_factory: SessionFactory = session_scope) -> N
         for workspace_id in workspace_ids:
             todays_session = _bootstrap_workspace(db, workspace_id, today_ist)
             # Ops-Hardening Phase 6: creates committed StrategyRun rows only
-            # (no thread starting here) -- _resume_strategy_runners below
+            # (no thread starting here) -- resume_strategy_runners below
             # picks them up, same as it would any other non-STOPPED run with
             # no live thread yet. `todays_session` can be `None` ("no prior
             # session ever" skip case) or non-ACTIVE (a human already ended
             # today's session, e.g. kill_switch/manual end, before a restart
             # re-ran this same-day bootstrap tick) -- both must be skipped,
-            # not just the None case: _resume_strategy_runners only ever
+            # not just the None case: resume_strategy_runners only ever
             # resumes runs on an ACTIVE session, so attaching a fresh run to
             # an already-ended one would create a zombie StrategyRun no
             # runner thread ever picks up.
@@ -270,49 +262,24 @@ def run_daily_bootstrap(*, session_factory: SessionFactory = session_scope) -> N
     # its own before this scheduler's thread even starts, making this call
     # a harmless no-op rather than the only time it runs.
     #
-    # Module-level import (see top of file), not a local one here -- this
-    # function has no session_factory of its own (hardcoded to the real
-    # session_scope internally), so a test must be able to monkeypatch this
-    # module's own reference to it (`bootstrapper_module._resume_strategy_
-    # runners`) rather than have it re-imported fresh from app.main on every
-    # call, which a local import here would make impossible to intercept.
-    _resume_strategy_runners()
+    # Module-level import (see top of file) -- since this now imports
+    # downward from `strategy_engine.recovery` rather than reaching up into
+    # `app.main`, there's no circular-import reason to keep it local, and a
+    # test can still monkeypatch this module's own reference to it
+    # (`bootstrapper_module.resume_strategy_runners`) the same way whether
+    # the import is local or module-level, since `monkeypatch.setattr`
+    # replaces the attribute on this module either way.
+    resume_strategy_runners()
 
 
-class DailyBootstrapScheduler:
+class DailyBootstrapScheduler(DailyAtTimeScheduler):
+    _cycle_failed_log_message = "daily bootstrap cycle failed"
+
     def __init__(self, tick_seconds: float = 60.0) -> None:
-        self._tick_seconds = tick_seconds
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._last_bootstrap_date: date | None = None
+        super().__init__(logger, BOOTSTRAP_TIME, tick_seconds=tick_seconds)
 
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._tick_seconds + 5)
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def run_once(self) -> None:
-        now = now_ist()
-        if now.time() < BOOTSTRAP_TIME or self._last_bootstrap_date == now.date():
-            return
+    def _do_run(self) -> None:
         run_daily_bootstrap()
-        self._last_bootstrap_date = now.date()
-
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception("daily bootstrap cycle failed")
-            self._stop_event.wait(self._tick_seconds)
 
 
 _scheduler: DailyBootstrapScheduler | None = None

@@ -19,13 +19,12 @@ import logging
 import threading
 import uuid
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
 from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import is_past_eod_scanning_stop, is_within_global_trading_window, now_ist
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, reuse_session, session_scope
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode
@@ -44,7 +43,7 @@ from app.modules.market_data.freshness import (
     ensure_fresh_option_chain,
 )
 from app.modules.market_data.market_hours import is_within_market_hours
-from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
+from app.modules.market_data.provider_composition import is_market_data_ready
 from app.modules.market_data.registry import unsubscribe_symbol
 from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
@@ -54,8 +53,6 @@ from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.service import submit_signal
 
 logger = logging.getLogger("app.strategy_engine.runner")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 # Ops-Hardening Phase 2. Patterned after market_data.freshness's own
 # FreshnessThresholds convention (a new instance, not a reuse of
@@ -98,11 +95,12 @@ def _check_runner_watchdog(
 
     Gated on `is_within_market_hours()` (08:30-16:00 IST) rather than the
     narrower `is_within_global_trading_window()` (09:31-15:09) `run_cycle`'s
-    own evaluate/submit block uses -- deliberate: an open position is
-    actively managed (including EOD square-off) through `cutoff_time`
-    (15:20 by default), well past the entry window's own close, so the
-    watchdog needs to keep watching through that whole span, not just while
-    new entries are allowed.
+    own evaluate/submit block uses -- deliberate: `cutoff_time` (15:09 by
+    default) is when EOD force-close *fires*, not when a position finishes
+    being closed -- `PositionManager`'s own 3s poll and any unfilled-exit
+    reconciliation can still be actively working past that instant, so the
+    watchdog needs to keep watching through the wider market-hours span,
+    not just while new entries are allowed.
 
     Takes `latest_bar` directly (the same `PriceBar | None` `run_cycle`
     already fetched this cycle) rather than that function's own `window_ts`
@@ -191,7 +189,7 @@ def _maybe_stop_for_eod(
     already known `False` — never re-derives it. A run *with* an open
     position is untouched here; `PositionManager`'s own stop/target/trail/
     EOD-square-off keeps managing it through `TradingSession.cutoff_time`
-    (15:20 by default) regardless of this function.
+    (15:09 by default) regardless of this function.
 
     Reuses the existing `STOPPED` status (identical to a manual
     `stop_strategy` call) rather than a new terminal status — `STOPPED` is
@@ -300,7 +298,7 @@ def run_cycle(
     guard, so a cold-start cycle degrades to the old wall-clock behavior
     instead of ever touching `latest_bar.bucket_start` on a `None`.
 
-    2026-08-14: also requires `is_shoonya_market_data_ready()` alongside the
+    2026-08-14: also requires `is_market_data_ready()` alongside the
     window check — `get_broker()` (used for the option-chain refresh right
     below) falls back to the mock broker until a human reconnects Shoonya,
     same root cause `market_data.registry.reset_for_reconnect`'s docstring
@@ -324,13 +322,11 @@ def run_cycle(
     """
     decision: RiskDecision | None = None
 
-    @contextmanager
-    def _same_session():
-        # Reuses run_cycle's own already-open db/transaction for any
-        # option-chain refresh, rather than record_option_chain_snapshot's
-        # own default of opening a second, independently-committing
-        # connection — keeps the refresh atomic with the rest of this cycle.
-        yield db
+    # reuse_session: reuses run_cycle's own already-open db/transaction for
+    # any option-chain refresh, rather than record_option_chain_snapshot's
+    # own default of opening a second, independently-committing connection
+    # — keeps the refresh atomic with the rest of this cycle.
+    same_session = reuse_session(db)
 
     latest_bars = get_recent_completed_bars(db, strategy.instrument_id, limit=1)
     if latest_bars:
@@ -340,13 +336,13 @@ def run_cycle(
         latest_bar = None
         window_ts = now_ist()
 
-    if is_within_global_trading_window(window_ts) and is_shoonya_market_data_ready():
+    if is_within_global_trading_window(window_ts) and is_market_data_ready():
         freshness = ensure_fresh_option_chain(
             db,
             get_broker(),
             strategy.instrument_id,
             strategy.expiry_date,
-            session_factory=_same_session,
+            session_factory=same_session,
         )
         if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
             logger.warning(

@@ -9,6 +9,7 @@ from datetime import datetime
 
 import pytest
 
+import app.modules.scheduler.base as scheduler_base_module
 import app.modules.scheduler.contract_sync_scheduler as contract_sync_module
 from app.core.clock import IST
 from app.modules.scheduler.contract_sync_scheduler import (
@@ -31,7 +32,7 @@ def _at(hour: int, minute: int, day: int = 18) -> datetime:
 
 
 def test_does_not_trigger_before_sync_time(monkeypatch, calls):
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 29))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 29))
     scheduler = ContractSyncScheduler()
 
     scheduler.run_once()
@@ -40,7 +41,7 @@ def test_does_not_trigger_before_sync_time(monkeypatch, calls):
 
 
 def test_triggers_on_first_tick_at_or_after_sync_time(monkeypatch, calls):
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 30))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 30))
     scheduler = ContractSyncScheduler()
 
     scheduler.run_once()
@@ -49,22 +50,22 @@ def test_triggers_on_first_tick_at_or_after_sync_time(monkeypatch, calls):
 
 
 def test_does_not_retrigger_later_the_same_day(monkeypatch, calls):
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 30))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 30))
     scheduler = ContractSyncScheduler()
     scheduler.run_once()
 
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(12, 0))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(12, 0))
     scheduler.run_once()
 
     assert len(calls) == 1
 
 
 def test_triggers_again_the_next_day(monkeypatch, calls):
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 30, day=18))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 30, day=18))
     scheduler = ContractSyncScheduler()
     scheduler.run_once()
 
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 30, day=19))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 30, day=19))
     scheduler.run_once()
 
     assert len(calls) == 2
@@ -75,13 +76,13 @@ def test_does_not_mark_the_day_done_when_sync_raises(monkeypatch):
         raise RuntimeError("db hiccup")
 
     monkeypatch.setattr(contract_sync_module, "run_contract_sync", _raise)
-    monkeypatch.setattr(contract_sync_module, "now_ist", lambda: _at(8, 30))
+    monkeypatch.setattr(scheduler_base_module, "now_ist", lambda: _at(8, 30))
     scheduler = ContractSyncScheduler()
 
     with pytest.raises(RuntimeError):
         scheduler.run_once()
 
-    assert scheduler._last_sync_date is None
+    assert scheduler._last_run_date is None
 
 
 def test_sync_time_constant_is_08_30():
@@ -90,7 +91,7 @@ def test_sync_time_constant_is_08_30():
 
 
 def test_run_contract_sync_skips_when_shoonya_not_connected(monkeypatch):
-    monkeypatch.setattr(contract_sync_module, "is_shoonya_configured", lambda: False)
+    monkeypatch.setattr(contract_sync_module, "is_execution_broker_connected", lambda: False)
     sync_calls: list[None] = []
     monkeypatch.setattr(
         contract_sync_module, "sync_instrument_master", lambda *a, **kw: sync_calls.append(None)
@@ -104,7 +105,7 @@ def test_run_contract_sync_skips_when_shoonya_not_connected(monkeypatch):
 def test_run_contract_sync_calls_sync_when_shoonya_connected(monkeypatch):
     from contextlib import contextmanager
 
-    monkeypatch.setattr(contract_sync_module, "is_shoonya_configured", lambda: True)
+    monkeypatch.setattr(contract_sync_module, "is_execution_broker_connected", lambda: True)
     monkeypatch.setattr(contract_sync_module, "get_broker", lambda: object())
 
     class _FakeLog:

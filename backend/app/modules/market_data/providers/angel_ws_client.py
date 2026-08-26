@@ -620,11 +620,11 @@ class AngelWSClient:
         observed, not a fix for that one.
 
         The raw-data line was `.warning()`, deliberately, while this method
-        had never been confirmed to receive a single live tick — this
-        deployment has no logging configuration anywhere (see
-        `shoonya/ws_client.py`'s own `_authenticate` docstring for the
-        identical reasoning), so anything below WARNING is invisible in the
-        real logs. **2026-08-11: confirmed live** — the proxy-routing fix
+        had never been confirmed to receive a single live tick — at the
+        time this was written, this deployment had no logging configuration
+        at all (fixed 2026-08-14, `app.main`'s own `logging.basicConfig`
+        call), so anything below WARNING was invisible in the real logs.
+        **2026-08-11: confirmed live** — the proxy-routing fix
         (see module docstring) got real ticks flowing, ~230/minute for a
         single index token, so that line is now `.debug()` (silent by
         default, same "no config anywhere" reasoning applied the other

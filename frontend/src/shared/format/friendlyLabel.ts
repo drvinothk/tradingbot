@@ -46,10 +46,6 @@ export function friendlyTradeLabel(
   return parts.filter((part): part is string => Boolean(part)).join(' · ')
 }
 
-export function shortId(id: string): string {
-  return id.slice(0, 8)
-}
-
 // `ExitReason` (backend `app.domain.execution.models.ExitReason`) values,
 // mapped to a short label for the "Exit Via" column -- target/stop/trail are
 // the common cases and get the plain labels the user actually asked for;

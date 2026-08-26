@@ -47,13 +47,13 @@ TODAY = date(2026, 8, 18)
 
 @pytest.fixture(autouse=True)
 def _no_real_resume(monkeypatch):
-    """`_resume_strategy_runners` is hardcoded to the real `session_scope`
+    """`resume_strategy_runners` is hardcoded to the real `session_scope`
     internally (no injectable factory of its own) -- must never run for
     real inside a test, same "don't let a background write default to the
     production DB inside a test" discipline as every other phase.
     """
     calls: list[None] = []
-    monkeypatch.setattr(bootstrapper_module, "_resume_strategy_runners", lambda: calls.append(None))
+    monkeypatch.setattr(bootstrapper_module, "resume_strategy_runners", lambda: calls.append(None))
     return calls
 
 
@@ -414,7 +414,7 @@ def test_auto_spawner_runs_against_todays_freshly_created_session(
     """
     import app.modules.strategy_engine.auto_spawner as auto_spawner_module
 
-    monkeypatch.setattr(auto_spawner_module, "is_shoonya_market_data_ready", lambda: True)
+    monkeypatch.setattr(auto_spawner_module, "is_market_data_ready", lambda: True)
     monkeypatch.setattr(
         auto_spawner_module, "record_option_chain_snapshot", lambda *a, **kw: None
     )

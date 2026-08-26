@@ -29,7 +29,12 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.modules.audit_service.service import record_event
-from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured, set_broker
+from app.modules.broker_adapter.composition import (
+    get_broker,
+    is_shoonya_configured,
+    set_broker,
+    unwrap_broker,
+)
 from app.modules.broker_adapter.shoonya.auth import build_authorize_url, exchange_code_for_token
 from app.modules.broker_adapter.shoonya.session_cache import set_cached_shoonya_session
 from app.modules.scheduler.instrument_sync import sync_instrument_master
@@ -98,7 +103,7 @@ def ws_diagnostic(user: User = Depends(require_permission("session.start"))) -> 
     # composition.py wraps every real adapter in `_AuthAwareBroker` — unwrap
     # it, since `isinstance(broker, ShoonyaBrokerAdapter)` alone is always
     # False against the wrapper.
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     if not isinstance(inner, ShoonyaBrokerAdapter):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -133,7 +138,7 @@ def export_ws_session_for_diagnostic(
     from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 
     broker = get_broker()
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     if not isinstance(inner, ShoonyaBrokerAdapter):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -183,7 +188,7 @@ def ws_tick_diagnostic(
     from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 
     broker = get_broker()
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     if not isinstance(inner, ShoonyaBrokerAdapter):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -226,7 +231,7 @@ def search_scrip_diagnostic(
     from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 
     broker = get_broker()
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     if not isinstance(inner, ShoonyaBrokerAdapter):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -284,7 +289,7 @@ def subscribe_diagnostic(
     from app.modules.market_data.provider_composition import get_market_data_provider
 
     broker = get_broker()
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     if not isinstance(inner, ShoonyaBrokerAdapter):
         raise HTTPException(
             status.HTTP_409_CONFLICT,

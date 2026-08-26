@@ -11,13 +11,14 @@ check for trading_sessions.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist, to_ist
+from app.core.db.base import utcnow as _utcnow
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
@@ -51,12 +52,13 @@ from app.modules.market_data.freshness import (
     classify_option_chain,
     worse_of,
 )
-from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
+from app.modules.market_data.provider_composition import is_market_data_ready
 from app.modules.market_data.registry import ensure_ingestion_running
 from app.modules.strategy_engine.auto_spawner import SpawnStatus, spawn_one_now
 from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.runner import StrategyRunner
+from app.modules.strategy_engine.service import new_strategy_run
 from app.modules.strategy_engine.strategies import (
     EMAMicroPullbackStrategy,
     LiquiditySweepReversalStrategy,
@@ -70,10 +72,6 @@ router = APIRouter(tags=["strategies"])
 
 # strategy_run_id -> live runner thread. See module docstring.
 _RUNNERS: dict[uuid.UUID, StrategyRunner] = {}
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 ORB_PARAM_KEYS = {
@@ -682,11 +680,11 @@ def start_strategy(
     # against entirely fabricated data instead of raising BrokerError, and
     # ensure_ingestion_running further below would start real ingestion
     # against that same mock-wrapped provider — the same bug class fixed in
-    # _resume_strategy_runners/MarketDataScheduler, just human-triggered
+    # resume_strategy_runners/MarketDataScheduler, just human-triggered
     # (starting a new strategy before reconnecting) rather than
     # restart-triggered. Angel One/TrueData/mock configurations are
-    # unaffected -- is_shoonya_market_data_ready() is always True for them.
-    if not is_shoonya_market_data_ready():
+    # unaffected -- is_market_data_ready() is always True for them.
+    if not is_market_data_ready():
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Shoonya is not connected — connect Shoonya before starting a strategy",
@@ -743,19 +741,17 @@ def start_strategy(
         if existing_run is not None:
             raise HTTPException(status.HTTP_409_CONFLICT, "Strategy already has an active run")
 
-        run = StrategyRun(
-            id=uuid.uuid4(),
+        # instrument_id/expiry_date/interval_seconds persisted so a restart
+        # can rebuild this run's Strategy object (see strategy_engine
+        # .recovery.resume_strategy_runners) — previously these were
+        # request-only params, never recorded anywhere once the runner
+        # thread was built, which is exactly why a restart could never
+        # resume a run even in principle.
+        run = new_strategy_run(
             strategy_config_id=strategy_id,
             trading_session_id=trading_session.id,
             execution_mode=body.execution_mode,
-            status=StrategyRunStatus.SCANNING,
-            started_at=_utcnow(),
             started_by_user_id=user.id,
-            # Persisted so a restart can rebuild this run's Strategy object
-            # (see app.main._resume_strategy_runners) — previously these were
-            # request-only params, never recorded anywhere once the runner
-            # thread was built, which is exactly why a restart could never
-            # resume a run even in principle.
             instrument_id=body.instrument_id,
             expiry_date=body.expiry_date,
             interval_seconds=body.interval_seconds,

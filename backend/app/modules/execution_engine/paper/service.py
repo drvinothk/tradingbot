@@ -5,9 +5,11 @@ replace Phase 2's `close_dispatched_trade_intent_synthetically`/
 
 Calls `BrokerPort.place_order`/`get_positions` against whichever adapter
 `app.modules.broker_adapter.composition.get_execution_broker` resolves to
-(the persistent mock, today, regardless of what `get_broker()` — the
-market-data accessor — currently holds) rather than simulating fills purely
-from tick data — this reuses Phase 1's already-built order/position
+(the mock for paper-routed sessions/strategies, the real connected broker
+for genuinely live ones — see that function's own routing table; separate
+from what `get_broker()` — the market-data accessor — currently holds)
+rather than simulating fills purely from tick data — this reuses Phase 1's
+already-built order/position
 simulation and gives Reconciliation Service a genuine broker-side state to
 diff local `positions` against. See the Phase 3 plan's "Key design
 decision" note for the full reasoning; Phase 6's real live-order path will
@@ -43,15 +45,16 @@ crossed with this one, which nothing in this codebase does.
 
 from __future__ import annotations
 
-import enum
 import logging
 import uuid
-from datetime import UTC, datetime
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
+from decimal import Decimal
+from typing import NamedTuple
 
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
+from app.core.db.base import utcnow as _utcnow
+from app.core.db.session import SessionFactory
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.pnl import signed_pnl
 from app.core.sleep_inhibitor import get_sleep_inhibitor
@@ -60,9 +63,7 @@ from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import (
     ExitReason,
     Order,
-    OrderEvent,
     OrderMode,
-    OrderSide,
     OrderStatus,
     OrderType,
     Position,
@@ -74,7 +75,7 @@ from app.domain.execution.models import (
     TrailPlanStatus,
 )
 from app.domain.market.models import Instrument, OptionContract
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent, TradeIntentStatus
 from app.modules.alerting.manager import send_alert
@@ -86,26 +87,44 @@ from app.modules.broker_adapter.base.contracts import (
     OrderResult,
     Tick,
 )
-from app.modules.broker_adapter.base.contracts import OrderSide as BrokerOrderSide
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
-from app.modules.broker_adapter.base.errors import BrokerError
+from app.modules.broker_adapter.base.errors import ConfigurationError
 from app.modules.broker_adapter.composition import (
     get_broker,
     get_execution_broker,
     is_execution_broker_live,
+    unwrap_broker,
 )
 from app.modules.broker_adapter.preflight import run_preflight_checks
+from app.modules.execution_engine.paper.order_helpers import (
+    _apply_slippage,
+    _dec,
+    _map_status,
+    _new_order,
+    _new_order_event,
+    _opposite,
+    _round_to_tick,
+    _to_broker_side,
+    _to_domain_side,
+)
+from app.modules.execution_engine.paper.protective_stop import (
+    CancelOutcome,
+    cancel_resting_protective_stop,
+    place_protective_stop,
+    sync_resting_protective_stop,
+)
 from app.modules.market_data.freshness import (
     OPTION_CHAIN_THRESHOLDS,
-    TICK_THRESHOLDS,
     FreshnessState,
-    classify_age,
+    classify_option_chain,
     ensure_fresh_option_chain,
+    fresh_tick_or_none,
     latest_snapshot_tick,
 )
-from app.modules.market_data.ingestion import SessionFactory
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.reconciliation.service import run_reconciliation
+from app.modules.risk_engine.service import record_trade_outcome_effects
+from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME, get_recent_completed_bars
 
 logger = logging.getLogger("app.execution_engine.paper.service")
 
@@ -125,14 +144,6 @@ TRAIL_LOCK_FRACTION = Decimal("0.5")
 # force-exited by the same bar the entry filter would merely have scored
 # lower, only once liquidity has genuinely dried up.
 SPREAD_BLOWOUT_PCT = Decimal("0.30")
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
-
-
-def _dec(value: object) -> Decimal:
-    return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
 def _structure_break_confirmed_by_bar_close(
@@ -158,17 +169,7 @@ def _structure_break_confirmed_by_bar_close(
     (`classify_latest_tick`) but wiring it into this specific check is
     separate, not-yet-done scope, flagged here rather than silently assumed
     fine.
-
-    Local import, not module-level: `strategy_engine/__init__.py` eagerly
-    imports `strategy_engine.service`, which imports `dispatch_trade_intent`
-    from *this* module at its own top level -- a module-level import of
-    `strategy_engine.common_rules` here would be a real circular import at
-    app startup (surfaces immediately across the whole test suite, not just
-    a style choice), same shape `api.v1.sessions.py`'s own local import of
-    `session.bootstrapper` already documents.
     """
-    from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME, get_recent_completed_bars
-
     bars = get_recent_completed_bars(db, instrument_id, BAR_TIMEFRAME, limit=1)
     if not bars:
         return False
@@ -176,61 +177,57 @@ def _structure_break_confirmed_by_bar_close(
     return close < buffered_level if favorable else close > buffered_level
 
 
-def _opposite(side: SignalSide) -> SignalSide:
-    return SignalSide.SELL if side == SignalSide.BUY else SignalSide.BUY
-
-
-def _to_broker_side(side: SignalSide) -> BrokerOrderSide:
-    return BrokerOrderSide.BUY if side == SignalSide.BUY else BrokerOrderSide.SELL
-
-
-def _to_domain_side(side: SignalSide) -> OrderSide:
-    return OrderSide.BUY if side == SignalSide.BUY else OrderSide.SELL
-
-
-def _map_status(status: BrokerOrderStatus) -> OrderStatus:
-    return OrderStatus(status.value)
-
-
-def _apply_slippage(price: Decimal, order_side: SignalSide, slippage_pct: Decimal) -> Decimal:
-    """Worse execution than the reference price, in whichever direction
-    actually hurts the trader for *this order's own side* -- a BUY (opening
-    a long, or closing a short) fills slightly higher; a SELL (closing a
-    long, or opening a short) fills slightly lower. The same rule works
-    uniformly for both an entry order and an exit order without needing to
-    know which one this is -- only the order's own side matters.
+def _raise_if_option_chain_stale(
+    db: Session, trading_session: TradingSession, option_contract: OptionContract
+) -> None:
+    """2026-08-26: moved here from `broker_adapter.preflight.run_preflight_
+    checks` -- that module talking to `market_data.freshness` was the one
+    import making the `broker_adapter`/`market_data` package relationship
+    bidirectional, when both packages' own docstrings claim one-directional
+    layering. This module already depends on `market_data` elsewhere, so
+    the check belongs here, called alongside `run_preflight_checks` at each
+    real-dispatch call site rather than inside it.
     """
-    if slippage_pct == 0:
-        return price
-    if order_side == SignalSide.BUY:
-        return price * (Decimal("1") + slippage_pct)
-    return price * (Decimal("1") - slippage_pct)
+    freshness = classify_option_chain(
+        db, option_contract.instrument_id, option_contract.expiry_date
+    )
+    if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
+        raise ConfigurationError(
+            f"Pre-flight failed for trading_session {trading_session.id}: option chain for "
+            f"{option_contract.symbol} is {freshness.value} -- refusing real dispatch."
+        )
 
 
-def _round_to_tick(price: Decimal, tick_size: Decimal, order_side: SignalSide) -> Decimal:
-    """**2026-08-20, live incident**: a real Shoonya order was rejected for
-    a price that wasn't a multiple of the instrument's own tick size (NSE
-    requires 0.05 multiples for these contracts; anything else, e.g. a
-    stray 0.03, is rejected outright) -- `_apply_slippage`'s percentage-
-    based buffer (`AppSettings.live_limit_order_buffer_pct`) almost never
-    lands on a clean multiple on its own (a real quoted `entry_price` is
-    already tick-aligned, but multiplying it by `1 + buffer_pct` generally
-    isn't). Only ever actually mattered for LIVE limit orders -- PAPER
-    still sends MARKET, which has no price to round.
+class _ResolvedOrderPricing(NamedTuple):
+    limit_price: float
+    broker_order_type: BrokerOrderType
+    domain_order_type: OrderType
 
-    Rounds in the direction that preserves (or very slightly increases)
-    the buffer's own protective margin rather than eroding it, same "which
-    direction actually helps this order's own side" reasoning
-    `_apply_slippage` already uses: up for a BUY (rounding down would mean
-    paying *less* than the buffer intended, undermining the whole point of
-    padding the price to tolerate LTP movement since the trading decision
-    was made), down for a SELL (mirror reasoning).
+
+def _resolve_order_pricing(
+    order_mode: OrderMode, price: Decimal, side: SignalSide, tick_size: Decimal
+) -> _ResolvedOrderPricing:
+    """order_type: **live-corrected 2026-08-19** -- a real Shoonya PlaceOrder
+    call rejects order_type=MARKET outright ("ALGO_CHK: MKT Order type not
+    allowed for API order", live-confirmed). PAPER keeps MARKET unchanged
+    (existing contract/tests expect it; the mock doesn't care). LIVE sends a
+    real LIMIT order, priced with its own dedicated buffer
+    (`AppSettings.live_limit_order_buffer_pct`) rather than paper's
+    `fill_slippage_pct` (which defaults to 0.0 and exists for a different
+    purpose -- realistic paper fill simulation, not "will a real limit order
+    actually execute despite LTP moving between decision and placement").
+    Shared by `dispatch_trade_intent`'s entry order and `close_position`'s
+    exit order -- previously duplicated identically in both.
     """
-    if tick_size <= 0:
-        return price
-    ticks = price / tick_size
-    rounding = ROUND_CEILING if order_side == SignalSide.BUY else ROUND_FLOOR
-    return ticks.to_integral_value(rounding=rounding) * tick_size
+    if order_mode == OrderMode.LIVE:
+        buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+        buffered_price = _apply_slippage(price, side, buffer_pct)
+        limit_price = float(_round_to_tick(buffered_price, tick_size, side))
+        return _ResolvedOrderPricing(limit_price, BrokerOrderType.LIMIT, OrderType.LIMIT)
+
+    slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
+    limit_price = float(_apply_slippage(price, side, slippage_pct))
+    return _ResolvedOrderPricing(limit_price, BrokerOrderType.MARKET, OrderType.MARKET)
 
 
 def dispatch_trade_intent(
@@ -293,12 +290,8 @@ def dispatch_trade_intent(
         now = _utcnow()
 
         if order_mode == OrderMode.LIVE:
-            run_preflight_checks(
-                db,
-                broker,
-                trading_session=trading_session,
-                option_contract=option_contract,
-            )
+            run_preflight_checks(broker, trading_session=trading_session)
+            _raise_if_option_chain_stale(db, trading_session, option_contract)
 
         # trade_intent.entry_price is already the strategy's real,
         # REST-option-chain-derived proposed price (see every strategy's
@@ -306,28 +299,9 @@ def dispatch_trade_intent(
         # basis instead of leaving MockBrokerAdapter to fill at its own
         # independent synthetic price.
         #
-        # order_type: **live-corrected 2026-08-19** -- a real Shoonya
-        # PlaceOrder call rejects order_type=MARKET outright
-        # ("ALGO_CHK: MKT Order type not allowed for API order",
-        # live-confirmed). PAPER keeps MARKET unchanged (existing
-        # contract/tests expect it; the mock doesn't care). LIVE now sends
-        # a real LIMIT order, priced with its own dedicated buffer
-        # (`AppSettings.live_limit_order_buffer_pct`) rather than paper's
-        # `fill_slippage_pct` (which defaults to 0.0 and exists for a
-        # different purpose -- realistic paper fill simulation, not "will
-        # a real limit order actually execute despite LTP moving between
-        # decision and placement").
-        if order_mode == OrderMode.LIVE:
-            buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-            buffered_price = _apply_slippage(_dec(trade_intent.entry_price), side, buffer_pct)
-            limit_price = float(_round_to_tick(buffered_price, _dec(instrument.tick_size), side))
-            broker_order_type = BrokerOrderType.LIMIT
-            domain_order_type = OrderType.LIMIT
-        else:
-            slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
-            limit_price = float(_apply_slippage(_dec(trade_intent.entry_price), side, slippage_pct))
-            broker_order_type = BrokerOrderType.MARKET
-            domain_order_type = OrderType.MARKET
+        limit_price, broker_order_type, domain_order_type = _resolve_order_pricing(
+            order_mode, _dec(trade_intent.entry_price), side, _dec(instrument.tick_size)
+        )
 
         order_result = broker.place_order(
             OrderRequest(
@@ -342,40 +316,28 @@ def dispatch_trade_intent(
             )
         )
 
-        order = Order(
-            id=uuid.uuid4(),
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            option_contract_id=option_contract.id,
-            trade_intent_id=trade_intent.id,
-            idempotency_key=trade_intent.idempotency_key,
+        order = _new_order(
+            trading_session,
+            option_contract,
+            order_result,
             mode=order_mode,
             side=_to_domain_side(side),
             order_type=domain_order_type,
             qty=qty,
-            status=_map_status(order_result.status),
-            filled_qty=order_result.filled_qty,
-            avg_fill_price=order_result.avg_fill_price,
-            broker_order_id=order_result.broker_order_id,
-            submitted_at=now,
-            updated_at=now,
+            idempotency_key=trade_intent.idempotency_key,
+            now=now,
+            trade_intent_id=trade_intent.id,
         )
         db.add(order)
         db.flush()
 
         db.add(
-            OrderEvent(
-                id=uuid.uuid4(),
-                order_id=order.id,
+            _new_order_event(
+                order.id,
+                order_result,
                 event_type="filled" if order.status == OrderStatus.FILLED else "submitted",
-                raw_payload={
-                    "broker_order_id": order_result.broker_order_id,
-                    "status": order_result.status.value,
-                    "filled_qty": order_result.filled_qty,
-                    "avg_fill_price": order_result.avg_fill_price,
-                    "raw_message": order_result.raw_message,
-                },
-                ts=now,
+                now=now,
+                include_raw_message=True,
             )
         )
 
@@ -530,7 +492,7 @@ def _open_position_from_fill(
     # PAPER positions are untouched: today's pure local-monitoring stays
     # the only mechanism, unchanged.
     if order.mode == OrderMode.LIVE:
-        _place_protective_stop(db, trading_session, position, stop_plan, option_contract, broker)
+        place_protective_stop(db, trading_session, position, stop_plan, option_contract, broker)
 
     record_event(
         db,
@@ -567,156 +529,6 @@ def _open_position_from_fill(
     # fixtures to accidentally bypass.
 
     return position
-
-
-def _place_protective_stop(
-    db: Session,
-    trading_session: TradingSession,
-    position: Position,
-    stop_plan: StopPlan,
-    option_contract: OptionContract,
-    broker: BrokerPort,
-) -> None:
-    """LIVE-only crash-resilience layer: places a real broker-side SL-LMT
-    immediately on entry fill, tagged `stop:{position_id}` (distinct from
-    the existing `exit:{position_id}` convention `close_position` uses) so
-    `reconcile_pending_live_exit_orders`/`_apply_resolved_pending_exit_order`
-    can tell "the resting stop itself filled" apart from "a manual/target
-    exit filled" — see that function's own branch. `SL-MKT` is exchange-
-    banned for options since 2021-09-27 (confirmed, see project memory),
-    hence `SL_LIMIT`, never `SL_MARKET`.
-
-    Never raises — a placement failure must leave the position exactly as
-    protected as it was before this feature existed (today's pure local
-    stop/target/trail monitoring), not worse. On failure: log, raise a
-    CRITICAL `SystemAlert`, and return with `stop_plan.resting_order_id`
-    left `None` — `evaluate_open_position`'s own stop check only skips
-    itself when `resting_order_id` is set, so a `None` here means local
-    monitoring keeps working exactly as it does for every position today.
-
-    Deliberately does **not** call `run_preflight_checks` (unlike every
-    other LIVE order this module places) — that gate exists to block a
-    *new risk-taking* dispatch on stale option-chain data or thin margin,
-    but a protective stop *reduces* risk. Gating it the same way would be
-    actively counterproductive: margin is often at its tightest right after
-    the entry that just consumed it, which is exactly when this must not
-    be skipped.
-    """
-    instrument = db.get(Instrument, option_contract.instrument_id)
-    if instrument is None:
-        return
-
-    exit_side = _opposite(SignalSide(position.side))
-    tick_size = _dec(instrument.tick_size)
-    trigger_price = _round_to_tick(_dec(stop_plan.stop_price), tick_size, exit_side)
-    # Same buffer/tick discipline as every other LIVE limit-priced exit in
-    # this module (see `_apply_slippage`/`_round_to_tick`'s own docstrings)
-    # -- the limit price trails the trigger by the protective buffer so the
-    # order can actually execute once triggered, not sit rejected-on-fill
-    # for being priced exactly at a level the market has already passed.
-    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-    limit_price = _round_to_tick(
-        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
-    )
-    stop_idempotency_key = f"stop:{position.id}"
-
-    try:
-        order_result = broker.place_order(
-            OrderRequest(
-                idempotency_key=stop_idempotency_key,
-                contract_symbol=option_contract.symbol,
-                side=_to_broker_side(exit_side),
-                order_type=BrokerOrderType.SL_LIMIT,
-                qty=position.qty,
-                limit_price=float(limit_price),
-                trigger_price=float(trigger_price),
-                lot_size=instrument.lot_size,
-                tag=f"session:{trading_session.id}",
-            )
-        )
-    except Exception:  # noqa: BLE001 - see this function's own "never raises" contract
-        # Broader than `BrokerError` deliberately: this function's own
-        # docstring promises to never leave the position worse off than
-        # before this feature existed, and `_open_position_from_fill`
-        # (this function's only caller) has nothing wrapping it either --
-        # an uncaught exception here would abort the entire entry-fill
-        # transaction for a position the broker has *already genuinely
-        # filled*, or (via evaluate_open_position's own un-wrapped
-        # PositionManager call site) abort that whole cycle's handling of
-        # every other open position in the session, not just this one.
-        # `place_order`'s own 1-lot `CriticalSafetyException` is a real,
-        # concrete example of a non-`BrokerError` this must still catch.
-        logger.exception(
-            "protective SL-LMT placement failed for position %s -- falling back to "
-            "local-only stop/target/trail monitoring for this position",
-            position.id,
-        )
-        send_alert(
-            db,
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            severity=AlertSeverity.CRITICAL,
-            category="protective_stop_placement_failed",
-            message=(
-                f"Protective SL-LMT placement failed for position {position.id}; "
-                "using local-only monitoring."
-            ),
-            mode=OrderMode.LIVE,
-            dedup_key=f"protective_stop_placement_failed:{position.id}",
-        )
-        return
-
-    now = _utcnow()
-    stop_order = Order(
-        id=uuid.uuid4(),
-        workspace_id=trading_session.workspace_id,
-        trading_session_id=trading_session.id,
-        option_contract_id=option_contract.id,
-        position_id=position.id,
-        idempotency_key=stop_idempotency_key,
-        mode=OrderMode.LIVE,
-        side=_to_domain_side(exit_side),
-        order_type=OrderType.SL_LIMIT,
-        qty=position.qty,
-        status=_map_status(order_result.status),
-        filled_qty=order_result.filled_qty,
-        avg_fill_price=order_result.avg_fill_price,
-        broker_order_id=order_result.broker_order_id,
-        submitted_at=now,
-        updated_at=now,
-    )
-    db.add(stop_order)
-    stop_plan.resting_order_id = order_result.broker_order_id
-    stop_plan.resting_order_price = float(trigger_price)
-    stop_plan.updated_at = now
-    db.add(stop_plan)
-    db.flush()
-
-    db.add(
-        OrderEvent(
-            id=uuid.uuid4(),
-            order_id=stop_order.id,
-            event_type="filled" if stop_order.status == OrderStatus.FILLED else "submitted",
-            raw_payload={
-                "broker_order_id": order_result.broker_order_id,
-                "status": order_result.status.value,
-                "filled_qty": order_result.filled_qty,
-                "avg_fill_price": order_result.avg_fill_price,
-            },
-            ts=now,
-        )
-    )
-
-    # Defensive only -- a real resting stop shouldn't fill synchronously at
-    # placement (its trigger is on the wrong side of the current price by
-    # construction), but every other order in this system already handles
-    # this synchronous/asynchronous duality, so this does too rather than
-    # leaving a FILLED order dangling with resting_order_id still set.
-    if stop_order.status == OrderStatus.FILLED and stop_order.avg_fill_price is not None:
-        _finalize_position_close(
-            db, trading_session, position, stop_order, ExitReason.STOP, OrderMode.LIVE, None
-        )
-        db.flush()
 
 
 # 2026-08-20, live incident: a real Shoonya LIVE LIMIT order (Test 1,
@@ -814,8 +626,8 @@ def reconcile_pending_live_orders(
             # fixed (see get_execution_broker's `order` param), but this
             # whole block -- resolution included, not just the REST call --
             # is still real-money-adjacent I/O and deserves the same
-            # "never raises" discipline as _place_protective_stop/
-            # _cancel_resting_protective_stop/_sync_resting_protective_stop
+            # "never raises" discipline as place_protective_stop/
+            # cancel_resting_protective_stop/sync_resting_protective_stop
             # already have. Resolution itself can legitimately raise too
             # (e.g. `ConfigurationError` if Shoonya isn't connected yet
             # right after a restart) and must not crash the cycle either.
@@ -836,12 +648,12 @@ def reconcile_pending_live_orders(
 
 
 def _peek_order_update(broker: BrokerPort, broker_order_id: str) -> OrderResult | None:
-    """Reaches past `_AuthAwareBroker`'s `_inner` wrap (same pattern
-    `api.v1.shoonya`'s diagnostics already use) to `peek_cached_order_update`
+    """Reaches past `_AuthAwareBroker`'s wrap (via `unwrap_broker`, same
+    helper `api.v1.shoonya`'s diagnostics use) to `peek_cached_order_update`
     — Shoonya-specific, not part of `BrokerPort`, since no other adapter has
     a WS order-update push to cache from.
     """
-    inner = getattr(broker, "_inner", broker)
+    inner = unwrap_broker(broker)
     peek = getattr(inner, "peek_cached_order_update", None)
     if not callable(peek):
         return None
@@ -864,18 +676,12 @@ def _apply_resolved_pending_order(
     db.add(order)
 
     db.add(
-        OrderEvent(
-            id=uuid.uuid4(),
-            order_id=order.id,
+        _new_order_event(
+            order.id,
+            result,
             event_type="filled" if order.status == OrderStatus.FILLED else "resolved",
-            raw_payload={
-                "broker_order_id": result.broker_order_id,
-                "status": result.status.value,
-                "filled_qty": result.filled_qty,
-                "avg_fill_price": result.avg_fill_price,
-                "source": "reconcile_pending_live_orders",
-            },
-            ts=now,
+            now=now,
+            source="reconcile_pending_live_orders",
         )
     )
 
@@ -947,228 +753,6 @@ def resolve_broker_for_position(
     return get_execution_broker(trading_session, strategy_run, position=position)
 
 
-class _CancelOutcome(enum.Enum):
-    """Result of `_cancel_resting_protective_stop` — deliberately not
-    exposed anywhere beyond `close_position`'s own use of it; this is
-    call-site plumbing, not a domain concept."""
-
-    CANCELLED = "cancelled"
-    ALREADY_FILLED = "already_filled"
-    FAILED = "failed"
-
-
-def _cancel_resting_protective_stop(
-    db: Session,
-    trading_session: TradingSession,
-    position: Position,
-    stop_plan: StopPlan,
-    resting_order_id: str,
-    broker: BrokerPort,
-) -> _CancelOutcome:
-    """Cancels this position's resting protective SL-LMT before
-    `close_position` proceeds with any other exit reason — see that
-    function's own comment for the safety invariant this exists to
-    protect. Never raises; every outcome (including a genuine failure) is
-    reported back as a `_CancelOutcome` so the caller can decide what's
-    safe to do next rather than this helper guessing. `resting_order_id`
-    is passed explicitly (not re-read from `stop_plan`) so a caller that
-    already narrowed it non-`None` doesn't lose that at this call boundary.
-    """
-    now = _utcnow()
-    try:
-        result = broker.cancel_order(resting_order_id)
-    except Exception:  # noqa: BLE001 - see _place_protective_stop's identical reasoning
-        # Broader than `BrokerError` deliberately -- `close_position` has
-        # nothing wrapping this call either, and an uncaught exception here
-        # would abort whatever closed this position for (target/EOD/
-        # manual/margin-breach), same "never worse off, never crash the
-        # caller" contract every helper in this feature makes.
-        logger.exception(
-            "failed to cancel resting protective stop %s for position %s -- "
-            "not proceeding with a new exit order until this is resolved",
-            resting_order_id,
-            position.id,
-        )
-        send_alert(
-            db,
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            severity=AlertSeverity.CRITICAL,
-            category="protective_stop_cancel_failed",
-            message=(
-                f"Failed to cancel resting protective stop for position "
-                f"{position.id}; exit deferred."
-            ),
-            mode=OrderMode.LIVE,
-            dedup_key=f"protective_stop_cancel_failed:{position.id}",
-        )
-        return _CancelOutcome.FAILED
-
-    if result.status == BrokerOrderStatus.FILLED:
-        # The stop fired before our cancel reached the broker -- record its
-        # real fill on the stop order's own row; the caller finalizes the
-        # position as STOP from there.
-        stop_order = (
-            db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one_or_none()
-        )
-        if stop_order is not None:
-            stop_order.status = OrderStatus.FILLED
-            stop_order.filled_qty = result.filled_qty
-            stop_order.avg_fill_price = result.avg_fill_price
-            stop_order.updated_at = now
-            db.add(stop_order)
-        stop_plan.resting_order_id = None
-        stop_plan.resting_order_price = None
-        stop_plan.updated_at = now
-        db.add(stop_plan)
-        db.flush()
-        return _CancelOutcome.ALREADY_FILLED
-
-    if result.status == BrokerOrderStatus.CANCELLED:
-        stop_plan.resting_order_id = None
-        stop_plan.resting_order_price = None
-        stop_plan.updated_at = now
-        db.add(stop_plan)
-        db.flush()
-        return _CancelOutcome.CANCELLED
-
-    # Any other status (still pending-cancel, an unexpected rejection of
-    # the cancel itself, etc.) is ambiguous -- same conservative treatment
-    # as the BrokerError case above, never guess.
-    logger.error(
-        "cancel_order for resting protective stop %s (position %s) returned "
-        "unexpected status %s -- not proceeding with a new exit order",
-        resting_order_id,
-        position.id,
-        result.status,
-    )
-    send_alert(
-        db,
-        workspace_id=trading_session.workspace_id,
-        trading_session_id=trading_session.id,
-        severity=AlertSeverity.CRITICAL,
-        category="protective_stop_cancel_unresolved",
-        message=(
-            f"Cancelling resting protective stop for position {position.id} "
-            f"returned unexpected status {result.status.value}; exit deferred."
-        ),
-        mode=OrderMode.LIVE,
-        dedup_key=f"protective_stop_cancel_unresolved:{position.id}",
-    )
-    return _CancelOutcome.FAILED
-
-
-def _sync_resting_protective_stop(
-    db: Session,
-    trading_session: TradingSession,
-    position: Position,
-    stop_plan: StopPlan,
-    resting_order_id: str,
-    desired_trigger_price: Decimal,
-    broker: BrokerPort | None,
-) -> None:
-    """Keeps this position's resting protective SL-LMT's own trigger/limit
-    price in step with `desired_trigger_price` (the current effective
-    protective floor — `trail_plan.current_stop_price` once trail is
-    active, computed by `evaluate_open_position`'s own step 5) via a real
-    `ModifyOrder` call — the TSL half of "Hard SL with Local Target",
-    `_place_protective_stop`'s placement being the other half.
-
-    **Fallback if the modify is rejected**: never raises, and never
-    touches `stop_plan.resting_order_id` — the resting order itself is
-    untouched, still armed at its last successfully-confirmed price, which
-    is real, valid protection, just not yet at the tightened level. Only
-    `stop_plan.resting_order_price` tracks "the price we last successfully
-    confirmed" versus "the price we currently want" — if a modify fails,
-    those two values keep disagreeing, so this same function retries on
-    every later cycle the trail is active, with no separate retry/backoff
-    bookkeeping needed. Critically, the position's actual exit (target/
-    trail/structure/spread/EOD/manual/margin-breach) never depends on the
-    resting order's own armed price at all — `close_position`'s Path B
-    (`_cancel_resting_protective_stop`) always cancels whatever is resting
-    and places a fresh exit at the locally-computed intended price,
-    regardless of what price the resting order happened to be armed at —
-    so a stuck/failed sync only degrades this position's *crash-only*
-    resilience for the trailed delta, never its normal (process-alive)
-    exit correctness. A `WARNING`, not `CRITICAL`, `SystemAlert` reflects
-    that: the position is not left unprotected, just running on its last
-    confirmed level.
-    """
-    option_contract = db.get(OptionContract, position.option_contract_id)
-    if option_contract is None:
-        return
-    instrument = db.get(Instrument, option_contract.instrument_id)
-    if instrument is None:
-        return
-
-    exit_side = _opposite(SignalSide(position.side))
-    tick_size = _dec(instrument.tick_size)
-    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
-
-    # Compare tick-*rounded* values, not the raw Decimal the trail
-    # arithmetic produced -- `desired_trigger_price` creeps by sub-tick
-    # amounts most cycles, which would otherwise trigger a redundant
-    # ModifyOrder call even when the actual price at the broker wouldn't
-    # change at all once rounded.
-    current_price = (
-        _dec(stop_plan.resting_order_price) if stop_plan.resting_order_price is not None else None
-    )
-    if current_price is not None and current_price == trigger_price:
-        return
-
-    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-    limit_price = _round_to_tick(
-        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
-    )
-    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
-
-    try:
-        resolved_broker.modify_order(
-            resting_order_id,
-            contract_symbol=option_contract.symbol,
-            trigger_price=float(trigger_price),
-            limit_price=float(limit_price),
-        )
-    except Exception:  # noqa: BLE001 - see _place_protective_stop's identical reasoning
-        # Broader than `BrokerError` deliberately -- `evaluate_open_
-        # position` has nothing wrapping this call, and PositionManager's
-        # own per-position loop has no try/except around evaluate_open_
-        # position either, so an uncaught exception here would abort that
-        # entire cycle's handling of every other open position in the
-        # session, not just this one's TSL sync.
-        logger.warning(
-            "TSL sync failed for position %s (resting order %s) -- resting stop stays "
-            "armed at its last confirmed price %s, not the newly tightened %s; will "
-            "retry next cycle",
-            position.id,
-            resting_order_id,
-            stop_plan.resting_order_price,
-            float(trigger_price),
-            exc_info=True,
-        )
-        db.add(
-            SystemAlert(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                severity=AlertSeverity.WARNING,
-                category="protective_stop_modify_failed",
-                message=(
-                    f"TSL modify failed for position {position.id}; resting stop still "
-                    f"armed at {stop_plan.resting_order_price}, not yet {float(trigger_price)}."
-                ),
-                created_at=_utcnow(),
-            )
-        )
-        db.flush()
-        return
-
-    stop_plan.resting_order_price = float(trigger_price)
-    stop_plan.updated_at = _utcnow()
-    db.add(stop_plan)
-    db.flush()
-
-
 def close_position(
     db: Session,
     trading_session: TradingSession,
@@ -1226,10 +810,10 @@ def close_position(
         # cancel the resting order first.
         stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
         if stop_plan is not None and stop_plan.resting_order_id is not None:
-            cancel_outcome = _cancel_resting_protective_stop(
+            cancel_outcome = cancel_resting_protective_stop(
                 db, trading_session, position, stop_plan, stop_plan.resting_order_id, broker
             )
-            if cancel_outcome is _CancelOutcome.ALREADY_FILLED:
+            if cancel_outcome is CancelOutcome.ALREADY_FILLED:
                 # Reality beat us to it -- the resting stop fired before
                 # our cancel reached the broker. Finalize as STOP using
                 # its own real fill data instead of placing a redundant
@@ -1252,14 +836,14 @@ def close_position(
                 db.flush()
                 run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
                 return outcome
-            if cancel_outcome is _CancelOutcome.FAILED:
+            if cancel_outcome is CancelOutcome.FAILED:
                 # Can't confirm the resting stop is gone -- never place a
                 # second live exit order while that's ambiguous; the
                 # SystemAlert already raised inside the helper covers
                 # alerting, and the position stays OPEN for the next
                 # cycle/manual intervention to retry.
                 return None
-            # cancel_outcome is _CancelOutcome.CANCELLED -- fall through to
+            # cancel_outcome is CancelOutcome.CANCELLED -- fall through to
             # the existing exit-order placement logic below, unchanged.
 
         exit_order = (
@@ -1273,33 +857,19 @@ def close_position(
             # dispatch_trade_intent, instead of leaving MockBrokerAdapter to
             # fill at its own independent synthetic price.
             if order_mode == OrderMode.LIVE:
-                run_preflight_checks(
-                    db,
-                    broker,
-                    trading_session=trading_session,
-                    option_contract=option_contract,
-                )
+                run_preflight_checks(broker, trading_session=trading_session)
+                _raise_if_option_chain_stale(db, trading_session, option_contract)
 
             # order_type: same 2026-08-19 live-correction as
-            # dispatch_trade_intent's own entry order -- see that
-            # function's docstring for the real Shoonya rejection this
-            # fixes and why the buffer setting is a separate one from
-            # paper's fill_slippage_pct.
-            if order_mode == OrderMode.LIVE:
-                buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-                exit_buffered_price = _apply_slippage(_dec(intended_price), exit_side, buffer_pct)
-                exit_limit_price = float(
-                    _round_to_tick(exit_buffered_price, _dec(instrument.tick_size), exit_side)
+            # dispatch_trade_intent's own entry order -- see
+            # _resolve_order_pricing's own docstring for the real Shoonya
+            # rejection this fixes and why the buffer setting is a separate
+            # one from paper's fill_slippage_pct.
+            exit_limit_price, exit_broker_order_type, exit_domain_order_type = (
+                _resolve_order_pricing(
+                    order_mode, _dec(intended_price), exit_side, _dec(instrument.tick_size)
                 )
-                exit_broker_order_type = BrokerOrderType.LIMIT
-                exit_domain_order_type = OrderType.LIMIT
-            else:
-                slippage_pct = _dec(get_settings().paper_trading.fill_slippage_pct)
-                exit_limit_price = float(
-                    _apply_slippage(_dec(intended_price), exit_side, slippage_pct)
-                )
-                exit_broker_order_type = BrokerOrderType.MARKET
-                exit_domain_order_type = OrderType.MARKET
+            )
 
             order_result = broker.place_order(
                 OrderRequest(
@@ -1313,45 +883,28 @@ def close_position(
                     tag=f"session:{trading_session.id}",
                 )
             )
-            exit_order = Order(
-                id=uuid.uuid4(),
-                workspace_id=trading_session.workspace_id,
-                trading_session_id=trading_session.id,
-                option_contract_id=option_contract.id,
-                position_id=position.id,
-                idempotency_key=exit_idempotency_key,
+            exit_order = _new_order(
+                trading_session,
+                option_contract,
+                order_result,
                 mode=order_mode,
                 side=_to_domain_side(exit_side),
                 order_type=exit_domain_order_type,
                 qty=position.qty,
-                status=_map_status(order_result.status),
-                filled_qty=order_result.filled_qty,
-                avg_fill_price=order_result.avg_fill_price,
-                broker_order_id=order_result.broker_order_id,
+                idempotency_key=exit_idempotency_key,
+                now=now,
+                position_id=position.id,
                 # The caller's real reason for this exit, captured now --
                 # before it's known whether this order will fill
                 # synchronously below or needs to be picked up later by
                 # reconcile_pending_live_exit_orders. See this column's own
                 # docstring on Order for why.
                 intended_exit_reason=exit_reason,
-                submitted_at=now,
-                updated_at=now,
             )
             db.add(exit_order)
             db.flush()
             db.add(
-                OrderEvent(
-                    id=uuid.uuid4(),
-                    order_id=exit_order.id,
-                    event_type="filled",
-                    raw_payload={
-                        "broker_order_id": order_result.broker_order_id,
-                        "status": order_result.status.value,
-                        "filled_qty": order_result.filled_qty,
-                        "avg_fill_price": order_result.avg_fill_price,
-                    },
-                    ts=now,
-                )
+                _new_order_event(exit_order.id, order_result, event_type="filled", now=now)
             )
 
         # Narrowly scoped: only a non-FILLED (or price-less) exit order hits
@@ -1451,13 +1004,15 @@ def _finalize_position_close(
             StopPlanStatus.TRIGGERED if exit_reason == ExitReason.STOP else StopPlanStatus.CANCELLED
         )
         stop_plan.updated_at = now
-        # Single centralized cleanup point for the LIVE-only resting
-        # protective-stop feature -- every path that ends a position (a
-        # normal close_position exit, the resting stop's own async fill
-        # discovered by reconcile_pending_live_exit_orders, or the
-        # already-filled race _cancel_resting_protective_stop can hit)
-        # funnels through here, so this is the one place that needs to
-        # clear it rather than duplicating that at every call site.
+        # Clears the resting-protective-stop bookkeeping for the path that
+        # actually reaches `_finalize_position_close` -- but this is *not*
+        # the only place that has to: a late-discovered async fill that
+        # `_apply_resolved_pending_exit_order` handles via its own
+        # `elif is_protective_stop` branch, and `close_position`'s own
+        # CANCELLED-then-no-refill path, both close a position without ever
+        # calling this function, and clear the same triple independently.
+        # See those two call sites if this field's own semantics ever
+        # change -- all three need to move together.
         stop_plan.resting_order_id = None
         stop_plan.resting_order_price = None
         db.add(stop_plan)
@@ -1501,14 +1056,6 @@ def _finalize_position_close(
             "slippage": float(slippage),
         },
     )
-
-    # Imported here, not at module scope: risk_engine.service never
-    # imports this module (it only marks a TradeIntent DISPATCHED and lets
-    # the caller invoke dispatch_trade_intent), so this stays a
-    # one-directional dependency — importing at module scope would work
-    # too, but keeping it local makes that directionality obvious at the
-    # call site instead of relying on remembering it.
-    from app.modules.risk_engine.service import record_trade_outcome_effects
 
     record_trade_outcome_effects(
         db, trading_session, float(realized_pnl), is_live=(order_mode == OrderMode.LIVE)
@@ -1557,20 +1104,41 @@ def reconcile_pending_live_exit_orders(
         position = db.get(Position, order.position_id)
         if position is None or position.status != PositionStatus.OPEN:
             continue
-        resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
+        try:
+            resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
 
-        result = _peek_order_update(resolved_broker, order.broker_order_id)
-        if result is None and allow_rest_fallback:
-            try:
+            result = _peek_order_update(resolved_broker, order.broker_order_id)
+            if result is None and allow_rest_fallback:
                 result = resolved_broker.get_order_status(order.broker_order_id)
-            except BrokerError:
-                logger.exception(
-                    "get_order_status failed while reconciling pending exit order %s "
-                    "(broker_order_id=%s)",
-                    order.id,
-                    order.broker_order_id,
-                )
-                continue
+        except Exception:  # noqa: BLE001 - a PositionManager cycle must never die
+            # 2026-08-26: widened from a narrow `except BrokerError` around
+            # only the REST call to wrap `resolve_broker_for_position` too,
+            # mirroring `reconcile_pending_live_orders`'s own identical fix
+            # (2026-08-19, see that function's own docstring). Same failure
+            # mode, same root cause: right after a restart with Shoonya not
+            # yet reconnected, `resolve_broker_for_position` ->
+            # `get_execution_broker` raises `ConfigurationError` for a
+            # genuinely-live position -- deliberately *not* a `BrokerError`
+            # subclass, so the old narrow catch never saw it, and this
+            # aborted the entire `_run_cycle` every ~3s: skipping
+            # `run_eod_square_off` and `run_full_reconciliation` for every
+            # other position that cycle too, not just this order's own
+            # reconciliation, and freezing the REST-poll-fallback throttle
+            # at whatever state it was in when the failure started. Catching
+            # `ConfigurationError` here is deliberately scoped to this
+            # status-*polling* loop, not a dispatch decision -- it does not
+            # relax `ConfigurationError`'s own contract elsewhere (it must
+            # still propagate and abort a *new* live dispatch attempt); this
+            # loop just can't let one order's transient broker-resolution
+            # failure take down every other position's handling for the
+            # rest of the cycle, same reasoning the entry-side fix already
+            # established.
+            logger.exception(
+                "reconciling pending exit order %s (broker_order_id=%s) failed",
+                order.id,
+                order.broker_order_id,
+            )
+            continue
 
         if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
             continue
@@ -1594,23 +1162,17 @@ def _apply_resolved_pending_exit_order(
     db.add(order)
 
     db.add(
-        OrderEvent(
-            id=uuid.uuid4(),
-            order_id=order.id,
+        _new_order_event(
+            order.id,
+            result,
             event_type="filled" if order.status == OrderStatus.FILLED else "resolved",
-            raw_payload={
-                "broker_order_id": result.broker_order_id,
-                "status": result.status.value,
-                "filled_qty": result.filled_qty,
-                "avg_fill_price": result.avg_fill_price,
-                "source": "reconcile_pending_live_exit_orders",
-            },
-            ts=now,
+            now=now,
+            source="reconcile_pending_live_exit_orders",
         )
     )
 
     # `stop:` orders are this position's own resting protective SL-LMT
-    # (see `_place_protective_stop`) -- distinct idempotency-key prefix
+    # (see `place_protective_stop`) -- distinct idempotency-key prefix
     # from the `exit:` orders `close_position` places, so its own fill is
     # always a genuine STOP exit regardless of anything else. Otherwise,
     # `close_position` already recorded the caller's real reason on
@@ -1642,7 +1204,7 @@ def _apply_resolved_pending_exit_order(
     elif is_protective_stop:
         # The resting stop resolved to CANCELLED/REJECTED without this app
         # having initiated the cancel itself -- `close_position`'s own
-        # `_cancel_resting_protective_stop` already clears
+        # `cancel_resting_protective_stop` already clears
         # `resting_order_id` synchronously when *it* cancels one, so this
         # only fires for a broker-unilateral cancel/rejection discovered
         # here later. Position is untouched either way -- just stop
@@ -1694,7 +1256,7 @@ def evaluate_open_position(
     `tick_price` (plus, for the two Phase 4 checks, the option's own live
     `bid`/`ask` and the *underlying's* current price) and closes the position
     if triggered; otherwise advances the trail plan per the generic Phase-3
-    rule. Called by `PositionManager` on every price poll, and by
+    rule. Called by `PositionManager` on every price poll. By contrast,
     `scheduler.eod_square_off` is *not* routed through here — EOD is an
     unconditional force-close regardless of where price sits.
 
@@ -1754,7 +1316,7 @@ def evaluate_open_position(
     # regardless, for defense-in-depth).
     #
     # Skipped entirely when a LIVE resting protective SL-LMT already exists
-    # (`stop_plan.resting_order_id` set, see `_place_protective_stop`) --
+    # (`stop_plan.resting_order_id` set, see `place_protective_stop`) --
     # the broker is now the authoritative stop mechanism for this position,
     # and this local check firing at the same time would race
     # `close_position` against `reconcile_pending_live_exit_orders`'s own
@@ -1913,13 +1475,13 @@ def evaluate_open_position(
             # current protective floor. Checked every cycle the trail is
             # active (not just when `tightened` fired this cycle) so a
             # previously failed sync keeps retrying — see
-            # `_sync_resting_protective_stop`'s own docstring for the
+            # `sync_resting_protective_stop`'s own docstring for the
             # fallback when a `ModifyOrder` call is rejected. Skipped on
             # the same cycle `hit_trail` fires above (position is closing
             # anyway, `close_position`'s own Path B cancels the resting
             # order right after this returns).
             if stop_plan.resting_order_id is not None:
-                _sync_resting_protective_stop(
+                sync_resting_protective_stop(
                     db,
                     trading_session,
                     position,
@@ -1945,10 +1507,13 @@ def current_contract_price(
     every strategy's own `rank_from_latest_snapshot` already reads
     (refreshed via `market_data.freshness.ensure_fresh_option_chain`,
     threshold-gated -- not a REST call every poll) rather than
-    `broker.get_quote()`. That fallback matters: since `get_execution_broker()`
-    always resolves to the mock regardless of session mode, `broker.get_quote()`
-    would return the mock's own synthetic, strategy-independent price -- the
-    exact price-source mismatch this whole change exists to close. Shared by
+    `broker.get_quote()`. That fallback matters: for a paper-routed position
+    `get_execution_broker()` resolves the mock, whose `get_quote()` returns
+    its own synthetic, strategy-independent price -- the exact price-source
+    mismatch this whole change exists to close (a genuinely live position's
+    real broker quote wouldn't have this problem, but this function doesn't
+    know which case it's in without checking, so it always prefers the
+    snapshot). Shared by
     `PositionManager._run_cycle` (open-position stop/target/trail pricing)
     and `scheduler.eod_square_off._square_off_all_open_positions` (forced
     square-off pricing) so the fallback chain lives in exactly one place.
@@ -1968,11 +1533,11 @@ def current_contract_price(
     check silently unevaluated" discipline -- always returns *something*.
     """
     if market_data_provider is not None:
-        tick = market_data_provider.get_latest_tick(option_contract.symbol)
-        if tick is not None:
-            state = classify_age(tick.ts, datetime.now(UTC), TICK_THRESHOLDS)
-            if state in (FreshnessState.LIVE, FreshnessState.DEGRADED):
-                return tick
+        fresh_tick = fresh_tick_or_none(
+            market_data_provider.get_latest_tick(option_contract.symbol), _utcnow()
+        )
+        if fresh_tick is not None:
+            return fresh_tick
 
     freshness_state = ensure_fresh_option_chain(
         db,

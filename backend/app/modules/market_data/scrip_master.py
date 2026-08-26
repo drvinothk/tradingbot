@@ -38,16 +38,15 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Literal
 
 import httpx
 from sqlalchemy.orm import Session
 
-from app.core.db.session import session_scope
+from app.core.db.base import utcnow as _utcnow
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.market.models import (
     BrokerSymbolMap,
     Instrument,
@@ -59,8 +58,6 @@ from app.domain.market.models import (
 )
 
 logger = logging.getLogger("app.market_data.scrip_master")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 # NFO is options+futures; these are indexed even though this system doesn't
 # trade futures today (see module docstring's "index it, don't have to use
@@ -186,10 +183,6 @@ def parse_scrip_row(raw: dict) -> AngelScripRow | None:
     except (KeyError, ValueError, TypeError, ScripMasterParseError):
         logger.warning("Skipping unparseable Angel scrip master row: %r", raw)
         return None
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _structural_key(row: AngelScripRow) -> tuple:

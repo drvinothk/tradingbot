@@ -175,7 +175,7 @@ def test_fresh_startup_into_active_market_defers_subscription_when_shoonya_not_c
 ):
     """2026-08-14 regression: a restart during market hours reaches this
     transition within one tick, independent of and before
-    `app.main._resume_strategy_runners`'s own reconnect-aware guard --
+    `strategy_engine.recovery.resume_strategy_runners`'s own reconnect-aware guard --
     without this, `ensure_ingestion_running` starts a real background
     thread writing fabricated prices to price_bars/quote_ticks in the
     window between a restart and a human reconnecting. `connect()` itself
@@ -187,7 +187,7 @@ def test_fresh_startup_into_active_market_defers_subscription_when_shoonya_not_c
     sched = _scheduler_with_phase_sequence(
         monkeypatch, [MarketPhase.ACTIVE_MARKET], provider, subscribe_calls
     )
-    monkeypatch.setattr(scheduler_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(scheduler_module, "is_market_data_ready", lambda: False)
 
     sched.run_once()
 
@@ -202,7 +202,7 @@ def test_pre_market_defers_subscription_when_shoonya_not_connected(monkeypatch):
     sched = _scheduler_with_phase_sequence(
         monkeypatch, [MarketPhase.PRE_MARKET], provider, subscribe_calls, reset_calls
     )
-    monkeypatch.setattr(scheduler_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(scheduler_module, "is_market_data_ready", lambda: False)
 
     sched.run_once()
 

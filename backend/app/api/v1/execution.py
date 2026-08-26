@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.v1._common import get_session_or_404 as _get_session_or_404
+from app.core.db.base import utcnow as _utcnow
 from app.core.db.session import get_db
 from app.core.pnl import signed_pnl
 from app.core.security.rbac import require_permission
@@ -69,20 +71,6 @@ def _latest_ticks(
         .all()
     )
     return {row.option_contract_id: (float(row.ltp), row.ts) for row in rows}
-
-
-def _get_session_or_404(db: Session, user: User, session_id: uuid.UUID) -> TradingSession:
-    trading_session = (
-        db.query(TradingSession)
-        .filter(
-            TradingSession.id == session_id,
-            TradingSession.workspace_id == user.workspace_id,
-        )
-        .one_or_none()
-    )
-    if trading_session is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
-    return trading_session
 
 
 class OrderOut(BaseModel):
@@ -253,7 +241,7 @@ def list_positions(
         if position.status == PositionStatus.OPEN
     ]
     latest_ticks = _latest_ticks(db, open_contract_ids)
-    now = datetime.now(UTC)
+    now = _utcnow()
 
     result: list[PositionOut] = []
     for (

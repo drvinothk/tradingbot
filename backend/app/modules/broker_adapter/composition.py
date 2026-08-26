@@ -109,6 +109,16 @@ class _AuthAwareBroker(BrokerPort):
     def __init__(self, inner: BrokerPort) -> None:
         self._inner = inner
 
+    def unwrap(self) -> BrokerPort:
+        """The real, concrete adapter this proxy wraps — for the handful of
+        real API endpoints (`api.v1.shoonya`'s diagnostics) that need a
+        Shoonya-only method not part of `BrokerPort` itself. Prefer
+        `unwrap_broker()` at module scope, which also handles the
+        not-wrapped case (mock, or a broker that was never routed through
+        `set_broker`).
+        """
+        return self._inner
+
     def _mark_disconnected(self, exc: BrokerAuthError) -> None:
         global _shoonya_connected
         if _shoonya_connected:
@@ -414,7 +424,7 @@ def get_execution_broker(
        crash-looping `PositionManager` every cycle — which in turn meant
        the real fill could never be reconciled into a `Position` at all,
        leaving a real, already-filled option completely unprotected (no
-       `_place_protective_stop` resting order) for as long as the crash
+       `place_protective_stop` resting order) for as long as the crash
        loop continued. Live-confirmed 2026-08-25 on a real Test 1
        (ema_micro_pullback) live-mode entry.
     2. `mode` in `(paper_only, degraded_mode, kill_switch,
@@ -551,5 +561,40 @@ def is_shoonya_configured() -> bool:
     not just the OAuth callback) correctly flips this back to `False` —
     before this, the check only asked "was a real adapter ever installed,"
     which stayed `True` forever even after the session died.
+
+    Named `is_shoonya_configured` because this composition root is
+    genuinely Shoonya-specific today (the only real execution adapter
+    implemented) — see `is_execution_broker_connected` for the
+    broker-agnostic form every broker-agnostic caller should use instead.
     """
     return _shoonya_connected
+
+
+def is_execution_broker_connected() -> bool:
+    """Broker-agnostic form of `is_shoonya_configured` — 2026-08-26, added
+    so broker-agnostic modules (preflight checks, reconciliation, schedulers,
+    strategy runners/spawners) stop branching on a Shoonya-named predicate
+    directly, per this codebase's own stated convention that everything but
+    `api.v1.shoonya` itself should only ever talk to `BrokerPort`, never a
+    concrete adapter by name. A second real execution broker would only ever
+    need to change this one function's body, not every caller.
+    """
+    return is_shoonya_configured()
+
+
+def unwrap_broker(broker: BrokerPort) -> BrokerPort:
+    """The real, concrete adapter underneath `broker` — unwraps
+    `_AuthAwareBroker` if it's wrapped, returns `broker` itself otherwise
+    (the mock, or a broker that was never routed through `set_broker`).
+    2026-08-26: replaces `getattr(broker, "_inner", broker)`, which reached
+    into another class's private attribute by string name — a rename of
+    `_AuthAwareBroker._inner` would have broken every one of those call
+    sites silently, with no type error. `api.v1.shoonya`'s diagnostics are
+    the only real callers — they need Shoonya-only methods
+    (`seed_option_anchor`, `get_product_capabilities`, `diagnose_ws_auth`,
+    `diagnose_ws_ticks`, `peek_cached_order_update`) that aren't part of
+    `BrokerPort` itself.
+    """
+    if isinstance(broker, _AuthAwareBroker):
+        return broker.unwrap()
+    return broker

@@ -29,20 +29,23 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import date
 
 from sqlalchemy.orm import Session
 
+from app.core.db.base import utcnow as _utcnow
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import (
     ApprovalStatus,
+    ExecutionMode,
     PendingTradeApproval,
     Signal,
     StrategyConfig,
     StrategyRun,
+    StrategyRunStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -54,8 +57,36 @@ from app.modules.strategy_engine.interface import TradeProposal
 logger = logging.getLogger("app.strategy_engine.service")
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
+def new_strategy_run(
+    *,
+    strategy_config_id: uuid.UUID,
+    trading_session_id: uuid.UUID,
+    execution_mode: ExecutionMode,
+    started_by_user_id: uuid.UUID,
+    instrument_id: uuid.UUID | None,
+    expiry_date: date | None,
+    interval_seconds: float | None,
+) -> StrategyRun:
+    """Shared field set every new `StrategyRun` row gets — `api.v1.strategies
+    .start_strategy` (a human clicking Start) and `strategy_engine
+    .auto_spawner._spawn_one` (the daily ambient sweep) each build this same
+    row under `LOCK_EXECUTION_SINGLETON`, differing only in `execution_mode`,
+    the `started_by_user_id` fallback, and which audit `event_type` the
+    caller records afterward (that part stays the caller's own job — this
+    only builds the row, doesn't add/flush/audit it).
+    """
+    return StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=strategy_config_id,
+        trading_session_id=trading_session_id,
+        execution_mode=execution_mode,
+        status=StrategyRunStatus.SCANNING,
+        started_at=_utcnow(),
+        started_by_user_id=started_by_user_id,
+        instrument_id=instrument_id,
+        expiry_date=expiry_date,
+        interval_seconds=interval_seconds,
+    )
 
 
 def submit_signal(

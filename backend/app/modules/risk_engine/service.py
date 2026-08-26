@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 from sqlalchemy import or_ as sa_or
@@ -39,6 +39,7 @@ from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
 from app.core.clock import to_ist
+from app.core.db.base import utcnow as _utcnow
 from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
 from app.core.pnl import signed_pnl
@@ -46,7 +47,7 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision, RiskDecisionOutcome, RiskLimitConfig
 from app.domain.session.models import (
     EntriesPausedReason,
@@ -73,10 +74,12 @@ from app.modules.market_data.freshness import PRICE_DRIFT_TOLERANCE_PCT, check_p
 
 logger = logging.getLogger("app.risk_engine")
 
-# Stub only — no real broker margin API exists until Phase 5. MTF's actual
-# leverage terms are account-specific and broker-supplied; this constant
-# exists purely so capital_required is funding-mode-aware from the start per
-# the locked architectural decision, not to model real margin math.
+# Stub only — `BrokerPort.get_margin` exists (Addendum batch), but it
+# returns an account's available/used margin, not a clean per-trade MTF
+# leverage multiplier; MTF's actual leverage terms are account-specific and
+# broker-supplied. This constant exists purely so capital_required is
+# funding-mode-aware from the start per the locked architectural decision,
+# not to model real margin math.
 MTF_STUB_LEVERAGE_FACTOR = Decimal("5")
 
 # Governance-limit rejection reasons that should raise a visible alert (every
@@ -94,10 +97,6 @@ _ALERT_WORTHY_REASON_PREFIXES = (
     "per_trade_lot_cap_exceeded",
     "margin_check_failed",
 )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _dec(value: object) -> Decimal:
@@ -480,6 +479,11 @@ def evaluate_trade_intent(
         )
 
         reasons: list[str] = []
+        # Computed once — this function evaluates a single TradeIntent
+        # under LOCK_RISK_EVALUATION_QUEUE, so neither trading_session nor
+        # strategy_run mutates between here and the function's own return;
+        # the predicate has no side effects either. Was recomputed 7 times.
+        is_live = is_strategy_routed_live(trading_session, strategy_run)
 
         current_mode = SafeMode(trading_session.mode)
         if current_mode in (
@@ -499,7 +503,7 @@ def evaluate_trade_intent(
         # kill_switch/degraded_mode/reconciliation_lock above.
         if trading_session.entries_paused_reason is not None and (
             trading_session.entries_paused_reason != EntriesPausedReason.DAILY_TARGET_REACHED
-            or is_strategy_routed_live(trading_session, strategy_run)
+            or is_live
         ):
             reasons.append(f"entries_paused:{trading_session.entries_paused_reason}")
 
@@ -515,7 +519,7 @@ def evaluate_trade_intent(
         # blocked by pre-existing *live* congestion either (paper isn't
         # sharing real capacity). _open_trade_intents_query is itself
         # live-only now too (see its own docstring).
-        if is_strategy_routed_live(trading_session, strategy_run):
+        if is_live:
             open_count = _open_trade_intents_query(db, trading_session.id).count()
             if open_count >= risk_config.max_concurrent_positions:
                 reasons.append("max_concurrent_positions_reached")
@@ -556,7 +560,7 @@ def evaluate_trade_intent(
         # `Order.mode == LIVE` (not just any DISPATCHED trade_intent) fixes
         # the second — a strategy's earlier paper-era dispatches (however
         # many) never contribute to its live-era cap.
-        if is_strategy_routed_live(trading_session, strategy_run):
+        if is_live:
             dispatched_today = (
                 db.query(TradeIntent)
                 .join(StrategyRun, StrategyRun.id == TradeIntent.strategy_run_id)
@@ -578,7 +582,7 @@ def evaluate_trade_intent(
         # pure-paper day regardless; the explicit gate matters on a *mixed*
         # day, where a live-side losing streak must not stop a paper
         # strategy from continuing to test.
-        if is_strategy_routed_live(trading_session, strategy_run) and (
+        if is_live and (
             trading_session.consecutive_losses >= risk_config.consecutive_loss_pause_threshold
         ):
             reasons.append("consecutive_loss_pause_active")
@@ -596,10 +600,7 @@ def evaluate_trade_intent(
         # The mode-aware default's own comment already says paper is
         # "risk-service-exempt" for this cap; this was the missing half of
         # that design.
-        if (
-            is_strategy_routed_live(trading_session, strategy_run)
-            and trade_intent.qty_lots > risk_config.per_trade_lot_cap
-        ):
+        if is_live and trade_intent.qty_lots > risk_config.per_trade_lot_cap:
             reasons.append("per_trade_lot_cap_exceeded")
 
         # Safe against every current test/live-paper path, not just
@@ -655,7 +656,7 @@ def evaluate_trade_intent(
         # budget at all (not just "existing paper commitments excluded" —
         # _open_committed_capital already handles that side, see its own
         # docstring), same reasoning as max_concurrent_positions above.
-        if is_strategy_routed_live(trading_session, strategy_run):
+        if is_live:
             open_committed = _open_committed_capital(db, trading_session.id)
             projected_committed = open_committed + _dec(analytics.capital_required)
             if projected_committed > _dec(trading_session.budget_amount):
@@ -701,31 +702,29 @@ def evaluate_trade_intent(
                 label = _friendly_trade_intent_label(
                     db, trade_intent, strategy_run, option_contract
                 )
-                db.add(
-                    SystemAlert(
-                        id=uuid.uuid4(),
-                        workspace_id=trading_session.workspace_id,
-                        trading_session_id=trading_session.id,
-                        severity=AlertSeverity.WARNING,
-                        category="risk_limit_breach",
-                        message=(
-                            f"TradeIntent for {label} ({trade_intent.id}) rejected: "
-                            f"{', '.join(reasons)}"
-                        ),
-                        payload={"trade_intent_id": str(trade_intent.id), "reasons": reasons},
-                        created_at=_utcnow(),
-                    )
+                send_alert(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    trading_session_id=trading_session.id,
+                    severity=AlertSeverity.WARNING,
+                    category="risk_limit_breach",
+                    message=(
+                        f"TradeIntent for {label} ({trade_intent.id}) rejected: "
+                        f"{', '.join(reasons)}"
+                    ),
+                    mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
+                    dedup_key=f"risk_limit_breach:{trade_intent.id}",
+                    payload={"trade_intent_id": str(trade_intent.id), "reasons": reasons},
                 )
         elif (
             strategy_run.execution_mode == ExecutionMode.AUTO
             # Paper trades always auto-dispatch, regardless of the
             # strategy's configured execution_mode -- approval-required
             # exists to gate real-money risk, and a paper trade carries
-            # none. Uses the same is_strategy_routed_live predicate this
-            # function already gates its risk caps on (2026-08-19 fix,
-            # see that function's own docstring) so this stays consistent
-            # with every other paper-vs-live decision in this module.
-            or not is_strategy_routed_live(trading_session, strategy_run)
+            # none. Uses the same is_live this function already gates its
+            # risk caps on (2026-08-19 fix) so this stays consistent with
+            # every other paper-vs-live decision in this module.
+            or not is_live
         ):
             trade_intent.status = TradeIntentStatus.DISPATCHED
             trade_intent.dispatched_at = _utcnow()
@@ -883,20 +882,21 @@ def record_trade_outcome_effects(
                 trading_session_id=trading_session.id,
                 payload={"cumulative_realized_pnl": float(new_cumulative)},
             )
-            db.add(
-                SystemAlert(
-                    id=uuid.uuid4(),
-                    workspace_id=trading_session.workspace_id,
-                    trading_session_id=trading_session.id,
-                    severity=AlertSeverity.INFO,
-                    category="daily_target_reached",
-                    message=(
-                        "Daily target profit reached — new entries paused. "
-                        f"cumulative_realized_pnl={new_cumulative}"
-                    ),
-                    payload={"cumulative_realized_pnl": float(new_cumulative)},
-                    created_at=_utcnow(),
-                )
+            send_alert(
+                db,
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.INFO,
+                category="daily_target_reached",
+                message=(
+                    "Daily target profit reached — new entries paused. "
+                    f"cumulative_realized_pnl={new_cumulative}"
+                ),
+                # Same reasoning as the daily_loss_cap_breached branch above --
+                # this whole function returns early unless is_live.
+                mode=OrderMode.LIVE,
+                dedup_key=f"daily_target_reached:{trading_session.id}",
+                payload={"cumulative_realized_pnl": float(new_cumulative)},
             )
 
         db.flush()

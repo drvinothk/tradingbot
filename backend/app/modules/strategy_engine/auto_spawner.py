@@ -5,16 +5,16 @@ until a human manually clicked Start on every strategy. This module closes
 that gap: for every `is_enabled` `StrategyConfig`, resolve its underlying's
 nearest listed expiry and create a committed `StrategyRun` row.
 
-**Deliberately does not start any runner thread itself.** `app.main.
-_resume_strategy_runners` already does exactly that — "find every non-STOPPED
-StrategyRun on an ACTIVE session with no live runner thread, build its
-Strategy, start the runner + market-data ingestion + PositionManager" — and
-`session.bootstrapper.run_daily_bootstrap` already calls it immediately after
-this module runs. That function is agnostic to *why* a run has no thread
-(crash-restart or freshly auto-spawned look identical to it), so duplicating
-the start/ingestion/position-manager dance a third time here (start_strategy
-being the first, _resume_strategy_runners the second) would just be drift
-risk for zero benefit.
+**Deliberately does not start any runner thread itself.**
+`strategy_engine.recovery.resume_strategy_runners` already does exactly that
+— "find every non-STOPPED StrategyRun on an ACTIVE session with no live
+runner thread, build its Strategy, start the runner + market-data ingestion
++ PositionManager" — and `session.bootstrapper.run_daily_bootstrap` already
+calls it immediately after this module runs. That function is agnostic to
+*why* a run has no thread (crash-restart or freshly auto-spawned look
+identical to it), so duplicating the start/ingestion/position-manager dance
+a third time here (start_strategy being the first, resume_strategy_runners
+the second) would just be drift risk for zero benefit.
 
 Every failure (missing `underlying_symbol`, unknown instrument, no active
 option_contracts, DTE > MAX_DTE, a real BrokerError from the snapshot call)
@@ -84,7 +84,8 @@ from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_broker
 from app.modules.market_data import record_option_chain_snapshot
-from app.modules.market_data.provider_composition import is_shoonya_market_data_ready
+from app.modules.market_data.provider_composition import is_market_data_ready
+from app.modules.strategy_engine.service import new_strategy_run
 
 logger = logging.getLogger("app.strategy_engine.auto_spawner")
 
@@ -314,11 +315,12 @@ def _spawn_one(
     # cycle, mirroring start_strategy's own "validate before creating the
     # row" discipline -- a real BrokerError here means no zombie StrategyRun
     # gets created. Skipped entirely (not attempted against whatever
-    # get_broker() would otherwise silently fall back to) when Shoonya isn't
-    # connected yet at 09:00 -- same precedent app.main._resume_strategy_
-    # runners already established: the run still gets created and its
-    # runner thread still starts, just idle, until a human reconnects.
-    if is_shoonya_market_data_ready():
+    # get_broker() would otherwise silently fall back to) when the broker
+    # isn't connected yet at 09:00 -- same precedent
+    # strategy_engine.recovery.resume_strategy_runners already established:
+    # the run still gets created and its runner thread still starts, just
+    # idle, until a human reconnects.
+    if is_market_data_ready():
         snapshot_key = (instrument.id, expiry)
         if snapshot_key not in snapshotted:
             try:
@@ -350,19 +352,16 @@ def _spawn_one(
         if race_skip is not None:
             return race_skip
 
-        run = StrategyRun(
-            id=uuid.uuid4(),
+        # actor_id may be a real human (mid-day Power toggle) or None
+        # (ambient cron/login path) -- when None, inherit the session's
+        # own creator, same precedent session.bootstrapper
+        # ._bootstrap_workspace already established for
+        # TradingSession.started_by_user_id rather than requiring a
+        # schema change/system-user sentinel.
+        run = new_strategy_run(
             strategy_config_id=config.id,
             trading_session_id=trading_session.id,
             execution_mode=ExecutionMode.AUTO,
-            status=StrategyRunStatus.SCANNING,
-            started_at=datetime.now(UTC),
-            # actor_id may be a real human (mid-day Power toggle) or None
-            # (ambient cron/login path) -- when None, inherit the session's
-            # own creator, same precedent session.bootstrapper
-            # ._bootstrap_workspace already established for
-            # TradingSession.started_by_user_id rather than requiring a
-            # schema change/system-user sentinel.
             started_by_user_id=actor_id or trading_session.started_by_user_id,
             instrument_id=instrument.id,
             expiry_date=expiry,

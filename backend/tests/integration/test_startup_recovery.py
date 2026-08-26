@@ -5,7 +5,7 @@ must come back up with its `PositionManager` resumed and an immediate
 reconciliation pass run, not idle. Requires real Postgres (dispatch/close
 and reconciliation all run under advisory locks).
 
-Also covers `app.main._resume_strategy_runners` — the equivalent gap for
+Also covers `strategy_engine.recovery.resume_strategy_runners` — the equivalent gap for
 `StrategyRunner` (an in-process thread with even less durable state than
 `PositionManager`: before `StrategyRun.instrument_id`/`expiry_date` existed,
 a restart could never resume a run even in principle). `StrategyRunner`
@@ -314,7 +314,7 @@ def _clear_fake_strategy_runners():
 
 
 def _patch_strategy_resume_collaborators(monkeypatch, db: Session):
-    """Everything `_resume_strategy_runners` locally imports that would
+    """Everything `resume_strategy_runners` locally imports that would
     otherwise touch the production DB or spawn a real thread — mirrors
     `test_api_strategies.py`'s `fake_runner` fixture, patched at each
     collaborator's *source* module since the function under test re-imports
@@ -405,9 +405,9 @@ def test_resume_strategy_runners_resumes_scanning_run_with_instrument_and_expiry
     )
     _patch_strategy_resume_collaborators(monkeypatch, db)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     from app.api.v1.strategies import _RUNNERS
 
@@ -444,9 +444,9 @@ def test_resume_strategy_runners_defers_ingestion_when_shoonya_not_connected(
     )
     monkeypatch.setattr(provider_composition_module, "is_shoonya_market_data_ready", lambda: False)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     from app.api.v1.strategies import _RUNNERS
 
@@ -475,9 +475,9 @@ def test_resume_strategy_runners_starts_ingestion_when_shoonya_connected(
     )
     monkeypatch.setattr(provider_composition_module, "is_shoonya_market_data_ready", lambda: True)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     assert ingestion_calls == [instrument.symbol]
 
@@ -495,9 +495,9 @@ def test_resume_strategy_runners_skips_runs_missing_instrument_id(
     assert strategy_run.expiry_date is None
     _patch_strategy_resume_collaborators(monkeypatch, db)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     from app.api.v1.strategies import _RUNNERS
 
@@ -528,9 +528,9 @@ def test_resume_strategy_runners_ignores_non_active_session(
     )
     _patch_strategy_resume_collaborators(monkeypatch, db)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     from app.api.v1.strategies import _RUNNERS
 
@@ -550,9 +550,9 @@ def test_resume_strategy_runners_ignores_stopped_runs(
     db.flush()
     _patch_strategy_resume_collaborators(monkeypatch, db)
 
-    from app.main import _resume_strategy_runners
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
 
-    _resume_strategy_runners()
+    resume_strategy_runners()
 
     from app.api.v1.strategies import _RUNNERS
 

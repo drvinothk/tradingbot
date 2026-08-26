@@ -1280,3 +1280,79 @@ def test_handle_order_update_overwrites_a_stale_cache_entry_for_the_same_order()
     result = adapter.peek_cached_order_update("1")
     assert result is not None
     assert result.status == BrokerOrderStatus.FILLED
+
+
+# -- subscribe_quotes: single-callback-slot contract --------------------------
+
+
+class _FakeWSClient:
+    """No real networking -- records the callback pair it was constructed
+    with and every `subscribe()` call, mirroring the real `ShoonyaWSClient`'s
+    constructor/start/subscribe shape closely enough for this contract.
+    """
+
+    def __init__(self, ws_host, *, uid, actid, access_token, on_tick, on_depth=None, **kwargs):
+        self.on_tick = on_tick
+        self.on_depth = on_depth
+        self.subscribe_calls: list[list[tuple[str, str, str]]] = []
+
+    def start(self) -> None:
+        pass
+
+    def subscribe(self, entries: list[tuple[str, str, str]]) -> None:
+        self.subscribe_calls.append(entries)
+
+
+def test_subscribe_quotes_second_call_with_the_same_callback_does_not_raise(monkeypatch):
+    """The real production shape: `BrokerPortMarketDataAdapter` calls
+    `subscribe_quotes` once per symbol batch, always passing its own stable
+    `self._handle_tick` bound method -- a *fresh* bound-method object each
+    time (Python never caches these), but `==`-equal to the one already
+    bound, since it's the same underlying method on the same instance. This
+    must not be mistaken for a genuinely different callback.
+    """
+    import app.modules.broker_adapter.shoonya.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "ShoonyaWSClient", _FakeWSClient)
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    adapter, _ = _adapter(rest)
+
+    class _Dispatcher:
+        def on_tick(self, tick) -> None:
+            pass
+
+    dispatcher = _Dispatcher()
+    adapter.subscribe_quotes(["NIFTY"], on_tick=dispatcher.on_tick)
+    # A second, later call with a *fresh* bound-method object for the same
+    # underlying dispatcher -- must be treated as the same callback.
+    adapter.subscribe_quotes(["NIFTY"], on_tick=dispatcher.on_tick)
+
+    assert adapter._ws.subscribe_calls == [
+        [("NIFTY", "NSE", "26000")],
+        [("NIFTY", "NSE", "26000")],
+    ]
+
+
+def test_subscribe_quotes_second_call_with_a_different_callback_raises(monkeypatch):
+    """A genuinely different callback on an already-connected client would
+    silently receive zero ticks forever (ShoonyaWSClient binds one callback
+    pair at construction, no setter) -- must now fail loudly instead.
+    """
+    import app.modules.broker_adapter.shoonya.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "ShoonyaWSClient", _FakeWSClient)
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    adapter, _ = _adapter(rest)
+
+    def _first_callback(tick) -> None:
+        pass
+
+    def _second_callback(tick) -> None:
+        pass
+
+    adapter.subscribe_quotes(["NIFTY"], on_tick=_first_callback)
+
+    with pytest.raises(RuntimeError, match="second time with a"):
+        adapter.subscribe_quotes(["NIFTY"], on_tick=_second_callback)

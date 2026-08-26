@@ -291,7 +291,7 @@ def test_run_cycle_skips_evaluate_when_shoonya_not_yet_connected(
     reasoning for why this needs seeded data, not just an empty DB.
     """
     _seed_market_data(db, instrument, option_contract)
-    monkeypatch.setattr(runner_module, "is_shoonya_market_data_ready", lambda: False)
+    monkeypatch.setattr(runner_module, "is_market_data_ready", lambda: False)
 
     strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
     decision = run_cycle(

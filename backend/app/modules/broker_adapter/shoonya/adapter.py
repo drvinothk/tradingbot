@@ -42,12 +42,13 @@ import json
 import logging
 import threading
 import time
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 
 import httpx
 from websockets.sync.client import connect as _ws_connect
 
 from app.config.settings import ShoonyaSettings
+from app.core.db.base import utcnow as _utcnow
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -255,8 +256,13 @@ class ShoonyaBrokerAdapter(BrokerPort):
         self._option_anchor_cache: dict[tuple[str, date], str] = {}
 
         self._ws: ShoonyaWSClient | None = None
-        self._ws_on_tick: TickCallback | None = None
-        self._ws_on_depth: DepthCallback | None = None
+        # Set once, at real construction time in subscribe_quotes below --
+        # not on every call -- purely so a later call with a genuinely
+        # different callback pair can be detected and rejected loudly. See
+        # subscribe_quotes's own docstring for why a second, silent rebind
+        # is not possible here.
+        self._ws_bound_on_tick: TickCallback | None = None
+        self._ws_bound_on_depth: DepthCallback | None = None
 
         # idempotency_key -> OrderResult, per BrokerPort.place_order's own
         # contract — a repeated call for the same key must return the
@@ -667,9 +673,20 @@ class ShoonyaBrokerAdapter(BrokerPort):
         constructing a *second* streaming thing per instrument silently
         drops every other one's ticks; this codebase now only ever builds
         one, shared, everywhere).
+
+        `ShoonyaWSClient` binds exactly one `on_tick`/`on_depth` pair at
+        construction, with no way to rebind it afterwards — so a call here
+        with a *different* callback than the one already bound would
+        silently receive zero ticks/depth updates, no error, forever (found
+        2026-08-26: this is exactly why `/shoonya/ws-tick-diagnostic`
+        always reported `ticks_received: 0`, since ingestion always
+        subscribes first with its own stable dispatcher). Every real
+        production caller already goes through `BrokerPortMarketDataAdapter`
+        (`market_data/providers/broker_port_shim.py`), which always passes
+        the *same* stable callback object on every call — so this has never
+        bitten real tick flow — but a bare second call with a genuinely
+        different callback now fails loudly instead of silently.
         """
-        self._ws_on_tick = on_tick
-        self._ws_on_depth = on_depth
         if self._ws is None:
             self._ws = ShoonyaWSClient(
                 self._settings.ws_host,
@@ -682,6 +699,17 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 source=self._settings.ws_auth_source,
             )
             self._ws.start()
+            self._ws_bound_on_tick = on_tick
+            self._ws_bound_on_depth = on_depth
+        elif on_tick != self._ws_bound_on_tick or on_depth != self._ws_bound_on_depth:
+            raise RuntimeError(
+                "ShoonyaBrokerAdapter.subscribe_quotes called a second time with a "
+                "different on_tick/on_depth callback -- ShoonyaWSClient binds exactly "
+                "one callback pair at construction with no way to rebind it later, so "
+                "this caller would silently receive zero ticks. Route through "
+                "BrokerPortMarketDataAdapter's shared dispatcher instead of calling "
+                "this adapter's subscribe_quotes directly with a new callback."
+            )
 
         entries = [(symbol, *self._resolve_symbol_token(symbol)) for symbol in contract_symbols]
         self._ws.subscribe(entries)
@@ -1030,11 +1058,8 @@ class ShoonyaBrokerAdapter(BrokerPort):
         except normalizer.NormalizationError:
             logger.exception("Failed to normalize Shoonya WS order-update message: %r", message)
             return
-        # .warning, not .info -- this app has no logging configuration
-        # anywhere, so with no handler attached Python falls back to its
-        # "handler of last resort" (stderr, WARNING+ only); an .info call
-        # here would never appear in production logs. Deliberately logged
-        # on every successful cache, not once-per-order -- this line is the
+        # .warning, not .info -- deliberately logged on every successful
+        # cache, not once-per-order -- this line is the
         # only live evidence this whole push mechanism actually works,
         # unconfirmed against a real account as of 2026-08-20 (see this
         # method's own docstring) -- worth the extra log volume until that
@@ -1065,7 +1090,3 @@ class ShoonyaBrokerAdapter(BrokerPort):
     def get_margin(self) -> MarginInfo:
         raw = self._rest.get_limits(self._uid, self._actid)
         return normalizer.parse_margin(raw)
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)

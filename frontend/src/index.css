@@ -506,18 +506,6 @@ tbody tr:hover {
   border-color: rgba(245, 158, 11, 0.4);
 }
 
-.mode-auto {
-  background: rgba(139, 92, 246, 0.1);
-  color: var(--accent);
-  border: 1px solid var(--accent);
-}
-
-.mode-manual {
-  background: rgba(245, 158, 11, 0.1);
-  color: var(--warning);
-  border: 1px solid var(--warning);
-}
-
 .badge-wip {
   background: rgba(148, 163, 184, 0.08);
   color: var(--text-muted);
@@ -556,13 +544,6 @@ tbody tr:hover {
   flex-direction: column;
   gap: 0.3rem;
   margin-bottom: 0.7rem;
-}
-
-.form-actions {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.6rem;
-  flex-wrap: wrap;
 }
 
 .row-actions {

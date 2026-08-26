@@ -261,11 +261,13 @@ check, then exercise it live).
   `app/modules/audit_service/service.py`'s `record_event`, which maintains a
   SHA-256 hash chain (`verify_chain` detects tampering). Every phase's "done when"
   criteria in the build plan includes an audit-log check for this reason.
-- **Idempotency and single-writer discipline**: `core/idempotency.py` +
-  `core/locking.py` (`LOCK_EXECUTION_SINGLETON`, `LOCK_PROCESS_SINGLETON`,
-  `LOCK_AUDIT_CHAIN`) exist because this system's #1 failure mode to avoid is a
-  duplicate live order or two processes both believing they're the execution
-  authority. Any new write path that could plausibly run twice needs to reason about
+- **Idempotency and single-writer discipline**: `idempotency_key` columns
+  (populated by each caller directly, e.g. via `uuid.uuid4()` — no shared
+  generator module) plus `core/locking.py` (`LOCK_EXECUTION_SINGLETON`,
+  `LOCK_PROCESS_SINGLETON`, `LOCK_AUDIT_CHAIN`) exist because this system's
+  #1 failure mode to avoid is a duplicate live order or two processes both
+  believing they're the execution authority. Any new write path that could
+  plausibly run twice needs to reason about
   this explicitly, not assume it away. Risk Service's `evaluate_trade_intent` reuses
   the same pattern via `LOCK_RISK_EVALUATION_QUEUE` (also from `core/locking.py`) —
   every TradeIntent is evaluated one at a time, never concurrently, which is what
@@ -381,14 +383,14 @@ check, then exercise it live).
   returns `(indicator_values, completed_bar)` and `market_data.ingestion`
   persists the bar too — same instrument-only convention `indicator_snapshots`
   already uses, same `f"{timeframe_seconds}s"` timeframe string.
-- **`TradingSession.cutoff_time` defaults to 15:20 IST — tests that build a
+- **`TradingSession.cutoff_time` defaults to 15:09 IST — tests that build a
   `TradingSession` without setting it explicitly, then exercise anything that
   checks `now_ist().time() >= cutoff_time` (`PositionManager.run_once`,
   `scheduler.eod_square_off`), pass only while real wall-clock IST stays
   before that time.** Several test files' `trading_session` fixtures rely on
   the column default; `test_position_manager.py`'s tests that expect a
   position to stay OPEN started failing for real (not flaky — 100%
-  reproducible) once a session's work ran past 15:20 IST, and were fixed by
+  reproducible) once a session's work ran past 15:09 IST, and were fixed by
   setting `cutoff_time=dt_time(23, 59)` explicitly in that fixture. Same trap
   will resurface in any other test file exercising this code path if worked
   on later in the day — set `cutoff_time` explicitly rather than trusting the

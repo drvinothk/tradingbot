@@ -216,6 +216,42 @@ def test_live_enabled_with_flag_and_connected_broker_returns_real(monkeypatch):
     assert composition.is_execution_broker_live(broker) is True
 
 
+def test_auth_aware_broker_overrides_every_broker_port_method():
+    """A future `BrokerPort` method added as a *concrete* (non-abstract)
+    method would silently resolve to `BrokerPort`'s own default instead of
+    proxying to `_inner` -- with no error, unlike an abstract method, which
+    Python's `ABCMeta` already guarantees is overridden (else
+    `_AuthAwareBroker` couldn't be instantiated at all). Comparing method
+    *names* directly (not `__abstractmethods__`) catches that gap
+    regardless of whether the new method is abstract or concrete.
+    """
+    port_methods = {
+        name
+        for name, member in vars(BrokerPort).items()
+        if callable(member) and not name.startswith("_")
+    }
+    assert port_methods, "sanity check: BrokerPort should expose public methods"
+
+    missing = port_methods - set(vars(composition._AuthAwareBroker))
+    assert missing == set(), f"_AuthAwareBroker does not override: {sorted(missing)}"
+
+
+def test_unwrap_broker_returns_the_real_adapter_underneath_auth_aware_broker(monkeypatch):
+    real = _FakeRealBroker()
+    composition.set_broker(real)
+
+    wrapped = composition.get_broker()
+
+    assert wrapped is not real  # confirms it really is wrapped
+    assert composition.unwrap_broker(wrapped) is real
+
+
+def test_unwrap_broker_returns_the_broker_itself_when_not_wrapped():
+    mock = MockBrokerAdapter()
+
+    assert composition.unwrap_broker(mock) is mock
+
+
 def test_guarded_live_with_no_strategy_run_returns_mock_even_with_flag_on(monkeypatch):
     _allow_real_money(monkeypatch, True)
     composition.set_broker(_FakeRealBroker())

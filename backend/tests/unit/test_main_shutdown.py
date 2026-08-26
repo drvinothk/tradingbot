@@ -64,7 +64,7 @@ def _patched_lifespan_dependencies(monkeypatch):
     monkeypatch.setattr(main_module, "_sync_mock_instrument_universe", lambda: None)
     monkeypatch.setattr(main_module, "_sync_angel_one_scrip_master", lambda: None)
     monkeypatch.setattr(main_module, "_run_startup_recovery_check", lambda: None)
-    monkeypatch.setattr(main_module, "_resume_strategy_runners", lambda: None)
+    monkeypatch.setattr(main_module, "resume_strategy_runners", lambda: None)
 
     monkeypatch.setattr(locking_module, "release_advisory_lock", lambda *a, **kw: None)
     monkeypatch.setattr(

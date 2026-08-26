@@ -46,6 +46,7 @@ from __future__ import annotations
 import re
 from datetime import UTC, date, datetime
 
+from app.core.db.base import utcnow as _utcnow
 from app.modules.broker_adapter.base.contracts import (
     BrokerOrderStatus,
     DepthLevel,
@@ -409,8 +410,8 @@ def parse_order_result(raw: dict, *, idempotency_key: str) -> OrderResult:
     means "the modify/cancel *request* was accepted for processing," not
     that it has actually taken effect yet -- the real outcome only arrives
     later via a WS order-update push, exactly the two-step flow this
-    codebase's own `_sync_resting_protective_stop`/
-    `_cancel_resting_protective_stop` already correctly wait for). Neither
+    codebase's own `sync_resting_protective_stop`/
+    `cancel_resting_protective_stop` already correctly wait for). Neither
     call had ever run against a real account before that session (see
     `ShoonyaBrokerAdapter.modify_order`'s own docstring: "Phase B found zero
     production callers"), so this response shape was untested, not just
@@ -421,7 +422,7 @@ def parse_order_result(raw: dict, *, idempotency_key: str) -> OrderResult:
     NOT trying to also infer a real `status` from this ack alone (still
     defaults to `PENDING` below, same as before) -- `stat: Ok` genuinely
     isn't "cancelled"/"modified" yet, and guessing otherwise would be
-    exactly the premature inference `_cancel_resting_protective_stop`'s own
+    exactly the premature inference `cancel_resting_protective_stop`'s own
     "never guess" contract exists to avoid.
     """
     broker_order_id = str(raw.get("norenordno") or raw.get("nOrdNo") or raw.get("result") or "")
@@ -490,7 +491,3 @@ def parse_margin(raw: dict) -> MarginInfo:
     return MarginInfo(
         available_margin=total - used, used_margin=used, total_margin=total, ts=_utcnow()
     )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)

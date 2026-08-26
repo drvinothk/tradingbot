@@ -15,40 +15,32 @@ maybe-check. `dispatch_trade_intent` runs this inside its own
 propagates out uncaught, which is the explicit design intent: register the
 order attempt as failed and halt the calling strategy cycle, never
 silently retry as paper.
+
+2026-08-26: the option-chain freshness check that used to live here moved
+to the caller (`execution_engine.paper.service`) — this module's own
+docstring (and `market_data.freshness`'s own) both claim `broker_adapter`/
+`market_data` depend on each other in one direction only; this was the one
+import making that bidirectional. Broker connectivity + margin are the
+genuinely broker_adapter-scoped checks that belong here.
 """
 
 from __future__ import annotations
 
-from sqlalchemy.orm import Session
-
-from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
-from app.modules.broker_adapter.composition import is_shoonya_configured
-from app.modules.market_data.freshness import FreshnessState, classify_option_chain
+from app.modules.broker_adapter.composition import is_execution_broker_connected
 
 
 def run_preflight_checks(
-    db: Session,
     broker: BrokerPort,
     *,
     trading_session: TradingSession,
-    option_contract: OptionContract,
 ) -> None:
-    if not is_shoonya_configured():
+    if not is_execution_broker_connected():
         raise ConfigurationError(
             f"Pre-flight failed for trading_session {trading_session.id}: Shoonya is not "
             "connected -- refusing real dispatch."
-        )
-
-    freshness = classify_option_chain(
-        db, option_contract.instrument_id, option_contract.expiry_date
-    )
-    if freshness in (FreshnessState.STALE, FreshnessState.DEAD):
-        raise ConfigurationError(
-            f"Pre-flight failed for trading_session {trading_session.id}: option chain for "
-            f"{option_contract.symbol} is {freshness.value} -- refusing real dispatch."
         )
 
     try:

@@ -397,6 +397,10 @@ def test_live_position_not_flagged_against_a_fresh_paper_mock(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
 
     _dispatch_live_position(db, trading_session, strategy_run, option_contract)
 
@@ -421,7 +425,9 @@ def test_run_full_reconciliation_checks_both_books(
         def get_positions(self) -> list[BrokerPosition]:
             return [BrokerPosition(contract_symbol="NIFTY26JUL99999CE", qty=25, avg_price=80.0)]
 
-    monkeypatch.setattr("app.modules.reconciliation.service.is_shoonya_configured", lambda: True)
+    monkeypatch.setattr(
+        "app.modules.reconciliation.service.is_execution_broker_connected", lambda: True
+    )
     monkeypatch.setattr("app.modules.reconciliation.service.get_execution_mock", lambda: broker)
     monkeypatch.setattr("app.modules.reconciliation.service.get_broker", lambda: _StrayLiveBroker())
 
@@ -437,7 +443,9 @@ def test_run_full_reconciliation_checks_both_books(
 def test_run_full_reconciliation_skips_live_pass_when_shoonya_not_configured(
     db: Session, trading_session, monkeypatch
 ):
-    monkeypatch.setattr("app.modules.reconciliation.service.is_shoonya_configured", lambda: False)
+    monkeypatch.setattr(
+        "app.modules.reconciliation.service.is_execution_broker_connected", lambda: False
+    )
 
     runs = run_full_reconciliation(db, trading_session, ReconciliationTrigger.POLL)
 

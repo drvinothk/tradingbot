@@ -15,8 +15,9 @@ import time
 import uuid
 import zlib
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 
+from app.core.db.base import utcnow as _utcnow
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -42,10 +43,6 @@ from app.modules.broker_adapter.base.errors import BrokerConnectivityError
 # model real margin math (see MTF_STUB_LEVERAGE_FACTOR's own docstring in
 # risk_engine/service.py for the equivalent reasoning on the leverage side).
 _SYNTHETIC_TOTAL_MARGIN = 10_000_000.0
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 @dataclass(frozen=True)

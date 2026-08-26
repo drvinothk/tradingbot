@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from app.modules.broker_adapter.base import (
+from app.modules.broker_adapter.base.contracts import (
     BrokerOrderStatus,
     InstrumentInfo,
     OptionType,

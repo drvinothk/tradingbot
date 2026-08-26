@@ -116,11 +116,11 @@ def trading_session(db: Session, workspace, broker_account, user: User) -> Tradi
         daily_target_profit=1_000_000,
         daily_loss_cap=1_000_000,
         funding_mode=FundingMode.CASH,
-        # Explicit, not the column default (15:20 IST) — tests in this file
+        # Explicit, not the column default (15:09 IST) — tests in this file
         # that expect a position to stay OPEN must not depend on real
         # wall-clock IST staying before cutoff_time; the default silently
         # started forcing EOD square-off on every position once a real test
-        # run happened to execute after 15:20 IST.
+        # run happened to execute after 15:09 IST.
         cutoff_time=dt_time(23, 59),
     )
     db.add(ts)

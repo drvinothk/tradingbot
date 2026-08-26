@@ -11,11 +11,11 @@ un-forgeable-after-the-fact via the audit hash chain.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 from typing import Literal
 
 from sqlalchemy.orm import Session
 
+from app.core.db.base import utcnow as _utcnow
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes.transitions import ALLOWED_TRANSITIONS
 from app.core.security.rbac import get_user_permissions
@@ -35,8 +35,6 @@ class ModeTransitionError(Exception):
     API layer should turn this into a 409/403 as appropriate, not a 500."""
 
 
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _write_transition(

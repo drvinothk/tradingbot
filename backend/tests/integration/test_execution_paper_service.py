@@ -46,7 +46,7 @@ from app.domain.strategy.models import (
 )
 from app.modules.broker_adapter import composition
 from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, OrderResult
-from app.modules.broker_adapter.base.errors import BrokerError
+from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
     close_position,
@@ -416,6 +416,10 @@ def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
 
     trade_intent = _make_trade_intent(
         db, trading_session, strategy_run, option_contract, entry_price=80.0
@@ -427,6 +431,48 @@ def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
     # BUY side, 0.5% default buffer -- priced *above* entry_price so a real
     # limit order still tolerates adverse LTP movement and fills.
     assert _price(order.avg_fill_price) == pytest.approx(80.0 * 1.005, rel=1e-3)
+
+
+def test_dispatch_raises_when_option_chain_is_stale_for_a_live_dispatch(
+    db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
+    option_contract, monkeypatch,
+):
+    """2026-08-26: the option-chain freshness gate moved here from
+    `broker_adapter.preflight.run_preflight_checks` (see
+    `_raise_if_option_chain_stale`'s own docstring for why) -- this pins the
+    same live-only behavior at its new call site: no `OptionChainSnapshot`
+    seeded at all means `classify_option_chain` returns DEAD, which must
+    still refuse a genuinely live dispatch.
+    """
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    strategy_config.status = StrategyStatus.LIVE
+    db.add(strategy_config)
+    db.flush()
+
+    class _FakeLiveBroker:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    fake_live_broker = _FakeLiveBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda trading_session, strategy_run=None, **kwargs: fake_live_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+
+    with pytest.raises(ConfigurationError, match="dead"):
+        dispatch_trade_intent(db, trading_session, trade_intent)
 
 
 def test_dispatch_marks_trade_intent_expired_on_synchronous_rejection(
@@ -488,7 +534,7 @@ class _FakeOrderStatusBroker:
 
     def place_order(self, request):
         """A resolved-FILLED entry order now also triggers protective-stop
-        placement (`_place_protective_stop`, LIVE-only) — this double must
+        placement (`place_protective_stop`, LIVE-only) — this double must
         answer that call too, not just the entry-side `get_order_status`/
         `peek_cached_order_update` it was originally built for. A plain
         `OPEN` ack is enough; these tests assert on the entry order/
@@ -695,7 +741,7 @@ def test_reconcile_pending_live_orders_continues_after_one_orders_broker_error(
 
         def place_order(self, request):
             """order_b resolving to FILLED now also triggers protective-
-            stop placement (`_place_protective_stop`, LIVE-only) — see
+            stop placement (`place_protective_stop`, LIVE-only) — see
             `_FakeOrderStatusBroker.place_order`'s identical comment.
             """
             return OrderResult(
@@ -902,6 +948,10 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
 
     outcome = close_position(db, trading_session, position, ExitReason.STOP, intended_price=72.0)
 
@@ -982,6 +1032,10 @@ def test_run_single_position_square_off_routes_a_live_positions_exit_through_its
     )
     monkeypatch.setattr(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
         lambda *args, **kwargs: None,
     )
 
@@ -1418,6 +1472,58 @@ def test_reconcile_pending_live_exit_orders_leaves_position_open_on_rejection(
     assert db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).count() == 0
 
 
+def test_reconcile_pending_live_exit_orders_continues_after_one_orders_resolve_raises(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-08-26 fix: `resolve_broker_for_position` raising
+    `ConfigurationError` for one position (the real, live-found failure mode
+    right after a restart with Shoonya not yet reconnected) must not abort
+    the whole reconciliation loop -- a second position whose broker resolves
+    fine must still get processed in the same cycle, matching the entry
+    side's own `..._continues_after_one_orders_broker_error` test. Before
+    this fix, `resolve_broker_for_position` was called with no try/except at
+    all, so this scenario would propagate straight out of the function.
+    """
+    import app.modules.execution_engine.paper.service as paper_service_module
+
+    position_a = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order_a = _make_pending_live_exit_order(
+        db, trading_session, position_a, broker_order_id="EXIT-CFG-A"
+    )
+    position_b = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+    exit_order_b = _make_pending_live_exit_order(
+        db, trading_session, position_b, broker_order_id="EXIT-CFG-B"
+    )
+
+    fake_broker = _FakeOrderStatusBroker(
+        cached_result=OrderResult(
+            idempotency_key=exit_order_b.idempotency_key,
+            broker_order_id=exit_order_b.broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position_b.qty,
+            avg_fill_price=90.0,
+        )
+    )
+
+    def _fake_resolve(db_arg, trading_session_arg, position_arg):
+        if position_arg.id == position_a.id:
+            raise ConfigurationError("Shoonya not connected")
+        return fake_broker
+
+    monkeypatch.setattr(paper_service_module, "resolve_broker_for_position", _fake_resolve)
+
+    reconcile_pending_live_exit_orders(db, trading_session, allow_rest_fallback=False)
+
+    db.refresh(exit_order_a)
+    db.refresh(exit_order_b)
+    db.refresh(position_a)
+    db.refresh(position_b)
+    assert exit_order_a.status == OrderStatus.PENDING
+    assert position_a.status == PositionStatus.OPEN
+    assert exit_order_b.status == OrderStatus.FILLED
+    assert position_b.status == PositionStatus.CLOSED
+
+
 # -- evaluate_open_position: stop/target/trail --------------------------------
 
 
@@ -1588,11 +1694,15 @@ def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(
     db: Session, trading_session, strategy_run, option_contract, monkeypatch
 ):
     """TSL half of "Hard SL with Local Target": once the resting protective
-    stop exists (`_place_protective_stop`), every trail tightening must
+    stop exists (`place_protective_stop`), every trail tightening must
     push a real `ModifyOrder` to keep it in step — this is that happy path.
     """
     monkeypatch.setattr(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
         lambda *args, **kwargs: None,
     )
     live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)
@@ -1643,6 +1753,10 @@ def test_evaluate_open_position_tsl_sync_retries_after_a_rejected_modify(
     """
     monkeypatch.setattr(
         "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
         lambda *args, **kwargs: None,
     )
     live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)

@@ -44,8 +44,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Literal
@@ -53,7 +51,7 @@ from typing import Literal
 import httpx
 from sqlalchemy.orm import Session
 
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.market.models import (
     BrokerSymbolMap,
     Instrument,
@@ -66,8 +64,6 @@ from app.domain.market.models import (
 
 logger = logging.getLogger("app.market_data.alice_blue_scrip_master")
 
-SessionFactory = Callable[[], AbstractContextManager[Session]]
-
 _NFO_OPTION_TYPES = frozenset({"OPTIDX"})
 
 # Our DB symbol -> Alice Blue's own INDICES display name. Scoped to what
@@ -75,10 +71,6 @@ _NFO_OPTION_TYPES = frozenset({"OPTIDX"})
 _INDEX_DISPLAY_NAME = {"NIFTY": "NIFTY 50", "BANKNIFTY": "NIFTY BANK"}
 
 RowKind = Literal["index", "option"]
-
-
-class ScripMasterParseError(Exception):
-    pass
 
 
 @dataclass(frozen=True)

@@ -67,15 +67,11 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy.orm import Session
-
 from app.config.settings import get_settings
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.domain.ops.models import MarketDataDiagnosticRun, MarketDataDiagnosticSnapshot
 from app.modules.broker_adapter.composition import get_broker, is_shoonya_configured
 from app.modules.market_data.provider_composition import get_market_data_provider
@@ -85,8 +81,6 @@ from app.modules.market_data.providers.alice_blue_ws_client import AliceBlueWSCl
 from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketDataAdapter
 
 logger = logging.getLogger("app.market_data.diagnostic_session")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 _SNAPSHOT_INTERVAL_SECONDS = 30.0
 _ROLES = ("default", "failback")

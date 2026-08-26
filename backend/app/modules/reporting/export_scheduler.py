@@ -2,30 +2,31 @@
 shape as `scheduler.health_check.HealthCheckScheduler` (daemon thread, a
 `stop_event` for clean shutdown, `run_once()` exposed separately so tests can
 drive it deterministically), triggering once daily at `EXPORT_TIME` (15:35
-IST — chosen so intraday square-offs, which fire by `cutoff_time`/15:20 at
+IST — chosen so intraday square-offs, which fire by `cutoff_time`/15:09 at
 the latest, are fully settled in the DB before this reads `TradeOutcome`).
 
 The "once daily" trigger is transition-detection, not a fixed short
 interval — same shape `market_data_scheduler.MarketDataScheduler` already
-uses for its own time-of-day boundaries: `_last_export_date` tracked
-in-memory, compared each tick against `now_ist().date()`. This is
-deliberately **not** persisted across restarts — a restart after 15:35
-re-triggers on the very next tick, which is safe (not a duplicate-data bug)
-purely because `exporter.export_trade_log_for_workspace`'s own append step
-is idempotent (see that module's docstring). If `export_completed_trades_for_day`
-raises, `_last_export_date` is deliberately left unset so the next tick
-retries — a transient DB hiccup should mean "try again shortly," never
-"silently skip today's export."
+uses for its own time-of-day boundaries: `DailyAtTimeScheduler`'s shared
+`_last_run_date` tracked in-memory, compared each tick against
+`now_ist().date()`. This is deliberately **not** persisted across
+restarts — a restart after 15:35 re-triggers on the very next tick, which
+is safe (not a duplicate-data bug) purely because
+`exporter.export_trade_log_for_workspace`'s own append step is idempotent
+(see that module's docstring). If `export_completed_trades_for_day` raises,
+`_last_run_date` is deliberately left unset so the next tick retries — a
+transient DB hiccup should mean "try again shortly," never "silently skip
+today's export."
 """
 
 from __future__ import annotations
 
 import logging
-import threading
-from datetime import date, time
+from datetime import time
 
 from app.core.clock import now_ist
 from app.modules.reporting.exporter import export_completed_trades_for_day
+from app.modules.scheduler.base import DailyAtTimeScheduler
 
 logger = logging.getLogger("app.reporting.export_scheduler")
 
@@ -38,40 +39,14 @@ DEFAULT_TICK_SECONDS = 60.0
 EXPORT_TIME = time(15, 35)
 
 
-class TradeLogExportScheduler:
+class TradeLogExportScheduler(DailyAtTimeScheduler):
+    _cycle_failed_log_message = "trade log export cycle failed"
+
     def __init__(self, tick_seconds: float = DEFAULT_TICK_SECONDS) -> None:
-        self._tick_seconds = tick_seconds
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._last_export_date: date | None = None
+        super().__init__(logger, EXPORT_TIME, tick_seconds=tick_seconds)
 
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._tick_seconds + 5)
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def run_once(self) -> None:
-        now = now_ist()
-        if now.time() < EXPORT_TIME or self._last_export_date == now.date():
-            return
-        export_completed_trades_for_day(now.date())
-        self._last_export_date = now.date()
-
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception("trade log export cycle failed")
-            self._stop_event.wait(self._tick_seconds)
+    def _do_run(self) -> None:
+        export_completed_trades_for_day(now_ist().date())
 
 
 _scheduler: TradeLogExportScheduler | None = None

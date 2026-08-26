@@ -11,23 +11,20 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections import defaultdict
-from datetime import UTC, date, datetime
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
+from app.core.db.base import utcnow as _utcnow
 from app.domain.identity.models import Workspace
 from app.domain.market.models import Instrument, InstrumentMasterSyncLog, OptionContract, SyncStatus
 from app.domain.market.models import OptionType as MarketOptionType
-from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.domain.ops.models import AlertSeverity
+from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 
 logger = logging.getLogger("app.scheduler.instrument_sync")
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _alert_on_instrument_change(
@@ -61,19 +58,17 @@ def _alert_on_instrument_change(
         changes.append(f"freeze_qty {old_freeze_qty} -> {instrument.freeze_qty}")
     if not changes:
         return
-    db.add(
-        SystemAlert(
-            id=uuid.uuid4(),
-            workspace_id=workspace.id,
-            severity=AlertSeverity.WARNING,
-            category="instrument_master_changed",
-            message=(
-                f"{instrument.symbol} ({instrument.exchange}) instrument data changed on "
-                f"sync: {', '.join(changes)}. Verify against the broker before the next "
-                "live order on this instrument."
-            ),
-            created_at=_utcnow(),
-        )
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="instrument_master_changed",
+        message=(
+            f"{instrument.symbol} ({instrument.exchange}) instrument data changed on "
+            f"sync: {', '.join(changes)}. Verify against the broker before the next "
+            "live order on this instrument."
+        ),
+        dedup_key=f"instrument_master_changed:{instrument.id}",
     )
 
 
@@ -121,27 +116,6 @@ def sync_instrument_master(
             infos = broker.get_instrument_master(exchange)
             underlying_infos = [i for i in infos if not i.is_option]
             option_infos = [i for i in infos if i.is_option]
-
-            # 2026-08-12 temporary diagnostic: the diff-deactivation block
-            # below deactivated a previously-correct 84-contract batch
-            # (NIFTY+BANKNIFTY's real Aug-13 series) the first time it ran
-            # for real, with zero new contracts added in the same run --
-            # this logs exactly what SearchScrip actually returned, per
-            # underlying, so that can be root-caused instead of guessed at.
-            # `.warning` since this app has no logging config (see
-            # ws_client.py's own identical reasoning) -- remove once the
-            # 2026-08-12 NIFTY-instrument-missing investigation is closed.
-            expiries_by_underlying: dict[str, set[date]] = defaultdict(set)
-            for info in option_infos:
-                if info.underlying and info.expiry is not None:
-                    expiries_by_underlying[info.underlying].add(info.expiry)
-            logger.warning(
-                "sync_instrument_master(%s): %d option rows from broker; "
-                "expiries seen per underlying: %s",
-                exchange,
-                len(option_infos),
-                {u: sorted(exps) for u, exps in expiries_by_underlying.items()},
-            )
 
             symbol_to_instrument_id: dict[str, uuid.UUID] = {}
             for info in underlying_infos:

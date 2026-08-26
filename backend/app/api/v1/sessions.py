@@ -6,14 +6,16 @@ square-off/reconcile triggers alongside the mode machine and kill switch.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.api.v1._common import get_session_or_404 as _get_session_or_404
 from app.config.settings import get_settings
 from app.core.clock import now_ist
+from app.core.db.base import utcnow as _utcnow
 from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes import (
@@ -174,7 +176,7 @@ def create_session(
             broker_account_id=broker_account.id,
             started_by_user_id=user.id,
             mode=SafeMode.PAPER_ONLY,
-            started_at=datetime.now(UTC),
+            started_at=_utcnow(),
             budget_amount=body.budget_amount or defaults.default_budget,
             daily_target_profit=body.daily_target_profit or defaults.daily_target_profit,
             daily_loss_cap=body.daily_loss_cap or defaults.daily_loss_cap,
@@ -277,20 +279,6 @@ def set_daily_plan(
     return trading_session
 
 
-def _get_session_or_404(db: Session, user: User, session_id: uuid.UUID) -> TradingSession:
-    trading_session = (
-        db.query(TradingSession)
-        .filter(
-            TradingSession.id == session_id,
-            TradingSession.workspace_id == user.workspace_id,
-        )
-        .one_or_none()
-    )
-    if trading_session is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
-    return trading_session
-
-
 @router.get("/{session_id}", response_model=SessionOut)
 def get_session(
     session_id: uuid.UUID,
@@ -351,7 +339,7 @@ def end_session(
         )
 
     trading_session.status = TradingSessionStatus.ENDED
-    trading_session.ended_at = datetime.now(UTC)
+    trading_session.ended_at = _utcnow()
     record_event(
         db,
         workspace_id=user.workspace_id,

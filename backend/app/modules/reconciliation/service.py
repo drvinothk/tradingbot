@@ -27,10 +27,10 @@ happens to prefer (see that function's own docstring).
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
+from app.core.db.base import utcnow as _utcnow
 from app.core.modes.state_machine import transition_mode
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
@@ -44,8 +44,8 @@ from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.composition import (
     get_broker,
     get_execution_mock,
+    is_execution_broker_connected,
     is_execution_broker_live,
-    is_shoonya_configured,
 )
 
 # Only these two modes ever escalate to reconciliation_lock — matches
@@ -53,10 +53,6 @@ from app.modules.broker_adapter.composition import (
 _RECONCILIATION_LOCK_ELIGIBLE_MODES = frozenset(
     {SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED}
 )
-
-
-def _utcnow() -> datetime:
-    return datetime.now(UTC)
 
 
 def _local_net_qty_by_symbol(
@@ -246,6 +242,6 @@ def run_full_reconciliation(
     re-check the other side at that exact instant.
     """
     runs = [run_reconciliation(db, get_execution_mock(), trading_session, trigger_type)]
-    if is_shoonya_configured():
+    if is_execution_broker_connected():
         runs.append(run_reconciliation(db, get_broker(), trading_session, trigger_type))
     return runs

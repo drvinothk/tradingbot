@@ -8,6 +8,7 @@ unit-testable without a trading_session or DB in scope at all.
 from __future__ import annotations
 
 import shutil
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
@@ -134,6 +135,10 @@ def check_ntp_drift(
         return ClockCheckResult(ok=abs(drift) <= max_drift_seconds, drift_seconds=drift)
 
     return ClockCheckResult(ok=False, drift_seconds=None, error=error)
+
+
+def is_windows() -> bool:
+    return sys.platform == "win32"
 
 
 def check_disk_space(path: str = "/", min_free_gb: float = 2.0) -> DiskCheckResult:

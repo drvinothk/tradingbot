@@ -3,8 +3,6 @@
 // generator adds a dependency for little benefit right now.
 
 export type ExecutionMode = 'auto' | 'approval_required'
-export type FundingMode = 'cash' | 'mtf'
-export type StrategyRunStatus = 'scanning' | 'in_position' | 'paused' | 'stopped'
 export type StrategyType =
   | 'synthetic'
   | 'orb'

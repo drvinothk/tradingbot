@@ -73,6 +73,24 @@ def classify_age(ts: datetime, now: datetime, thresholds: FreshnessThresholds) -
     return FreshnessState.DEAD
 
 
+def fresh_tick_or_none(tick: Tick | None, now: datetime) -> Tick | None:
+    """`tick` if it's LIVE/DEGRADED by `TICK_THRESHOLDS`, else `None` -- the
+    "is this live feed reading actually usable, or should the caller fall
+    back to a REST quote" gate. `execution_engine.paper.service
+    .current_contract_price` uses this directly; `PositionManager._live_tick`
+    calls `classify_age` itself instead (same threshold, same shared
+    primitive) since it also logs *which* freshness state triggered the
+    fallback -- this function intentionally doesn't expose that, to keep
+    the common case (no logging, just "is it fresh") a one-liner.
+    """
+    if tick is None:
+        return None
+    state = classify_age(tick.ts, now, TICK_THRESHOLDS)
+    if state in (FreshnessState.LIVE, FreshnessState.DEGRADED):
+        return tick
+    return None
+
+
 def classify_latest_tick(
     db: Session, instrument_id: uuid.UUID, *, thresholds: FreshnessThresholds = TICK_THRESHOLDS
 ) -> FreshnessState:

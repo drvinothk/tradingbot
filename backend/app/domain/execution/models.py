@@ -281,13 +281,13 @@ class StopPlan(Base, UUIDPkMixin):
     # absence of this field alone is the single source of truth for
     # whether a resting order currently exists; `status` still owns the
     # plan's own lifecycle. See execution_engine.paper.service's
-    # `_place_protective_stop`/`_cancel_resting_protective_stop`.
+    # `place_protective_stop`/`cancel_resting_protective_stop`.
     resting_order_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
     # The trigger price last *successfully confirmed* (Shoonya `ModifyOrder`
     # didn't raise) armed at the broker for `resting_order_id` -- not merely
     # "the price we last computed locally," which could differ if a
     # `ModifyOrder` call failed. This is what makes TSL-via-ModifyOrder
-    # self-healing: `_sync_resting_protective_stop`'s own retry-until-
+    # self-healing: `sync_resting_protective_stop`'s own retry-until-
     # confirmed logic compares the current best local level against *this*
     # field, not against `trail_plan.current_stop_price` directly, so a
     # failed sync attempt is retried on every later cycle (the two values

@@ -28,16 +28,13 @@ happens for it.
 from __future__ import annotations
 
 import logging
-import threading
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import check_disk_space, check_ntp_drift
-from app.core.db.session import session_scope
+from app.core.clock import check_disk_space, check_ntp_drift, is_windows
+from app.core.db.session import SessionFactory, session_scope
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
 from app.domain.market.models import Instrument
 from app.domain.ops.models import AlertSeverity
@@ -55,10 +52,9 @@ from app.modules.market_data.freshness import (
 )
 from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_within_market_hours
 from app.modules.ops.metrics_service import record_metric
+from app.modules.scheduler.base import IntervalScheduler
 
 logger = logging.getLogger("app.scheduler.health_check")
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 300.0
 
@@ -76,37 +72,19 @@ _MARKET_DATA_STALE_THRESHOLDS = FreshnessThresholds(
 )
 
 
-class HealthCheckScheduler:
+class HealthCheckScheduler(IntervalScheduler):
+    _cycle_failed_log_message = "health check cycle failed"
+
     def __init__(
         self,
         interval_seconds: float = DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS,
         session_factory: SessionFactory = session_scope,
     ) -> None:
-        self._interval_seconds = interval_seconds
-        self._session_factory = session_factory
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._interval_seconds + 5)
-
-    def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    def run_once(self) -> None:
-        with self._session_factory() as db:
-            self._run_cycle(db)
+        super().__init__(logger, interval_seconds, session_factory=session_factory)
 
     def _run_cycle(self, db: Session) -> None:
         ntp = check_ntp_drift()
-        disk = check_disk_space("C:/" if _is_windows() else "/")
+        disk = check_disk_space("C:/" if is_windows() else "/")
 
         active_sessions = (
             db.query(TradingSession)
@@ -232,19 +210,6 @@ class HealthCheckScheduler:
                     dedup_key=f"market_data_stale:{symbol}:{workspace_id}",
                 )
 
-    def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self.run_once()
-            except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
-                logger.exception("health check cycle failed")
-            self._stop_event.wait(self._interval_seconds)
-
-
-def _is_windows() -> bool:
-    import sys
-
-    return sys.platform == "win32"
 
 
 _scheduler: HealthCheckScheduler | None = None

@@ -255,10 +255,8 @@ class ShoonyaWSClient:
         # "t": "c" / "susertoken" pair that never once got past NOT_OK.
         # Deliberately logs uid/actid/source (account identifiers, not
         # secrets) but never accesstoken.
-        # `.warning`, not `.info`: this app has no logging configuration
-        # anywhere (no basicConfig/setLevel), so with no handler attached,
-        # Python falls back to its "handler of last resort" — stderr,
-        # WARNING+ only. An .info call here would silently never appear.
+        # `.warning`, not `.info`: a real per-connection auth attempt is
+        # worth always seeing, not routine chatter.
         logger.warning(
             "Shoonya WebSocket auth attempt: uid=%r actid=%r source=%r",
             self._uid,
@@ -402,10 +400,9 @@ class ShoonyaWSClient:
         # own unconditional REST poll is the actual safety net if this
         # never fires or the field shape turns out to be wrong.
         if msg_type == "om":
-            # .warning, not .info -- see this module's own established
-            # reasoning (no logging config anywhere in this app, stderr
-            # WARNING+ only). Logged on *every* raw "om" frame received,
-            # separate from adapter.py's own "successfully cached" log --
+            # .warning, not .info -- logged on *every* raw "om" frame
+            # received, separate from adapter.py's own "successfully cached"
+            # log --
             # this line proves the message *type* assumption is correct
             # even if parsing later fails, the two signals this whole
             # unconfirmed mechanism needs to be diagnosable tomorrow.

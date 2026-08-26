@@ -22,18 +22,11 @@ underlyings, all share the one real connection.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from contextlib import AbstractContextManager
-
-from sqlalchemy.orm import Session
-
-from app.core.db.session import session_scope
+from app.core.db.session import SessionFactory, session_scope
 from app.modules.market_data.indicators import IndicatorEngine
 from app.modules.market_data.ingestion import MarketDataIngestionService
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
-
-SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 _service: MarketDataIngestionService | None = None
 _subscribed_symbols: set[str] = set()

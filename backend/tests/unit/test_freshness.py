@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
+from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
     _snapshot_has_live_prices,
     check_price_drift,
     classify_age,
+    fresh_tick_or_none,
     worse_of,
 )
 
@@ -38,6 +40,31 @@ def test_classify_age_dead_past_dead_ceiling():
 def test_classify_age_future_timestamp_treated_as_live():
     # Clock skew between writer/reader shouldn't itself be a staleness signal.
     assert classify_age(_ts_ago(-5), datetime.now(UTC), _THRESHOLDS) == FreshnessState.LIVE
+
+
+def _tick(seconds_ago: float) -> Tick:
+    return Tick(
+        contract_symbol="NIFTY", ltp=100.0, bid=99.5, ask=100.5, volume=0, oi=None,
+        ts=_ts_ago(seconds_ago),
+    )
+
+
+def test_fresh_tick_or_none_returns_the_tick_when_live():
+    tick = _tick(5)
+    assert fresh_tick_or_none(tick, datetime.now(UTC)) is tick
+
+
+def test_fresh_tick_or_none_returns_the_tick_when_degraded():
+    tick = _tick(15)
+    assert fresh_tick_or_none(tick, datetime.now(UTC)) is tick
+
+
+def test_fresh_tick_or_none_returns_none_when_stale():
+    assert fresh_tick_or_none(_tick(120), datetime.now(UTC)) is None
+
+
+def test_fresh_tick_or_none_returns_none_when_tick_is_none():
+    assert fresh_tick_or_none(None, datetime.now(UTC)) is None
 
 
 def test_worse_of_picks_more_severe_state():
