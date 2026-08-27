@@ -332,6 +332,24 @@ def _sync_angel_one_scrip_master() -> None:
     ensure_scrip_master_refresh_scheduler_running(scrip_master)
 
 
+def _rebuild_execution_mock_position_book() -> None:
+    """Reconstruct the persistent execution mock's in-memory position book
+    from the durable `positions` table — a restart wipes the mock's memory
+    while the DB survives, and a paper position open across the restart
+    would otherwise leave the mock net short by its lost opening fill,
+    firing a permanent `reconciliation_mismatch`. Must run before
+    `_run_startup_recovery_check` (which reconciles) and
+    `resume_strategy_runners` (which can open new positions).
+    """
+    from app.core.db.session import session_scope
+    from app.modules.execution_engine.paper.registry import (
+        rebuild_execution_mock_position_book,
+    )
+
+    with session_scope() as db:
+        rebuild_execution_mock_position_book(db)
+
+
 def _run_startup_recovery_check() -> None:
     """For every trading_session left ACTIVE with at least one open Position
     (the signature of a crash/reboot mid-position, not a clean shutdown):
@@ -412,6 +430,7 @@ async def lifespan(app: FastAPI):
         _attempt_shoonya_reconnect_from_cache()
         _sync_mock_instrument_universe()
         _sync_angel_one_scrip_master()
+        _rebuild_execution_mock_position_book()
         _run_startup_recovery_check()
         resume_strategy_runners()
 

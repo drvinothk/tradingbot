@@ -228,6 +228,39 @@ def test_telegram_blocked_for_paper_mode(db: Session, workspace, _configured, _w
     assert _configured == []
 
 
+def test_telegram_paper_mode_still_pushed_when_override_suppression_set(
+    db: Session, workspace, _configured, _within_alert_window
+):
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+        mode=OrderMode.PAPER,
+        override_paper_mode_suppression=True,
+    )
+
+    assert len(_configured) == 1
+
+
+def test_override_suppression_does_not_bypass_the_other_gates(
+    db: Session, workspace, _configured, _within_alert_window
+):
+    # Non-CRITICAL severity is still blocked even with the override.
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+        mode=OrderMode.PAPER,
+        override_paper_mode_suppression=True,
+    )
+
+    assert _configured == []
+
+
 def test_telegram_allowed_for_live_mode(db: Session, workspace, _configured, _within_alert_window):
     send_alert(
         db,

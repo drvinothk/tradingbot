@@ -6,11 +6,17 @@ even in paper mode, since `execution_engine.paper.service` dispatches
 through the same `BrokerPort.place_order`/`get_positions()` calls a real
 adapter would (see the Phase 3 plan's "Key design decision"). Any mismatch
 is recorded in `broker_sync_states`, logged as a `ReconciliationRun`, and
-raises a `SystemAlert` — and, matching the state-machine's transition table
-exactly (`ALLOWED_TRANSITIONS` only wires `RECONCILIATION_LOCK` in from
-`paper_plus_guarded_live`/`live_enabled`), escalates to `reconciliation_lock`
-only from those two modes. A `paper_only` session has no live money at risk,
-so a mismatch there is flagged and left running, not blocked.
+raises a `SystemAlert`. Escalation to `reconciliation_lock` requires **both**
+that the session is `paper_plus_guarded_live`/`live_enabled` (matching
+`ALLOWED_TRANSITIONS`, which only wires `RECONCILIATION_LOCK` in from those
+two) **and** that the mismatched book is the *live* one (`order_mode ==
+LIVE`). A `paper_only` session has no live money at risk; and a paper/mock
+discrepancy — even on a live-active session — has no real-money meaning and
+must never halt live execution (the mock's position book is process-memory
+only and can legitimately drift from the DB across a restart). Such a paper
+mismatch is still alerted + audited, and additionally pushed to Telegram
+when the session is live-active (a broken paper book is then a
+system-health signal worth investigating), but it does not block.
 
 **2026-08-19**: per-strategy paper/live graduation means a single session
 can now hold open positions in both modes at once. `run_reconciliation`
@@ -154,6 +160,9 @@ def run_reconciliation(
     action_taken = "none"
 
     if mismatches:
+        current_mode = SafeMode(trading_session.mode)
+        session_is_live_active = current_mode in _RECONCILIATION_LOCK_ELIGIBLE_MODES
+
         send_alert(
             db,
             workspace_id=trading_session.workspace_id,
@@ -163,15 +172,25 @@ def run_reconciliation(
             message=f"Reconciliation found {len(mismatches)} local-vs-broker mismatch(es).",
             payload={"mismatches": mismatches},
             # order_mode (computed above) is which book this pass actually
-            # reconciled -- a paper-book mismatch stays DB-only (no live
-            # money at risk, per this module's own docstring), only a
-            # live-book mismatch pushes to Telegram.
+            # reconciled. A live-book mismatch always pushes to Telegram. A
+            # paper-book mismatch normally stays DB-only (no live money at
+            # risk) -- but when the same session is live-active (a
+            # per-strategy-graduated session holding real positions too), a
+            # broken paper book is a system-health signal the user must
+            # still investigate, so override the paper suppression for that
+            # case only.
             mode=order_mode,
+            override_paper_mode_suppression=(
+                order_mode == OrderMode.PAPER and session_is_live_active
+            ),
             dedup_key=f"reconciliation_mismatch:{trading_session.id}:{order_mode.value}",
         )
 
-        current_mode = SafeMode(trading_session.mode)
-        if current_mode in _RECONCILIATION_LOCK_ELIGIBLE_MODES:
+        # Only a *live-book* mismatch on a live-eligible session escalates to
+        # reconciliation_lock -- a paper/mock discrepancy has no real-money
+        # meaning and must never halt live execution (see this module's
+        # docstring). The paper pass still alerts + audits above.
+        if order_mode == OrderMode.LIVE and session_is_live_active:
             transition_mode(
                 db,
                 trading_session,

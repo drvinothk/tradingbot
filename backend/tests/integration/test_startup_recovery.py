@@ -558,3 +558,42 @@ def test_resume_strategy_runners_ignores_stopped_runs(
 
     assert strategy_run.id not in _RUNNERS
     assert _FakeStrategyRunner.instances == []
+
+
+def test_rebuild_execution_mock_position_book_seeds_open_paper_positions(
+    db: Session, workspace, broker_account, user
+):
+    """After a restart wipes the mock's memory, the book is reconstructed
+    from the durable `positions` table so a position open across the
+    restart can't leave the mock net short by its lost opening fill.
+    """
+    from app.modules.broker_adapter import composition
+    from app.modules.execution_engine.paper.registry import (
+        rebuild_execution_mock_position_book,
+    )
+
+    trading_session = _crashed_session_with_open_position(db, workspace, broker_account, user)
+    assert trading_session is not None
+
+    # Fresh (empty) mock, as after a process restart.
+    composition.reset_for_tests()
+    assert composition.get_execution_mock().get_positions() == []
+
+    seeded = rebuild_execution_mock_position_book(db)
+
+    assert seeded == 1
+    positions = {p.contract_symbol: p.qty for p in composition.get_execution_mock().get_positions()}
+    assert positions == {"NIFTY-RECOVERY-26JUL22000CE": 25}
+
+
+def test_rebuild_execution_mock_position_book_no_open_positions_is_a_noop(db: Session):
+    from app.modules.broker_adapter import composition
+    from app.modules.execution_engine.paper.registry import (
+        rebuild_execution_mock_position_book,
+    )
+
+    composition.reset_for_tests()
+    seeded = rebuild_execution_mock_position_book(db)
+
+    assert seeded == 0
+    assert composition.get_execution_mock().get_positions() == []

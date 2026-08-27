@@ -37,7 +37,12 @@ hold, checked in `_should_push_to_telegram`:
    "no notification for paper trade at all". `mode=None` (the default) is
    for alerts with no specific paper/live position or order behind them at
    all (health checks, instrument-master sync) — infrastructure-level, not
-   suppressed by this rule.
+   suppressed by this rule. One explicit exception: a caller may pass
+   `override_paper_mode_suppression=True` to push a paper-mode alert
+   anyway (reconciliation does this for a paper-book mismatch on a
+   live-active session — a broken paper book is then a system-health
+   signal the user must still see). All other conditions (1, 2, 4, 5)
+   still apply.
 4. **Time window (09:00-15:30 IST)** — a live position genuinely at risk
    off-hours isn't reachable this system can't already act on: the broker
    itself force-squares-off, per explicit user reasoning ("the position
@@ -209,12 +214,13 @@ def _should_push_to_telegram(
     severity: AlertSeverity,
     mode: OrderMode | None,
     dedup_key: str,
+    override_paper_mode_suppression: bool = False,
 ) -> bool:
     if category not in TELEGRAM_ALLOWED_CATEGORIES:
         return False
     if severity != AlertSeverity.CRITICAL:
         return False
-    if mode == OrderMode.PAPER:
+    if mode == OrderMode.PAPER and not override_paper_mode_suppression:
         return False
     now = now_ist()
     if not _within_alert_window(now):
@@ -263,6 +269,7 @@ def send_alert(
     mode: OrderMode | None = None,
     dedup_key: str | None = None,
     payload: dict | None = None,
+    override_paper_mode_suppression: bool = False,
 ) -> SystemAlert:
     """Writes the `SystemAlert` row first, then attempts Telegram — matching
     `audit_service.record_event`'s own contract, this only flushes, never
@@ -271,11 +278,17 @@ def send_alert(
     `HealthCheckScheduler`'s own loop) owns the commit.
 
     `mode`: the `OrderMode` of the specific position/order this alert
-    concerns, if any. `OrderMode.PAPER` unconditionally blocks the Telegram
-    push (see module docstring); `None` is for alerts with no specific
-    paper/live position behind them (health checks, instrument-master
-    sync) and is never paper-suppressed. Ignored entirely for the
-    `SystemAlert` row itself — that's written the same regardless.
+    concerns, if any. `OrderMode.PAPER` blocks the Telegram push (see
+    module docstring) unless `override_paper_mode_suppression=True`; `None`
+    is for alerts with no specific paper/live position behind them (health
+    checks, instrument-master sync) and is never paper-suppressed. Ignored
+    entirely for the `SystemAlert` row itself — that's written the same
+    regardless.
+
+    `override_paper_mode_suppression`: when `True`, a `mode=OrderMode.PAPER`
+    alert is still eligible for Telegram (all other gates — allowlist,
+    CRITICAL, time window, dedup — still apply). Used by reconciliation for
+    a paper-book mismatch on a live-active session.
 
     `dedup_key`: identifies "the same issue" for the 15-minute Telegram
     dedup window. Defaults to `f"{category}:{trading_session_id or
@@ -304,7 +317,11 @@ def send_alert(
 
     effective_dedup_key = dedup_key or f"{category}:{trading_session_id or workspace_id}"
     if _should_push_to_telegram(
-        category=category, severity=severity, mode=mode, dedup_key=effective_dedup_key
+        category=category,
+        severity=severity,
+        mode=mode,
+        dedup_key=effective_dedup_key,
+        override_paper_mode_suppression=override_paper_mode_suppression,
     ):
         text = f"[{severity.value.upper()}] {category}: {message}"
         tip = TELEGRAM_SUGGESTED_ACTIONS.get(category)

@@ -300,3 +300,41 @@ def test_simulate_disconnect_raises_on_get_quote_and_place_order():
 
     api.simulate_disconnect(False)
     assert api.place_order(_order("disconnected-2")).status == BrokerOrderStatus.FILLED
+
+
+def test_seed_position_restores_a_signed_position_into_the_book():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=41)
+
+    api.seed_position("NIFTY30JUL26C24000", 50, 101.5)
+    api.seed_position("NIFTY30JUL26P24000", -75, 88.0)
+
+    by_symbol = {p.contract_symbol: p for p in api.get_positions()}
+    assert by_symbol["NIFTY30JUL26C24000"].qty == 50
+    assert by_symbol["NIFTY30JUL26P24000"].qty == -75
+    assert by_symbol["NIFTY30JUL26C24000"].avg_price == 101.5
+
+
+def test_seed_position_zero_qty_clears_the_entry():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=43)
+    api.seed_position("NIFTY30JUL26C24000", 25, 100.0)
+    assert api.get_positions()
+
+    api.seed_position("NIFTY30JUL26C24000", 0, 0.0)
+    assert api.get_positions() == []
+
+
+def test_seed_position_then_close_via_place_order_nets_to_flat():
+    api = MockBrokerAdapter(instruments=_instruments(), seed=47)
+    api.seed_position("NIFTY30JUL26C24000", 25, 100.0)
+
+    api.place_order(
+        OrderRequest(
+            idempotency_key="close-seeded-1",
+            contract_symbol="NIFTY30JUL26C24000",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            qty=25,
+        )
+    )
+
+    assert api.get_positions() == []

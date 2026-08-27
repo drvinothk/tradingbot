@@ -108,6 +108,30 @@ class MockBrokerAdapter(BrokerPort):
         """
         self._disconnected = disconnected
 
+    def seed_position(self, contract_symbol: str, signed_qty: int, avg_price: float) -> None:
+        """Restore a known position straight into the in-memory book,
+        bypassing `place_order`. `signed_qty` is net and signed (negative =
+        short); a zero clears the entry.
+
+        This adapter's position book is process-memory only, while paper
+        execution also persists every fill to the durable `positions`/
+        `orders` tables. A backend restart therefore wipes this book while
+        the DB survives — and a paper position that was *open* across the
+        restart then loses its opening fill here but still has its closing
+        fill applied afterwards, leaving a phantom net short that
+        reconciliation flags forever. `execution_engine.paper.registry
+        .rebuild_execution_mock_position_book` calls this on startup to
+        reconstruct the book from the DB (the source of truth) before any
+        reconciliation pass runs. Test/recovery hook only — normal flow
+        goes through `place_order`.
+        """
+        if signed_qty == 0:
+            self._positions.pop(contract_symbol, None)
+            return
+        self._positions[contract_symbol] = Position(
+            contract_symbol=contract_symbol, qty=signed_qty, avg_price=avg_price
+        )
+
     # -- price simulation -------------------------------------------------
 
     def _price_for(self, contract_symbol: str) -> float:

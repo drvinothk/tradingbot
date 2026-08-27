@@ -306,9 +306,34 @@ def test_run_reconciliation_flags_an_injected_mismatch(
     assert trading_session.mode == SafeMode.PAPER_ONLY
 
 
-def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live(
+def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live_on_live_mismatch(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
+    """A *live-book* mismatch on a live-eligible session locks the session."""
+    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    db.add(trading_session)
+    db.flush()
+
+    class _StrayLiveBroker:
+        def get_positions(self) -> list[BrokerPosition]:
+            return [BrokerPosition(contract_symbol=option_contract.symbol, qty=10, avg_price=80.0)]
+
+    run = run_reconciliation(
+        db, _StrayLiveBroker(), trading_session, ReconciliationTrigger.POLL  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 1
+    assert run.action_taken == "reconciliation_lock_entered"
+    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+
+
+def test_paper_book_mismatch_never_locks_a_live_active_session(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A mock/paper-book discrepancy has no real-money meaning and must not
+    halt live execution -- even on a paper_plus_guarded_live session. It is
+    still alerted + audited, just not mode-blocked.
+    """
     trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
     db.add(trading_session)
     db.flush()
@@ -327,8 +352,85 @@ def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live(
     run = run_reconciliation(db, broker, trading_session, ReconciliationTrigger.POLL)
 
     assert run.mismatches_found == 1
-    assert run.action_taken == "reconciliation_lock_entered"
-    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+    assert run.action_taken == "alert_raised"
+    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "reconciliation_mismatch",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_paper_book_mismatch_on_live_active_session_overrides_paper_telegram_suppression(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """The paper-book mismatch on a live-active session still can't lock,
+    but it *does* reach Telegram (override_paper_mode_suppression=True) so
+    the user investigates a broken paper book while real money is in play.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)
+    broker.place_order(
+        OrderRequest(
+            idempotency_key=f"manual-injection-{uuid.uuid4()}",
+            contract_symbol=option_contract.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=10,
+        )
+    )
+
+    captured: dict[str, object] = {}
+
+    def _spy_send_alert(*args, **kwargs):
+        captured.update(kwargs)
+        from app.modules.alerting.manager import send_alert as real
+
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("app.modules.reconciliation.service.send_alert", _spy_send_alert)
+
+    run = run_reconciliation(db, broker, trading_session, ReconciliationTrigger.POLL)
+
+    assert run.action_taken == "alert_raised"
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+    assert captured["override_paper_mode_suppression"] is True
+
+
+def test_paper_book_mismatch_on_paper_only_session_does_not_override_suppression(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)
+    broker.place_order(
+        OrderRequest(
+            idempotency_key=f"manual-injection-{uuid.uuid4()}",
+            contract_symbol=option_contract.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=10,
+        )
+    )
+
+    from app.modules.alerting.manager import send_alert as _real_alert
+
+    captured: dict[str, object] = {}
+
+    def _spy(*args, **kwargs):
+        captured.update(kwargs)
+        return _real_alert(*args, **kwargs)
+
+    monkeypatch.setattr("app.modules.reconciliation.service.send_alert", _spy)
+
+    run_reconciliation(db, broker, trading_session, ReconciliationTrigger.POLL)
+
+    assert captured["override_paper_mode_suppression"] is False
 
 
 def test_run_reconciliation_records_a_run_row_even_when_clean(

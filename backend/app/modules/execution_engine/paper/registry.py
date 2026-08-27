@@ -21,7 +21,10 @@ management instead of coming back up idle.
 
 from __future__ import annotations
 
+import logging
 import uuid
+
+from sqlalchemy.orm import Session
 
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.execution_engine.paper.position_manager import (
@@ -30,7 +33,56 @@ from app.modules.execution_engine.paper.position_manager import (
     PositionManager,
 )
 
+logger = logging.getLogger("app.execution_engine.paper.registry")
+
 _managers: dict[uuid.UUID, PositionManager] = {}
+
+
+def rebuild_execution_mock_position_book(db: Session) -> int:
+    """Reconstruct the persistent execution mock's in-memory position book
+    from the durable `positions` table — run once on startup, before any
+    reconciliation pass, so a restart can't leave the mock net short by an
+    opening fill it lost while the DB kept it (see
+    `MockBrokerAdapter.seed_position`'s docstring for the full failure
+    mode). Nets every OPEN position whose *opening* order was `PAPER`, per
+    contract symbol — the same grouping `reconciliation.service
+    ._local_net_qty_by_symbol` uses, so the two agree by construction.
+    Returns the number of contracts seeded.
+    """
+    from app.domain.execution.models import Order, OrderMode, OrderSide, Position, PositionStatus
+    from app.domain.market.models import OptionContract
+    from app.modules.broker_adapter.composition import get_execution_mock
+
+    net_qty: dict[str, int] = {}
+    last_price: dict[str, float] = {}
+    positions = (
+        db.query(Position)
+        .join(Order, Order.id == Position.opening_order_id)
+        .filter(
+            Position.status == PositionStatus.OPEN,
+            Order.mode == OrderMode.PAPER,
+        )
+        .all()
+    )
+    for position in positions:
+        option_contract = db.get(OptionContract, position.option_contract_id)
+        if option_contract is None:
+            continue
+        signed_qty = position.qty if position.side == OrderSide.BUY else -position.qty
+        net_qty[option_contract.symbol] = net_qty.get(option_contract.symbol, 0) + signed_qty
+        last_price[option_contract.symbol] = float(position.entry_price)
+
+    mock = get_execution_mock()
+    for symbol, qty in net_qty.items():
+        mock.seed_position(symbol, qty, last_price.get(symbol, 0.0))
+
+    if net_qty:
+        logger.info(
+            "Rebuilt execution mock position book from DB: %d contract(s) seeded (%s)",
+            len(net_qty),
+            {s: q for s, q in net_qty.items()},
+        )
+    return len(net_qty)
 
 
 def ensure_position_manager_running(
