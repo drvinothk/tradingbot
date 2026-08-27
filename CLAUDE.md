@@ -606,6 +606,58 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-27: phantom `reconciliation_mismatch` from the execution mock's
+  position book being wiped on restart — root-caused, fixed, DEPLOYED to
+  OCI + live-verified.** Symptom: a CRITICAL `reconciliation_mismatch`
+  alert (`local_qty: 0, broker_qty: -650`, `option_contract_id: null`)
+  firing every ~15s on the `paper_only` OCI session, recurring on many
+  prior days (Aug 12/13/14/19/20/24/25/27), ~3,857 unresolved rows.
+  Root cause: `MockBrokerAdapter`'s position book
+  (`_execution_mock` in `composition.py`) is process-memory only, while
+  paper execution *also* persists every fill to the durable `positions`/
+  `orders` tables. Three backend restarts that morning wiped the mock's
+  book but not the DB — a paper position open *across* a restart lost its
+  opening fill in the mock while its closing fill still applied
+  afterwards, leaving the mock net short by one lot-group forever. The
+  live Shoonya book was never involved (confirmed: no real position, no
+  real orders — `ShoonyaBrokerAdapter.get_positions()` is a live
+  `PositionBook` REST call, no in-memory state, so live positions have no
+  equivalent restart-wipe failure mode). Fix, commit `5a697cc` on
+  `fix/shoonya-option-chain-expiry-anchor` (branch is 24 commits ahead of
+  `main` again; not merged):
+  - **F1** — `MockBrokerAdapter.seed_position()` +
+    `execution_engine/paper/registry.rebuild_execution_mock_position_book()`,
+    called from `app.main._rebuild_execution_mock_position_book()` in
+    `lifespan` *before* `_run_startup_recovery_check`/
+    `resume_strategy_runners`. Reconstructs the mock's book from OPEN
+    paper positions in the DB on every startup (same net-signed-qty
+    grouping as `reconciliation.service._local_net_qty_by_symbol`), so a
+    lost opening fill is re-seeded before any closing fill or
+    reconciliation pass — the phantom is now structurally impossible.
+    Seed-only (never clears a mock symbol absent from the DB) — at
+    startup the mock is freshly empty anyway, and clearing could mask a
+    genuine paper divergence the canary should catch.
+  - **F2a** — `run_reconciliation` now escalates to `reconciliation_lock`
+    only when `order_mode == LIVE` *and* the session is
+    `paper_plus_guarded_live`/`live_enabled` (previously the session-mode
+    check alone — so a paper/mock phantom could have frozen live trading
+    on a per-strategy-graduated session). The paper pass still alerts +
+    audits + writes its `ReconciliationRun` row; it just can't lock.
+  - **F2b** — new `send_alert(..., override_paper_mode_suppression=False)`.
+    `run_reconciliation` sets it `True` for a paper-book mismatch when the
+    session is live-active, so a broken paper book still reaches Telegram
+    (normally paper alerts are DB-only) while real money is in play. All
+    other Telegram gates (allowlist, CRITICAL, 09:00-15:30 window,
+    15-min dedup) unchanged.
+  1155 backend tests pass (up from 1113), ruff/mypy clean, no schema
+  change. Live-verified on OCI: after redeploy+restart, reconciliation
+  runs report `mismatches_found=0`/`action_taken=none` (both mock and
+  live passes), zero new `reconciliation_mismatch` alerts. The 3,857
+  stale rows were bulk-resolved via `UPDATE system_alerts SET
+  is_resolved=true` (rows kept, not deleted; CSV dump at
+  `/tmp/system_alerts_recon_resolved_2026-08-27.csv` on the box —
+  non-durable, but the rows themselves persist in the table).
+
 - **2026-08-26: Live deployment migrated from OCI E2 (`68.233.110.76`, ~1GB
   RAM) to OCI A1.Flex ARM (`144.24.137.112`, 6GB RAM, Always Free) —
   DONE, LIVE-VERIFIED, real bug found+fixed mid-migration.** A genuine
