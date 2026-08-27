@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -24,7 +26,7 @@ from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 
 from app.config.settings import get_settings
-from app.core.db.session import SessionFactory, get_db, session_scope
+from app.core.db.session import get_db, session_scope
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
@@ -85,6 +87,12 @@ def _seed_option_anchors(db: Session, adapter: object) -> None:
         for expiry_date, tsym in rows:
             seed(symbol, expiry_date, tsym)
 
+
+# Matches `market_data.registry`'s own local definition of this same alias
+# -- not importing a shared one from `core.db.session`, since this module's
+# own OCI deployment history has shown app/-tree files can drift out of
+# sync with each other between incremental single-file deploys.
+SessionFactory = Callable[[], AbstractContextManager[Session]]
 
 _post_login_background_lock = threading.Lock()
 

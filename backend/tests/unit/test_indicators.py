@@ -8,6 +8,7 @@ import pytest
 from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.market_data.indicators import (
     ATRCalculator,
+    Bar,
     BarAggregator,
     EMACalculator,
     IndicatorEngine,
@@ -323,3 +324,167 @@ class TestIndicatorEngine:
         engine.on_completed_bar(instrument_id, candle)
 
         assert instrument_id not in engine._bar_aggregators
+
+
+class TestWarmStart:
+    """`warm_start` exists to close the exact live incident recorded in its
+    own docstring: after a cold restart, EMA9 (9-bar warmup) and EMA20
+    (20-bar warmup) used to re-arm ~11 minutes apart, and
+    `EMAMicroPullbackStrategy` zipped a fresh EMA9 against a stale EMA20
+    during that gap. These tests verify the fix's actual invariant — EMA9
+    and EMA20 (and ATR14) become warmed *together*, in one synchronous call,
+    not on their own independent real-time schedules.
+    """
+
+    def test_warms_ema9_ema20_atr14_simultaneously(self):
+        """The whole point: unlike feeding these bars one at a time through
+        real ticks (where EMA9 would be warm at bar 9, ATR14 at bar 14, and
+        EMA20 not until bar 20 -- a real gap), a single `warm_start` call
+        with enough history leaves all three warmed at once.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        bars = [
+            Bar(bucket_start=_ts(i * 60), open=100.0, high=101.0, low=99.0, close=100.0, volume=0)
+            for i in range(25)
+        ]
+
+        engine.warm_start(instrument_id, bars)
+
+        assert engine._ema9[instrument_id].is_warmed_up
+        assert engine._ema20[instrument_id].is_warmed_up
+        assert engine._atr[instrument_id].is_warmed_up
+
+    def test_matches_replaying_the_same_bars_through_on_completed_bar(self):
+        """`warm_start` must be mathematically identical to normal live
+        warmup, not an approximation — same inputs, same order, same
+        result, whether they arrive via `warm_start` all at once or via
+        `on_completed_bar` one at a time.
+        """
+        bars = [
+            Bar(
+                bucket_start=_ts(i * 60),
+                open=100.0 + i,
+                high=101.0 + i,
+                low=99.0 + i,
+                close=100.0 + i * 0.7,
+                volume=0,
+            )
+            for i in range(30)
+        ]
+
+        warm_started = IndicatorEngine(timeframe_seconds=60)
+        warm_id = uuid.uuid4()
+        warm_started.warm_start(warm_id, bars)
+
+        live = IndicatorEngine(timeframe_seconds=60)
+        live_id = uuid.uuid4()
+        results: dict[str, float] = {}
+        for bar in bars:
+            candle = PriceCandle(
+                bucket_start=bar.bucket_start,
+                open=bar.open,
+                high=bar.high,
+                low=bar.low,
+                close=bar.close,
+                volume=bar.volume,
+            )
+            results = live.on_completed_bar(live_id, candle)
+
+        assert warm_started._ema9[warm_id].value == pytest.approx(results["EMA9"])
+        assert warm_started._ema20[warm_id].value == pytest.approx(results["EMA20"])
+        assert warm_started._atr[warm_id].value == pytest.approx(results["ATR14"])
+
+    def test_is_a_noop_once_a_live_tick_already_arrived(self):
+        """The critical safety property: replaying stale historical bars
+        over already-live state would silently regress a correct running
+        value back to an approximation. If a live tick got there first
+        (whatever ordering reason), `warm_start` must do nothing.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(0)),
+        )
+        # A second tick, crossing the bucket boundary, is what actually
+        # completes the first bar and creates the EMA9/EMA20 calculator
+        # entries this test needs to exist (but still cold — 1 bar in, not
+        # the 9 EMA9 needs).
+        engine.on_tick(
+            instrument_id,
+            Tick("NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(61)),
+        )
+        assert not engine._ema9[instrument_id].is_warmed_up  # only 1 bar in so far
+
+        bars = [
+            Bar(bucket_start=_ts(i * 60), open=50.0, high=51.0, low=49.0, close=50.0, volume=0)
+            for i in range(1, 25)
+        ]
+        engine.warm_start(instrument_id, bars)
+
+        # Still not warmed -- warm_start must not have touched this
+        # instrument's calculators once a live tick already created them.
+        assert not engine._ema9[instrument_id].is_warmed_up
+
+    def test_is_idempotent_second_call_is_ignored(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        first_bars = [
+            Bar(bucket_start=_ts(i * 60), open=100.0, high=101.0, low=99.0, close=100.0, volume=0)
+            for i in range(25)
+        ]
+        engine.warm_start(instrument_id, first_bars)
+        value_after_first = engine._ema9[instrument_id].value
+
+        second_bars = [
+            Bar(bucket_start=_ts(i * 60), open=200.0, high=201.0, low=199.0, close=200.0, volume=0)
+            for i in range(25)
+        ]
+        engine.warm_start(instrument_id, second_bars)
+
+        assert engine._ema9[instrument_id].value == pytest.approx(value_after_first)
+
+    def test_empty_bars_list_leaves_no_state_and_stays_a_noop(self):
+        """A genuinely new instrument with no persisted `price_bars` yet
+        must warm up from live ticks exactly as before this method existed
+        -- no half-created calculator entries left behind.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        engine.warm_start(instrument_id, [])
+
+        assert instrument_id not in engine._ema9
+        assert instrument_id not in engine._ema20
+        assert instrument_id not in engine._atr
+
+    def test_replaying_fewer_than_the_warmup_period_leaves_indicators_unwarmed(self):
+        """Same 'not enough history yet' semantics as live warmup -- a
+        restart soon after market open, with fewer than 20 persisted bars
+        available, must not fake a warmed EMA20 out of insufficient data.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+        bars = [
+            Bar(bucket_start=_ts(i * 60), open=100.0, high=101.0, low=99.0, close=100.0, volume=0)
+            for i in range(12)
+        ]
+
+        engine.warm_start(instrument_id, bars)
+
+        assert engine._ema9[instrument_id].is_warmed_up
+        assert not engine._ema20[instrument_id].is_warmed_up
+
+    def test_other_instruments_are_unaffected(self):
+        engine = IndicatorEngine(timeframe_seconds=60)
+        warmed_id, untouched_id = uuid.uuid4(), uuid.uuid4()
+        bars = [
+            Bar(bucket_start=_ts(i * 60), open=100.0, high=101.0, low=99.0, close=100.0, volume=0)
+            for i in range(25)
+        ]
+
+        engine.warm_start(warmed_id, bars)
+
+        assert warmed_id in engine._ema9
+        assert untouched_id not in engine._ema9

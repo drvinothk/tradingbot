@@ -26,6 +26,7 @@ from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
 from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
+from app.modules.market_data.indicators.bar_aggregator import Bar
 from app.modules.market_data.indicators.engine import IndicatorEngine
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
@@ -125,6 +126,19 @@ _EMPTY_POLL_WARNING_THRESHOLD_SECONDS = 90.0
 # more than necessary.
 _WS_RECOVERY_PROBE_EVERY_N_POLLS = 10
 
+# How many already-persisted completed bars to replay through
+# `IndicatorEngine.warm_start` when a fresh (post-restart) engine first sees
+# an underlying -- see that method's own docstring for why this exists at
+# all. 60 is well past both EMA9 (9) and EMA20 (20)'s own warmup sample
+# counts, so both are guaranteed to warm together; it's also generous enough
+# that the replayed EMA20 has genuinely converged rather than sitting right
+# at its just-warmed SMA seed (EMA20's alpha=2/21 means a bar 60 replays back
+# has decayed to ~(19/21)^60 ≈ 0.3% of its original weight -- effectively
+# fully converged). Harmless if fewer than 60 bars exist yet (e.g. a restart
+# soon after market open) -- `warm_start` just replays whatever's available,
+# same "not enough history yet -> None" semantics `EMACalculator` already has.
+_WARM_START_LOOKBACK_BARS = 60
+
 _SymbolRef = tuple[str, uuid.UUID]  # ("instrument" | "option_contract", row id)
 
 
@@ -172,10 +186,12 @@ class MarketDataIngestionService:
         rate_limit_backoff_seconds: float = _RATE_LIMIT_BACKOFF_SECONDS,
         min_plausible_price_by_symbol: dict[str, float] | None = None,
         ws_recovery_probe_every_n_polls: int = _WS_RECOVERY_PROBE_EVERY_N_POLLS,
+        warm_start_lookback_bars: int = _WARM_START_LOOKBACK_BARS,
     ) -> None:
         self._provider = provider
         self._session_factory = session_factory
         self._indicator_engine = indicator_engine
+        self._warm_start_lookback_bars = warm_start_lookback_bars
         self._symbol_map: dict[str, _SymbolRef] = {}
 
         # WS-health watchdog / REST-polling fallback — see module docstring.
@@ -254,6 +270,51 @@ class MarketDataIngestionService:
                 symbol_map[contract.symbol] = ("option_contract", contract.id)
         return symbol_map
 
+    def _warm_start_indicators(self, instrument_id: uuid.UUID) -> None:
+        """Reads the last `_warm_start_lookback_bars` already-persisted
+        `price_bars` rows for `instrument_id` and replays them through
+        `IndicatorEngine.warm_start` -- see that method's own docstring for
+        why. A no-op when `_indicator_engine` is absent (checked by the one
+        caller, `start`, before this is invoked) or when nothing has ever
+        been persisted for this instrument yet (a genuinely new instrument,
+        or the very first bar of a trading day) -- `warm_start` handles an
+        empty list the same as `EMACalculator` already handles "not enough
+        history yet": nothing changes, live ticks warm up from zero exactly
+        as they always have.
+        """
+        assert self._indicator_engine is not None
+        timeframe = f"{self._indicator_engine.timeframe_seconds}s"
+        # Bar objects must be built *inside* this block, from row attributes
+        # read before the session closes -- reading them after (e.g. in a
+        # comprehension outside the `with`) hits SQLAlchemy's own
+        # DetachedInstanceError, the exact trap this codebase's
+        # `record_option_chain_snapshot` docstring already documents once.
+        with self._session_factory() as db:
+            rows = (
+                db.query(PriceBarRow)
+                .filter(
+                    PriceBarRow.instrument_id == instrument_id,
+                    PriceBarRow.timeframe == timeframe,
+                )
+                .order_by(PriceBarRow.bucket_start.desc())
+                .limit(self._warm_start_lookback_bars)
+                .all()
+            )
+            bars = [
+                Bar(
+                    bucket_start=row.bucket_start,
+                    open=float(row.open),
+                    high=float(row.high),
+                    low=float(row.low),
+                    close=float(row.close),
+                    volume=row.volume,
+                )
+                for row in reversed(rows)  # ascending -- oldest first, see warm_start's docstring
+            ]
+        if not bars:
+            return
+        self._indicator_engine.warm_start(instrument_id, bars)
+
     def start(self, contract_symbols: list[str]) -> None:
         self._symbol_map.update(self._build_symbol_map(contract_symbols))
         unknown = set(contract_symbols) - set(self._symbol_map)
@@ -265,6 +326,14 @@ class MarketDataIngestionService:
                 len(unknown),
                 sorted(unknown),
             )
+        # Must run before subscribe_ticks below -- warm_start is a no-op once
+        # a live tick has already reached this instrument (see its own
+        # docstring), so warming late would silently do nothing.
+        if self._indicator_engine is not None:
+            for symbol in contract_symbols:
+                ref = self._symbol_map.get(symbol)
+                if ref is not None and ref[0] == "instrument":
+                    self._warm_start_indicators(ref[1])
         self._provider.subscribe_ticks(
             contract_symbols, on_tick=self._on_tick, on_depth=self._on_depth
         )

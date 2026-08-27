@@ -231,6 +231,140 @@ def test_indicator_engine_persists_vwap_immediately_and_ema_after_warmup(
     assert "EMA20" not in names_after_warmup
 
 
+def test_start_warm_starts_ema_atr_from_pre_existing_price_bars(
+    seeded_universe, test_session_factory, db: Session
+):
+    """The actual fix under test: a *fresh* service (standing in for a
+    process having just restarted) must warm EMA9/EMA20/ATR14 together from
+    whatever `price_bars` already exist for this instrument, before any live
+    tick ever arrives — closing the real, live-confirmed gap recorded in
+    `IndicatorEngine.warm_start`'s own docstring (EMA9 re-arming ~11 minutes
+    before EMA20 after a cold restart, which fed
+    `EMAMicroPullbackStrategy`'s expansion filter a stale/fresh mismatched
+    pair and produced a real losing trade on 2026-08-26).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    base = datetime(2026, 7, 24, 9, 15, 0, tzinfo=UTC)
+    with test_session_factory() as seed_db:
+        for i in range(25):
+            seed_db.add(
+                PriceBar(
+                    id=uuid.uuid4(),
+                    instrument_id=nifty.id,
+                    timeframe="60s",
+                    bucket_start=base + timedelta(minutes=i),
+                    open=24100.0,
+                    high=24101.0,
+                    low=24099.0,
+                    close=24100.0 + i,
+                    volume=0,
+                )
+            )
+
+    broker = _NeverTicksBroker()  # deterministic: this test cares only about
+    # start()'s own synchronous warm-start effect, not real streaming.
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+    )
+
+    service.start([underlying_symbol])
+
+    engine = service._indicator_engine  # noqa: SLF001
+    assert engine is not None
+    assert engine._ema9[nifty.id].is_warmed_up  # noqa: SLF001
+    assert engine._ema20[nifty.id].is_warmed_up  # noqa: SLF001
+    assert engine._atr[nifty.id].is_warmed_up  # noqa: SLF001
+
+
+def test_start_warm_start_does_not_touch_the_database(
+    seeded_universe, test_session_factory, db: Session
+):
+    """`warm_start` is in-memory-only by design (see its own docstring) —
+    replaying already-persisted bars must never write new
+    `indicator_snapshots` rows or re-insert `price_bars` rows (which would
+    hit `uq_price_bar_bucket` and crash startup, the exact regression risk
+    this fix's own design review flagged).
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    base = datetime(2026, 7, 24, 9, 15, 0, tzinfo=UTC)
+    with test_session_factory() as seed_db:
+        for i in range(25):
+            seed_db.add(
+                PriceBar(
+                    id=uuid.uuid4(),
+                    instrument_id=nifty.id,
+                    timeframe="60s",
+                    bucket_start=base + timedelta(minutes=i),
+                    open=24100.0,
+                    high=24101.0,
+                    low=24099.0,
+                    close=24100.0 + i,
+                    volume=0,
+                )
+            )
+
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+    )
+
+    service.start([underlying_symbol])
+
+    assert (
+        db.query(IndicatorSnapshot).filter(IndicatorSnapshot.instrument_id == nifty.id).count()
+        == 0
+    )
+    assert db.query(PriceBar).filter(PriceBar.instrument_id == nifty.id).count() == 25
+
+
+def test_start_without_pre_existing_price_bars_leaves_indicators_cold(
+    seeded_universe, test_session_factory, db: Session
+):
+    """No `price_bars` yet for this instrument (a genuinely new one, or the
+    very first restart of the day before any bar has completed) — `start`
+    must behave exactly as it did before this fix existed: indicators warm
+    up from live ticks only, from zero.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    nifty = db.query(Instrument).filter(Instrument.symbol == underlying_symbol).one()
+
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(
+        _provider(broker),
+        session_factory=test_session_factory,
+        indicator_engine=IndicatorEngine(timeframe_seconds=60),
+    )
+
+    service.start([underlying_symbol])
+
+    engine = service._indicator_engine  # noqa: SLF001
+    assert engine is not None
+    assert nifty.id not in engine._ema9  # noqa: SLF001
+    assert nifty.id not in engine._ema20  # noqa: SLF001
+
+
+def test_start_without_an_indicator_engine_skips_warm_start(
+    seeded_universe, test_session_factory
+):
+    """`indicator_engine=None` (e.g. a test double, or a future caller with
+    no indicator use at all) must not crash `start` just because warm-start
+    has nothing to warm.
+    """
+    underlying_symbol = next(i.symbol for i in seeded_universe if not i.is_option)
+    broker = _NeverTicksBroker()
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+
+    service.start([underlying_symbol])  # must not raise
+
+
 def test_reset_daily_indicators_resets_the_underlying_engine(
     seeded_universe, test_session_factory
 ):

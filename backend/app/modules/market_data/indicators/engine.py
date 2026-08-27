@@ -101,6 +101,61 @@ class IndicatorEngine:
             results["ATR14"] = atr_value
         return results
 
+    def warm_start(self, instrument_id: uuid.UUID, bars: list[Bar]) -> None:
+        """Replays already-persisted completed bars (oldest first) through
+        EMA9/EMA20/ATR14 so a freshly-constructed engine — built cold on
+        every process restart, since none of this state persists on its own
+        (see this class's own module docstring) — doesn't warm up from zero
+        in real time.
+
+        **Why this matters**: EMA9 (9-bar warmup) and EMA20 (20-bar warmup)
+        only ever advance on live `on_tick`/`on_completed_bar` calls, so
+        after a cold restart they'd otherwise re-arm ~11 minutes apart.
+        `EMAMicroPullbackStrategy`'s own expansion filter reads the latest N
+        EMA9 and EMA20 rows from `indicator_snapshots` as two independent
+        queries and zips them positionally, assuming same-bar pairing
+        (`common_rules.get_recent_indicator_values`'s own docstring states
+        this assumption explicitly) — during that gap it silently paired a
+        fresh post-restart EMA9 against a stale pre-restart EMA20,
+        manufacturing a false "accelerating expansion" spread neither
+        indicator actually showed on its own. Live-confirmed 2026-08-26: a
+        restart at ~10:33 IST produced exactly this gap (EMA9 resumed at
+        10:42, EMA20 not until 10:53) and fired a real, losing counter-trend
+        trade off the resulting bogus signal.
+
+        Idempotent and one-shot per `instrument_id` for this engine's
+        lifetime — a no-op if this instrument already has EMA9/EMA20
+        calculator state, whether from an earlier `warm_start` call or
+        because a live tick already arrived first. Replaying historical bars
+        over already-live state would silently regress a correct running
+        value back to a stale approximation, not fix anything — so callers
+        must call this once, synchronously, *before* the live provider
+        subscription for `instrument_id` begins (see
+        `MarketDataIngestionService.start`'s own call site).
+
+        Deliberately does **not** touch the database — unlike
+        `on_completed_bar`, nothing here is persisted to
+        `indicator_snapshots`, and `bars` themselves must already exist in
+        `price_bars` (re-inserting them would hit `uq_price_bar_bucket`).
+        Only this engine's in-memory calculator state is fast-forwarded; the
+        next live completed bar persists EMA9+EMA20 together as normal,
+        which is what actually closes the gap going forward (both are
+        warmed together by this point, so neither is ever missing from that
+        write).
+        """
+        if instrument_id in self._ema9 or instrument_id in self._ema20:
+            return
+        if not bars:
+            return  # nothing to replay -- leave state untouched, not "touched but cold"
+
+        ema9_calc = self._ema9.setdefault(instrument_id, EMACalculator(EMA_SHORT_PERIOD))
+        ema20_calc = self._ema20.setdefault(instrument_id, EMACalculator(EMA_LONG_PERIOD))
+        atr_calc = self._atr.setdefault(instrument_id, ATRCalculator(ATR_PERIOD))
+        for bar in bars:
+            ema9_calc.update(bar.close)
+            ema20_calc.update(bar.close)
+            atr_calc.update(bar.high, bar.low, bar.close)
+
     def reset_session(self, instrument_id: uuid.UUID | None = None) -> None:
         """VWAP resets at the start of each trading day; EMA deliberately
         does not (trend continuity across sessions is the whole point of an
