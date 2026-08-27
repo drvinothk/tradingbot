@@ -128,6 +128,11 @@ def seeded_admin(engine):
         from app.domain.audit.models import AuditEvent
         from app.domain.identity.models import LoginSession
         from app.domain.ops.models import MarketDataDiagnosticRun, MarketDataDiagnosticSnapshot
+        from app.modules.market_data import diagnostic_session
+
+        # Defensively join any diagnostic background thread a test left
+        # running, so it can't insert a snapshot row between the deletes below.
+        diagnostic_session.stop_all()
 
         cleanup_db.query(AuditEvent).filter(
             AuditEvent.workspace_id == ids["workspace_id"]
@@ -399,6 +404,13 @@ def test_diagnostic_default_role_start_is_idempotent(api_client: TestClient, see
     assert first.json()["default"]["already_running"] is False
     assert second.json()["default"]["already_running"] is True
     assert first.json()["default"]["run_id"] == second.json()["default"]["run_id"]
+
+    # Stop the background diagnostic thread this test started -- otherwise it
+    # keeps writing MarketDataDiagnosticSnapshot rows (real commits) and races
+    # `seeded_admin`'s teardown, which deletes the parent run row: an
+    # intermittent FK violation that aborts teardown and cascades leaked
+    # Permission rows into ~50 later tests.
+    api_client.post("/api/v1/market-data/diagnostic/stop", json={"mode": "default"})
 
 
 def test_diagnostic_failback_role_rejects_unsupported_provider_synchronously(
