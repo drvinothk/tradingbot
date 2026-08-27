@@ -24,7 +24,7 @@ from app.modules.strategy_engine.common_rules import (
     DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ConfirmationFilterStrategy,
     compute_stop_target,
-    get_latest_indicator_value,
+    get_latest_indicator_value_with_ts,
     get_recent_completed_bars,
     resolve_structure_break_buffer,
     touch_and_confirm,
@@ -38,6 +38,16 @@ from app.modules.strategy_engine.strike_ranking.engine import (
 )
 
 logger = logging.getLogger("app.strategy_engine.vwap_pullback")
+
+# Under healthy WS ingestion VWAP updates every tick (sub-second). If the
+# latest persisted VWAP is older than this relative to the bar being
+# evaluated, the live volume-weighted VWAP feed has effectively stopped —
+# `get_latest_indicator_value` would otherwise keep returning a stale,
+# possibly days-old frozen scalar (real incident 2026-08-27: the underlying
+# switched to an index feed with no traded volume, so VWAP could never
+# accumulate and the strategy traded a 2-day-old constant). Better to sit
+# out than to trade a bias derived from a dead indicator.
+DEFAULT_VWAP_MAX_STALENESS_SECONDS = 300.0
 
 
 class VWAPPullbackStrategy(ConfirmationFilterStrategy):
@@ -58,6 +68,7 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         min_trend_side_fraction: float = 0.70,
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
+        vwap_max_staleness_seconds: float = DEFAULT_VWAP_MAX_STALENESS_SECONDS,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -73,6 +84,7 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         self.min_trend_side_fraction = min_trend_side_fraction
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
+        self.vwap_max_staleness_seconds = vwap_max_staleness_seconds
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -82,8 +94,23 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
             return None
         prev_bar = bars[0]  # bars[1] is latest_bar itself
 
-        vwap = get_latest_indicator_value(db, self.instrument_id, "VWAP", self.timeframe)
-        if vwap is None:
+        vwap_row = get_latest_indicator_value_with_ts(
+            db, self.instrument_id, "VWAP", self.timeframe
+        )
+        if vwap_row is None:
+            return None
+        vwap, vwap_ts = vwap_row
+        vwap_age_seconds = (latest_bar.bucket_start - vwap_ts).total_seconds()
+        if vwap_age_seconds > self.vwap_max_staleness_seconds:
+            self._log_once(
+                logger,
+                "vwap_stale",
+                "run %s: latest VWAP is %.0fs stale (> %.0fs) — sitting out until a "
+                "live volume-bearing VWAP feed is restored",
+                strategy_run.id,
+                vwap_age_seconds,
+                self.vwap_max_staleness_seconds,
+            )
             return None
 
         direction = touch_and_confirm(prev_bar, latest_bar, vwap, self.pullback_tolerance_frac)

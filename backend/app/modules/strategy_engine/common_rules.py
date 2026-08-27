@@ -138,6 +138,37 @@ def get_latest_indicator_value(
     return float(row.value) if row is not None else None
 
 
+def get_latest_indicator_value_with_ts(
+    db: Session,
+    instrument_id: uuid.UUID,
+    indicator_name: str,
+    timeframe: str = BAR_TIMEFRAME,
+) -> tuple[float, datetime] | None:
+    """Same as `get_latest_indicator_value` but also returns the row's `ts`,
+    so a caller can reject a value that is technically present but far too
+    old to trust. `None` means "no row at all" (not warmed up yet), same
+    convention as the scalar helper above.
+
+    Added for VWAP Pullback's staleness gate: `get_latest_indicator_value`
+    silently returns the newest row regardless of age, so when the live
+    VWAP feed stops (e.g. an underlying source with no traded volume — a
+    computed index — can never accumulate a volume-weighted VWAP), the
+    strategy kept trading on a days-old frozen value. See
+    `strategies/vwap_pullback.py`'s own `vwap_max_staleness_seconds`.
+    """
+    row = (
+        db.query(IndicatorSnapshot)
+        .filter(
+            IndicatorSnapshot.instrument_id == instrument_id,
+            IndicatorSnapshot.indicator_name == indicator_name,
+            IndicatorSnapshot.timeframe == timeframe,
+        )
+        .order_by(IndicatorSnapshot.ts.desc())
+        .first()
+    )
+    return (float(row.value), row.ts) if row is not None else None
+
+
 # Placeholder starting values for the structure-break confirmation fix
 # (see project memory `project_structure_break_confirmation_fix_plan_2026_08_24`)
 # — the mid-point of the research doc's own suggested starting ranges

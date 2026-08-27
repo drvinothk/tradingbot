@@ -450,3 +450,66 @@ class TestVWAPPullbackStrategy:
 
         strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
         assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_no_signal_when_vwap_is_stale(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """A valid bullish touch+confirm pattern, but the only persisted VWAP
+        row is far older than the bar being evaluated -- the live
+        volume-weighted VWAP feed has effectively stopped (real incident
+        2026-08-27: an index underlying with no traded volume). Sit out
+        rather than trade a frozen scalar.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        db.add(
+            IndicatorSnapshot(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                indicator_name="VWAP",
+                timeframe=BAR_TIMEFRAME,
+                value=VWAP,
+                ts=base - timedelta(hours=1),  # 3600s stale vs the confirmation bar
+            )
+        )
+        db.flush()
+        _seed_trending_history(db, instrument, base, "bullish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        assert strategy.check_setup(db, strategy_run, confirmation) is None
+
+    def test_signal_fires_when_vwap_is_fresh_relative_to_the_bar(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Regression guard for the staleness gate: a VWAP row timestamped at
+        the bar itself is well within tolerance and must not be filtered.
+        """
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        db.add(
+            IndicatorSnapshot(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                indicator_name="VWAP",
+                timeframe=BAR_TIMEFRAME,
+                value=VWAP,
+                ts=base + timedelta(minutes=1),
+            )
+        )
+        db.flush()
+        _seed_trending_history(db, instrument, base, "bullish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)
+        proposal = strategy.check_setup(db, strategy_run, confirmation)
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
