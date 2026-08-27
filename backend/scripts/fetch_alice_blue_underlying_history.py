@@ -56,7 +56,11 @@ DATA_DIR = REPO_ROOT / "data" / "historical"
 
 # (underlying name, NSE index token) -- confirmed live 2026-08-21, see
 # alice_blue_scrip_master.py's own docstring: same tokens Shoonya uses.
-UNDERLYING_TOKENS = {"NIFTY": "26000", "BANKNIFTY": "26009"}
+# INDIA_VIX (token 26017, from Alice's own public INDICES contract master)
+# added 2026-08-24: live-probed to return real, gap-free 1-min candles back
+# to ~Oct 2024 -- a genuine upgrade over TrueData's VIX, which only ever had
+# 1-min for the live ~12-day window (EOD-only beyond that).
+UNDERLYING_TOKENS = {"NIFTY": "26000", "BANKNIFTY": "26009", "INDIA_VIX": "26017"}
 
 WINDOW_DAYS = 30
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", "oi"]

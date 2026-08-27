@@ -205,6 +205,30 @@ class ShoonyaWSClient:
                 self._entries_by_key[entry.key] = entry
         self._send_subscribe(parsed)
 
+    def set_callbacks(
+        self, on_tick: TickCallback, on_depth: DepthCallback | None = None
+    ) -> None:
+        """Re-point the tick/depth callbacks on an already-running client.
+
+        `_handle_message`'s receive loop reads `self._on_tick`/`self._on_depth`
+        live on every frame, so a plain assignment (done here under `_lock`
+        for memory-visibility, though CPython attribute stores are atomic
+        anyway) takes effect from the next frame on — no reconnect needed.
+
+        Used by `ShoonyaBrokerAdapter.subscribe_quotes` when the process's
+        shared `BrokerPortMarketDataAdapter` gets rebuilt (a Shoonya
+        reconnect runs `market_data.registry.reset_for_reconnect` ->
+        `set_market_data_provider(None)`), which hands this still-alive client
+        a fresh — but behaviourally identical — dispatcher bound method.
+        Last-writer-wins is correct there: the previous shim instance is
+        being discarded, and its `get_latest_tick` cache going cold is
+        already covered by `PositionManager._live_tick`'s `broker.get_quote`
+        fallback.
+        """
+        with self._lock:
+            self._on_tick = on_tick
+            self._on_depth = on_depth
+
     def unsubscribe(self, contract_symbols: list[str]) -> None:
         with self._lock:
             to_remove = [

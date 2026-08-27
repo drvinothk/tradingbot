@@ -137,6 +137,27 @@ def test_handle_message_dispatches_tick_to_on_tick():
     assert ticks[0].ltp == 123.45
 
 
+def test_set_callbacks_repoints_dispatch_on_a_running_client():
+    """`ShoonyaBrokerAdapter.subscribe_quotes` calls this when a Shoonya
+    reconnect rebuilds the shared `BrokerPortMarketDataAdapter` — the live
+    receive loop must forward to the new callback from the next frame on,
+    without a reconnect.
+    """
+    client, original_ticks, _ = _client()
+    client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])
+
+    rebound_ticks: list = []
+    client.set_callbacks(on_tick=lambda t: rebound_ticks.append(t))
+
+    client._handle_message(
+        json.dumps({"t": "tk", "e": "NFO", "tk": "12345", "lp": "123.45"})
+    )
+
+    assert original_ticks == []
+    assert len(rebound_ticks) == 1
+    assert rebound_ticks[0].ltp == 123.45
+
+
 def test_handle_message_dispatches_depth_to_on_depth():
     client, _, depths = _client()
     client.subscribe([("NIFTY30JUL26C24000", "NFO", "12345")])

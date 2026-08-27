@@ -256,11 +256,11 @@ class ShoonyaBrokerAdapter(BrokerPort):
         self._option_anchor_cache: dict[tuple[str, date], str] = {}
 
         self._ws: ShoonyaWSClient | None = None
-        # Set once, at real construction time in subscribe_quotes below --
-        # not on every call -- purely so a later call with a genuinely
-        # different callback pair can be detected and rejected loudly. See
-        # subscribe_quotes's own docstring for why a second, silent rebind
-        # is not possible here.
+        # The callback pair currently forwarded to by the live ShoonyaWSClient.
+        # Tracked so subscribe_quotes can skip a redundant set_callbacks when
+        # the same dispatcher re-subscribes (the common case), and re-point
+        # the client when a rebuilt BrokerPortMarketDataAdapter hands us a
+        # fresh one -- see subscribe_quotes's own docstring.
         self._ws_bound_on_tick: TickCallback | None = None
         self._ws_bound_on_depth: DepthCallback | None = None
 
@@ -674,18 +674,22 @@ class ShoonyaBrokerAdapter(BrokerPort):
         drops every other one's ticks; this codebase now only ever builds
         one, shared, everywhere).
 
-        `ShoonyaWSClient` binds exactly one `on_tick`/`on_depth` pair at
-        construction, with no way to rebind it afterwards — so a call here
-        with a *different* callback than the one already bound would
-        silently receive zero ticks/depth updates, no error, forever (found
-        2026-08-26: this is exactly why `/shoonya/ws-tick-diagnostic`
-        always reported `ticks_received: 0`, since ingestion always
-        subscribes first with its own stable dispatcher). Every real
-        production caller already goes through `BrokerPortMarketDataAdapter`
-        (`market_data/providers/broker_port_shim.py`), which always passes
-        the *same* stable callback object on every call — so this has never
-        bitten real tick flow — but a bare second call with a genuinely
-        different callback now fails loudly instead of silently.
+        `ShoonyaWSClient` forwards ticks/depth to one callback pair, read
+        live by its receive loop. A second call here with a *different*
+        callback re-points that pair (`set_callbacks`) rather than raising
+        or silently dropping ticks — necessary because a Shoonya reconnect
+        runs `market_data.registry.reset_for_reconnect`, which rebuilds the
+        process's shared `BrokerPortMarketDataAdapter` and hands this
+        still-alive client a fresh (but behaviourally identical) dispatcher
+        bound method. Last-writer-wins is correct: the previous shim
+        instance is being discarded. The same-callback case (the common one
+        — `BrokerPortMarketDataAdapter` re-subscribes with its own stable
+        `_handle_tick` on every batch) is a cheap no-op.
+
+        Found 2026-08-26 / re-hit 2026-08-27: the old behaviour here (raise
+        on a different callback) turned every post-reconnect re-subscribe
+        into a hard failure — market-data ingestion and strategy-runner
+        resume both went down until the next process restart.
         """
         if self._ws is None:
             self._ws = ShoonyaWSClient(
@@ -702,14 +706,13 @@ class ShoonyaBrokerAdapter(BrokerPort):
             self._ws_bound_on_tick = on_tick
             self._ws_bound_on_depth = on_depth
         elif on_tick != self._ws_bound_on_tick or on_depth != self._ws_bound_on_depth:
-            raise RuntimeError(
-                "ShoonyaBrokerAdapter.subscribe_quotes called a second time with a "
-                "different on_tick/on_depth callback -- ShoonyaWSClient binds exactly "
-                "one callback pair at construction with no way to rebind it later, so "
-                "this caller would silently receive zero ticks. Route through "
-                "BrokerPortMarketDataAdapter's shared dispatcher instead of calling "
-                "this adapter's subscribe_quotes directly with a new callback."
+            logger.info(
+                "Shoonya WS callback pair re-pointed (BrokerPortMarketDataAdapter "
+                "was rebuilt) — last-writer-wins, previous shim instance discarded"
             )
+            self._ws.set_callbacks(on_tick, on_depth)
+            self._ws_bound_on_tick = on_tick
+            self._ws_bound_on_depth = on_depth
 
         entries = [(symbol, *self._resolve_symbol_token(symbol)) for symbol in contract_symbols]
         self._ws.subscribe(entries)
@@ -731,11 +734,19 @@ class ShoonyaBrokerAdapter(BrokerPort):
         `MARKET_DATA_PROVIDER` would 500. `get_price_history` never hit this
         because it already routes through `_resolve_underlying_token`
         (cache, then a live NSE search_scrip fallback) — this just applies
-        the same routing here, for known underlyings only; an option
+        the same routing here, for index-style symbols only; an option
         contract symbol still goes through the plain, fallback-free
         `_resolve_token` unchanged.
+
+        2026-08-27: widened the gate from `KNOWN_UNDERLYINGS`
+        (NIFTY/BANKNIFTY) to every key of `_UNDERLYING_INDEX_TSYM`, which
+        also covers `INDIA VIX`. VIX has no option chain and no
+        instrument-master path to warm its token, so the old cache-only
+        `_resolve_token` fall-through always raised here and VIX ticks
+        never streamed — but `_resolve_underlying_token` already fully
+        supports it (`tsym="INDIAVIX"`, NSE search anchor `"VIX"`).
         """
-        if symbol.upper() in KNOWN_UNDERLYINGS:
+        if symbol.upper() in _UNDERLYING_INDEX_TSYM:
             return self._resolve_underlying_token(symbol)
         return self._resolve_token(symbol)
 

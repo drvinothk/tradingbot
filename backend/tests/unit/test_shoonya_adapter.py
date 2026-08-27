@@ -782,6 +782,27 @@ def test_resolve_symbol_token_for_a_known_underlying_uses_the_cache_when_already
     assert rest.calls == [], "must not re-search once cached"
 
 
+def test_resolve_symbol_token_for_india_vix_falls_back_to_a_live_search():
+    """2026-08-27: VIX was stale for days because `_resolve_symbol_token`
+    only routed NIFTY/BANKNIFTY through `_resolve_underlying_token`; INDIA
+    VIX (no option chain, no instrument-master path to warm its token) fell
+    through to the cache-only `_resolve_token` and always raised on
+    subscribe. The gate now covers every `_UNDERLYING_INDEX_TSYM` key.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [
+        {"tsym": "Nifty 50", "token": "26000"},
+        {"tsym": "INDIAVIX", "token": "26017"},
+    ]
+
+    exchange, token = adapter._resolve_symbol_token("INDIA VIX")
+
+    assert (exchange, token) == ("NSE", "26017")
+    search_calls = [call[1] for call in rest.calls if call[0] == "search_scrip"]
+    assert search_calls == [("FA1", "NSE", "VIX")]
+
+
 def test_resolve_symbol_token_for_an_option_contract_still_raises_when_uncached():
     """An option contract's token has no reasonable blind fallback (no
     expiry/strike context to search on) -- only known underlyings get the
@@ -1299,6 +1320,10 @@ class _FakeWSClient:
     def start(self) -> None:
         pass
 
+    def set_callbacks(self, on_tick, on_depth=None) -> None:
+        self.on_tick = on_tick
+        self.on_depth = on_depth
+
     def subscribe(self, entries: list[tuple[str, str, str]]) -> None:
         self.subscribe_calls.append(entries)
 
@@ -1334,10 +1359,13 @@ def test_subscribe_quotes_second_call_with_the_same_callback_does_not_raise(monk
     ]
 
 
-def test_subscribe_quotes_second_call_with_a_different_callback_raises(monkeypatch):
-    """A genuinely different callback on an already-connected client would
-    silently receive zero ticks forever (ShoonyaWSClient binds one callback
-    pair at construction, no setter) -- must now fail loudly instead.
+def test_subscribe_quotes_second_call_with_a_different_callback_rebinds(monkeypatch):
+    """A Shoonya reconnect rebuilds the process's shared
+    `BrokerPortMarketDataAdapter`, so the still-alive `ShoonyaWSClient` gets
+    handed a fresh (behaviourally identical) dispatcher on the next
+    re-subscribe. That must re-point the live client (last-writer-wins),
+    not raise -- the old behaviour turned every post-reconnect re-subscribe
+    into a hard market-data + strategy-resume outage (2026-08-27).
     """
     import app.modules.broker_adapter.shoonya.adapter as adapter_module
 
@@ -1353,6 +1381,11 @@ def test_subscribe_quotes_second_call_with_a_different_callback_raises(monkeypat
         pass
 
     adapter.subscribe_quotes(["NIFTY"], on_tick=_first_callback)
+    adapter.subscribe_quotes(["NIFTY"], on_tick=_second_callback)
 
-    with pytest.raises(RuntimeError, match="second time with a"):
-        adapter.subscribe_quotes(["NIFTY"], on_tick=_second_callback)
+    assert adapter._ws.on_tick is _second_callback
+    assert adapter._ws_bound_on_tick is _second_callback
+    assert adapter._ws.subscribe_calls == [
+        [("NIFTY", "NSE", "26000")],
+        [("NIFTY", "NSE", "26000")],
+    ]
