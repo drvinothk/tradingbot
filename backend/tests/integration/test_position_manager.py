@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.domain.broker.models import ReconciliationRun
 from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
-from app.domain.market.models import Instrument, OptionContract, OptionType
+from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
 from app.domain.ops.models import SystemAlert
 from app.domain.session.models import (
     FundingMode,
@@ -650,6 +650,39 @@ def test_run_once_leaves_position_open_when_price_is_fine(
 
     db.refresh(position)
     assert position.status == PositionStatus.OPEN
+
+
+def test_run_once_archives_the_option_quote_tick_for_an_open_position(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-08-27, explicit user request: every real option-contract price
+    `evaluate_open_position` actually prices a check against should be kept
+    for future backtest-fidelity work, not discarded — see
+    `PositionManager._archive_option_tick`'s own docstring."""
+    real_price = broker._price_for(option_contract.symbol)  # noqa: SLF001
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=real_price - 10.0, target_price=real_price + 10.0,
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    archived = (
+        db.query(QuoteTick)
+        .filter(QuoteTick.option_contract_id == option_contract.id)
+        .one_or_none()
+    )
+    assert archived is not None
+    assert archived.instrument_id is None
+    assert float(archived.ltp) == pytest.approx(real_price)
 
 
 def test_run_once_exits_on_underlying_structure_break(

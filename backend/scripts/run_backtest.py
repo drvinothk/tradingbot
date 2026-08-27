@@ -245,7 +245,7 @@ from backtest_pivots import PivotLevels, compute_floor_pivots, prior_day_ohlc  #
 from sqlalchemy import create_engine, text  # noqa: E402
 from sqlalchemy.orm import Session, sessionmaker  # noqa: E402
 
-from app.api.v1.strategies import _DEFAULT_QTY_LOTS_PAPER, _build_strategy  # noqa: E402
+from app.api.v1.strategies import _build_strategy  # noqa: E402
 from app.config.settings import get_settings  # noqa: E402
 from app.core.clock import IST, to_ist  # noqa: E402
 from app.core.db.base import Base  # noqa: E402
@@ -1464,14 +1464,17 @@ def _reconstruct_exit_current(
     genuine, permanent ceiling of the historical data available (no source
     offers real bid/ask or sub-minute bars).
 
-    `qty_lots` is an explicit caller-supplied value, not
-    `trade_intent.qty_lots` (which is always the pinned stub `1` regardless
-    of exit-mode — set once at signal-generation time before any exit-mode
-    branching runs, see `strategy_config_stub`'s own comment). The caller
-    passes `app.api.v1.strategies._DEFAULT_QTY_LOTS_PAPER` (today's real
-    paper default), so this mode's PnL is real-scale without any post-hoc
-    rescaling — the same established pattern `_reconstruct_exit_legs`'s own
-    `LegSpec.qty_lots` already uses for the identical reason.
+    `qty_lots` is an explicit caller-supplied value (today, `1` — same as
+    `legacy`/`target_mult`), not `trade_intent.qty_lots` (which is always
+    the pinned stub `1` regardless of exit-mode — set once at
+    signal-generation time before any exit-mode branching runs, see
+    `strategy_config_stub`'s own comment). 2026-08-27, explicit user
+    decision: paper trading's own real 10-lot sizing is a deliberate paper-
+    only choice, not something backtest (or live) needs to mirror — "fine
+    to run backtest and live with 1x lot, unless I ask to change." Kept as
+    a caller-supplied parameter, not hardcoded inline, for exactly that
+    "unless I ask to change" case — the same established pattern
+    `_reconstruct_exit_legs`'s own `LegSpec.qty_lots` already uses.
 
     Same-bar tie-break (confirmed with the user, 2026-08-27 fidelity plan):
     a single bar's [low, high] range can plausibly satisfy more than one
@@ -2449,7 +2452,7 @@ def _run_single_backtest(
                             symbol,
                             bars,
                             ctx.lot_size,
-                            _DEFAULT_QTY_LOTS_PAPER,
+                            1,  # 1 lot, matching legacy/target_mult -- see qty_lots param docstring
                             underlying_series=underlying_series,
                             entry_diagnostics=entry_diagnostics_by_intent.get(intent_id),
                             diagnostics=diagnostics,
@@ -2609,15 +2612,17 @@ def main() -> None:
         f"{', '.join(EXIT_MODES)}. 'current' (default, 2026-08-27) = the faithful mode: all 5 "
         "real steps of execution_engine.paper.service.evaluate_open_position (stop, target, "
         "structure-break, spread-blowout, trail, in that exact order), using each bar's "
-        "high/low (not just close), real qty_lots (api.v1.strategies._DEFAULT_QTY_LOTS_PAPER) "
-        "and real lot sizes (UNDERLYING_META). Always means 'whatever production's real "
-        "stop%%/target%% is today' -- see the printed report's own bracketed label (e.g. "
+        "high/low (not just close), and real lot sizes (UNDERLYING_META). qty_lots=1, same as "
+        "'legacy' -- paper trading's real 10-lot sizing is a deliberate paper-only choice, not "
+        "something backtest mirrors by default (2026-08-27 user decision: 'fine to run backtest "
+        "and live with 1x lot, unless I ask to change'). Always means 'whatever production's "
+        "real stop%%/target%% is today' -- see the printed report's own bracketed label (e.g. "
         "'current [stop 12%% / target 20%%]', from _current_mode_label) for the exact values in "
         "effect for this run, since those can change later without this mode's name changing. "
         "'legacy' = today's fixed-%%-target/stop/trail, close-only pricing, no structure-break/"
-        "spread-blowout, pinned qty_lots=1 -- frozen, byte-identical to every pre-2026-08-24 "
-        "run (and every run before this date), kept exactly as-is for reproducing old baseline "
-        "CSVs; not the default any more. 'near_only'/'far_only' = 100%% of --total-lots exits "
+        "spread-blowout -- frozen, byte-identical to every pre-2026-08-24 run (and every run "
+        "before this date), kept exactly as-is for reproducing old baseline CSVs; not the "
+        "default any more. 'near_only'/'far_only' = 100%% of --total-lots exits "
         "at the underlying's R1/S1 or R2/S2 classic floor-pivot level (see backtest_pivots.py), "
         "computed off the prior trading day's OHLC. 'no_target_only' = 100%% of --total-lots, "
         "no target at all, stop/trail/EOD only. 'split_30_30_40' = one entry split "

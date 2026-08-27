@@ -43,6 +43,7 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import OrderMode, Position, PositionStatus
 from app.domain.market.models import Instrument, OptionContract
+from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import (
     SafeMode,
@@ -320,6 +321,67 @@ class PositionManager:
                 "Failed to subscribe %s for live pricing; will retry next cycle", symbol
             )
 
+    def _archive_option_tick(
+        self, db: Session, option_contract_id: uuid.UUID, tick: Tick
+    ) -> None:
+        """Persists the exact price `evaluate_open_position` is about to use
+        for this cycle's stop/target/structure-break/spread-blowout/trail
+        checks — 2026-08-27, explicit user request to keep every real
+        option-contract price observation this system receives, so future
+        backtest-fidelity work has real option tick/spread history to
+        replay instead of the synthetic OI/volume-derived proxy
+        `run_backtest.py`'s `HistoricalBrokerAdapter` has always had to use
+        (see that module's own docstring). Deliberately a *different* hook
+        than `_ensure_symbol_subscribed`'s no-op WS callback (`lambda
+        _tick: None`) — that one stays exactly as-is, since a QC pass
+        already found that persisting through a provider-level callback
+        (with no test-safe DB session in scope) spawned thousands of stray
+        rows against the *production* dev database from ordinary test runs
+        that never expected market data to be touched (see that method's
+        own docstring). This hook instead reuses `_run_cycle`'s own
+        already-test-injected `db` session — the exact same one every
+        other write in this cycle already goes through — so it's exactly
+        as test-isolated as the rest of `PositionManager`, no new risk.
+
+        One known, bounded, already-logged limitation, not silently
+        glossed over: `current_contract_price`'s own last-resort fallback
+        (`broker.get_quote()`) is the *mock* adapter's synthetic,
+        strategy-independent quote for a paper-routed position — this can
+        rarely persist a non-real price on that specific fallback path, only
+        when both the live feed and the REST option-chain snapshot are
+        already stale/dead for this contract (a state
+        `current_contract_price` itself already logs a warning for). Not
+        filtered out here — doing so cheaply would mean re-deriving
+        `current_contract_price`'s own two freshness checks, real coupling
+        to a shared, two-caller function for a rare edge case. A future
+        reader of this archive should already expect to sanity-filter
+        implausible rows the same way any real market-data archive would.
+
+        Best-effort: a failure here must never block the real safety check
+        that follows — this cycle's own db session already has real rows
+        pending flush for this position regardless of whether this
+        insert lands.
+        """
+        try:
+            db.add(
+                QuoteTickRow(
+                    id=uuid.uuid4(),
+                    instrument_id=None,
+                    option_contract_id=option_contract_id,
+                    ltp=tick.ltp,
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    volume=tick.volume,
+                    oi=tick.oi,
+                    ts=tick.ts,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to archive option quote tick for %s; continuing without it",
+                option_contract_id,
+            )
+
     def _live_tick(
         self, provider: BaseMarketDataProvider, symbol: str, broker: BrokerPort
     ) -> Tick:
@@ -417,6 +479,7 @@ class PositionManager:
                     market_data_provider=market_data_provider,
                     session_factory=same_session,
                 )
+                self._archive_option_tick(db, option_contract.id, tick)
 
                 cache_key = (option_contract.instrument_id, id(broker))
                 underlying_price = underlying_price_cache.get(cache_key)
