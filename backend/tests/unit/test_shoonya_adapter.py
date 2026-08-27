@@ -64,6 +64,9 @@ class _FakeRestClient:
         # see normalizer.parse_option_chain_entry's own docstring.
         self.get_option_chain_response: list[dict] = []
         self.get_time_price_series_response: list[dict] = []
+        # Per-token override (index token vs its front-month future return
+        # different volume) — falls through to the flat response above.
+        self.get_time_price_series_response_by_token: dict[str, list[dict]] = {}
         self.order_book_response: list[dict] = []
         # When set, place_order raises this instead of returning
         # place_order_response — used to simulate an ack-timeout/dropped
@@ -98,6 +101,8 @@ class _FakeRestClient:
         self._record(
             "get_time_price_series", uid, exchange, token, start_time, end_time, interval_minutes
         )
+        if token in self.get_time_price_series_response_by_token:
+            return self.get_time_price_series_response_by_token[token]
         return self.get_time_price_series_response
 
     def place_order(self, payload):
@@ -1316,6 +1321,7 @@ class _FakeWSClient:
         self.on_tick = on_tick
         self.on_depth = on_depth
         self.subscribe_calls: list[list[tuple[str, str, str]]] = []
+        self.volume_proxy_calls: list[tuple[tuple, tuple]] = []
 
     def start(self) -> None:
         pass
@@ -1326,6 +1332,9 @@ class _FakeWSClient:
 
     def subscribe(self, entries: list[tuple[str, str, str]]) -> None:
         self.subscribe_calls.append(entries)
+
+    def set_volume_proxy(self, target: tuple, source: tuple) -> None:
+        self.volume_proxy_calls.append((target, source))
 
 
 def test_subscribe_quotes_second_call_with_the_same_callback_does_not_raise(monkeypatch):
@@ -1389,3 +1398,147 @@ def test_subscribe_quotes_second_call_with_a_different_callback_rebinds(monkeypa
         [("NIFTY", "NSE", "26000")],
         [("NIFTY", "NSE", "26000")],
     ]
+
+
+# -- front-month future volume proxy (NSE cash-index has no `v`) --------------
+
+from datetime import timedelta  # noqa: E402
+
+
+def _fut_row(underlying: str, tsym: str, token: str, exp: date) -> dict:
+    return {
+        "instname": "FUTIDX",
+        "symname": underlying,
+        "tsym": tsym,
+        "token": token,
+        "exd": exp.strftime("%d-%b-%Y").upper(),
+    }
+
+
+def test_resolve_front_month_future_picks_nearest_unexpired_and_caches():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    near = date.today() + timedelta(days=10)
+    far = date.today() + timedelta(days=40)
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        _fut_row("NIFTY", "NIFTY_FAR_F", "70002", far),
+        _fut_row("NIFTY", "NIFTY_NEAR_F", "70001", near),
+        {"instname": "OPTIDX", "symname": "NIFTY", "tsym": "NIFTYOPT", "token": "9", "exd":
+            near.strftime("%d-%b-%Y").upper()},
+    ]
+
+    assert adapter._resolve_front_month_future("NIFTY") == ("NIFTY_NEAR_F", "NFO", "70001")
+
+    # second call is cache-served — no extra search_scrip
+    rest.calls.clear()
+    assert adapter._resolve_front_month_future("NIFTY") == ("NIFTY_NEAR_F", "NFO", "70001")
+    assert not any(c[0] == "search_scrip" for c in rest.calls)
+
+
+def test_resolve_front_month_future_ignores_expired_rows():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        _fut_row("NIFTY", "NIFTY_OLD_F", "1", date.today() - timedelta(days=5)),
+        _fut_row("NIFTY", "NIFTY_LIVE_F", "2", date.today() + timedelta(days=20)),
+    ]
+    assert adapter._resolve_front_month_future("NIFTY") == ("NIFTY_LIVE_F", "NFO", "2")
+
+
+def test_resolve_front_month_future_raises_when_none_listed():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        {"instname": "OPTIDX", "symname": "NIFTY", "tsym": "X", "token": "1", "exd": "30-DEC-2099"},
+    ]
+    with pytest.raises(ShoonyaApiError):
+        adapter._resolve_front_month_future("NIFTY")
+
+
+def test_subscribe_quotes_wires_volume_proxy_for_known_underlying(monkeypatch):
+    import app.modules.broker_adapter.shoonya.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "ShoonyaWSClient", _FakeWSClient)
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        _fut_row("NIFTY", "NIFTY_F", "70001", date.today() + timedelta(days=15)),
+    ]
+    adapter, _ = _adapter(rest)
+
+    adapter.subscribe_quotes(["NIFTY"], on_tick=lambda t: None)
+
+    assert adapter._ws.volume_proxy_calls == [
+        (("NIFTY", "NSE", "26000"), ("NIFTY_F", "NFO", "70001")),
+    ]
+
+
+def test_subscribe_quotes_does_not_wire_volume_proxy_for_an_option_symbol(monkeypatch):
+    import app.modules.broker_adapter.shoonya.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "ShoonyaWSClient", _FakeWSClient)
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    adapter._remember_token("NIFTY30JUL26C24000", "NFO", "12345")
+
+    adapter.subscribe_quotes(["NIFTY30JUL26C24000"], on_tick=lambda t: None)
+
+    assert adapter._ws.volume_proxy_calls == []
+
+
+def test_subscribe_quotes_volume_proxy_failure_does_not_block_subscription(monkeypatch):
+    import app.modules.broker_adapter.shoonya.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "ShoonyaWSClient", _FakeWSClient)
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    # no NFO futures rows -> _resolve_front_month_future raises
+    adapter, _ = _adapter(rest)
+
+    adapter.subscribe_quotes(["NIFTY"], on_tick=lambda t: None)
+
+    assert adapter._ws.subscribe_calls == [[("NIFTY", "NSE", "26000")]]
+    assert adapter._ws.volume_proxy_calls == []
+
+
+def test_get_price_history_splices_front_month_future_volume_by_bucket():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    rest.search_scrip_response_by_exchange["NFO"] = [
+        _fut_row("NIFTY", "NIFTY_F", "70001", date.today() + timedelta(days=15)),
+    ]
+    rest.get_time_price_series_response_by_token["26000"] = [
+        {"ssboe": "1785831900", "into": "1", "inth": "2", "intl": "1", "intc": "24446.80",
+         "intv": "0"},
+        {"ssboe": "1785831960", "into": "1", "inth": "2", "intl": "1", "intc": "24450.10",
+         "intv": "0"},
+    ]
+    rest.get_time_price_series_response_by_token["70001"] = [
+        {"ssboe": "1785831900", "into": "1", "inth": "2", "intl": "1", "intc": "24600.0",
+         "intv": "1500"},
+        # second bucket missing on the future series -> falls back to index intv (0)
+    ]
+    start = datetime(2026, 8, 4, 13, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 4, 14, 0, tzinfo=UTC)
+
+    candles = adapter.get_price_history("NIFTY", start, end, timeframe_seconds=60)
+
+    assert [(c.close, c.volume) for c in candles] == [(24446.80, 1500), (24450.10, 0)]
+
+
+def test_get_price_history_splice_failure_keeps_zero_volume():
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    rest.search_scrip_response_by_exchange["NSE"] = [{"tsym": "Nifty 50", "token": "26000"}]
+    # no NFO rows -> front-month future resolution raises -> splice skipped
+    rest.get_time_price_series_response = [
+        {"ssboe": "1785831900", "into": "1", "inth": "2", "intl": "1", "intc": "24446.80",
+         "intv": "0"},
+    ]
+    start = datetime(2026, 8, 4, 13, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 4, 14, 0, tzinfo=UTC)
+
+    candles = adapter.get_price_history("NIFTY", start, end, timeframe_seconds=60)
+
+    assert [(c.close, c.volume) for c in candles] == [(24446.80, 0)]

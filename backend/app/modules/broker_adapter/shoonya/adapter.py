@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
+from dataclasses import replace
 from datetime import date, datetime
 
 import httpx
@@ -254,6 +256,13 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # (contrast a "nearest expiry" cache, which has to reroll as time
         # passes). A different requested expiry is simply a different key.
         self._option_anchor_cache: dict[tuple[str, date], str] = {}
+
+        # underlying -> (front-month future expiry, tsym, exchange, token).
+        # Re-resolved once its expiry has passed (monthly rollover). Feeds
+        # the WS volume-proxy and get_price_history's volume splice, since
+        # the NSE cash-index tokens carry no volume of their own (live-
+        # confirmed 2026-08-27).
+        self._front_future_cache: dict[str, tuple[date, str, str, str]] = {}
 
         self._ws: ShoonyaWSClient | None = None
         # The callback pair currently forwarded to by the live ShoonyaWSClient.
@@ -531,6 +540,48 @@ class ShoonyaBrokerAdapter(BrokerPort):
             )
             raise
 
+    def _resolve_front_month_future(self, underlying: str) -> tuple[str, str, str]:
+        """`(tsym, exchange, token)` of the nearest not-yet-expired NFO
+        future for `underlying`. Cached until its own expiry passes — NFO
+        futures are monthly, so a resolved front-month is stable for weeks,
+        and `subscribe_quotes`/`get_price_history` both re-enter this on
+        every call so a rollover is picked up without any scheduler.
+
+        Only meaningful for `KNOWN_UNDERLYINGS` (NIFTY/BANKNIFTY) — India
+        VIX has no future and callers must not ask.
+        """
+        today = date.today()
+        with self._token_lock:
+            cached = self._front_future_cache.get(underlying)
+        if cached is not None and today <= cached[0]:
+            return cached[1], cached[2], cached[3]
+
+        rows = self._rest.search_scrip(self._uid, "NFO", underlying)
+        best: tuple[date, str, str] | None = None
+        for row in rows:
+            if not str(row.get("instname", "")).upper().startswith("FUT"):
+                continue
+            if str(row.get("symname", "")).upper() != underlying.upper():
+                continue
+            try:
+                exp = normalizer.parse_shoonya_date(str(row.get("exd", "")))
+            except normalizer.NormalizationError:
+                continue
+            if exp < today:
+                continue
+            if best is None or exp < best[0]:
+                best = (exp, str(row.get("tsym", "")), str(row.get("token", "")))
+        if best is None or not best[2]:
+            raise ShoonyaApiError(
+                "resolve_front_month_future",
+                f"no listed NFO future with a token for underlying {underlying!r}",
+            )
+        exp, tsym, token = best
+        self._remember_token(tsym, "NFO", token)
+        with self._token_lock:
+            self._front_future_cache[underlying] = (exp, tsym, "NFO", token)
+        return tsym, "NFO", token
+
     def get_price_history(
         self, underlying: str, start: datetime, end: datetime, timeframe_seconds: int = 60
     ) -> list[PriceCandle]:
@@ -539,11 +590,15 @@ class ShoonyaBrokerAdapter(BrokerPort):
         (NIFTY/BANKNIFTY spot), contrary to a documented, unresolved
         community report that index historical queries return no data on
         Shoonya. `intv` (volume) is genuinely `0` on every index candle
-        though — confirmed by comparing against the same call against the
-        underlying's own front-month futures token, which reports real
-        volume in the same window. That's a real broker-side data gap for
-        the index feed, not a parsing bug — `parse_tpseries_row` reports it
-        as `0`, not a fabricated or estimated value.
+        though — the NSE cash-index feed carries no volume at all, while the
+        underlying's own front-month future reports real volume in the same
+        window (live-confirmed again 2026-08-27). For `KNOWN_UNDERLYINGS`
+        the per-bucket futures `intv` is spliced onto the (correct, index)
+        OHLC here, so a downstream VWAP has real volume weights whether it
+        is fed from this REST path or the WS path (which does the equivalent
+        splice in `ShoonyaWSClient.set_volume_proxy`). Price stays the index
+        price; only `volume` is substituted. A failure fetching the futures
+        series degrades cleanly to the old all-zero-volume behaviour.
 
         `interval_minutes` only supports whole-minute granularity per
         Shoonya's own docs ("1","3","5","10","15","30","60",...) — divides
@@ -561,7 +616,47 @@ class ShoonyaBrokerAdapter(BrokerPort):
             int(end.timestamp()),
             interval_minutes=interval_minutes,
         )
-        return [normalizer.parse_tpseries_row(row) for row in rows]
+        candles = [normalizer.parse_tpseries_row(row) for row in rows]
+        if underlying.upper() in KNOWN_UNDERLYINGS and candles:
+            candles = self._splice_future_volume(
+                underlying, candles, start, end, interval_minutes
+            )
+        return candles
+
+    def _splice_future_volume(
+        self,
+        underlying: str,
+        candles: list[PriceCandle],
+        start: datetime,
+        end: datetime,
+        interval_minutes: int,
+    ) -> list[PriceCandle]:
+        try:
+            _tsym, fut_exch, fut_token = self._resolve_front_month_future(underlying)
+            fut_rows = self._rest.get_time_price_series(
+                self._uid,
+                fut_exch,
+                fut_token,
+                int(start.timestamp()),
+                int(end.timestamp()),
+                interval_minutes=interval_minutes,
+            )
+        except Exception:
+            # A splice failure must never break price_bars — degrade to the
+            # old all-zero-volume behaviour, never propagate.
+            logger.warning(
+                "Front-month future volume splice failed for %r; candles keep intv=0",
+                underlying,
+                exc_info=True,
+            )
+            return candles
+        vol_by_bucket = {
+            fc.bucket_start: fc.volume
+            for fc in (normalizer.parse_tpseries_row(r) for r in fut_rows)
+        }
+        return [
+            replace(c, volume=vol_by_bucket.get(c.bucket_start, c.volume)) for c in candles
+        ]
 
     def _resolve_option_anchor_tsym(self, underlying: str, expiry: date) -> str:
         """`GetOptionChain` needs a real, currently-listed contract symbol
@@ -715,7 +810,49 @@ class ShoonyaBrokerAdapter(BrokerPort):
             self._ws_bound_on_depth = on_depth
 
         entries = [(symbol, *self._resolve_symbol_token(symbol)) for symbol in contract_symbols]
+        if os.environ.get("SHOONYA_WS_FRAME_DEBUG", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            # TEMPORARY DIAGNOSTIC (2026-08-27) — pairs with ws_client's
+            # WS FRAME DEBUG: shows which (exchange, token) each subscribed
+            # underlying actually resolved to, so a zero-`v` frame can be
+            # attributed to "index token has no volume" vs a real data gap.
+            logger.warning("WS FRAME DEBUG subscribe resolution: %r", entries)
         self._ws.subscribe(entries)
+
+        # NSE cash-index touchline carries no volume field at all (live-
+        # confirmed 2026-08-27), so a session-cumulative VWAP fed from these
+        # ticks never warms and `vwap_pullback` can't fire. Splice the
+        # front-month future's volume onto the underlying's ticks — price
+        # stays the index price, only `v` is substituted. Re-entered on
+        # every subscribe (reconnect / daily re-subscribe) so a monthly
+        # futures rollover is picked up. Best-effort: a resolution failure
+        # just leaves volume at 0 (today's behaviour), never blocks the
+        # real subscription above.
+        for symbol in contract_symbols:
+            if symbol.upper() not in KNOWN_UNDERLYINGS:
+                continue
+            try:
+                idx_exch, idx_token = self._resolve_underlying_token(symbol)
+                fut_tsym, fut_exch, fut_token = self._resolve_front_month_future(symbol)
+                self._ws.set_volume_proxy(
+                    (symbol, idx_exch, idx_token),
+                    (fut_tsym, fut_exch, fut_token),
+                )
+            except Exception:
+                # Never let the volume-proxy enhancement break the real tick
+                # subscription above (which already succeeded). Worst case is
+                # today's behaviour: VWAP lacks volume until a later
+                # re-subscribe (reconnect / daily) resolves it.
+                logger.warning(
+                    "Volume-proxy setup failed for %r; VWAP will lack volume until "
+                    "a later re-subscribe succeeds",
+                    symbol,
+                    exc_info=True,
+                )
 
     def _resolve_symbol_token(self, symbol: str) -> tuple[str, str]:
         """2026-08-12: real gap found and fixed. `MarketDataIngestionService`

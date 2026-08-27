@@ -325,3 +325,91 @@ def test_authenticate_raises_on_not_ok_ack():
         client._authenticate(ws)
 
 
+
+
+# -- volume proxy (NSE cash-index has no `v`; front-month future supplies it) --
+
+
+def _idx_tick(**over):
+    msg = {"t": "tf", "e": "NSE", "tk": "26000", "lp": "24100.0"}
+    msg.update(over)
+    return json.dumps(msg)
+
+
+def _fut_tick(v):
+    return json.dumps({"t": "tf", "e": "NFO", "tk": "68407", "lp": "24300.0", "v": str(v)})
+
+
+def test_volume_proxy_splices_future_volume_increment_into_index_ticks():
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+
+    client._handle_message(_fut_tick(1_000_000))   # source baseline
+    client._handle_message(_idx_tick())            # first index tick -> increment 0
+    client._handle_message(_fut_tick(1_002_500))   # +2500 cumulative
+    client._handle_message(_idx_tick(lp="24110.0"))
+
+    assert [t.contract_symbol for t in ticks] == ["NIFTY", "NIFTY"]
+    assert ticks[0].volume == 0
+    assert ticks[0].ltp == 24100.0          # price stays the index price
+    assert ticks[1].volume == 2500
+    assert ticks[1].ltp == 24110.0
+
+
+def test_volume_proxy_source_frames_are_never_forwarded():
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+
+    client._handle_message(_fut_tick(1_000_000))
+    client._handle_message(_fut_tick(1_000_500))
+
+    assert ticks == []
+
+
+def test_volume_proxy_clamps_to_zero_when_cumulative_volume_resets():
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+
+    client._handle_message(_fut_tick(9_000_000))
+    client._handle_message(_idx_tick())            # baseline established, 0
+    client._handle_message(_fut_tick(1_200))       # new day: cum < last
+    client._handle_message(_idx_tick())            # must not go negative / huge
+    client._handle_message(_fut_tick(3_700))
+    client._handle_message(_idx_tick())
+
+    assert [t.volume for t in ticks] == [0, 0, 2500]
+
+
+def test_volume_proxy_index_tick_before_any_future_frame_reports_zero_volume():
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+
+    client._handle_message(_idx_tick())
+
+    assert ticks[0].volume == 0
+
+
+def test_set_volume_proxy_supersedes_old_source_on_rollover():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY27OCT26F", "NFO", "70001"))
+
+    assert "NFO|68407" not in client._entries_by_key
+    assert "NFO|70001" in client._entries_by_key
+    assert client._volume_proxy["NSE|26000"] == "NFO|70001"
+
+
+def test_unsubscribe_target_also_drops_its_volume_proxy_source():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+    client.unsubscribe(["NIFTY"])
+
+    assert client._entries_by_key == {}
+    assert client._volume_proxy == {}
+    assert client._proxy_last_cum_v == {}

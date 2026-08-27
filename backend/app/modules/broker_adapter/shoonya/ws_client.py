@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -96,6 +97,23 @@ OrderUpdateCallback = Callable[[dict], None]
 
 logger = logging.getLogger("app.broker_adapter.shoonya.ws")
 
+# TEMPORARY DIAGNOSTIC (2026-08-27) — set SHOONYA_WS_FRAME_DEBUG=1 to log the
+# first `_FRAME_DEBUG_MAX_PER_KEY` raw `tk`/`tf` touchline frames received per
+# subscription key, verbatim, plus the merged snapshot's `v` (volume) field.
+# Built to answer one open question during market hours: whether Shoonya's WS
+# touchline for the subscribed NIFTY/BANKNIFTY token still carries a usable
+# `v` at all (volume has read 0 on every tick since 2026-08-24, breaking
+# session-cumulative VWAP and `vwap_pullback`). Off by default, self-limiting
+# even when on, and safe to leave in — remove once the volume-source fix
+# lands and is verified.
+_FRAME_DEBUG = os.environ.get("SHOONYA_WS_FRAME_DEBUG", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_FRAME_DEBUG_MAX_PER_KEY = 30
+
 # Reconnect backoff — capped, not exponential-forever, since a broker outage
 # lasting hours shouldn't turn into a multi-hour sleep before the next retry.
 _RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 15, 30)
@@ -113,6 +131,11 @@ class _SubscriptionEntry:
     contract_symbol: str
     exchange: str
     token: str
+    # False for a "volume proxy" source token (a front-month future whose
+    # `v` is spliced into another token's ticks — see `set_volume_proxy`):
+    # its frames are merged into `_last_known_by_key` so the latest `v` is
+    # always available, but never forwarded to `_on_tick`/`_on_depth`.
+    dispatch: bool = True
 
     @property
     def key(self) -> str:
@@ -149,6 +172,15 @@ class ShoonyaWSClient:
         # own docstring for the live evidence and full reasoning. Keyed the
         # same as `_entries_by_key`.
         self._last_known_by_key: dict[str, dict] = {}
+        # Volume-proxy wiring — `{target key: source key}`. A tick for
+        # `target` gets its `v` (volume) field replaced with the *increment*
+        # of the source token's cumulative `v` since the last such tick. See
+        # `set_volume_proxy`: NSE cash-index touchline (NIFTY/BANKNIFTY spot)
+        # carries no `v` at all, so their front-month future supplies it.
+        self._volume_proxy: dict[str, str] = {}
+        self._proxy_last_cum_v: dict[str, float] = {}
+        # TEMPORARY DIAGNOSTIC (2026-08-27) — see `_FRAME_DEBUG` above.
+        self._frame_debug_count: dict[str, int] = {}
         self._lock = threading.Lock()
 
         # The live connection object, set only while `_run`'s `with connect(...)`
@@ -229,19 +261,66 @@ class ShoonyaWSClient:
             self._on_tick = on_tick
             self._on_depth = on_depth
 
+    def set_volume_proxy(
+        self,
+        target: tuple[str, str, str],
+        source: tuple[str, str, str],
+    ) -> None:
+        """Splice `source`'s volume into `target`'s ticks.
+
+        `target`/`source` are `(contract_symbol, exchange, broker_token)`.
+        `source` is subscribed in cache-only mode (`dispatch=False`) — its
+        frames update the running snapshot but are never forwarded — and
+        every forwarded `target` tick then carries `v` = the *increment* of
+        `source`'s cumulative `v` since the previous `target` tick (0 on the
+        first tick and across a day/reset rollover, matching what
+        `VWAPCalculator`/`BarAggregator` already expect from every other
+        provider). `target`'s own price/bid/ask/oi are untouched.
+
+        Built for NSE cash-index underlyings (NIFTY/BANKNIFTY spot), whose
+        Noren touchline carries no `v` field at all (live-confirmed
+        2026-08-27) — their front-month future does. Idempotent; re-calling
+        with a new `source` (monthly futures rollover) drops the old one.
+        """
+        tgt = _SubscriptionEntry(*target)
+        src = _SubscriptionEntry(*source, dispatch=False)
+        with self._lock:
+            old_src_key = self._volume_proxy.get(tgt.key)
+            if old_src_key is not None and old_src_key != src.key:
+                self._entries_by_key.pop(old_src_key, None)
+                self._last_known_by_key.pop(old_src_key, None)
+            self._volume_proxy[tgt.key] = src.key
+            self._proxy_last_cum_v.pop(tgt.key, None)
+            already = self._entries_by_key.get(src.key)
+            self._entries_by_key[src.key] = src
+        if already is None:
+            self._send_subscribe([src])
+
     def unsubscribe(self, contract_symbols: list[str]) -> None:
         with self._lock:
             to_remove = [
                 entry
                 for entry in self._entries_by_key.values()
-                if entry.contract_symbol in contract_symbols
+                if entry.contract_symbol in contract_symbols and entry.dispatch
             ]
+            extra_sources: list[_SubscriptionEntry] = []
             for entry in to_remove:
                 del self._entries_by_key[entry.key]
                 # A later resubscribe (same or a different contract sharing
                 # the exchange|token key, however unlikely) must never
                 # inherit a stale merged snapshot from this subscription.
                 self._last_known_by_key.pop(entry.key, None)
+                # Drop the volume-proxy source bound to this target, unless
+                # something else still proxies off the same source key
+                # (never today: one future per underlying).
+                src_key = self._volume_proxy.pop(entry.key, None)
+                self._proxy_last_cum_v.pop(entry.key, None)
+                if src_key is not None and src_key not in self._volume_proxy.values():
+                    stale = self._entries_by_key.pop(src_key, None)
+                    self._last_known_by_key.pop(src_key, None)
+                    if stale is not None:
+                        extra_sources.append(stale)
+            to_remove.extend(extra_sources)
         if to_remove:
             self._send_unsubscribe(to_remove)
 
@@ -445,11 +524,52 @@ class ShoonyaWSClient:
                 return
             merged = {**self._last_known_by_key.get(key, {}), **message}
             self._last_known_by_key[key] = merged
+            if _FRAME_DEBUG and msg_type in ("tk", "tf", "dk", "df"):
+                seen = self._frame_debug_count.get(key, 0)
+                if seen < _FRAME_DEBUG_MAX_PER_KEY:
+                    self._frame_debug_count[key] = seen + 1
+                    logger.warning(
+                        "WS FRAME DEBUG %s [%s sym=%s disp=%s] raw=%r  merged.v=%r lp=%r",
+                        msg_type,
+                        key,
+                        entry.contract_symbol,
+                        entry.dispatch,
+                        message,
+                        merged.get("v"),
+                        merged.get("lp"),
+                    )
+            if not entry.dispatch:
+                # Cache-only source (volume proxy) — snapshot kept above,
+                # nothing forwarded.
+                return
+            to_parse = merged
+            src_key = self._volume_proxy.get(key)
+            if src_key is not None:
+                to_parse = {**merged, "v": self._volume_proxy_increment(key, src_key)}
 
         try:
             if msg_type in ("tk", "tf"):
-                self._on_tick(parse_tick(merged, entry.contract_symbol))
+                self._on_tick(parse_tick(to_parse, entry.contract_symbol))
             elif msg_type in ("dk", "df") and self._on_depth is not None:
                 self._on_depth(parse_depth(merged, entry.contract_symbol))
         except NormalizationError:
             logger.exception("Failed to normalize Shoonya WebSocket message: %r", merged)
+
+    def _volume_proxy_increment(self, target_key: str, source_key: str) -> int:
+        """Volume delta of the proxy source since the last `target` tick.
+        Caller holds `self._lock`. `0` on the first tick and whenever the
+        source's cumulative `v` has gone backwards (a new trading day, or a
+        reconnect that re-sent a fresh snapshot before the old baseline was
+        cleared) — never a negative or a spurious huge spike."""
+        raw_v = self._last_known_by_key.get(source_key, {}).get("v")
+        if raw_v is None:
+            return 0
+        try:
+            cum = float(raw_v)
+        except (TypeError, ValueError):
+            return 0
+        last = self._proxy_last_cum_v.get(target_key)
+        self._proxy_last_cum_v[target_key] = cum
+        if last is None or cum < last:
+            return 0
+        return int(cum - last)
