@@ -25,7 +25,7 @@ from app.core.security.rbac import require_permission
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
-from app.domain.market.models import Instrument, QuoteTick
+from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
 from app.domain.strategy.models import (
     ApprovalStatus,
@@ -35,7 +35,6 @@ from app.domain.strategy.models import (
     StrategyRun,
     StrategyRunStatus,
     StrategyRuntimeMode,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -50,6 +49,7 @@ from app.modules.market_data.freshness import (
     check_price_drift,
     classify_latest_tick,
     classify_option_chain,
+    fresh_reference_premium,
     worse_of,
 )
 from app.modules.market_data.provider_composition import is_market_data_ready
@@ -59,6 +59,7 @@ from app.modules.strategy_engine.common_rules import get_open_position_for_run
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.runner import StrategyRunner
 from app.modules.strategy_engine.service import new_strategy_run
+from app.modules.strategy_engine.sizing import resolve_qty_lots
 from app.modules.strategy_engine.strategies import (
     ATR_BREAKOUT_PARAM_KEYS,
     CONVICTION_PARAM_KEYS,
@@ -208,46 +209,31 @@ LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
 # reasoning as ORB's own expiry-day-only config hooks.
 
 
-# 2026-08-24: qty_lots was a hardcoded `QTY_LOTS = 1` module constant in
-# every strategy file -- no config surface at all, unlike every other
-# tunable (stop_pct, target_pct, ...) which already flows through
-# `strategy_config.params`. Removed in favor of a real, per-strategy
-# `qty_lots` param (added to each *_PARAM_KEYS allowlist above) with a
-# mode-aware default so an operator who never touches it keeps today's
-# conservative live behavior automatically -- explicit user request:
-# "default will be 1 lot for live trading, and 10 lots for paper trading...
-# if I dont edit, 1 lot stays as default, hence the risk is also managed
-# there." Mirrors the "overrides only ever restrict, never expand"
-# philosophy `StrategyRuntimeMode`/`SafeMode` already use elsewhere in this
-# codebase: err toward the paper (larger-lot, but risk-service-exempt --
-# see risk_engine.service's mode-aware rule) default whenever a strategy
-# isn't unambiguously graduated to real-money LIVE status, rather than try
-# to perfectly resolve live-ness from the session's own mode machinery too.
-_DEFAULT_QTY_LOTS_LIVE = 1
-_DEFAULT_QTY_LOTS_PAPER = 10
-
-
-def _default_qty_lots(strategy_config: StrategyConfig) -> int:
-    is_paper = (
-        strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
-        or strategy_config.status != StrategyStatus.LIVE
-    )
-    return _DEFAULT_QTY_LOTS_PAPER if is_paper else _DEFAULT_QTY_LOTS_LIVE
-
-
 def _build_strategy(
-    strategy_config: StrategyConfig, instrument_id: uuid.UUID, expiry_date: date
+    strategy_config: StrategyConfig,
+    instrument_id: uuid.UUID,
+    expiry_date: date,
+    *,
+    trading_session: TradingSession | None = None,
+    strategy_run: StrategyRun | None = None,
 ) -> Strategy:
     """Maps `strategy_config.strategy_type` to its `Strategy` class, reading
     that strategy's own tunables from `strategy_config.params` (missing keys
     fall back to each strategy's own constructor defaults, except
-    `qty_lots` which falls back to `_default_qty_lots` instead of each
-    strategy class's own conservative `1` -- see that function's own
-    docstring) — the only place in the codebase that needs to know all six
-    concrete strategy types.
+    `qty_lots` which falls back to `strategy_engine.sizing.resolve_qty_lots`
+    -- the mode-aware default keyed on whether this run routes live, see that
+    module's own docstring) — the only place in the codebase that needs to
+    know all six concrete strategy types.
+
+    `trading_session`/`strategy_run` are only used to resolve the `qty_lots`
+    default; omitting them (param-mapping unit tests) yields the paper
+    default. `run_cycle` re-resolves `qty_lots` every cycle from the live
+    session/run, so a mid-session Paper<->Live flip re-sizes without a restart.
     """
     params = dict(strategy_config.params or {})
-    params.setdefault("qty_lots", _default_qty_lots(strategy_config))
+    params.setdefault(
+        "qty_lots", resolve_qty_lots(strategy_config, trading_session, strategy_run)
+    )
     strategy_type = strategy_config.strategy_type
 
     if strategy_type == "synthetic":
@@ -343,7 +329,13 @@ def _start_runner_thread(
     # different underlyings all share it.
     ensure_ingestion_running(instrument.symbol)
 
-    strategy = _build_strategy(strategy_config, instrument.id, expiry_date)
+    strategy = _build_strategy(
+        strategy_config,
+        instrument.id,
+        expiry_date,
+        trading_session=trading_session,
+        strategy_run=run,
+    )
     runner = StrategyRunner(
         strategy,
         run.id,
@@ -1173,19 +1165,27 @@ def approve_trade_approval(
         # rather than silently dispatching the original, now-stale numbers; the
         # approval stays PENDING so re-clicking Approve retries this check.
         # Shared with evaluate_trade_intent's AUTO-mode equivalent via
-        # market_data.freshness.check_price_drift.
-        latest_tick = (
-            db.query(QuoteTick)
-            .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
-            .order_by(QuoteTick.ts.desc())
-            .first()
+        # market_data.freshness.fresh_reference_premium (a fresh streamed tick,
+        # else the fresh option-chain snapshot, else None -> skip; never a
+        # stale per-contract tick).
+        option_contract = db.get(OptionContract, trade_intent.option_contract_id)
+        reference_premium = (
+            fresh_reference_premium(
+                db,
+                option_contract_id=trade_intent.option_contract_id,
+                instrument_id=option_contract.instrument_id,
+                expiry_date=option_contract.expiry_date,
+                contract_symbol=option_contract.symbol,
+            )
+            if option_contract is not None
+            else None
         )
-        if latest_tick is not None and check_price_drift(
-            float(latest_tick.ltp),
+        if reference_premium is not None and check_price_drift(
+            reference_premium,
             float(trade_intent.entry_price),
             tolerance_pct=PRICE_DRIFT_TOLERANCE_PCT,
         ):
-            drift = abs(float(latest_tick.ltp) - float(trade_intent.entry_price)) / float(
+            drift = abs(reference_premium - float(trade_intent.entry_price)) / float(
                 trade_intent.entry_price
             )
             record_event(

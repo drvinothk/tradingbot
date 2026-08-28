@@ -46,7 +46,7 @@ from app.core.pnl import signed_pnl
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import User
-from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
+from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision, RiskDecisionOutcome, RiskLimitConfig
 from app.domain.session.models import (
@@ -70,7 +70,11 @@ from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_execution_broker, is_strategy_routed_live
-from app.modules.market_data.freshness import PRICE_DRIFT_TOLERANCE_PCT, check_price_drift
+from app.modules.market_data.freshness import (
+    PRICE_DRIFT_TOLERANCE_PCT,
+    check_price_drift,
+    fresh_reference_premium,
+)
 
 logger = logging.getLogger("app.risk_engine")
 
@@ -590,8 +594,8 @@ def evaluate_trade_intent(
         # 2026-08-26: gated on is_strategy_routed_live, same as
         # max_trades_per_day/consecutive_loss_pause_active above -- was
         # unconditional, which meant every FORCE_PAPER strategy's new
-        # mode-aware default of 10 lots (`api.v1.strategies
-        # ._DEFAULT_QTY_LOTS_PAPER`, added 2026-08-24 specifically so paper
+        # mode-aware default of 10 lots (`strategy_engine.sizing
+        # .DEFAULT_QTY_LOTS_PAPER`, added 2026-08-24 specifically so paper
         # strategies could run at a larger size than live's 1-lot default)
         # was rejected outright against this cap's live-safety value of 1
         # -- confirmed live: 100% of paper trade_intents across all 5
@@ -629,19 +633,22 @@ def evaluate_trade_intent(
                     reasons.append("freeze_qty_exceeded")
 
         # AUTO-mode equivalent of the manual-approval price-drift re-check
-        # (api.v1.strategies.approve_trade_approval) — same shared helper,
-        # same tolerance. Closes the asymmetry where a human's Approve click
-        # was re-validated against the latest tick but an AUTO-dispatched
-        # intent, generated from a proposal that may itself be a cycle or
-        # more old by the time this evaluation runs, never was.
-        latest_tick = (
-            db.query(QuoteTick)
-            .filter(QuoteTick.option_contract_id == trade_intent.option_contract_id)
-            .order_by(QuoteTick.ts.desc())
-            .first()
+        # (api.v1.strategies.approve_trade_approval) — same shared helpers.
+        # The reference is the freshest *usable* premium for this contract
+        # (fresh_reference_premium: a fresh streamed tick, else the fresh
+        # option-chain snapshot the strategy proposed from, else None ->
+        # skip). Never a stale per-contract tick, which for a contract with
+        # no open position is hours old and was fabricating rejections
+        # (2026-08-28).
+        reference_premium = fresh_reference_premium(
+            db,
+            option_contract_id=trade_intent.option_contract_id,
+            instrument_id=option_contract.instrument_id,
+            expiry_date=option_contract.expiry_date,
+            contract_symbol=option_contract.symbol,
         )
-        if latest_tick is not None and check_price_drift(
-            float(latest_tick.ltp),
+        if reference_premium is not None and check_price_drift(
+            reference_premium,
             float(trade_intent.entry_price),
             tolerance_pct=PRICE_DRIFT_TOLERANCE_PCT,
         ):

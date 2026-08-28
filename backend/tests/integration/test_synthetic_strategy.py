@@ -38,6 +38,7 @@ from app.modules.audit_service.service import verify_chain
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.risk_engine.service import create_new_risk_limit_config_version
 from app.modules.strategy_engine.runner import StrategyRunner, run_cycle
+from app.modules.strategy_engine.sizing import DEFAULT_QTY_LOTS_PAPER
 from app.modules.strategy_engine.strategies.synthetic import SyntheticStrategy
 
 EXPIRY = date(2026, 7, 30)
@@ -213,6 +214,32 @@ def test_run_cycle_with_no_market_data_yields_nothing(
     assert decision is None
 
 
+def test_run_cycle_reresolves_qty_lots_when_session_mode_flips(
+    db: Session, instrument: Instrument, strategy_run, trading_session, strategy_config
+):
+    """A running strategy built while paper picks up the 1-lot live default on
+    its next cycle after the session master switch flips to live -- no restart
+    needed (the 2026-08-28 Cause-B fix)."""
+    from app.domain.session.models import SafeMode
+    from app.modules.strategy_engine.sizing import DEFAULT_QTY_LOTS_LIVE
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY, qty_lots=1)
+
+    trading_session.mode = SafeMode.PAPER_ONLY
+    db.add(trading_session)
+    db.flush()
+    run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
+              alert_session_factory=_same_session_factory(db))
+    assert strategy.qty_lots == DEFAULT_QTY_LOTS_PAPER
+
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+    run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
+              alert_session_factory=_same_session_factory(db))
+    assert strategy.qty_lots == DEFAULT_QTY_LOTS_LIVE
+
+
 def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(
     db: Session,
     instrument: Instrument,
@@ -324,7 +351,10 @@ def test_run_cycle_dispatches_and_closes_and_audits_full_loop(
 
     assert decision is not None
     assert decision.decision == "approved"
-    assert decision.capital_required == pytest.approx(80.0 * 25 * 1)
+    # run_cycle re-resolves qty_lots each cycle: this session is PAPER_ONLY with
+    # no explicit params["qty_lots"], so the paper default (DEFAULT_QTY_LOTS_PAPER)
+    # applies rather than SyntheticStrategy's own constructor default of 1.
+    assert decision.capital_required == pytest.approx(80.0 * 25 * DEFAULT_QTY_LOTS_PAPER)
 
     trade_intent = db.get(TradeIntent, decision.trade_intent_id)
     assert trade_intent is not None

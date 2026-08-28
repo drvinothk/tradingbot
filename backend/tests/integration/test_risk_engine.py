@@ -952,7 +952,7 @@ def test_per_trade_lot_cap_does_not_block_a_paper_routed_strategy(
     option_contract, monkeypatch,
 ):
     """The bug this gate fixes: a FORCE_PAPER strategy's mode-aware default
-    of 10 lots (`api.v1.strategies._DEFAULT_QTY_LOTS_PAPER`) must not be
+    of 10 lots (`strategy_engine.sizing.DEFAULT_QTY_LOTS_PAPER`) must not be
     rejected against the live-safety `per_trade_lot_cap` of 1 -- confirmed
     live on 2026-08-26, every paper trade_intent across 5 running
     strategies was risk_rejected for this exact reason before this fix.
@@ -1152,12 +1152,12 @@ def test_evaluate_trade_intent_price_drift_exceeded(
         QuoteTick(
             id=uuid.uuid4(),
             option_contract_id=option_contract.id,
-            ltp=95.0,  # ~19% away from entry_price=80.0, past the 3% tolerance
+            ltp=95.0,  # ~19% away from entry_price=80.0, past the 5% tolerance
             bid=94.9,
             ask=95.1,
             volume=100,
             oi=1000,
-            ts=datetime.now(UTC),
+            ts=datetime.now(UTC),  # fresh -> used as the drift reference
         )
     )
     db.flush()
@@ -1166,6 +1166,36 @@ def test_evaluate_trade_intent_price_drift_exceeded(
 
     assert decision.decision == "rejected"
     assert "price_drift_exceeded" in decision.reasons
+
+
+def test_evaluate_trade_intent_no_drift_rejection_when_reference_tick_is_stale(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """The 2026-08-28 bug: a per-contract QuoteTick goes stale within minutes
+    of a position closing (it only streams while subscribed), so a
+    freshly-proposed contract's newest tick can be hours old. That stale tick
+    must not be used as the drift reference — with no fresh tick and no fresh
+    option-chain snapshot, the drift check is skipped, not fabricated."""
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=80.0
+    )
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(),
+            option_contract_id=option_contract.id,
+            ltp=140.0,  # 75% away, but 4h stale -> must be ignored
+            bid=139.5,
+            ask=140.5,
+            volume=100,
+            oi=1000,
+            ts=datetime.now(UTC) - timedelta(hours=4),
+        )
+    )
+    db.flush()
+
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "price_drift_exceeded" not in decision.reasons
 
 
 def test_evaluate_trade_intent_no_drift_rejection_when_tick_within_tolerance(
@@ -1178,7 +1208,7 @@ def test_evaluate_trade_intent_no_drift_rejection_when_tick_within_tolerance(
         QuoteTick(
             id=uuid.uuid4(),
             option_contract_id=option_contract.id,
-            ltp=81.0,  # ~1.25% away, within the 3% tolerance
+            ltp=81.0,  # ~1.25% away, within the 5% tolerance
             bid=80.9,
             ask=81.1,
             volume=100,

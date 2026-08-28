@@ -69,11 +69,13 @@ UI_BAR_FRESH_THRESHOLDS = FreshnessThresholds(
     degraded_after_seconds=90.0, stale_after_seconds=210.0
 )
 
-# How much the underlying's premium may have moved since a price was proposed
+# How much a contract's premium may have moved since a price was proposed
 # (a Signal/TradeIntent's entry_price) before it's treated as stale — shared
 # by the manual-approval re-check and evaluate_trade_intent's AUTO-mode
-# equivalent, see check_price_drift below.
-PRICE_DRIFT_TOLERANCE_PCT = 0.03
+# equivalent, see check_price_drift / fresh_reference_premium below. 5%
+# (raised from 3% on 2026-08-28): option premiums routinely move more than 3%
+# cycle-to-cycle without the proposal being meaningfully stale.
+PRICE_DRIFT_TOLERANCE_PCT = 0.05
 
 
 def classify_age(ts: datetime, now: datetime, thresholds: FreshnessThresholds) -> FreshnessState:
@@ -366,3 +368,61 @@ def check_price_drift(latest_ltp: float, reference_price: float, *, tolerance_pc
     if reference_price == 0:
         return False
     return abs(latest_ltp - reference_price) / reference_price > tolerance_pct
+
+
+def fresh_reference_premium(
+    db: Session,
+    *,
+    option_contract_id: uuid.UUID,
+    instrument_id: uuid.UUID,
+    expiry_date: date,
+    contract_symbol: str,
+    now: datetime | None = None,
+) -> float | None:
+    """The freshest *usable* premium for a contract, to re-validate a proposed
+    `entry_price` against — resolved in priority order:
+
+    1. The latest streamed `QuoteTick` for the contract, **if fresh**
+       (`classify_age` LIVE/DEGRADED by `TICK_THRESHOLDS`, i.e. ≤ 60s) and
+       `ltp > 0` — the continuous WS feed, used only while it's actually
+       flowing (a contract with an open position, or one subscribed for
+       another reason).
+    2. Else the latest `OptionChainSnapshot` LTP for the contract via
+       `latest_snapshot_tick`, **if fresh** (LIVE/DEGRADED by
+       `OPTION_CHAIN_THRESHOLDS`, ≤ 600s) and `ltp > 0` — always available,
+       continuously refreshed each run cycle by `ensure_fresh_option_chain`,
+       the same source the strategy proposed from.
+    3. Else `None` — no fresh reference exists; the caller must **skip** the
+       drift check, never fabricate a rejection from stale data (the
+       2026-08-28 bug: a 4-hour-old per-contract tick read as a 37% "drift").
+       Proposal-time staleness is already gated upstream by
+       `ensure_fresh_option_chain`.
+    """
+    from app.domain.market.models import QuoteTick
+
+    now = now or datetime.now(UTC)
+
+    tick = (
+        db.query(QuoteTick)
+        .filter(QuoteTick.option_contract_id == option_contract_id)
+        .order_by(QuoteTick.ts.desc())
+        .first()
+    )
+    if (
+        tick is not None
+        and float(tick.ltp) > 0
+        and classify_age(tick.ts, now, TICK_THRESHOLDS)
+        in (FreshnessState.LIVE, FreshnessState.DEGRADED)
+    ):
+        return float(tick.ltp)
+
+    snapshot_tick = latest_snapshot_tick(db, instrument_id, expiry_date, contract_symbol)
+    if (
+        snapshot_tick is not None
+        and snapshot_tick.ltp > 0
+        and classify_age(snapshot_tick.ts, now, OPTION_CHAIN_THRESHOLDS)
+        in (FreshnessState.LIVE, FreshnessState.DEGRADED)
+    ):
+        return snapshot_tick.ltp
+
+    return None

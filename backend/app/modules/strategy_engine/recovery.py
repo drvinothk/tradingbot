@@ -98,14 +98,22 @@ def resume_strategy_runners() -> None:
             try:
                 strategy_config = db.get(StrategyConfig, run.strategy_config_id)
                 instrument = db.get(Instrument, run.instrument_id)
-                if strategy_config is None or instrument is None:
+                run_session = db.get(TradingSession, run.trading_session_id)
+                if strategy_config is None or instrument is None or run_session is None:
                     logger.warning(
-                        "strategy_run %s references a missing config/instrument — skipping resume",
+                        "strategy_run %s references a missing config/instrument/session — "
+                        "skipping resume",
                         run.id,
                     )
                     continue
 
-                strategy = _build_strategy(strategy_config, run.instrument_id, run.expiry_date)
+                strategy = _build_strategy(
+                    strategy_config,
+                    run.instrument_id,
+                    run.expiry_date,
+                    trading_session=run_session,
+                    strategy_run=run,
+                )
                 interval = run.interval_seconds if run.interval_seconds is not None else 30.0
 
                 def _forget_runner(run_id: uuid.UUID = run.id) -> None:

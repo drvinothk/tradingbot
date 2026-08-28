@@ -51,6 +51,7 @@ from app.modules.strategy_engine.common_rules import (
 )
 from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.service import submit_signal
+from app.modules.strategy_engine.sizing import resolve_qty_lots
 
 logger = logging.getLogger("app.strategy_engine.runner")
 
@@ -327,6 +328,14 @@ def run_cycle(
     # own default of opening a second, independently-committing connection
     # — keeps the refresh atomic with the rest of this cycle.
     same_session = reuse_session(db)
+
+    # Re-resolve qty_lots from the *current* session/run routing every cycle,
+    # so a mid-session Paper<->Live master-switch flip (or a force_paper
+    # toggle) re-sizes this already-running strategy on its next cycle
+    # instead of keeping whatever value it resolved to at construction. An
+    # explicit `params["qty_lots"]` still wins (handled in resolve_qty_lots).
+    if hasattr(strategy, "qty_lots"):
+        strategy.qty_lots = resolve_qty_lots(strategy_config, trading_session, strategy_run)
 
     latest_bars = get_recent_completed_bars(db, strategy.instrument_id, limit=1)
     if latest_bars:
