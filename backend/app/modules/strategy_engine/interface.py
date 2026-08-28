@@ -89,6 +89,21 @@ class TradeProposal:
     # set them.
     structure_break_buffer: float | None = None
     structure_break_persistence_seconds: float | None = None
+    # Optional hard risk overlays, independent of stop_price/structure_level:
+    #   max_loss_per_lot   — absolute INR loss per lot (entry_price - current) *
+    #                        lot_size; exit the moment it is reached, even if the
+    #                        premium stop_price hasn't been hit. Caps the fat
+    #                        left tail (adverse-gap / structure-break slippage).
+    #   time_stop_minutes  — minutes since entry after which the position is
+    #                        closed if it is not in profit ("trades that work,
+    #                        work fast"; a stale losing trade only bleeds theta).
+    # Both None = no overlay, the default for any strategy that doesn't opt in.
+    # As of 2026-08-28 these are consumed by the backtest exit reconstruction
+    # only; production PositionManager wiring + the stop_plans columns are a
+    # separate, deliberately-gated follow-up (see BACKTEST_TIME_CONVENTIONS.md
+    # / the conviction-strategy plan).
+    max_loss_per_lot: float | None = None
+    time_stop_minutes: float | None = None
     payload: TradePayload = field(default_factory=lambda: TradePayload())
 
 

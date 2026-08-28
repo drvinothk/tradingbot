@@ -227,6 +227,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 import uuid
 from bisect import bisect_right
@@ -324,6 +325,7 @@ from app.modules.execution_engine.paper.service import (  # noqa: E402
 from app.modules.market_data.indicators.engine import IndicatorEngine  # noqa: E402
 from app.modules.market_data.indicators.vwap import VWAPCalculator  # noqa: E402
 from app.modules.strategy_engine import runner as _runner_module  # noqa: E402
+from app.modules.strategy_engine.env_metrics import VIX_SYMBOL  # noqa: E402
 from app.modules.strategy_engine.runner import run_cycle  # noqa: E402
 
 # The stalled-feed watchdog inside run_cycle (see runner.py's own docstring)
@@ -365,6 +367,8 @@ BAR_TIMEFRAME = "60s"
 
 STRATEGY_TYPES = (
     "orb",
+    "orb_conviction",
+    "atr_breakout",
     "vwap_pullback",
     "ema_micro_pullback",
     "oi_volume_confirmed",
@@ -378,6 +382,14 @@ STRATEGY_TYPES = (
 MIN_SYNTHETIC_SPREAD_PCT = 0.0015  # tightest spread, most-liquid strike
 MAX_SYNTHETIC_SPREAD_PCT = 0.025  # widest spread, least-liquid strike
 MAX_SYNTHETIC_DEPTH_QTY = 2000  # depth_score saturates at 1000 (see engine.py)
+# PCR (put-OI / call-OI) is only meaningful once both sides of the loaded
+# strike window carry real open interest. Early in a weekly's life, or on a
+# thin/under-sampled chain, one side can be a few hundred contracts and the
+# ratio explodes to 100-500 or collapses to ~0 (observed live in the
+# 2026-08-27 sweep: pcr_entry ranged 0.003 - 505). Below this floor on
+# either side, report PCR as None ("no usable signal") rather than a
+# garbage number a gate could act on.
+PCR_MIN_SIDE_OI = 100_000
 
 
 def _liquidity_score(
@@ -630,7 +642,11 @@ class HistoricalBrokerAdapter(BrokerPort):
             else:
                 total_pe_oi += bar.oi
 
-        self.last_pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else None
+        self.last_pcr = (
+            (total_pe_oi / total_ce_oi)
+            if total_ce_oi >= PCR_MIN_SIDE_OI and total_pe_oi >= PCR_MIN_SIDE_OI
+            else None
+        )
         self._write_synthetic_depth(depth_by_symbol)
 
         # ts is real wall-clock `now`, deliberately not the simulated time —
@@ -828,6 +844,7 @@ class SeedContext:
     instrument_id: uuid.UUID
     lot_size: int
     tick_size: float
+    vix_instrument_id: uuid.UUID
 
 
 def _seed_backtest_entities(
@@ -918,6 +935,34 @@ def _seed_backtest_entities(
         db.add(instrument)
         db.flush()
 
+        # India VIX instrument — so `env_metrics.get_vix_as_of` (which every
+        # strategy's VIX gate/env payload reads via a QuoteTick lookup on
+        # this exact symbol) resolves against real backtest data instead of
+        # None. Ticks themselves are bulk-loaded in `_run_single_backtest`
+        # from `DiagnosticsSource.vix_minute`. Symbol must match
+        # `env_metrics.VIX_SYMBOL` verbatim, so — unlike the per-expiry
+        # underlying Instrument — it CANNOT be expiry-suffixed. `--all-
+        # expiries` reuses one DB across every expiry, so get-or-create
+        # here (the second and later expiry runs reuse the first's row).
+        # QuoteTick has only an index, not a unique constraint, on
+        # (instrument_id, ts), so overlapping-window VIX ticks across
+        # adjacent expiries are harmless (get_vix_as_of takes the latest).
+        vix_instrument = (
+            db.query(Instrument).filter(Instrument.symbol == VIX_SYMBOL).one_or_none()
+        )
+        if vix_instrument is None:
+            vix_instrument = Instrument(
+                id=uuid.uuid4(),
+                symbol=VIX_SYMBOL,
+                exchange="NSE",
+                lot_size=1,
+                tick_size=0.01,
+                freeze_qty=None,
+                is_active=True,
+            )
+            db.add(vix_instrument)
+            db.flush()
+
         for symbol, strike, option_type in contracts:
             db.add(
                 OptionContract(
@@ -987,6 +1032,7 @@ def _seed_backtest_entities(
             instrument_id=instrument.id,
             lot_size=lot_size,
             tick_size=tick_size,
+            vix_instrument_id=vix_instrument.id,
         )
 
 
@@ -1233,7 +1279,9 @@ def _pcr_at(
             total_ce_oi += oi
         else:
             total_pe_oi += oi
-    return (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else None
+    if total_ce_oi < PCR_MIN_SIDE_OI or total_pe_oi < PCR_MIN_SIDE_OI:
+        return None
+    return total_pe_oi / total_ce_oi
 
 
 def _contract_oi_at(bars: list[Bar], ts: datetime) -> int | None:
@@ -1446,6 +1494,8 @@ def _reconstruct_exit_current(
     all_contracts: list[tuple[str, float, ContractOptionType]] | None = None,
     all_option_bars: dict[str, list[Bar]] | None = None,
     atr_series: list[tuple[datetime, float]] | None = None,
+    max_loss_per_lot: float | None = None,
+    time_stop_minutes: float | None = None,
 ) -> ReconstructedTrade:
     """`--exit-mode current` (2026-08-27) — the faithful default, replacing
     `legacy` as `main()`'s own CLI default while `legacy` itself stays
@@ -1570,6 +1620,31 @@ def _reconstruct_exit_current(
 
         if bar.ts.time() >= EOD_CUTOFF:
             return _exit(bar.ts, close, ExitReason.EOD_SQUARE_OFF)
+
+        # Overlay 0a: hard per-lot rupee stop (TradeProposal.max_loss_per_lot).
+        # Checked before the premium stop_price so it can only tighten, never
+        # loosen, the exit — the adverse intrabar extreme vs entry.
+        if max_loss_per_lot is not None and lot_size > 0:
+            adverse = low if favorable else high
+            loss_per_lot = float((entry_price - adverse) * lot_size) if favorable else float(
+                (adverse - entry_price) * lot_size
+            )
+            if loss_per_lot >= max_loss_per_lot:
+                capped = (
+                    entry_price - Decimal(str(max_loss_per_lot / lot_size))
+                    if favorable
+                    else entry_price + Decimal(str(max_loss_per_lot / lot_size))
+                )
+                return _exit(bar.ts, capped, ExitReason.MAX_LOSS)
+
+        # Overlay 0b: time-stop (TradeProposal.time_stop_minutes) — exit if
+        # held past the window and NOT in profit ("let winners run").
+        if time_stop_minutes is not None:
+            elapsed_min = (bar.ts - entry_time).total_seconds() / 60
+            if elapsed_min >= time_stop_minutes:
+                in_profit = close > entry_price if favorable else close < entry_price
+                if not in_profit:
+                    return _exit(bar.ts, close, ExitReason.TIME_STOP)
 
         # Step 1: stop — intrabar (was close-only).
         hit_stop = low <= stop_price if favorable else high >= stop_price
@@ -2192,6 +2267,7 @@ def _run_single_backtest(
     total_lots: int = 10,
     underlying_series: list[tuple[datetime, float]] | None = None,
     target_multiplier: float = 2.0,
+    strategy_params: dict[str, object] | None = None,
 ) -> tuple[dict[str, list[ReconstructedTrade]], int, Counter[str], int]:
     """One expiry's full seed -> replay -> risk-outcome -> exit-reconstruction
     pass — the exact single-run body `main()` used to run inline, now
@@ -2293,7 +2369,11 @@ def _run_single_backtest(
         # script's own `--total-lots` (default 10) is the deliberate,
         # independent lever for exit-mode reconstruction sizing instead --
         # see EXIT_MODES / `_resolve_leg_specs`.
-        params={"qty_lots": 1},
+        # `--strategy-params` (2026-08-27) merges strategy-tunable overrides
+        # on top (gate flags, thresholds, target_r_multiple, ...) so a
+        # sweep can compare variants without a code change per variant;
+        # qty_lots stays 1 unless the caller explicitly overrides it.
+        params={"qty_lots": 1, **(strategy_params or {})},
     )
     strategy_obj = _build_strategy(strategy_config_stub, ctx.instrument_id, expiry_date)
 
@@ -2310,6 +2390,34 @@ def _run_single_backtest(
     pivots_by_date: dict[date, PivotLevels | None] = {}
 
     all_bars = sorted(warmup_bars + main_bars, key=lambda b: b.ts)
+
+    # Bulk-seed India VIX QuoteTicks aligned to each replay bar's own
+    # timestamp, so `env_metrics.get_vix_as_of(db, bar.bucket_start)` — the
+    # path every strategy's VIX gate uses — returns real values. `vix_at`
+    # is a nearest-at-or-before-minute lookup, so a bar with no exact VIX
+    # minute still resolves to the last known value (India VIX ticks
+    # sparsely — this matches production's own "latest tick, however old"
+    # semantics, see env_metrics' module docstring).
+    if diagnostics is not None and diagnostics.vix_minute:
+        with db_scope() as db:
+            for bar in all_bars:
+                v = diagnostics.vix_at(bar.ts)
+                if v is None:
+                    continue
+                db.add(
+                    QuoteTickRow(
+                        id=uuid.uuid4(),
+                        instrument_id=ctx.vix_instrument_id,
+                        option_contract_id=None,
+                        ltp=v,
+                        bid=v,
+                        ask=v,
+                        volume=0,
+                        oi=None,
+                        ts=bar.ts,
+                    )
+                )
+
     for i, bar in enumerate(all_bars):
         bar_day = bar.ts.date()
         if bar_day != current_day:
@@ -2459,6 +2567,13 @@ def _run_single_backtest(
                             all_contracts=contracts,
                             all_option_bars=option_bars,
                             atr_series=atr_series,
+                            # Hard risk overlays are deterministic strategy config
+                            # (not per-signal data) — read straight off the
+                            # strategy object rather than round-tripping through a
+                            # not-yet-existing DB column. Production wiring is a
+                            # separate gated follow-up (see TradeProposal docstring).
+                            max_loss_per_lot=getattr(strategy_obj, "max_loss_per_lot", None),
+                            time_stop_minutes=getattr(strategy_obj, "time_stop_minutes", None),
                         )
                     )
                     continue
@@ -2653,6 +2768,15 @@ def main() -> None:
         "stop price, same trail math anchored to the scaled target). Default 2.0.",
     )
     parser.add_argument(
+        "--strategy-params", default=None,
+        help="JSON object of strategy-tunable overrides merged into the backtest's "
+        "StrategyConfig.params (on top of qty_lots=1), e.g. "
+        '\'{"require_htf_ema_trend": true, "target_r_multiple": 2.5}\'. Only keys the '
+        "chosen --strategy's own *_PARAM_KEYS allowlist accepts are forwarded to its "
+        "constructor (api.v1.strategies._build_strategy); unknown keys are ignored, same "
+        "as a real strategy_config.",
+    )
+    parser.add_argument(
         "--pairs", default=None,
         help="Comma-separated list of exact 'YYYY-MM-DD:YYYY-MM-DD' day:expiry pairs -- one "
         "single-day _run_single_backtest call per pair, with the expiry directory given "
@@ -2702,6 +2826,15 @@ def main() -> None:
     if args.pairs and (args.all_expiries or args.dates):
         raise SystemExit("--pairs is mutually exclusive with --all-expiries/--dates (it already "
                           "names the exact expiry directory per day, no scan needed)")
+    strategy_params: dict[str, object] = {}
+    if args.strategy_params:
+        try:
+            strategy_params = json.loads(args.strategy_params)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"--strategy-params is not valid JSON: {exc}") from exc
+        if not isinstance(strategy_params, dict):
+            raise SystemExit("--strategy-params must be a JSON object")
+
     db_suffix = args.db_suffix or f"{args.strategy}_{args.underlying}"
 
     data_dir: Path = args.data_dir
@@ -2853,6 +2986,7 @@ def main() -> None:
                 trades_by_mode, rejected, reasons, signals = _run_single_backtest(
                     underlying=args.underlying,
                     strategy_type=args.strategy,
+                    strategy_params=strategy_params,
                     from_date=from_date,
                     to_date=to_date,
                     expiry_date=expiry_date,
@@ -2924,6 +3058,7 @@ def main() -> None:
             trades_by_mode, rejected, reasons, signals = _run_single_backtest(
                 underlying=args.underlying,
                 strategy_type=args.strategy,
+                strategy_params=strategy_params,
                 from_date=day,
                 to_date=day,
                 expiry_date=expiry_date,
@@ -2969,6 +3104,7 @@ def main() -> None:
             _run_single_backtest(
                 underlying=args.underlying,
                 strategy_type=args.strategy,
+                strategy_params=strategy_params,
                 from_date=args.from_date,
                 to_date=args.to_date,
                 expiry_date=expiry_date,

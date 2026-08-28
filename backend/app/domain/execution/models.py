@@ -114,6 +114,13 @@ class ExitReason(enum.StrEnum):
     # guarded-live/live session, distinct from EOD_SQUARE_OFF so
     # reports can tell a scheduled flatten from a forced one apart.
     MARGIN_BREACH = "margin_breach"
+    # 2026-08-28: hard risk overlays independent of the premium stop/target
+    # (TradeProposal.max_loss_per_lot / time_stop_minutes). MAX_LOSS = the
+    # absolute per-lot INR loss cap was reached before stop_price; TIME_STOP
+    # = held past time_stop_minutes without being in profit. Backtest exit
+    # reconstruction only for now; production wiring is a gated follow-up.
+    MAX_LOSS = "max_loss"
+    TIME_STOP = "time_stop"
     # 2026-08-20: an exit order that didn't fill synchronously in
     # close_position (left the position OPEN, per that function's own
     # comment) and was only discovered filled later by

@@ -60,9 +60,13 @@ from app.modules.strategy_engine.interface import Strategy
 from app.modules.strategy_engine.runner import StrategyRunner
 from app.modules.strategy_engine.service import new_strategy_run
 from app.modules.strategy_engine.strategies import (
+    ATR_BREAKOUT_PARAM_KEYS,
+    CONVICTION_PARAM_KEYS,
+    ATRBreakoutStrategy,
     EMAMicroPullbackStrategy,
     LiquiditySweepReversalStrategy,
     OIVolumeConfirmedStrategy,
+    ORBConvictionStrategy,
     ORBStrategy,
     SyntheticStrategy,
     VWAPPullbackStrategy,
@@ -95,6 +99,12 @@ ORB_PARAM_KEYS = {
 # constructor has no matching kwargs for them, so forwarding them here would
 # raise a TypeError at start_strategy time instead of leaving them as inert
 # config, defeating the point.
+
+# orb_conviction = every ORB param plus the conviction-gate tunables that
+# subclass adds (CONVICTION_PARAM_KEYS is that subclass's own explicit
+# literal, imported so the two never drift).
+ORB_CONVICTION_PARAM_KEYS = ORB_PARAM_KEYS | CONVICTION_PARAM_KEYS
+
 VWAP_PULLBACK_PARAM_KEYS = {
     "qty_lots",
     "pullback_tolerance_frac",
@@ -248,6 +258,18 @@ def _build_strategy(
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in ORB_PARAM_KEYS},
         )
+    if strategy_type == "orb_conviction":
+        return ORBConvictionStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in ORB_CONVICTION_PARAM_KEYS},
+        )
+    if strategy_type == "atr_breakout":
+        return ATRBreakoutStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{k: v for k, v in params.items() if k in ATR_BREAKOUT_PARAM_KEYS},
+        )
     if strategy_type == "vwap_pullback":
         return VWAPPullbackStrategy(
             instrument_id=instrument_id,
@@ -278,6 +300,8 @@ def _build_strategy(
 KNOWN_STRATEGY_TYPES = {
     "synthetic",
     "orb",
+    "orb_conviction",
+    "atr_breakout",
     "vwap_pullback",
     "ema_micro_pullback",
     "oi_volume_confirmed",
