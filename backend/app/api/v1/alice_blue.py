@@ -54,9 +54,14 @@ def get_login_url(user: User = Depends(require_permission("session.start"))) -> 
 
 @router.get("/status")
 def get_status(user: User = Depends(require_permission("session.start"))) -> dict:
-    from app.modules.market_data.providers.alice_blue_session import get_alice_blue_session
+    """`connected` = the cached token can still register a WS session right now
+    (a `createWsSess` probe, behind a 30s cache), not merely "a cache file
+    exists". Read-only — a dead token here is reported, never cleared, and the
+    WS reconnect loop is left running so it self-heals on the next real login.
+    """
+    from app.modules.market_data.providers.alice_blue_session import alice_blue_connection_live
 
-    return {"connected": get_alice_blue_session() is not None}
+    return {"connected": alice_blue_connection_live()}
 
 
 @router.get("/callback", response_class=HTMLResponse)

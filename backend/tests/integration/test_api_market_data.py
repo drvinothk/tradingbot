@@ -466,3 +466,91 @@ def test_diagnostic_both_mode_is_atomic_when_one_role_fails_validation(
     status_response = api_client.get("/api/v1/market-data/diagnostic/status").json()
     assert status_response["default"]["running"] is False
     assert status_response["failback"]["running"] is False
+
+
+# --- /aliceblue/status liveness probe ---------------------------------------
+
+
+@pytest.fixture
+def _isolate_alice_blue_cache_file(tmp_path, monkeypatch):
+    from app.modules.market_data.providers import alice_blue_session
+
+    monkeypatch.setattr(
+        alice_blue_session, "_CACHE_PATH", tmp_path / ".alice_blue_session_cache.json"
+    )
+    yield
+
+
+def test_aliceblue_status_requires_login(api_client: TestClient):
+    assert api_client.get("/aliceblue/status").status_code == 401
+
+
+def test_aliceblue_status_false_and_no_probe_when_no_session(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    from app.modules.market_data.providers import alice_blue_auth
+
+    probed = []
+
+    def _probe(*_a, **_k):
+        probed.append(1)
+        return "alive"
+
+    monkeypatch.setattr(alice_blue_auth, "probe_ws_session", _probe)
+    _login(api_client, seeded_admin)
+
+    body = api_client.get("/aliceblue/status").json()
+
+    assert body == {"connected": False}
+    assert probed == []
+
+
+def test_aliceblue_status_true_when_probe_alive(
+    api_client: TestClient, seeded_admin, monkeypatch, _isolate_alice_blue_cache_file
+):
+    from app.modules.market_data.providers import alice_blue_auth, alice_blue_session
+    from app.modules.market_data.providers.alice_blue_auth import AliceBlueSession
+
+    alice_blue_session.set_alice_blue_session(AliceBlueSession("288866", "tok"))
+    monkeypatch.setattr(alice_blue_auth, "probe_ws_session", lambda *a, **k: "alive")
+    _login(api_client, seeded_admin)
+
+    assert api_client.get("/aliceblue/status").json() == {"connected": True}
+
+
+def test_aliceblue_status_dead_probe_reports_false_without_clearing_session(
+    api_client: TestClient, seeded_admin, monkeypatch, _isolate_alice_blue_cache_file
+):
+    from app.modules.market_data.providers import alice_blue_auth, alice_blue_session
+    from app.modules.market_data.providers.alice_blue_auth import AliceBlueSession
+
+    alice_blue_session.set_alice_blue_session(AliceBlueSession("288866", "tok"))
+    monkeypatch.setattr(alice_blue_auth, "probe_ws_session", lambda *a, **k: "dead")
+    _login(api_client, seeded_admin)
+
+    assert api_client.get("/aliceblue/status").json() == {"connected": False}
+    # Read-only: the session must NOT be cleared, so the WS reconnect loop
+    # keeps running and self-heals on the next real login.
+    assert alice_blue_session.get_alice_blue_session() is not None
+
+
+def test_aliceblue_status_ttl_cache_collapses_repeat_probes(
+    api_client: TestClient, seeded_admin, monkeypatch, _isolate_alice_blue_cache_file
+):
+    from app.modules.market_data.providers import alice_blue_auth, alice_blue_session
+    from app.modules.market_data.providers.alice_blue_auth import AliceBlueSession
+
+    alice_blue_session.set_alice_blue_session(AliceBlueSession("288866", "tok"))
+    calls = []
+
+    def _probe(*_a, **_k):
+        calls.append(1)
+        return "alive"
+
+    monkeypatch.setattr(alice_blue_auth, "probe_ws_session", _probe)
+    _login(api_client, seeded_admin)
+
+    api_client.get("/aliceblue/status")
+    api_client.get("/aliceblue/status")
+
+    assert len(calls) == 1

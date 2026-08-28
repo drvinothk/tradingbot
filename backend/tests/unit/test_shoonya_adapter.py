@@ -1542,3 +1542,53 @@ def test_get_price_history_splice_failure_keeps_zero_volume():
     candles = adapter.get_price_history("NIFTY", start, end, timeframe_seconds=60)
 
     assert [(c.close, c.volume) for c in candles] == [(24446.80, 0)]
+
+
+# --- warm_token_cache (restart token-cache warm-up) ---------------------------
+
+
+def _nse_index_rows() -> list[dict]:
+    return [
+        {"tsym": "Nifty 50", "token": "26000", "instname": "UNDIND"},
+        {"tsym": "Nifty Bank", "token": "26009", "instname": "UNDIND"},
+    ]
+
+
+def test_warm_token_cache_remembers_options_and_resolves_both_underlyings():
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = _nse_index_rows()
+    adapter, rest = _adapter(rest)
+
+    adapter.warm_token_cache(
+        [("NIFTY28AUG25C24000", "111"), ("BANKNIFTY28AUG25P52000", "222")]
+    )
+
+    assert adapter._resolve_token("NIFTY28AUG25C24000") == ("NFO", "111")
+    assert adapter._resolve_token("BANKNIFTY28AUG25P52000") == ("NFO", "222")
+    assert adapter._resolve_token("NIFTY") == ("NSE", "26000")
+    assert adapter._resolve_token("BANKNIFTY") == ("NSE", "26009")
+    nse_searches = [c for c in rest.calls if c[0] == "search_scrip" and c[1][1] == "NSE"]
+    assert len(nse_searches) == 2
+
+
+def test_warm_token_cache_survives_underlying_resolution_failure():
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = []  # no exact tsym match -> raises internally
+    adapter, _ = _adapter(rest)
+
+    adapter.warm_token_cache([("NIFTY28AUG25C24000", "111")])  # must not raise
+
+    assert adapter._resolve_token("NIFTY28AUG25C24000") == ("NFO", "111")
+    with pytest.raises(ShoonyaApiError):
+        adapter._resolve_token("NIFTY")
+
+
+def test_warm_token_cache_skips_blank_option_tokens():
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = _nse_index_rows()
+    adapter, _ = _adapter(rest)
+
+    adapter.warm_token_cache([("NIFTY28AUG25C24000", "")])
+
+    with pytest.raises(ShoonyaApiError):
+        adapter._resolve_token("NIFTY28AUG25C24000")

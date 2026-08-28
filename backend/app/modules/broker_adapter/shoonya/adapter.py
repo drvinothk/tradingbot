@@ -742,6 +742,37 @@ class ShoonyaBrokerAdapter(BrokerPort):
         with self._token_lock:
             self._option_anchor_cache[(underlying, expiry)] = tsym
 
+    def warm_token_cache(self, option_symbol_tokens: list[tuple[str, str]]) -> None:
+        """Best-effort pre-population of the in-process token cache after a
+        session *restore* (`app.main._attempt_shoonya_reconnect_from_cache`),
+        so a restart doesn't leave the WS-subscribe and position-pricing
+        paths resolving tokens lazily under the strategy-resume storm — the
+        live-observed cause of a ~6-minute "no cached broker token for
+        'NIFTY…'" blind window after every restart.
+
+        `option_symbol_tokens` are `(OptionContract.symbol, broker_token)`
+        pairs the caller has already read from the DB (this adapter has no DB
+        access of its own — same boundary as `seed_option_anchor`). They fix
+        the fallback-free `_resolve_token` path that `PositionManager` uses
+        for open-position option symbols. The two `KNOWN_UNDERLYINGS`
+        resolutions are one live `SearchScrip("NSE", …)` each, done gently
+        and serially here, before the resume threads spin up. Per-underlying
+        `try/except` so a `BANKNIFTY` `SearchScrip` failure can't stop the
+        `NIFTY` token (or the option tokens) from being cached. Never raises.
+        """
+        for symbol, token in option_symbol_tokens:
+            self._remember_token(symbol, "NFO", token)
+        for underlying in KNOWN_UNDERLYINGS:
+            try:
+                self._resolve_underlying_token(underlying)
+            except Exception:
+                logger.warning(
+                    "warm_token_cache: could not resolve underlying %s token "
+                    "(will retry lazily / via MarketDataScheduler health check)",
+                    underlying,
+                    exc_info=True,
+                )
+
     # -- BrokerPort: quotes / depth -------------------------------------------
 
     def get_quote(self, contract_symbol: str) -> Tick:

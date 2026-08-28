@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
+from typing import Literal
 from urllib.parse import urlencode
 
 import httpx
@@ -165,3 +166,55 @@ def create_ws_session(
     finally:
         if owns_client:
             client.close()
+
+
+WsProbeResult = Literal["alive", "dead", "unknown"]
+
+
+def probe_ws_session(
+    settings: AliceBlueSettings,
+    session: AliceBlueSession,
+    *,
+    http_client: httpx.Client | None = None,
+) -> WsProbeResult:
+    """Read-only liveness check for `GET /aliceblue/status` — does the cached
+    `user_session` still register a WS session server-side?
+
+    Same `POST …/profile/createWsSess` as `create_ws_session`, but this one
+    *inspects the status code* (which `create_ws_session` deliberately
+    discards, since for its real caller a failure surfaces as the WS connect's
+    own auth rejection). `401`/`403` → `"dead"` (this is the response actually
+    observed for an expired Alice Blue token); any `2xx` → `"alive"`; anything
+    else — `5xx`, `429`, a non-HTTP transport error, a timeout — → `"unknown"`
+    (a transient blip must not flip the UI to "not connected"). Never raises.
+
+    Deliberately does **not** clear the session or touch the WS reconnect
+    loop — the loop self-heals the moment a valid token exists, which is
+    wanted for failback; this is purely an honest mirror.
+
+    Timeout is 5s (not `create_ws_session`'s 15s) because this sits on a
+    status endpoint the frontend polls.
+    """
+    owns_client = http_client is None
+    client = http_client or httpx.Client(timeout=5.0, proxy=settings.auth_proxy or None)
+    try:
+        response = client.post(
+            f"{settings.api_host}/open-api/od/v1/profile/createWsSess",
+            json={"source": "API", "userId": session.client_id},
+            headers={"Authorization": f"Bearer {session.user_session}"},
+        )
+    except httpx.HTTPError:
+        logger.warning("createWsSess liveness probe failed (transport) — treating as unknown")
+        return "unknown"
+    finally:
+        if owns_client:
+            client.close()
+
+    if response.status_code in (401, 403):
+        return "dead"
+    if 200 <= response.status_code < 300:
+        return "alive"
+    logger.warning(
+        "createWsSess liveness probe returned HTTP %d — treating as unknown", response.status_code
+    )
+    return "unknown"

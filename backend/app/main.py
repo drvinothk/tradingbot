@@ -14,7 +14,10 @@
    OAuth login when the morning's token is still genuinely valid. Validates
    the cached token with a real API call first — a dead/expired one is
    dropped and this falls through to the mock, exactly as if no cache
-   existed at all.
+   existed at all. Immediately after, `_warm_shoonya_token_cache_from_db`
+   replays the persisted option `broker_token`s and resolves the two
+   underlying tokens, so the strategy-resume storm in step 5 doesn't spend
+   ~6 minutes failing to resolve tokens lazily under load.
 4. Mock instrument universe sync — only when `get_broker()` resolves to
    `MockBrokerAdapter` (a no-op once Phase 5's real Shoonya adapter is wired
    in, including one just restored from cache by step 3): syncs
@@ -67,6 +70,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from sqlalchemy.orm import Session
 
 from app.api.v1 import (
     alice_blue,
@@ -224,6 +228,83 @@ def _attempt_shoonya_reconnect_from_cache() -> None:
 
     set_broker(adapter)
     logger.info("Shoonya session restored from disk cache — reconnected without a fresh login.")
+
+
+def _persisted_shoonya_option_tokens(db: Session) -> list[tuple[str, str]]:
+    """`(OptionContract.symbol, broker_token)` for every currently-tradable
+    NIFTY/BANKNIFTY option that already has a persisted broker token — the
+    read half of `_warm_shoonya_token_cache_from_db`. Factored out so it's
+    unit-testable without faking the full SQLAlchemy chain.
+    """
+    from datetime import date
+
+    from app.domain.market.models import Instrument, OptionContract
+    from app.modules.broker_adapter.shoonya.adapter import KNOWN_UNDERLYINGS
+
+    rows = (
+        db.query(OptionContract.symbol, OptionContract.broker_token)
+        .join(Instrument, OptionContract.instrument_id == Instrument.id)
+        .filter(
+            Instrument.symbol.in_(KNOWN_UNDERLYINGS),
+            OptionContract.is_active.is_(True),
+            OptionContract.broker_token != "",
+            OptionContract.expiry_date >= date.today(),
+        )
+        .all()
+    )
+    return [(symbol, token) for symbol, token in rows]
+
+
+def _warm_shoonya_token_cache_from_db() -> None:
+    """Runs once at startup, right after `_attempt_shoonya_reconnect_from_cache`
+    and *before* the recovery/strategy-resume storm, to defeat the ~6-minute
+    post-restart "no cached broker token for 'NIFTY…'" window: a fresh
+    `ShoonyaBrokerAdapter` has an empty in-process `_token_by_symbol`, and the
+    5-runners + PositionManager + option-chain-refresh burst that
+    `_run_startup_recovery_check`/`resume_strategy_runners` kick off otherwise
+    has to resolve every token lazily, under load, and fails for minutes.
+
+    Deliberately lighter and read-only vs. the fresh-OAuth path's
+    `sync_instrument_master` (no ~650KB scrip-master download, no
+    `instruments`/`option_contracts` upsert): replay the already-persisted
+    option `broker_token`s from the DB, then let the adapter resolve just the
+    two bare-underlying NSE tokens (one `SearchScrip` each). Synchronous on
+    purpose — it must finish before the storm; a backgrounded warm-up would
+    reintroduce the race. Entirely best-effort: any failure is logged and
+    startup continues (the `MarketDataScheduler` 300s health check remains the
+    backstop for whatever this misses).
+    """
+    from app.core.db.session import session_scope
+    from app.modules.broker_adapter.composition import (
+        get_broker,
+        is_shoonya_configured,
+        unwrap_broker,
+    )
+
+    if not is_shoonya_configured():
+        return
+
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+    inner = unwrap_broker(get_broker())
+    if not isinstance(inner, ShoonyaBrokerAdapter):
+        return
+
+    try:
+        with session_scope() as db:
+            pairs = _persisted_shoonya_option_tokens(db)
+        inner.warm_token_cache(pairs)
+        logger.info(
+            "Shoonya token-cache warm-up: replayed %d persisted option token(s) + resolved "
+            "NIFTY/BANKNIFTY underlyings before strategy resume.",
+            len(pairs),
+        )
+    except Exception:
+        logger.warning(
+            "Shoonya token-cache warm-up failed (non-fatal) — the feed will still recover "
+            "lazily, just slower.",
+            exc_info=True,
+        )
 
 
 def _sync_mock_instrument_universe() -> None:
@@ -428,6 +509,7 @@ async def lifespan(app: FastAPI):
     # success path instead.
     try:
         _attempt_shoonya_reconnect_from_cache()
+        _warm_shoonya_token_cache_from_db()
         _sync_mock_instrument_universe()
         _sync_angel_one_scrip_master()
         _rebuild_execution_mock_position_book()

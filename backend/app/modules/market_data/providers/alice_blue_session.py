@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import threading
+import time
 
 from app.config.settings import CREDENTIALS_DIR
 from app.modules.market_data.providers.alice_blue_auth import AliceBlueSession
@@ -45,6 +46,13 @@ _CACHE_PATH = CREDENTIALS_DIR / ".alice_blue_session_cache.json"
 _lock = threading.Lock()
 _session: AliceBlueSession | None = None
 _loaded_from_disk = False
+
+# Short-lived cache for `alice_blue_connection_live()` so the Market Terminal's
+# on-mount + on-focus polling of `/aliceblue/status` doesn't fire a
+# `createWsSess` probe every time. Holds the last *definitive* result only.
+_PROBE_TTL_SECONDS = 30.0
+_probe_lock = threading.Lock()
+_probe_cache: tuple[float, bool] | None = None  # (monotonic_deadline, connected)
 
 
 def _load_from_disk() -> AliceBlueSession | None:
@@ -94,6 +102,42 @@ def set_alice_blue_session(session: AliceBlueSession | None) -> None:
     _write_to_disk(session)
 
 
+def alice_blue_connection_live() -> bool:
+    """What `GET /aliceblue/status` reports: is the cached Alice Blue token
+    actually usable *right now*, not just "a cache file exists".
+
+    `None` session → `False` (no probe). Otherwise a `createWsSess` liveness
+    probe (`alice_blue_auth.probe_ws_session`), behind a 30s TTL:
+    `"alive"` → `True`, `"dead"` → `False`, `"unknown"` (transient) → the last
+    definitive result if we have one, else `True` (optimistic — a network
+    blip must not read as "not connected"). Read-only: never clears the
+    session, never touches the WS reconnect loop.
+    """
+    global _probe_cache
+
+    from app.config.settings import get_settings
+    from app.modules.market_data.providers.alice_blue_auth import probe_ws_session
+
+    session = get_alice_blue_session()
+    if session is None:
+        return False
+
+    now = time.monotonic()
+    with _probe_lock:
+        if _probe_cache is not None and now < _probe_cache[0]:
+            return _probe_cache[1]
+        last_known = _probe_cache[1] if _probe_cache is not None else None
+
+    result = probe_ws_session(get_settings().alice_blue, session)
+    if result == "unknown":
+        return last_known if last_known is not None else True
+
+    connected = result == "alive"
+    with _probe_lock:
+        _probe_cache = (time.monotonic() + _PROBE_TTL_SECONDS, connected)
+    return connected
+
+
 def reset_for_tests() -> None:
     """Resets only the in-memory singleton — deliberately does **not** call
     `set_alice_blue_session(None)`, which would delete the real on-disk
@@ -101,7 +145,9 @@ def reset_for_tests() -> None:
     `get_alice_blue_session()` call from re-loading a real cached session
     into a test process.
     """
-    global _session, _loaded_from_disk
+    global _session, _loaded_from_disk, _probe_cache
     with _lock:
         _session = None
         _loaded_from_disk = True
+    with _probe_lock:
+        _probe_cache = None
