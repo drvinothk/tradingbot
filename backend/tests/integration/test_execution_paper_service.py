@@ -40,7 +40,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -394,9 +393,8 @@ def test_dispatch_sends_buffered_limit_order_for_a_genuinely_live_dispatch(
     placement. Same live-routing/_FakeLiveBroker/preflight-neutralizing
     pattern as `test_close_position_updates_session_pnl_and_can_trigger_kill_switch`.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
-    strategy_config.status = StrategyStatus.LIVE
     db.add(strategy_config)
     db.flush()
 
@@ -444,9 +442,8 @@ def test_dispatch_raises_when_option_chain_is_stale_for_a_live_dispatch(
     seeded at all means `classify_option_chain` returns DEAD, which must
     still refuse a genuinely live dispatch.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
-    strategy_config.status = StrategyStatus.LIVE
     db.add(strategy_config)
     db.flush()
 
@@ -907,15 +904,14 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     that day's audit — paper losses used to trip a real kill_switch). The
     entry stays an explicit-broker paper dispatch (irrelevant to this
     test); the close is what needs to resolve live, so it's called without
-    an explicit broker, through a graduated strategy on a guarded-live
-    session, with `get_execution_broker`/preflight neutralized the same
+    an explicit broker, on a live_enabled
+    session (strategy not force_paper), with `get_execution_broker`/preflight neutralized the same
     way `test_evaluate_trade_intent_margin_check_failed`-style tests
     already do elsewhere in this suite.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     trading_session.daily_loss_cap = 1.0  # trivially small so any loss breaches it
     db.add(trading_session)
-    strategy_config.status = StrategyStatus.LIVE
     db.add(strategy_config)
     db.flush()
 
@@ -1004,8 +1000,7 @@ def test_run_single_position_square_off_routes_a_live_positions_exit_through_its
     effects and a LIMIT order (MARKET is what live Shoonya rejects for API
     orders), not a paper-tagged MARKET fill.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
-    strategy_config.status = StrategyStatus.LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(strategy_config)
     db.flush()
 

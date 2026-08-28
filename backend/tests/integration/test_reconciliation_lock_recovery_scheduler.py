@@ -88,14 +88,14 @@ def _scheduler_for(
 
 def _lock_session(db: Session, trading_session: TradingSession, authorized_user: User) -> None:
     """Same reachable-path reasoning every other reconciliation_lock test in
-    this codebase uses -- promote to paper_plus_guarded_live first, since
-    the lock is never reachable directly from paper_only. The promotion
-    itself needs a real permissioned actor (`livetrade.execute`); the lock
-    entry itself (RECONCILIATION trigger) does not."""
+    this codebase uses -- promote to live_enabled first, since the lock is
+    never reachable directly from paper_only. The promotion itself needs a
+    real permissioned actor (`livetrade.execute`); the lock entry itself
+    (RECONCILIATION trigger) does not."""
     transition_mode(
         db,
         trading_session,
-        SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        SafeMode.LIVE_ENABLED,
         TransitionTriggerType.MANUAL,
         actor_user=authorized_user,
     )
@@ -108,7 +108,7 @@ def _lock_session(db: Session, trading_session: TradingSession, authorized_user:
     )
     db.flush()
     assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
-    assert trading_session.prior_mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.prior_mode == SafeMode.LIVE_ENABLED
     assert trading_session.reconciliation_lock_clean_streak == 0
 
 
@@ -167,12 +167,12 @@ def test_auto_recovers_after_reaching_the_clean_streak_threshold(
     scheduler.run_once()
 
     db.refresh(trading_session)
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
     assert (
         db.query(SessionModeTransition)
         .filter(
             SessionModeTransition.trading_session_id == trading_session.id,
-            SessionModeTransition.to_mode == SafeMode.PAPER_PLUS_GUARDED_LIVE,
+            SessionModeTransition.to_mode == SafeMode.LIVE_ENABLED,
             SessionModeTransition.trigger_type == TransitionTriggerType.RECONCILIATION,
         )
         .count()
@@ -187,13 +187,6 @@ def test_auto_recovery_to_live_prior_mode_needs_zero_manual_actor(
     recovery all the way back to a live-adjacent prior_mode, with no
     `actor_user` involved in the *recovery* itself (only the earlier,
     ordinary promotion to live needs one, same as any other session)."""
-    transition_mode(
-        db,
-        trading_session,
-        SafeMode.PAPER_PLUS_GUARDED_LIVE,
-        TransitionTriggerType.MANUAL,
-        actor_user=authorized_user,
-    )
     transition_mode(
         db,
         trading_session,

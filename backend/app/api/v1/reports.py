@@ -1,4 +1,4 @@
-"""Reporting v1 API surface — the strategy graduation dashboard's two
+"""Reporting v1 API surface — the strategy performance dashboard's two
 read-only endpoints: a single session's daily report, and a strategy's
 scorecard across every session it's ever run in.
 """

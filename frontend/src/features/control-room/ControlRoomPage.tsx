@@ -28,13 +28,13 @@ const STATUS_BADGE_CLASS: Record<TradeRowStatus, string> = {
   closed: 'badge',
 }
 
-// Only these two modes place real orders -- the three emergency modes
+// Only `live_enabled` places real orders -- the three emergency modes
 // (kill_switch/degraded_mode/reconciliation_lock) are NOT "live" for the
 // purpose of the Go Live/Go Paper toggle, even though they're also not
 // paper_only. Treating them as "live" made "Go Paper" look normally
 // enabled while the session was actually stuck in an emergency state that
 // Go Paper can't fix -- see Advanced's Reconciliation & Recovery card.
-const LIVE_MODES = new Set(['paper_plus_guarded_live', 'live_enabled'])
+const LIVE_MODES = new Set(['live_enabled'])
 const EMERGENCY_MODES = new Set(['kill_switch', 'degraded_mode', 'reconciliation_lock'])
 
 // Stable reference so `?? EMPTY_RUNS` doesn't defeat downstream useMemo

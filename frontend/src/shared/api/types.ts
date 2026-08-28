@@ -50,7 +50,6 @@ export interface StrategyConfigOut {
   name: string
   strategy_type: string
   params: Record<string, unknown>
-  status: string
   is_enabled: boolean
   runtime_mode: string | null
   underlying_symbol: string | null

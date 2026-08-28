@@ -13,7 +13,7 @@ already-built order/position
 simulation and gives Reconciliation Service a genuine broker-side state to
 diff local `positions` against. See the Phase 3 plan's "Key design
 decision" note for the full reasoning; Phase 6's real live-order path will
-extend `get_execution_broker` with graduation gating, not rewrite this
+extend `get_execution_broker` with live-routing gating, not rewrite this
 module. `get_execution_broker` is deliberately separate from `get_broker`
 so that connecting Shoonya for real market data (Phase 5) can never, by
 itself, cause a paper trade to place a real order — see
@@ -726,8 +726,7 @@ def resolve_broker_for_position(
     strategy — must be called per-position, never once for a whole batch
     of positions, since different open positions in the same session can
     belong to differently-configured strategies (one `force_paper`, one
-    genuinely graduated live) whose orders must never share a single
-    broker resolution.
+    live) whose orders must never share a single broker resolution.
 
     **Live bug fixed 2026-08-19**: `PositionManager._run_cycle` used to
     resolve one broker via `get_execution_broker(trading_session)` (no

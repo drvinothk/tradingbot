@@ -18,8 +18,13 @@ from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
 
 
 class SafeMode(enum.StrEnum):
+    # 2026-08-28: the per-strategy graduation tier `PAPER_PLUS_GUARDED_LIVE`
+    # was retired (migration 0028) — it only ever paired with
+    # `StrategyConfig.status == LIVE`, a field that never had a setter. The
+    # master switch now walks `paper_only <-> live_enabled` directly; a
+    # single strategy is held on paper inside a live session via
+    # `StrategyRuntimeMode.FORCE_PAPER`, not a session sub-mode.
     PAPER_ONLY = "paper_only"
-    PAPER_PLUS_GUARDED_LIVE = "paper_plus_guarded_live"
     LIVE_ENABLED = "live_enabled"
     DEGRADED_MODE = "degraded_mode"
     RECONCILIATION_LOCK = "reconciliation_lock"

@@ -88,7 +88,7 @@ def test_manual_transition_without_actor_rejected(db, trading_session):
         transition_mode(
             db,
             trading_session,
-            SafeMode.PAPER_PLUS_GUARDED_LIVE,
+            SafeMode.LIVE_ENABLED,
             TransitionTriggerType.MANUAL,
             actor_user=None,
         )
@@ -100,20 +100,20 @@ def test_promotion_requires_livetrade_permission(db, trading_session, user):
         transition_mode(
             db,
             trading_session,
-            SafeMode.PAPER_PLUS_GUARDED_LIVE,
+            SafeMode.LIVE_ENABLED,
             TransitionTriggerType.MANUAL,
             actor_user=user,
         )
 
 
 def test_degraded_mode_remembers_prior_mode_and_recovers(db, trading_session, authorized_user):
-    # degraded_mode is only reachable from paper_plus_guarded_live/live_enabled
-    # (never directly from paper_only) — promote for real first, matching the
-    # actual reachable path rather than asserting an edge that doesn't exist.
+    # degraded_mode is only reachable from live_enabled (never directly from
+    # paper_only) — promote for real first, matching the actual reachable
+    # path rather than asserting an edge that doesn't exist.
     transition_mode(
         db,
         trading_session,
-        SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        SafeMode.LIVE_ENABLED,
         TransitionTriggerType.MANUAL,
         actor_user=authorized_user,
     )
@@ -126,7 +126,7 @@ def test_degraded_mode_remembers_prior_mode_and_recovers(db, trading_session, au
         reason="simulated WS drop",
     )
     assert trading_session.mode == SafeMode.DEGRADED_MODE
-    assert trading_session.prior_mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.prior_mode == SafeMode.LIVE_ENABLED
 
     # Resuming to anything above paper_only always requires a manual,
     # permissioned confirm, even though a health check is what detected recovery.
@@ -137,14 +137,14 @@ def test_degraded_mode_remembers_prior_mode_and_recovers(db, trading_session, au
         actor_user=authorized_user,
         reason="health ok, admin confirmed",
     )
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
 
 
-def _lock_session_from_guarded_live(db, trading_session, authorized_user) -> None:
+def _lock_session_from_live(db, trading_session, authorized_user) -> None:
     transition_mode(
         db,
         trading_session,
-        SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        SafeMode.LIVE_ENABLED,
         TransitionTriggerType.MANUAL,
         actor_user=authorized_user,
     )
@@ -156,13 +156,13 @@ def _lock_session_from_guarded_live(db, trading_session, authorized_user) -> Non
         reason="simulated broker mismatch",
     )
     assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
-    assert trading_session.prior_mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.prior_mode == SafeMode.LIVE_ENABLED
 
 
 def test_reconciliation_lock_remembers_prior_mode_and_recovers_manually(
     db, trading_session, authorized_user
 ):
-    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    _lock_session_from_live(db, trading_session, authorized_user)
 
     recover_from_reconciliation_lock(
         db,
@@ -171,7 +171,7 @@ def test_reconciliation_lock_remembers_prior_mode_and_recovers_manually(
         actor_user=authorized_user,
         reason="fresh reconciliation confirmed clean",
     )
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
 
 
 def test_reconciliation_lock_recovery_via_manual_trigger_without_permission_rejected(
@@ -180,7 +180,7 @@ def test_reconciliation_lock_recovery_via_manual_trigger_without_permission_reje
     # `user` has no roles/permissions at all (see test_promotion_requires_
     # livetrade_permission above) -- resuming to a live-adjacent prior_mode
     # must reject it exactly like recover_from_degraded already does.
-    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    _lock_session_from_live(db, trading_session, authorized_user)
 
     with pytest.raises(ModeTransitionError, match="livetrade.execute"):
         recover_from_reconciliation_lock(
@@ -197,7 +197,7 @@ def test_reconciliation_lock_recovery_via_reconciliation_trigger_succeeds_to_liv
     with zero manual actor involved — reserved for
     ReconciliationLockRecoveryScheduler after N consecutive clean checks.
     """
-    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    _lock_session_from_live(db, trading_session, authorized_user)
 
     recover_from_reconciliation_lock(
         db,
@@ -205,7 +205,7 @@ def test_reconciliation_lock_recovery_via_reconciliation_trigger_succeeds_to_liv
         TransitionTriggerType.RECONCILIATION,
         reason="auto-recovered after 3 consecutive clean reconciliation checks",
     )
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
 
 
 def test_reconciliation_lock_recovery_via_bare_system_trigger_to_live_rejected(
@@ -214,7 +214,7 @@ def test_reconciliation_lock_recovery_via_bare_system_trigger_to_live_rejected(
     """Pins the exception's narrowness: only RECONCILIATION (never a bare
     SYSTEM trigger) may resume a locked session to a live-adjacent
     prior_mode unattended."""
-    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    _lock_session_from_live(db, trading_session, authorized_user)
 
     with pytest.raises(ModeTransitionError):
         recover_from_reconciliation_lock(db, trading_session, TransitionTriggerType.SYSTEM)
@@ -228,12 +228,12 @@ def test_reconciliation_lock_recovery_to_paper_only_needs_no_permission(
     prior_mode recorded) works via any trigger, even a bare SYSTEM one with
     no actor -- matches recover_from_degraded's own "resuming to paper_only
     can be automatic" rule. `RECONCILIATION_LOCK` is only reachable from
-    `paper_plus_guarded_live`/`live_enabled` (never directly from
-    `paper_only`), so this locks the session via the real reachable path
+    `live_enabled` (never directly from `paper_only`), so this locks the
+    session via the real reachable path
     (same helper every other test above uses) and then manually clears
     `prior_mode` to isolate the no-recorded-prior-mode fallback itself.
     """
-    _lock_session_from_guarded_live(db, trading_session, authorized_user)
+    _lock_session_from_live(db, trading_session, authorized_user)
     trading_session.prior_mode = None
     db.add(trading_session)
     db.flush()
@@ -253,21 +253,9 @@ def test_every_transition_is_captured_in_the_audit_chain(db, trading_session, au
 # -- set_master_trading_mode ("master switch") ---------------------------
 
 
-def test_master_switch_live_from_paper_only_walks_both_hops(db, trading_session, authorized_user):
-    set_master_trading_mode(
-        db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
-    )
-    assert trading_session.mode == SafeMode.LIVE_ENABLED
-
-
-def test_master_switch_live_from_guarded_live_is_a_single_hop(db, trading_session, authorized_user):
-    transition_mode(
-        db,
-        trading_session,
-        SafeMode.PAPER_PLUS_GUARDED_LIVE,
-        TransitionTriggerType.MANUAL,
-        actor_user=authorized_user,
-    )
+def test_master_switch_live_from_paper_only_reaches_live_enabled(
+    db, trading_session, authorized_user
+):
     set_master_trading_mode(
         db, trading_session, "live", TransitionTriggerType.MANUAL, actor_user=authorized_user
     )
@@ -287,7 +275,7 @@ def test_master_switch_live_is_a_noop_when_already_live(db, trading_session, aut
     assert trading_session.mode == SafeMode.LIVE_ENABLED
 
 
-def test_master_switch_paper_from_live_enabled_walks_both_hops(
+def test_master_switch_paper_from_live_enabled_reaches_paper_only(
     db, trading_session, authorized_user
 ):
     set_master_trading_mode(

@@ -2,7 +2,6 @@ import { useActiveSessionMode } from '../shared/hooks/useActiveSessionMode'
 
 const MODE_LABELS: Record<string, string> = {
   paper_only: 'Paper only',
-  paper_plus_guarded_live: 'Paper + guarded live',
   live_enabled: 'Live enabled',
   degraded_mode: 'Degraded mode',
   reconciliation_lock: 'Reconciliation lock',

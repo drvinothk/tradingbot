@@ -25,10 +25,16 @@ import type {
 } from '../../shared/api/types'
 
 const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
+// "Main data provider" selector. Values must match backend
+// RECOGNIZED_OVERRIDE_PROVIDERS (app/api/v1/market_data.py) -- "" clears the
+// override (automatic health-based failover), "shoonya"/"alice_blue" pin the
+// live feed to that leg and freeze auto-switching in BOTH directions.
 // "angel_one" archived 2026-08-21 -- see CLAUDE.md's Angel One section.
-// "alice_blue" promoted 2026-08-25 as Shoonya's failover backup.
-// Must match backend RECOGNIZED_OVERRIDE_PROVIDERS (app/api/v1/market_data.py).
-const FAILOVER_PROVIDERS = ['shoonya', 'alice_blue'] as const
+const MAIN_PROVIDER_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Automatic — Shoonya, fails over to Alice Blue' },
+  { value: 'shoonya', label: 'Shoonya only (no failover)' },
+  { value: 'alice_blue', label: 'Alice Blue only (temporary)' },
+]
 
 // The user's real current 5 strategy types plus Synthetic, folded at the
 // bottom — see the plan's "Advanced" section. Order matters: it's the
@@ -231,7 +237,6 @@ function StrategyTypeGroup({
                   <th>Power</th>
                   <th>Mode</th>
                   <th>Instrument</th>
-                  <th>Status</th>
                   <th>Running</th>
                   <th></th>
                 </tr>
@@ -422,7 +427,6 @@ function StrategyConfigRow({
             ))}
           </select>
         </td>
-        <td>{config.status}</td>
         <td>
           {run ? (
             <span className="badge badge-success">{run.status}</span>
@@ -933,7 +937,14 @@ function GlobalSettingsCard() {
     mutationFn: (active_provider: string | null) =>
       api.patch<ProviderPreferenceOut>('/market-data/provider-preference', { active_provider }),
     onSuccess: (data) => queryClient.setQueryData(['market-data', 'provider-preference'], data),
-    onError: (err) => setError(err instanceof ApiError ? err.message : 'Provider preference update failed'),
+    onError: (err) => {
+      const msg = err instanceof ApiError ? err.message : 'Provider preference update failed'
+      setError(
+        /subscribe backup provider 'alice_blue'/.test(msg)
+          ? "Alice Blue isn't connected — connect it on the Market Terminal, then retry."
+          : msg,
+      )
+    },
   })
 
   const activeLiveInstruments = firewallQuery.data?.active_live_instruments ?? []
@@ -968,23 +979,27 @@ function GlobalSettingsCard() {
       </div>
 
       <div className="form-row">
-        <label htmlFor="failover-override">Market-data failover override</label>
+        <label htmlFor="failover-override">Main data provider</label>
         <select
           id="failover-override"
           value={providerPrefQuery.data?.active_provider ?? ''}
           disabled={providerPrefMutation.isPending || providerPrefQuery.isLoading}
           onChange={(e) => providerPrefMutation.mutate(e.target.value || null)}
         >
-          <option value="">Automatic (no override)</option>
-          {FAILOVER_PROVIDERS.map((provider) => (
-            <option key={provider} value={provider}>
-              {provider}
+          {MAIN_PROVIDER_OPTIONS.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
             </option>
           ))}
         </select>
         {providerPrefQuery.data?.live_active_leg && (
           <span className="badge">live: {providerPrefQuery.data.live_active_leg}</span>
         )}
+        <p className="muted" style={{ fontSize: '0.75rem', margin: '0.35rem 0 0' }}>
+          Automatic is the only self-healing mode. “Shoonya only” / “Alice Blue only”
+          pin the feed and disable switching both ways. “Alice Blue only” needs a live
+          Alice Blue session — connect it on the Market Terminal first.
+        </p>
       </div>
     </div>
   )

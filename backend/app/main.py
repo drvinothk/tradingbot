@@ -35,8 +35,8 @@
 6. Health-check scheduler — starts `HealthCheckScheduler`
    (`scheduler/health_check.py`), the repeating version of step 1's one-shot
    boot check: on a 5-minute timer, a failing NTP/disk check now writes
-   `metric_series` rows and moves any `paper_plus_guarded_live`/
-   `live_enabled` session to `degraded_mode`, not just a log line. Addendum
+   `metric_series` rows and moves any `live_enabled` session to
+   `degraded_mode`, not just a log line. Addendum
    hardening batch, promoted from "known open item" to a Phase 6
    prerequisite — see the build plan.
 7. Reconciliation-lock recovery scheduler — starts

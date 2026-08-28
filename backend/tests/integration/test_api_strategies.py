@@ -47,7 +47,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -643,7 +642,6 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
                 id=uuid.uuid4(),
                 workspace_id=seeded_admin["workspace_id"],
                 name="approval-flow-test",
-                status=StrategyStatus.LIVE,
             )
             db.add(strategy_config)
             db.flush()

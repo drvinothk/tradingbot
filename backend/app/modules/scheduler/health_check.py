@@ -17,8 +17,8 @@ guarantees exactly one backend process.
 
 Reaction to a failing check reuses `PositionManager._handle_broker_auth_error`'s
 exact legal-edge reasoning: `core/modes/transitions.py` only has a
-`SYSTEM`-triggered `degraded_mode` edge from `paper_plus_guarded_live`/
-`live_enabled`, never from `paper_only` — so a paper-only session is
+`SYSTEM`-triggered `degraded_mode` edge from `live_enabled`, never from
+`paper_only` — so a paper-only session is
 correctly logged-and-alerted only, never escalated, same as a broker auth
 failure. A `SystemAlert` is written per affected workspace regardless of
 mode, so paper-only visibility still exists even though no mode transition
@@ -58,7 +58,7 @@ logger = logging.getLogger("app.scheduler.health_check")
 
 DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 300.0
 
-_DEGRADABLE_MODES = (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED)
+_DEGRADABLE_MODES = (SafeMode.LIVE_ENABLED,)
 
 # 2026-08-25: dedicated "worth alerting a human" threshold for
 # _check_market_data_staleness -- deliberately its own tier, not a reuse of

@@ -25,7 +25,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -310,7 +309,7 @@ def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live_on_live
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
     """A *live-book* mismatch on a live-eligible session locks the session."""
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
     db.flush()
 
@@ -331,10 +330,10 @@ def test_paper_book_mismatch_never_locks_a_live_active_session(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
     """A mock/paper-book discrepancy has no real-money meaning and must not
-    halt live execution -- even on a paper_plus_guarded_live session. It is
+    halt live execution -- even on a live_enabled session. It is
     still alerted + audited, just not mode-blocked.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
     db.flush()
 
@@ -353,7 +352,7 @@ def test_paper_book_mismatch_never_locks_a_live_active_session(
 
     assert run.mismatches_found == 1
     assert run.action_taken == "alert_raised"
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
     assert (
         db.query(SystemAlert)
         .filter(
@@ -477,9 +476,8 @@ def test_live_position_not_flagged_against_a_fresh_paper_mock(
     """Symmetric case: a genuinely live position must not be flagged when
     reconciled against a fresh, unrelated paper mock.
     """
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
-    strategy_config.status = StrategyStatus.LIVE
     db.add(strategy_config)
     db.flush()
 
@@ -518,7 +516,7 @@ def test_run_full_reconciliation_checks_both_books(
     real broker is connected, also runs the live pass -- proving the
     2026-08-19 coverage-gap fix: the account-wide call sites (periodic
     poll, manual endpoint, startup recovery) used to resolve a single,
-    session-level broker that -- in paper_plus_guarded_live -- never
+    session-level broker that -- in live_enabled -- never
     touched the real broker's book at all.
     """
     _dispatch_position(db, trading_session, strategy_run, option_contract, broker)

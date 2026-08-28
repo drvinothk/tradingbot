@@ -406,8 +406,8 @@ def recover_from_degraded_mode(
     (`scheduler.health_check`'s NTP/disk trip, or a broker-auth failure
     `PositionManager` detects mid-session) but had no recovery path
     anywhere in the app -- no endpoint, no button. A session that trips
-    into `degraded_mode` from `live_enabled`/`paper_plus_guarded_live` was
-    stuck there permanently until this existed.
+    into `degraded_mode` from `live_enabled` was stuck there permanently
+    until this existed.
 
     `recover_from_degraded`'s own target is dynamic (`trading_session
     .prior_mode`, falling back to `paper_only` if unset) and it already
@@ -456,9 +456,9 @@ def recover_from_reconciliation_lock(
 
     Safe to call while already in `reconciliation_lock`:
     `run_reconciliation`'s own escalation check
-    (`_RECONCILIATION_LOCK_ELIGIBLE_MODES`) only fires from
-    `paper_plus_guarded_live`/`live_enabled`, so re-checking from inside the
-    lock can't recurse into trying to re-enter it.
+    (`_RECONCILIATION_LOCK_ELIGIBLE_MODES`) only fires from `live_enabled`,
+    so re-checking from inside the lock can't recurse into trying to
+    re-enter it.
 
     2026-08-25: the actual transition now goes through `state_machine
     .recover_from_reconciliation_lock` (dynamic `prior_mode` target) instead
@@ -526,17 +526,16 @@ def go_live(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("livetrade.execute")),
 ) -> TradingSession:
-    """The "master switch" -> Live. Walks `paper_only -> paper_plus_guarded_live
-    -> live_enabled` (skipping whichever hop is already satisfied) via
-    `set_master_trading_mode`, so this is the first place in the app that can
-    ever actually put a session into `live_enabled` -- see that helper's own
-    docstring for why the intermediate hop is safe to pass through
-    unattended, and why kill_switch/degraded_mode/reconciliation_lock refuse
-    rather than get walked through. A strategy only actually dispatches a
-    real order after this if its own `runtime_mode` isn't `force_paper` (see
-    `StrategiesPage`'s "Mode" column) and every other gate in
-    `get_execution_broker` (instrument firewall, `ALLOW_REAL_MONEY_DISPATCH`)
-    also passes -- this endpoint only ever controls the session-mode gate.
+    """The "master switch" -> Live. `paper_only -> live_enabled` is a direct
+    edge via `set_master_trading_mode`, so this is the first place in the app
+    that can ever actually put a session into `live_enabled` -- see that
+    helper's own docstring for why kill_switch/degraded_mode/
+    reconciliation_lock refuse rather than transition. A strategy only
+    actually dispatches a real order after this if its own `runtime_mode`
+    isn't `force_paper` (see `AdvancedPage`'s "Mode" column) and every other
+    gate in `get_execution_broker` (instrument firewall,
+    `ALLOW_REAL_MONEY_DISPATCH`) also passes -- this endpoint only ever
+    controls the session-mode gate.
     """
     trading_session = _get_session_or_404(db, user, session_id)
     try:
@@ -563,8 +562,8 @@ def go_paper(
 ) -> TradingSession:
     """The "master switch" -> Paper -- always the safety-decreasing
     direction, gated on `session.stop` (the same permission bar as every
-    other stop-like action in this file), not `livetrade.execute`. Walks
-    `live_enabled -> paper_plus_guarded_live -> paper_only` via
+    other stop-like action in this file), not `livetrade.execute`.
+    `live_enabled -> paper_only` is a direct edge via
     `set_master_trading_mode`. Master=Paper always wins: once this
     completes, `get_execution_broker` returns the mock for every strategy
     on this session regardless of any individual strategy's `runtime_mode`.

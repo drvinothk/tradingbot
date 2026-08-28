@@ -111,8 +111,8 @@ class ExitReason(enum.StrEnum):
     SPREAD_BLOWOUT = "spread_blowout"
     # Emergency square-off's one narrow automatic trigger (Addendum
     # hardening batch) — a detected negative available margin on a
-    # guarded-live/live session, distinct from EOD_SQUARE_OFF so
-    # reports can tell a scheduled flatten from a forced one apart.
+    # live session, distinct from EOD_SQUARE_OFF so reports can tell a
+    # scheduled flatten from a forced one apart.
     MARGIN_BREACH = "margin_breach"
     # 2026-08-28: hard risk overlays independent of the premium stop/target
     # (TradeProposal.max_loss_per_lot / time_stop_minutes). MAX_LOSS = the

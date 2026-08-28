@@ -26,7 +26,13 @@ class TransitionRule:
 # fmt: off
 ALLOWED_TRANSITIONS: dict[SafeMode, dict[SafeMode, TransitionRule]] = {
     SafeMode.PAPER_ONLY: {
-        SafeMode.PAPER_PLUS_GUARDED_LIVE: TransitionRule(
+        SafeMode.LIVE_ENABLED: TransitionRule(
+            # 2026-08-28: was `paper_only -> paper_plus_guarded_live`. The
+            # guarded intermediate tier only ever paired with per-strategy
+            # `StrategyConfig.status == LIVE` (a field with no setter), so it
+            # was retired -- the master switch now promotes straight to
+            # live_enabled and a single strategy is held back with
+            # `StrategyRuntimeMode.FORCE_PAPER`.
             allowed_triggers=frozenset({Trigger.MANUAL}),
             required_permission="livetrade.execute",
         ),
@@ -35,36 +41,15 @@ ALLOWED_TRANSITIONS: dict[SafeMode, dict[SafeMode, TransitionRule]] = {
             # straight to kill_switch regardless of safe-mode (see Phase 2's
             # Risk Service) — paper_only is not exempt just because no real
             # money is at stake; the discipline of the safety flow applies
-            # the same way it already does from the two live-adjacent modes
-            # below.
+            # the same way it already does from live_enabled below.
             allowed_triggers=frozenset({Trigger.MANUAL, Trigger.SYSTEM, Trigger.RISK}),
             required_permission="session.stop",
         ),
     },
-    SafeMode.PAPER_PLUS_GUARDED_LIVE: {
-        SafeMode.LIVE_ENABLED: TransitionRule(
-            allowed_triggers=frozenset({Trigger.MANUAL}),
-            required_permission="livetrade.execute",
-        ),
-        SafeMode.PAPER_ONLY: TransitionRule(
-            allowed_triggers=frozenset({Trigger.MANUAL, Trigger.RISK}),
-            required_permission="session.stop",
-        ),
-        SafeMode.DEGRADED_MODE: TransitionRule(
-            allowed_triggers=frozenset({Trigger.SYSTEM}),
-        ),
-        SafeMode.RECONCILIATION_LOCK: TransitionRule(
-            allowed_triggers=frozenset({Trigger.SYSTEM, Trigger.RECONCILIATION}),
-        ),
-        SafeMode.KILL_SWITCH: TransitionRule(
-            allowed_triggers=frozenset({Trigger.MANUAL, Trigger.RISK}),
-            required_permission="session.stop",
-        ),
-    },
     SafeMode.LIVE_ENABLED: {
-        SafeMode.PAPER_PLUS_GUARDED_LIVE: TransitionRule(
+        SafeMode.PAPER_ONLY: TransitionRule(
             # Manual only — a daily loss cap breach goes straight to
-            # kill_switch, never this soft step-down, even automatically.
+            # kill_switch, never an automatic step-down to paper.
             allowed_triggers=frozenset({Trigger.MANUAL}),
             required_permission="session.stop",
         ),

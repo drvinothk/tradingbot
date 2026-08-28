@@ -7,10 +7,10 @@ through the same `BrokerPort.place_order`/`get_positions()` calls a real
 adapter would (see the Phase 3 plan's "Key design decision"). Any mismatch
 is recorded in `broker_sync_states`, logged as a `ReconciliationRun`, and
 raises a `SystemAlert`. Escalation to `reconciliation_lock` requires **both**
-that the session is `paper_plus_guarded_live`/`live_enabled` (matching
-`ALLOWED_TRANSITIONS`, which only wires `RECONCILIATION_LOCK` in from those
-two) **and** that the mismatched book is the *live* one (`order_mode ==
-LIVE`). A `paper_only` session has no live money at risk; and a paper/mock
+that the session is `live_enabled` (matching `ALLOWED_TRANSITIONS`, which
+only wires `RECONCILIATION_LOCK` in from there) **and** that the mismatched
+book is the *live* one (`order_mode == LIVE`). A `paper_only` session has no
+live money at risk; and a paper/mock
 discrepancy — even on a live-active session — has no real-money meaning and
 must never halt live execution (the mock's position book is process-memory
 only and can legitimately drift from the DB across a restart). Such a paper
@@ -18,8 +18,9 @@ mismatch is still alerted + audited, and additionally pushed to Telegram
 when the session is live-active (a broken paper book is then a
 system-health signal worth investigating), but it does not block.
 
-**2026-08-19**: per-strategy paper/live graduation means a single session
-can now hold open positions in both modes at once. `run_reconciliation`
+**2026-08-19**: per-strategy paper/live routing means a single session
+can hold open positions in both modes at once (a FORCE_PAPER strategy
+alongside live ones). `run_reconciliation`
 itself only ever compares against *one* broker per call, so
 `_local_net_qty_by_symbol` is now scoped to the matching `Order.mode` —
 otherwise the other mode's positions would show up as phantom local-only
@@ -54,11 +55,9 @@ from app.modules.broker_adapter.composition import (
     is_execution_broker_live,
 )
 
-# Only these two modes ever escalate to reconciliation_lock — matches
+# Only this mode ever escalates to reconciliation_lock — matches
 # ALLOWED_TRANSITIONS in app.core.modes.transitions exactly.
-_RECONCILIATION_LOCK_ELIGIBLE_MODES = frozenset(
-    {SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED}
-)
+_RECONCILIATION_LOCK_ELIGIBLE_MODES = frozenset({SafeMode.LIVE_ENABLED})
 
 
 def _local_net_qty_by_symbol(
@@ -72,7 +71,8 @@ def _local_net_qty_by_symbol(
     the true net exposure, not assume the lock always held).
 
     **Mode-scoped since 2026-08-19**: a session can now hold both paper and
-    live positions at once (per-strategy graduation). Without this filter,
+    live positions at once (a FORCE_PAPER strategy alongside live ones).
+    Without this filter,
     a live-only comparison (real broker vs. every local position) would see
     paper positions as phantom local-only holdings, and vice versa for a
     paper-only comparison — a false mismatch on a real-money session.
@@ -175,7 +175,8 @@ def run_reconciliation(
             # reconciled. A live-book mismatch always pushes to Telegram. A
             # paper-book mismatch normally stays DB-only (no live money at
             # risk) -- but when the same session is live-active (a
-            # per-strategy-graduated session holding real positions too), a
+            # live session holding real positions alongside a FORCE_PAPER
+            # strategy's paper ones), a
             # broken paper book is a system-health signal the user must
             # still investigate, so override the paper suppression for that
             # case only.
@@ -240,11 +241,10 @@ def run_full_reconciliation(
     directly with a single, session-resolved broker for any "check this
     whole session" call site (periodic polling, manual trigger, startup
     recovery) — `get_execution_broker(trading_session)` with no
-    `strategy_run` only ever resolves the real broker when the *entire*
-    session is `live_enabled`; in `paper_plus_guarded_live` (per-strategy
-    graduation) it always resolves the mock, so a single-broker call would
-    silently never check the real broker's book at all while a
-    live-graduated strategy could be holding real positions.
+    `strategy_run` only ever resolves the real broker when the session is
+    `live_enabled`; a `FORCE_PAPER` strategy inside such a session still
+    resolves the mock, so a single-broker call could otherwise miss one
+    book while the other strategy holds real positions.
 
     Deliberately unconditional on the paper pass (no skipping it just
     because this session currently has zero known local paper positions) —

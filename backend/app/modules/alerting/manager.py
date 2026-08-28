@@ -167,7 +167,7 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
         "book before taking any action."
     ),
     "health_check_failed": (
-        "Check the host's disk space and system clock; a live/guarded session may "
+        "Check the host's disk space and system clock; a live session may "
         "already be in degraded_mode."
     ),
     "order_rejected": (

@@ -7,7 +7,7 @@ clean shutdown). One instance per `trading_session`, started by
 startup-recovery check after a restart — its job for the life of the
 session is: check every open Position's stop/target/trail against the
 current price, force a square-off once IST wall-clock passes
-`cutoff_time`, watch for a margin breach on guarded-live/live sessions
+`cutoff_time`, watch for a margin breach on live sessions
 (Addendum hardening batch's narrow emergency-square-off trigger), and
 periodically run a polling reconciliation pass.
 
@@ -72,7 +72,7 @@ from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
 logger = logging.getLogger("app.execution_engine.paper.position_manager")
 
-_MARGIN_BREACH_MODES = (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED)
+_MARGIN_BREACH_MODES = (SafeMode.LIVE_ENABLED,)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 3.0
 DEFAULT_RECONCILE_EVERY_N_CYCLES = 5
@@ -165,22 +165,21 @@ class PositionManager:
         Only actually moves the session to `degraded_mode` when the
         transitions table (`core/modes/transitions.py`) has a legal
         `SYSTEM`-triggered edge there from the current mode — which is
-        `paper_plus_guarded_live`/`live_enabled` only. `degraded_mode`
-        exists to protect *live* money; a `paper_only` session (all of
-        Phase 5's real traffic, since it's still no-live-orders) has
-        nothing for it to protect, so the state machine deliberately has
-        no edge there at all. Logging is the entire response in that case
-        — same "market data hiccup, not a safety event" reasoning this
-        system already applies to a `MockBrokerAdapter`-only run.
+        `live_enabled` only. `degraded_mode` exists to protect *live*
+        money; a `paper_only` session has nothing for it to protect, so
+        the state machine deliberately has no edge there at all. Logging
+        is the entire response in that case — same "market data hiccup,
+        not a safety event" reasoning this system already applies to a
+        `MockBrokerAdapter`-only run.
         """
         logger.warning(
             "broker auth failure for session %s: %s", self.trading_session_id, exc
         )
         from_mode = SafeMode(trading_session.mode)
-        if from_mode not in (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED):
+        if from_mode != SafeMode.LIVE_ENABLED:
             return
 
-        # 2026-08-25: this path previously only logged -- a live/guarded
+        # 2026-08-25: this path previously only logged -- a live
         # session losing its broker connection got zero notification
         # anywhere outside the log file. Alerted (and committed
         # immediately, not left riding on the transition below) so the
@@ -222,10 +221,10 @@ class PositionManager:
         """Addendum hardening batch's one narrow automatic emergency-square-
         off trigger (build-plan.md: "a detected margin breach on a live
         position — not on connectivity loss, reconciliation lag, or any
-        other transient condition"). Only called for
-        `paper_plus_guarded_live`/`live_enabled` sessions with open
-        positions (see `_run_cycle`'s guard) — kill-switch is deliberately
-        untouched by this path; a manual "exit all" endpoint and the
+        other transient condition"). Only called for `live_enabled`
+        sessions with open positions (see `_run_cycle`'s guard) —
+        kill-switch is deliberately untouched by this path; a manual
+        "exit all" endpoint and the
         existing EOD square-off cover the other two legs of that same
         Addendum decision.
         """
@@ -269,9 +268,9 @@ class PositionManager:
             severity=AlertSeverity.CRITICAL,
             category="margin_breach_square_off",
             message=reason,
-            # Only ever called for paper_plus_guarded_live/live_enabled
-            # sessions (see this method's own docstring) -- margin itself
-            # is a real-broker-account concept, never a paper simulation.
+            # Only ever called for live_enabled sessions (see this method's
+            # own docstring) -- margin itself is a real-broker-account
+            # concept, never a paper simulation.
             mode=OrderMode.LIVE,
             dedup_key=f"margin_breach_square_off:{trading_session.id}",
         )
@@ -507,8 +506,8 @@ class PositionManager:
                 )
             except BrokerAuthError:
                 # Must propagate to run_once's own except BrokerAuthError,
-                # not be swallowed here -- that's what moves a guarded-live/
-                # live session to degraded_mode (_handle_broker_auth_error).
+                # not be swallowed here -- that's what moves a live
+                # session to degraded_mode (_handle_broker_auth_error).
                 # A per-position try/except that caught this too would
                 # silently defeat that existing safety response for every
                 # position after the first one to hit it.
@@ -608,11 +607,11 @@ class PositionManager:
         self._cycle_count += 1
         if self._cycle_count % self._reconcile_every_n_cycles == 0:
             # run_full_reconciliation, not a single session_broker call --
-            # a session can hold both paper and live positions at once
-            # (per-strategy graduation), and session_broker (resolved with
-            # no strategy_run) would only ever be the real broker when the
-            # *whole* session is live_enabled. See that function's own
-            # docstring.
+            # a session can hold both paper and live positions at once (a
+            # FORCE_PAPER strategy alongside live ones), and session_broker
+            # (resolved with no strategy_run) would only ever be the real
+            # broker when the *whole* session is live_enabled. See that
+            # function's own docstring.
             run_full_reconciliation(db, trading_session, ReconciliationTrigger.POLL)
 
     def _loop(self) -> None:

@@ -7,7 +7,7 @@ of where price currently sits relative to its stop/target. Two callers share
   (see `app.core.clock.now_ist`).
 - `run_margin_breach_square_off`: the Addendum hardening batch's one narrow
   automatic emergency-square-off trigger — a detected negative available
-  margin on a guarded-live/live session (see `PositionManager._run_cycle`).
+  margin on a live session (see `PositionManager._run_cycle`).
   Deliberately *not* triggered by connectivity loss, reconciliation lag, or
   anything else — kill-switch stays freeze-and-alert by design; this is a
   separate, additional control.

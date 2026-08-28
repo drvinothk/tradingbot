@@ -550,8 +550,8 @@ def evaluate_trade_intent(
         # PositionManager's own broker resolution). Two real, opposite
         # incidents same day: a `force_paper` strategy got capped by trades
         # that were never real money (over-restrictive — this session's own
-        # `paper_plus_guarded_live`/`live_enabled` transition capped a
-        # strategy explicitly held back to paper), and a strategy that
+        # transition to a live mode capped a strategy explicitly held back
+        # to paper), and a strategy that
         # dispatched several genuinely-paper trades earlier (session was
         # still `paper_only`, or the strategy itself was still
         # `force_paper` at the time) then had its very first *live* signal

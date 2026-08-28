@@ -146,8 +146,8 @@ class AngelOneRestClient:
             # PositionManager._handle_broker_auth_error treats BrokerAuthError
             # as a mode-transition trigger. Misclassifying a transient proxy
             # blip as an auth failure would risk a spurious degraded_mode
-            # transition on a guarded-live/live session over what's really
-            # just "the relay hiccuped" — a real correctness bug in a
+            # transition on a live session over what's really just "the
+            # relay hiccuped" — a real correctness bug in a
             # real-money code path, not just an inaccurate label.
             raise BrokerConnectivityError(f"Angel One login request failed: {exc}") from exc
 

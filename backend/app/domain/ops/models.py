@@ -82,7 +82,7 @@ class MarketDataProviderPreference(Base, UUIDPkMixin, TimestampMixin):
     `FailoverMarketDataProvider.set_manual_override` by the PATCH endpoint
     whenever a live failover-wrapped singleton already exists. `String(30)`,
     not a native Postgres enum, matching every other enum-shaped column in
-    this codebase (`StrategyStatus`, `ExecutionMode`, etc.) — validated at
+    this codebase (`SafeMode`, `ExecutionMode`, etc.) — validated at
     the API layer against `provider_composition._RECOGNIZED_FAILOVER_
     BACKUPS`-equivalent values, not a DB constraint.
     """

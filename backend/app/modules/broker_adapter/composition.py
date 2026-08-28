@@ -65,7 +65,7 @@ from app.domain.market.mock_universe import build_mock_universe
 from app.domain.market.models import Instrument
 from app.domain.ops.models import DEFAULT_ACTIVE_LIVE_INSTRUMENTS, InstrumentFirewallConfig
 from app.domain.session.models import SafeMode
-from app.domain.strategy.models import StrategyConfig, StrategyRuntimeMode, StrategyStatus
+from app.domain.strategy.models import StrategyConfig, StrategyRuntimeMode
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -341,47 +341,28 @@ def is_strategy_routed_live(
     being evaluated. Two real, opposite-direction incidents same day: a
     `force_paper` strategy got capped by trades that were never real money
     (over-restrictive), and a strategy that dispatched several trades while
-    genuinely paper (session still `paper_only`, or the strategy itself
-    still `force_paper`) then got its very first *live* signal blocked
-    because those earlier paper dispatches had already used up its daily
-    count (under-restrictive protection — the cap's whole purpose is
-    capping real-money exposure, and here it was doing the opposite: it hid
-    behind an already-exhausted count made of trades that never touched
-    real money). This function is the shared "is this strategy live right
-    now" predicate `evaluate_trade_intent` uses to fix both — see its own
-    call site for how the count itself is also scoped to genuinely-live
-    dispatches only.
+    genuinely paper then got its very first *live* signal blocked because
+    those earlier paper dispatches had already used up its daily count
+    (under-restrictive). This function is the shared "is this strategy live
+    right now" predicate — see `evaluate_trade_intent` for how the count
+    itself is also scoped to genuinely-live dispatches only.
+
+    2026-08-28: simplified when `SafeMode.PAPER_PLUS_GUARDED_LIVE` /
+    `StrategyConfig.status` were retired. Live routing is now just: session
+    mode is `live_enabled` AND the strategy is not `FORCE_PAPER`.
     """
     mode = SafeMode(trading_session.mode)
-    if mode in (
-        SafeMode.PAPER_ONLY,
-        SafeMode.DEGRADED_MODE,
-        SafeMode.KILL_SWITCH,
-        SafeMode.RECONCILIATION_LOCK,
-    ):
+    if mode != SafeMode.LIVE_ENABLED:
         return False
 
-    strategy_is_live = False
-    strategy_force_paper = False
     if strategy_run is not None:
         db = object_session(strategy_run)
         if db is not None:
             config = db.get(StrategyConfig, strategy_run.strategy_config_id)
-            strategy_force_paper = (
-                config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
-            )
-            strategy_is_live = (
-                config is not None
-                and config.status == StrategyStatus.LIVE
-                and not strategy_force_paper
-            )
+            if config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER:
+                return False
 
-    if strategy_run is not None and strategy_force_paper:
-        return False
-
-    return mode == SafeMode.LIVE_ENABLED or (
-        mode == SafeMode.PAPER_PLUS_GUARDED_LIVE and strategy_is_live
-    )
+    return True
 
 
 def get_execution_broker(
@@ -427,22 +408,18 @@ def get_execution_broker(
        `place_protective_stop` resting order) for as long as the crash
        loop continued. Live-confirmed 2026-08-25 on a real Test 1
        (ema_micro_pullback) live-mode entry.
-    2. `mode` in `(paper_only, degraded_mode, kill_switch,
-       reconciliation_lock)` → mock, unconditionally, regardless of
+    2. `mode != live_enabled` (paper_only / degraded_mode / kill_switch /
+       reconciliation_lock) → mock, unconditionally, regardless of
        `strategy_run`.
-    3. `mode == live_enabled`, or `mode == paper_plus_guarded_live` and
-       `strategy_run`'s own `StrategyConfig.status == LIVE` (graduated) AND
-       `runtime_mode != FORCE_PAPER` → real broker, gated on
+    3. `mode == live_enabled` AND (`strategy_run` is None OR its
+       `StrategyConfig.runtime_mode != FORCE_PAPER`) → real broker, gated on
        `allow_real_money_dispatch` (raises `ConfigurationError` rather than
        falling back to paper if it's off — a missing/false flag must never
        be silently read as "use paper instead," per explicit design intent).
-       `runtime_mode.FORCE_PAPER` (Ops-Hardening Phase 1) is the tactical,
-       same-day override this check completes -- Phase 1's own docstring
-       named this exact gap ("a later phase's dispatch gating") and it had
-       zero runtime effect anywhere until Phase 6 wired it in here.
-    4. Otherwise (`paper_plus_guarded_live` with no `strategy_run`, or a
-       not-yet-graduated one) → mock. Missing strategy-graduation
-       information must never default *up* to real money.
+       `runtime_mode.FORCE_PAPER` (Ops-Hardening Phase 1) is the per-strategy
+       "hold this one on paper even in a live session" override.
+    4. `mode == live_enabled` AND `strategy_run`'s config is
+       `runtime_mode == FORCE_PAPER` → mock.
 
     **Ops-Hardening Phase 7**: whenever step 3 is about to return a real
     broker AND a `strategy_run` is given (i.e. this is a genuine new-order

@@ -266,8 +266,8 @@ def recover_from_reconciliation_lock(
 
 
 _MASTER_MODE_LADDER: dict[Literal["paper", "live"], list[SafeMode]] = {
-    "live": [SafeMode.PAPER_ONLY, SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED],
-    "paper": [SafeMode.LIVE_ENABLED, SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.PAPER_ONLY],
+    "live": [SafeMode.PAPER_ONLY, SafeMode.LIVE_ENABLED],
+    "paper": [SafeMode.LIVE_ENABLED, SafeMode.PAPER_ONLY],
 }
 
 
@@ -281,18 +281,11 @@ def set_master_trading_mode(
     reason: str = "",
 ) -> TradingSession:
     """The friendly, two-value "master switch" (Paper/Live) a human actually
-    wants, layered over the real 6-state SafeMode ladder -- there is no
-    direct `paper_only <-> live_enabled` edge in `transitions.py`, so both
-    directions walk through `paper_plus_guarded_live` as an intermediate
-    hop, one `transition_mode` call per hop.
-
-    That intermediate hop is safe to pass through unattended: it is
-    strictly more restrictive than `live_enabled` (it additionally requires
-    per-strategy graduation, `StrategyConfig.status == LIVE`, which nothing
-    in this codebase can currently set -- see that field's own docstring),
-    so a session sitting there for the instant between hops behaves
-    identically to `paper_only` for every strategy that exists today, in
-    either direction.
+    wants. `paper_only <-> live_enabled` is a direct edge in `transitions.py`
+    (since 2026-08-28, when the `paper_plus_guarded_live` intermediate tier
+    was retired), so this is a single `transition_mode` call — the ladder
+    structure is kept only for its "already at target = no-op" and "session
+    is in an unexpected mode = reject" guards.
 
     Deliberately refuses -- rather than walking through -- when the session
     is currently in one of the three emergency states (`kill_switch`,

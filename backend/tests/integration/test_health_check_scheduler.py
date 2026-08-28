@@ -103,7 +103,7 @@ def test_run_once_records_metrics_for_active_sessions_workspace(
 def test_run_once_moves_guarded_live_session_to_degraded_mode_on_failed_check(
     db: Session, trading_session, monkeypatch
 ):
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.flush()
 
     monkeypatch.setattr(

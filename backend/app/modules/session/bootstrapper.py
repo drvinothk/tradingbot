@@ -96,7 +96,8 @@ def _close_if_safe(db: Session, stale_session: TradingSession) -> None:
         logger.critical("Daily bootstrap: %s", message)
         # 2026-08-25: "no notification for paper trade at all" -- the open
         # risk left behind here could be entirely paper, entirely live, or
-        # a mix (per-strategy graduation lets one session hold both). Only
+        # a mix (a FORCE_PAPER strategy alongside live ones in one session).
+        # Only
         # push if at least one of the still-open positions is genuinely
         # LIVE; a paper-only stale session stays DB-only.
         has_live_open_position = (

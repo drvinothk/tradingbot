@@ -393,17 +393,16 @@ def test_run_once_moves_guarded_live_session_to_degraded_mode_on_broker_auth_err
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
     """`degraded_mode` exists to protect *live* money — only
-    `paper_plus_guarded_live`/`live_enabled` have a legal `SYSTEM`-triggered
-    edge there (see `core/modes/transitions.py`). This test uses a
-    guarded-live session specifically to exercise that edge; the next test
-    proves the (far more common, this phase) `paper_only` case correctly
-    does *not* transition.
+    `live_enabled` has a legal `SYSTEM`-triggered edge there (see
+    `core/modes/transitions.py`). This test uses a `live_enabled` session
+    specifically to exercise that edge; the next test proves the
+    `paper_only` case correctly does *not* transition.
     """
     _dispatch_position(
         db, trading_session, strategy_run, option_contract, broker,
         stop_price=72.0, target_price=92.0,
     )
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.flush()
 
     manager = PositionManager(
@@ -531,7 +530,7 @@ def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_se
         stop_price=72.0, target_price=92.0,
     )
     broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - keep it between stop/target
-    trading_session.mode = SafeMode.PAPER_PLUS_GUARDED_LIVE
+    trading_session.mode = SafeMode.LIVE_ENABLED
     db.flush()
 
     manager = PositionManager(
@@ -549,7 +548,7 @@ def test_run_once_squares_off_all_positions_on_margin_breach_for_guarded_live_se
 
     # Kill-switch is deliberately untouched by this path.
     db.refresh(trading_session)
-    assert trading_session.mode == SafeMode.PAPER_PLUS_GUARDED_LIVE
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
 
     assert (
         db.query(SystemAlert)
@@ -803,7 +802,7 @@ def test_run_cycle_resolves_broker_per_position_when_strategies_differ(
 ):
     """2026-08-19 regression: the actual live incident. Two open positions
     in the same cycle -- one opened by a force_paper strategy, one by a
-    genuinely graduated-live strategy -- on a session that has reached
+    plain (live-routed) strategy -- on a session that has reached
     live_enabled. PositionManager must resolve each position's own broker
     via its own strategy, not reuse a single broker for the whole cycle
     (the real bug: a force_paper position's close attempt routed to the

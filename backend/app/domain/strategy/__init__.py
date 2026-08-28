@@ -7,7 +7,6 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "StrategyConfig",
     "StrategyRun",
     "StrategyRunStatus",
-    "StrategyStatus",
     "TradeIntent",
     "TradeIntentStatus",
 ]

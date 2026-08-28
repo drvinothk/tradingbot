@@ -12,7 +12,7 @@ PERMISSIONS: dict[str, str] = {
     "session.start": "Can start a trading session",
     "session.stop": "Can stop a trading session",
     "papertrade.execute": "Can run strategies in paper mode",
-    "livetrade.execute": "Can run strategies in live/guarded-live mode",
+    "livetrade.execute": "Can run strategies in live mode",
     "broker.manage": "Can add/edit broker account configuration",
     "risk.override": "Can override risk limits, clear kill_switch/reconciliation_lock",
     "audit.view": "Can read the audit log",

@@ -1,11 +1,17 @@
-"""Strategy runtime domain. `StrategyConfig` is the graduation record (its
-`status` field is what Phase 6 checks before a strategy can receive a live
-TradeIntent); `Signal`/`TradeIntent` are what every strategy — synthetic now,
+"""Strategy runtime domain. `StrategyConfig` is a strategy's persistent
+definition (`is_enabled` on/off, `runtime_mode` force-paper override,
+`params`); `Signal`/`TradeIntent` are what every strategy — synthetic now,
 real from Phase 4 — is allowed to emit, per the shared `Strategy` interface
 in `app.modules.strategy_engine.interface` (no Order/Position access at any
 layer beneath it). A TradeIntent's own status lifecycle ends at `DISPATCHED`
 ("handed to Execution Service") — what happens after that lives in
 `app.domain.execution`'s Order/Position/TradeOutcome chain, not here.
+
+2026-08-28: the `StrategyStatus` graduation ladder
+(research/paper/paper_plus_guarded_live/live) was retired (migration 0028) —
+it never had an API setter and its only remaining reader
+(`broker_adapter.composition.is_strategy_routed_live`) now decides live
+routing purely from the session's `SafeMode` plus `runtime_mode`.
 """
 
 from __future__ import annotations
@@ -33,24 +39,15 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
 
 
-class StrategyStatus(enum.StrEnum):
-    RESEARCH = "research"
-    PAPER = "paper"
-    PAPER_PLUS_GUARDED_LIVE = "paper_plus_guarded_live"
-    LIVE = "live"
-
-
 class StrategyRuntimeMode(enum.StrEnum):
-    """Ops-Hardening Phase 1 (2026-08-14): a tactical, same-day override
-    layered on top of `StrategyConfig.status`'s own graduation ladder — e.g.
-    forcing a `live`-graduated strategy to trade paper-only for one choppy
-    session without touching its actual graduation status. Deliberately
-    downgrade-only, mirroring the 6-state `SafeMode` matrix's own "overrides
-    only ever restrict, never expand" philosophy
-    (`app.core.modes.state_machine`) — there is no `FORCE_LIVE` value, since
-    raising execution tier must always go through the real graduation ladder
-    (`status`), never a same-day toggle. `StrategyConfig.runtime_mode` is
-    nullable; `None` means "no override, defer to `status`'s own tier."
+    """Ops-Hardening Phase 1 (2026-08-14): a per-strategy "hold this one on
+    paper even though the session is live" override. Deliberately
+    downgrade-only, mirroring the `SafeMode` matrix's own "overrides only
+    ever restrict, never expand" philosophy
+    (`app.core.modes.state_machine`) — there is no `FORCE_LIVE` value; the
+    only way to raise a strategy to real money is the session master switch
+    (`SafeMode.LIVE_ENABLED`). `StrategyConfig.runtime_mode` is nullable;
+    `None` means "no override — route per the session mode."
     """
 
     FORCE_PAPER = "force_paper"
@@ -96,13 +93,12 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     name: Mapped[str] = mapped_column(String(120))
     # "synthetic" | "orb" | "vwap_pullback" | "ema_micro_pullback" — which
     # Strategy subclass api.v1.strategies.start_strategy instantiates. Not an
-    # enum.StrEnum column like the rest of this file's status fields because
-    # new strategy types are added by later phases (Phase 7/8) without a
+    # enum.StrEnum column like this file's other status fields because new
+    # strategy types are added by later phases (Phase 7/8) without a
     # migration touching every existing row's constraint.
     strategy_type: Mapped[str] = mapped_column(String(40), default="synthetic")
     params: Mapped[dict] = mapped_column(JSONB, default=dict)
-    status: Mapped[StrategyStatus] = mapped_column(String(30), default=StrategyStatus.RESEARCH)
-    # Ops-Hardening Phase 1: master on/off switch, independent of `status`.
+    # Ops-Hardening Phase 1: master on/off switch for the daily bootstrapper.
     # Load-bearing for the Phase 4 daily bootstrapper — a freshly
     # auto-created `TradingSession` has no existing `StrategyRun` rows to
     # resume, so `is_enabled` is what tells that bootstrap which configs

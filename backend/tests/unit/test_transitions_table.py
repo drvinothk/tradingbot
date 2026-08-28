@@ -24,9 +24,8 @@ def test_kill_switch_is_reachable_from_every_other_mode():
 
 def test_no_automatic_trigger_ever_targets_a_live_mode():
     """Rule 4: automatic (SYSTEM/RISK/RECONCILIATION) transitions only ever
-    move down in privilege — none of them may target paper_plus_guarded_live
-    or live_enabled."""
-    live_targets = {SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED}
+    move down in privilege — none of them may target live_enabled."""
+    live_targets = {SafeMode.LIVE_ENABLED}
     automatic_triggers = {Trigger.SYSTEM, Trigger.RISK, Trigger.RECONCILIATION}
 
     for from_mode, edges in ALLOWED_TRANSITIONS.items():
@@ -38,23 +37,18 @@ def test_no_automatic_trigger_ever_targets_a_live_mode():
                 )
 
 
-def test_live_enabled_loss_cap_stepdown_is_manual_only():
-    """Loss cap breach must escalate straight to kill_switch, never a soft
-    step-down to guarded_live — so that edge must not permit RISK-triggered
-    automatic transitions."""
-    rule = ALLOWED_TRANSITIONS[SafeMode.LIVE_ENABLED][SafeMode.PAPER_PLUS_GUARDED_LIVE]
+def test_live_enabled_stepdown_to_paper_is_manual_only():
+    """Loss cap breach must escalate straight to kill_switch, never an
+    automatic step-down to paper_only — so the `live_enabled -> paper_only`
+    edge must not permit RISK/SYSTEM-triggered automatic transitions."""
+    rule = ALLOWED_TRANSITIONS[SafeMode.LIVE_ENABLED][SafeMode.PAPER_ONLY]
     assert rule.allowed_triggers == frozenset({Trigger.MANUAL})
 
 
-def test_promotions_require_livetrade_execute_permission():
-    promotions = [
-        (SafeMode.PAPER_ONLY, SafeMode.PAPER_PLUS_GUARDED_LIVE),
-        (SafeMode.PAPER_PLUS_GUARDED_LIVE, SafeMode.LIVE_ENABLED),
-    ]
-    for from_mode, to_mode in promotions:
-        rule = ALLOWED_TRANSITIONS[from_mode][to_mode]
-        assert rule.required_permission == "livetrade.execute"
-        assert rule.allowed_triggers == frozenset({Trigger.MANUAL})
+def test_promotion_to_live_requires_livetrade_execute_permission():
+    rule = ALLOWED_TRANSITIONS[SafeMode.PAPER_ONLY][SafeMode.LIVE_ENABLED]
+    assert rule.required_permission == "livetrade.execute"
+    assert rule.allowed_triggers == frozenset({Trigger.MANUAL})
 
 
 def test_kill_switch_recovery_requires_permission():

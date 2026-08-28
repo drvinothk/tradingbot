@@ -9,9 +9,13 @@ wired in later via a credentials file.
 
 ## Status: Phase 0-4 + frontend + Phase 7 complete; Phase 5 in progress (Phase 6 blocked on it)
 
-- ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the full 6-state safe
-  operating-mode state machine (`paper_only` / `paper_plus_guarded_live` /
-  `live_enabled` / `degraded_mode` / `reconciliation_lock` / `kill_switch`), Postgres
+- ✅ **Phase 0** — Auth (Argon2) + RBAC, hash-chained audit log, the safe
+  operating-mode state machine (`paper_only` / `live_enabled` / `degraded_mode` /
+  `reconciliation_lock` / `kill_switch` — originally 6-state; the
+  `paper_plus_guarded_live` per-strategy graduation tier was retired 2026-08-28
+  along with `StrategyStatus`, migration 0028, so the master switch now walks
+  `paper_only <-> live_enabled` directly and a single strategy is held on paper
+  in a live session via `StrategyRuntimeMode.FORCE_PAPER`), Postgres
   advisory locking (execution singleton, process singleton, serialized audit writes),
   Windows sleep inhibitor, NTP/disk health checks, rate limiter, Windows Service
   wrapper, CI.
@@ -255,7 +259,11 @@ check, then exercise it live).
   (Phase 2 found and fixed a real gap here: `paper_only → kill_switch` didn't allow
   a `RISK`-triggered transition, so Risk Service's daily-loss-cap breach couldn't
   reach kill_switch from a `paper_only` session — added `Trigger.RISK` to that edge,
-  verified against every structural test in that file first.)
+  verified against every structural test in that file first.) **2026-08-28**:
+  `paper_plus_guarded_live` removed from the table (migration 0028) — `paper_only`
+  now has a direct manual `→ live_enabled` edge, `live_enabled` a direct manual
+  `→ paper_only` edge, and the structural tests were updated to assert the same
+  invariants against the collapsed shape.
 - **If it's not in `audit_events`, it didn't happen.** Every safety-relevant action
   (auth, mode transitions, later: risk decisions, orders) goes through
   `app/modules/audit_service/service.py`'s `record_event`, which maintains a

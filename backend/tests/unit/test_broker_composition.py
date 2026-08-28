@@ -252,13 +252,17 @@ def test_unwrap_broker_returns_the_broker_itself_when_not_wrapped():
     assert composition.unwrap_broker(mock) is mock
 
 
-def test_guarded_live_with_no_strategy_run_returns_mock_even_with_flag_on(monkeypatch):
+def test_live_enabled_with_no_strategy_run_and_flag_returns_real(monkeypatch):
+    # No strategy_run (reconciliation / EOD-square-off / margin-check call
+    # sites pass None) -- a live_enabled session still resolves the real
+    # broker for those. The old `paper_plus_guarded_live` "no strategy_run
+    # -> mock" case is gone (that mode was retired 2026-08-28).
     _allow_real_money(monkeypatch, True)
     composition.set_broker(_FakeRealBroker())
 
-    broker = composition.get_execution_broker(_session(SafeMode.PAPER_PLUS_GUARDED_LIVE))
+    broker = composition.get_execution_broker(_session(SafeMode.LIVE_ENABLED))
 
-    assert isinstance(broker, MockBrokerAdapter)
+    assert not isinstance(broker, MockBrokerAdapter)
 
 
 def test_is_execution_broker_live_distinguishes_mock_from_real():

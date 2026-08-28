@@ -1,8 +1,8 @@
-"""Ops-Hardening Phase 5: get_execution_broker's strategy-graduation
-(paper_plus_guarded_live + strategy_run) and position-aware (opened-live
-exits bypass SafeMode) gating -- the two branches that need real DB rows
-(StrategyConfig.status / Order.mode via object_session), unlike the
-mode-only branches already covered in tests/unit/test_broker_composition.py.
+"""get_execution_broker's per-strategy (FORCE_PAPER inside a live_enabled
+session) and position-aware (opened-live exits bypass SafeMode) gating --
+the branches that need real DB rows (StrategyConfig.runtime_mode / Order.mode
+via object_session), unlike the mode-only branches already covered in
+tests/unit/test_broker_composition.py.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from app.domain.strategy.models import (
     StrategyRun,
     StrategyRunStatus,
     StrategyRuntimeMode,
-    StrategyStatus,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -81,7 +80,7 @@ def trading_session(db: Session, workspace, broker_account, user: User) -> Tradi
         workspace_id=workspace.id,
         broker_account_id=broker_account.id,
         started_by_user_id=user.id,
-        mode=SafeMode.PAPER_PLUS_GUARDED_LIVE,
+        mode=SafeMode.LIVE_ENABLED,
         started_at=datetime.now(UTC),
         budget_amount=100_000,
         daily_target_profit=5_000,
@@ -99,7 +98,6 @@ def _strategy_run(
     workspace,
     trading_session,
     user,
-    status: StrategyStatus,
     runtime_mode: StrategyRuntimeMode | None = None,
     instrument_id: uuid.UUID | None = None,
 ) -> StrategyRun:
@@ -107,7 +105,6 @@ def _strategy_run(
         id=uuid.uuid4(),
         workspace_id=workspace.id,
         name=f"orb-{uuid.uuid4().hex[:6]}",
-        status=status,
         runtime_mode=runtime_mode,
     )
     db.add(config)
@@ -127,69 +124,40 @@ def _strategy_run(
     return run
 
 
-# -- strategy-graduation gating -----------------------------------------
+# -- live_enabled + per-strategy FORCE_PAPER gating --------------------
 
 
-def test_guarded_live_with_non_graduated_strategy_returns_mock(
+def test_live_session_plain_strategy_and_flag_returns_real(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     _allow_real_money(monkeypatch, True)
     composition.set_broker(_FakeRealBroker())
-    run = _strategy_run(
-        db,
-        workspace=workspace,
-        trading_session=trading_session,
-        user=user,
-        status=StrategyStatus.PAPER,
-    )
-
-    broker = composition.get_execution_broker(trading_session, run)
-
-    assert isinstance(broker, MockBrokerAdapter)
-
-
-def test_guarded_live_with_graduated_strategy_and_flag_returns_real(
-    db: Session, workspace, trading_session, user, monkeypatch
-):
-    _allow_real_money(monkeypatch, True)
-    composition.set_broker(_FakeRealBroker())
-    run = _strategy_run(
-        db,
-        workspace=workspace,
-        trading_session=trading_session,
-        user=user,
-        status=StrategyStatus.LIVE,
-    )
+    run = _strategy_run(db, workspace=workspace, trading_session=trading_session, user=user)
 
     broker = composition.get_execution_broker(trading_session, run)
 
     assert not isinstance(broker, MockBrokerAdapter)
 
 
-def test_guarded_live_with_graduated_strategy_but_no_flag_raises(
+def test_live_session_plain_strategy_but_no_flag_raises(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     _allow_real_money(monkeypatch, False)
     composition.set_broker(_FakeRealBroker())
-    run = _strategy_run(
-        db,
-        workspace=workspace,
-        trading_session=trading_session,
-        user=user,
-        status=StrategyStatus.LIVE,
-    )
+    run = _strategy_run(db, workspace=workspace, trading_session=trading_session, user=user)
 
     with pytest.raises(ConfigurationError):
         composition.get_execution_broker(trading_session, run)
 
 
-def test_guarded_live_with_graduated_strategy_but_force_paper_returns_mock(
+def test_live_session_with_force_paper_strategy_returns_mock(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
-    """Ops-Hardening Phase 6: `runtime_mode.FORCE_PAPER` overrides a graduated
-    (LIVE) strategy's routing back to mock, even with the flag on and a real
-    broker connected -- the tactical same-day downgrade Phase 1 introduced
-    but left with zero runtime effect until this wiring.
+    """`runtime_mode.FORCE_PAPER` holds a single strategy on paper even in a
+    `live_enabled` session, with the flag on and a real broker connected --
+    the "restricts, never expands" contract. This is now the *only*
+    per-strategy live/paper lever (the `StrategyStatus` graduation ladder
+    was retired 2026-08-28).
     """
     _allow_real_money(monkeypatch, True)
     composition.set_broker(_FakeRealBroker())
@@ -198,34 +166,6 @@ def test_guarded_live_with_graduated_strategy_but_force_paper_returns_mock(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
-        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
-    )
-
-    broker = composition.get_execution_broker(trading_session, run)
-
-    assert isinstance(broker, MockBrokerAdapter)
-
-
-def test_live_enabled_session_with_force_paper_strategy_still_returns_mock(
-    db: Session, workspace, trading_session, user, monkeypatch
-):
-    """Regression: the `live_enabled` branch never consults `strategy_is_live`
-    at all (a session-wide override that supersedes individual graduation),
-    so a first-pass implementation that only fed FORCE_PAPER into
-    `strategy_is_live` silently had zero effect once the session itself
-    reached `live_enabled` -- caught on Phase 7's own pre-deploy QC pass,
-    contradicting FORCE_PAPER's own "restricts, never expands" contract.
-    """
-    _allow_real_money(monkeypatch, True)
-    composition.set_broker(_FakeRealBroker())
-    trading_session.mode = SafeMode.LIVE_ENABLED
-    run = _strategy_run(
-        db,
-        workspace=workspace,
-        trading_session=trading_session,
-        user=user,
-        status=StrategyStatus.LIVE,
         runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
     )
 
@@ -247,7 +187,7 @@ def banknifty(db: Session) -> Instrument:
     return inst
 
 
-def test_guarded_live_with_instrument_on_firewall_returns_real(
+def test_live_session_with_instrument_on_firewall_returns_real(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     _allow_real_money(monkeypatch, True)
@@ -262,7 +202,6 @@ def test_guarded_live_with_instrument_on_firewall_returns_real(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
         instrument_id=nifty.id,
     )
 
@@ -271,7 +210,7 @@ def test_guarded_live_with_instrument_on_firewall_returns_real(
     assert not isinstance(broker, MockBrokerAdapter)
 
 
-def test_guarded_live_with_instrument_not_on_firewall_raises(
+def test_live_session_with_instrument_not_on_firewall_raises(
     db: Session, workspace, trading_session, user, banknifty, monkeypatch
 ):
     _allow_real_money(monkeypatch, True)
@@ -283,7 +222,6 @@ def test_guarded_live_with_instrument_not_on_firewall_raises(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
         instrument_id=banknifty.id,
     )
 
@@ -291,7 +229,7 @@ def test_guarded_live_with_instrument_not_on_firewall_raises(
         composition.get_execution_broker(trading_session, run)
 
 
-def test_guarded_live_with_no_firewall_row_defaults_to_nifty_only(
+def test_live_session_with_no_firewall_row_defaults_to_nifty_only(
     db: Session, workspace, trading_session, user, banknifty, monkeypatch
 ):
     # No InstrumentFirewallConfig row seeded at all -- must fall back to
@@ -303,7 +241,6 @@ def test_guarded_live_with_no_firewall_row_defaults_to_nifty_only(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
         instrument_id=banknifty.id,
     )
 
@@ -311,7 +248,7 @@ def test_guarded_live_with_no_firewall_row_defaults_to_nifty_only(
         composition.get_execution_broker(trading_session, run)
 
 
-def test_guarded_live_with_no_instrument_id_on_run_skips_firewall_check(
+def test_live_session_with_no_instrument_id_on_run_skips_firewall_check(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     # A strategy_run predating the instrument_id column (still NULL) --
@@ -325,7 +262,6 @@ def test_guarded_live_with_no_instrument_id_on_run_skips_firewall_check(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
         instrument_id=None,
     )
 
@@ -373,7 +309,6 @@ def _position(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
     )
     signal = Signal(
         id=uuid.uuid4(),
@@ -463,7 +398,6 @@ def _pending_order(
         workspace=workspace,
         trading_session=trading_session,
         user=user,
-        status=StrategyStatus.LIVE,
     )
     signal = Signal(
         id=uuid.uuid4(),

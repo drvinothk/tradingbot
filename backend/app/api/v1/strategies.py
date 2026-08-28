@@ -400,7 +400,6 @@ class StrategyConfigOut(BaseModel):
     name: str
     strategy_type: str
     params: dict
-    status: str
     is_enabled: bool
     runtime_mode: str | None
     underlying_symbol: str | None
@@ -538,9 +537,8 @@ def update_strategy(
     user: User = Depends(require_permission("strategy.edit")),
 ) -> StrategyConfig:
     """Ops-Hardening Phase 1 (`is_enabled`/`runtime_mode`) + Phase 6
-    (`underlying_symbol`). `status` (the graduation ladder) and
-    `strategy_type`/`params` are untouched here, deliberately not folded
-    into one catch-all PATCH.
+    (`underlying_symbol`). `strategy_type`/`params` are untouched here,
+    deliberately not folded into one catch-all PATCH.
 
     `runtime_mode: null`/`underlying_symbol: null` explicitly clear the
     field, distinct from omitting it entirely (which leaves it untouched) —

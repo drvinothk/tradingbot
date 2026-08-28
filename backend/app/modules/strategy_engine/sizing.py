@@ -6,14 +6,16 @@ mode-aware default -- explicit user request: "default will be 1 lot for live
 trading, and 10 lots for paper trading... if I dont edit, 1 lot stays as default,
 hence the risk is also managed there."
 
-2026-08-28: the first cut keyed the default off `StrategyConfig.status == LIVE`
--- a field with no API setter, stuck at `research` forever -- so a strategy
-graduated to live via the session master switch (`SafeMode.LIVE_ENABLED`) kept
-the 10-lot *paper* default while Risk Service (correctly) gated it as live,
-and every signal was rejected for `per_trade_lot_cap_exceeded`. Fixed by keying
-the default off the exact same predicate that actually routes the order --
+2026-08-28: the first cut keyed the default off the old
+`StrategyConfig.status == LIVE` graduation field -- which had no API setter,
+so a strategy taken live via the session master switch
+(`SafeMode.LIVE_ENABLED`) kept the 10-lot *paper* default while Risk Service
+(correctly) gated it as live, and every signal was rejected for
+`per_trade_lot_cap_exceeded`. Fixed by keying the default off the exact same
+predicate that actually routes the order --
 `broker_adapter.composition.is_strategy_routed_live` -- so sizing and
-risk/broker routing can never disagree again.
+risk/broker routing can never disagree again. (`StrategyStatus` was then
+retired entirely, migration 0028.)
 
 An explicit `params["qty_lots"]` always wins over the default, in either mode
 (1 lot is only a conservative testing-phase floor; real multi-lot sizing is set

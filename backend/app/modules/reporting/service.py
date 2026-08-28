@@ -1,11 +1,11 @@
-"""Reporting v1 — the strategy graduation dashboard's data layer. Both
+"""Reporting v1 — the strategy performance dashboard's data layer. Both
 `build_daily_report` (one trading_session) and `build_scorecard` (one
 strategy_config, across every session it's ever run in) compute the same
 shape of stats from real `trade_outcomes` rows — win rate, avg win/loss,
 profit factor, max drawdown, slippage — plus a signal-vs-execution count
 (`signals` generated vs `trade_intents` actually dispatched vs `positions`
 actually filled), which is what makes a strategy's paper performance
-legible enough to decide whether it graduates.
+legible enough to decide whether it's ready to run live.
 """
 
 from __future__ import annotations
