@@ -10,7 +10,7 @@ const MODE_LABELS: Record<string, string> = {
 }
 
 export function ModeBanner() {
-  const { isLoading, activeSession, shoonyaConnected } = useActiveSessionMode()
+  const { isLoading, activeSession, shoonyaConnected, shoonyaSessionValid } = useActiveSessionMode()
 
   if (isLoading) {
     return null
@@ -21,12 +21,26 @@ export function ModeBanner() {
     activeSession != null &&
     ['degraded_mode', 'reconciliation_lock', 'kill_switch'].includes(activeSession.mode)
 
+  // Identity ("Shoonya (REAL)" vs "Mock") tracks session_valid so a brief feed
+  // stall doesn't read as "switched to Mock"; a stalled-but-real feed gets an
+  // amber "no data" marker instead.
+  let brokerText: string
+  let brokerClass: string
+  if (!shoonyaSessionValid) {
+    brokerText = 'Broker: Mock'
+    brokerClass = 'badge'
+  } else if (shoonyaConnected) {
+    brokerText = 'Broker: Shoonya (REAL)'
+    brokerClass = 'badge badge-live'
+  } else {
+    brokerText = 'Broker: Shoonya (REAL) — no data'
+    brokerClass = 'badge badge-warning'
+  }
+
   return (
     <div className={`mode-banner${isAlarming ? ' mode-banner-alarm' : ''}`}>
       <span>{activeSession ? `Active session: ${modeLabel}` : 'No active session'}</span>
-      <span className={`badge${shoonyaConnected ? ' badge-live' : ''}`}>
-        Broker: {shoonyaConnected ? 'Shoonya (REAL)' : 'Mock'}
-      </span>
+      <span className={brokerClass}>{brokerText}</span>
     </div>
   )
 }

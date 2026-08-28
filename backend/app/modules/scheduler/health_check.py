@@ -48,7 +48,7 @@ from app.modules.alerting.manager import send_alert
 from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
-    classify_latest_tick,
+    underlying_feed_state,
 )
 from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_within_market_hours
 from app.modules.ops.metrics_service import record_metric
@@ -188,8 +188,16 @@ class HealthCheckScheduler(IntervalScheduler):
             if instrument is None:
                 continue
 
-            state = classify_latest_tick(
-                db, instrument.id, thresholds=_MARKET_DATA_STALE_THRESHOLDS
+            # Both the tick stream *and* the REST-fallback bar stream must be
+            # stale before this counts as a dead feed -- during a WS outage
+            # the ingestion service keeps `price_bars` flowing via REST
+            # polling even though `quote_ticks` have stopped, and that's a
+            # healthy state, not one to alert a human about.
+            state = underlying_feed_state(
+                db,
+                instrument.id,
+                tick_thresholds=_MARKET_DATA_STALE_THRESHOLDS,
+                bar_thresholds=_MARKET_DATA_STALE_THRESHOLDS,
             )
             if state not in (FreshnessState.STALE, FreshnessState.DEAD):
                 continue

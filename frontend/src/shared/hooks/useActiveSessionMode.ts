@@ -14,7 +14,12 @@ const EMERGENCY_MODES = new Set(['degraded_mode', 'reconciliation_lock', 'kill_s
 export interface ActiveSessionMode {
   isLoading: boolean
   activeSession: SessionOut | null
+  // Data is actually flowing right now (fresh tick/bar).
   shoonyaConnected: boolean
+  // A real Shoonya adapter is installed and hasn't hit an auth failure --
+  // stays true through a brief feed stall, so the "Shoonya (REAL)" vs "Mock"
+  // identity label doesn't flip to "Mock" just because ticks paused.
+  shoonyaSessionValid: boolean
 }
 
 export function useActiveSessionMode(): ActiveSessionMode {
@@ -49,5 +54,6 @@ export function useActiveSessionMode(): ActiveSessionMode {
     isLoading: sessionsQuery.isLoading || shoonyaStatusQuery.isLoading,
     activeSession,
     shoonyaConnected: shoonyaStatusQuery.data?.connected ?? false,
+    shoonyaSessionValid: shoonyaStatusQuery.data?.session_valid ?? false,
   }
 }

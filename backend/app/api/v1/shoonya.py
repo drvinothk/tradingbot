@@ -199,8 +199,31 @@ def _spawn_post_login_background_work(adapter: BrokerPort, *, market_data_provid
 
 
 @router.get("/status")
-def get_status(user: User = Depends(require_permission("session.start"))) -> dict:
-    return {"connected": is_shoonya_configured()}
+def get_status(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> dict:
+    """`connected` means data is actually flowing right now — a real Shoonya
+    adapter is installed *and* a fresh underlying tick or price bar exists.
+    `session_valid` is the older, weaker signal (a real adapter installed and
+    no `BrokerAuthError` seen through it) — kept so the header banner can show
+    an accurate "Shoonya (REAL)" vs "Mock" identity even while the feed is
+    momentarily stalled. Deliberately does no live broker call: freshness is a
+    cheap read off `quote_ticks`/`price_bars`, so a stalled feed reports
+    `connected: false` within one poll and flips back on its own the moment
+    the WS reconnect (or REST fallback, or a manual re-login) resumes writing.
+    """
+    session_valid = is_shoonya_configured()
+    if not session_valid:
+        return {"connected": False, "session_valid": False}
+
+    from app.modules.market_data.freshness import any_underlying_feed_fresh
+    from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS
+
+    return {
+        "connected": any_underlying_feed_fresh(db, TRADABLE_UNDERLYINGS),
+        "session_valid": True,
+    }
 
 
 @router.get("/ws-diagnostic")

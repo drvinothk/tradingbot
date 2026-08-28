@@ -8,6 +8,7 @@ from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
     _snapshot_has_live_prices,
+    better_of,
     check_price_drift,
     classify_age,
     fresh_tick_or_none,
@@ -71,6 +72,12 @@ def test_worse_of_picks_more_severe_state():
     assert worse_of(FreshnessState.LIVE, FreshnessState.STALE) == FreshnessState.STALE
     assert worse_of(FreshnessState.DEAD, FreshnessState.LIVE) == FreshnessState.DEAD
     assert worse_of(FreshnessState.DEGRADED, FreshnessState.DEGRADED) == FreshnessState.DEGRADED
+
+
+def test_better_of_picks_less_severe_state():
+    assert better_of(FreshnessState.LIVE, FreshnessState.STALE) == FreshnessState.LIVE
+    assert better_of(FreshnessState.DEAD, FreshnessState.DEGRADED) == FreshnessState.DEGRADED
+    assert better_of(FreshnessState.STALE, FreshnessState.STALE) == FreshnessState.STALE
 
 
 def test_check_price_drift_within_tolerance_is_false():

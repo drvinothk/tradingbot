@@ -15,7 +15,7 @@ import enum
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -54,6 +54,20 @@ OPTION_CHAIN_THRESHOLDS = FreshnessThresholds(
 
 # Beyond this, data has no useful age left to reason about at all.
 DEAD_AFTER_SECONDS = 3600.0
+
+# "Is the Shoonya feed live right now" for the connection indicator
+# (`GET /shoonya/status`) — deliberately looser than TICK_THRESHOLDS so a
+# brief hiccup doesn't flap the badge, and split per source: during a WS
+# outage the ingestion service auto-falls-back to REST polling, which writes
+# `price_bars` (a completed 60s bucket, so its newest row legitimately lags
+# ~60-150s even while perfectly healthy) but not `quote_ticks`. Either source
+# being fresh means the feed is up.
+UI_TICK_FRESH_THRESHOLDS = FreshnessThresholds(
+    degraded_after_seconds=30.0, stale_after_seconds=120.0
+)
+UI_BAR_FRESH_THRESHOLDS = FreshnessThresholds(
+    degraded_after_seconds=90.0, stale_after_seconds=210.0
+)
 
 # How much the underlying's premium may have moved since a price was proposed
 # (a Signal/TradeIntent's entry_price) before it's treated as stale — shared
@@ -110,6 +124,77 @@ def classify_latest_tick(
     if latest is None:
         return FreshnessState.DEAD
     return classify_age(latest.ts, datetime.now(UTC), thresholds)
+
+
+def classify_latest_bar(
+    db: Session,
+    instrument_id: uuid.UUID,
+    *,
+    timeframe_seconds: int = 60,
+    thresholds: FreshnessThresholds = TICK_THRESHOLDS,
+) -> FreshnessState:
+    """Read-only classification of the latest underlying `PriceBar` — the
+    second, independent "is data still arriving" signal alongside
+    `classify_latest_tick`. `price_bars` are the one thing the WS→REST
+    polling fallback (`MarketDataIngestionService._poll_loop`) keeps writing
+    when `quote_ticks` have stopped, so a caller that treats a stale tick
+    stream as "feed dead" without also checking this would misread a healthy
+    REST-fallback period.
+
+    A completed bucket represents data through `bucket_start + timeframe`, so
+    that sum is the effective "as of" time (`price_bars` has no write
+    timestamp column).
+    """
+    from app.domain.market.models import PriceBar
+
+    latest = (
+        db.query(PriceBar)
+        .filter(
+            PriceBar.instrument_id == instrument_id,
+            PriceBar.timeframe == f"{timeframe_seconds}s",
+        )
+        .order_by(PriceBar.bucket_start.desc())
+        .first()
+    )
+    if latest is None:
+        return FreshnessState.DEAD
+    effective_ts = latest.bucket_start + timedelta(seconds=timeframe_seconds)
+    return classify_age(effective_ts, datetime.now(UTC), thresholds)
+
+
+def underlying_feed_state(
+    db: Session,
+    instrument_id: uuid.UUID,
+    *,
+    tick_thresholds: FreshnessThresholds = UI_TICK_FRESH_THRESHOLDS,
+    bar_thresholds: FreshnessThresholds = UI_BAR_FRESH_THRESHOLDS,
+) -> FreshnessState:
+    """The better (fresher) of the tick stream and the REST-fallback bar
+    stream for one underlying — either being live means the feed is up.
+    """
+    return better_of(
+        classify_latest_tick(db, instrument_id, thresholds=tick_thresholds),
+        classify_latest_bar(db, instrument_id, thresholds=bar_thresholds),
+    )
+
+
+def any_underlying_feed_fresh(db: Session, symbols: tuple[str, ...]) -> bool:
+    """`True` if *any* of `symbols` (an `Instrument.symbol`) currently has a
+    live/degraded underlying feed. The Shoonya WS connection is shared across
+    both underlyings, so one flowing is enough to call the connection up;
+    per-underlying staleness is a separate concern handled by the health
+    check's `market_data_stale` alert.
+    """
+    for symbol in symbols:
+        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+        if instrument is None:
+            continue
+        if underlying_feed_state(db, instrument.id) in (
+            FreshnessState.LIVE,
+            FreshnessState.DEGRADED,
+        ):
+            return True
+    return False
 
 
 def _latest_chain_snapshot(
@@ -266,6 +351,10 @@ _SEVERITY = {
 
 def worse_of(a: FreshnessState, b: FreshnessState) -> FreshnessState:
     return a if _SEVERITY[a] >= _SEVERITY[b] else b
+
+
+def better_of(a: FreshnessState, b: FreshnessState) -> FreshnessState:
+    return a if _SEVERITY[a] <= _SEVERITY[b] else b
 
 
 def check_price_drift(latest_ltp: float, reference_price: float, *, tolerance_pct: float) -> bool:

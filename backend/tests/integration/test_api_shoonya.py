@@ -230,7 +230,40 @@ def test_status_reports_not_connected_by_default(api_client: TestClient, seeded_
     _login(api_client, seeded_admin)
     response = api_client.get("/shoonya/status")
     assert response.status_code == 200
-    assert response.json() == {"connected": False}
+    assert response.json() == {"connected": False, "session_valid": False}
+
+
+def test_status_connected_when_configured_and_feed_is_fresh(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    import app.modules.market_data.freshness as freshness_module
+
+    monkeypatch.setattr(shoonya_module, "is_shoonya_configured", lambda: True)
+    monkeypatch.setattr(freshness_module, "any_underlying_feed_fresh", lambda db, symbols: True)
+
+    _login(api_client, seeded_admin)
+    response = api_client.get("/shoonya/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"connected": True, "session_valid": True}
+
+
+def test_status_session_valid_but_not_connected_when_feed_is_stale(
+    api_client: TestClient, seeded_admin, monkeypatch
+):
+    """A real adapter is installed (session_valid) but no fresh tick/bar
+    exists — e.g. before the morning feed warms up, or a mid-session WS drop.
+    """
+    import app.modules.market_data.freshness as freshness_module
+
+    monkeypatch.setattr(shoonya_module, "is_shoonya_configured", lambda: True)
+    monkeypatch.setattr(freshness_module, "any_underlying_feed_fresh", lambda db, symbols: False)
+
+    _login(api_client, seeded_admin)
+    response = api_client.get("/shoonya/status")
+
+    assert response.status_code == 200
+    assert response.json() == {"connected": False, "session_valid": True}
 
 
 def test_login_url_returns_409_when_credentials_not_configured(

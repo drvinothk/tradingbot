@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
 
 import pytest
@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.clock import ClockCheckResult, DiskCheckResult
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
+from app.domain.market.models import Instrument, PriceBar, QuoteTick
 from app.domain.ops.models import MetricSeries, SystemAlert
 from app.domain.session.models import (
     FundingMode,
@@ -161,6 +162,94 @@ def test_run_once_does_not_transition_paper_only_session_on_failed_check(
         .filter(
             SystemAlert.workspace_id == trading_session.workspace_id,
             SystemAlert.category == "health_check_failed",
+        )
+        .count()
+        == 1
+    )
+
+
+def _seed_nifty(db: Session) -> Instrument:
+    inst = Instrument(
+        id=uuid.uuid4(), symbol="NIFTY", exchange="NSE", lot_size=75, tick_size=0.05
+    )
+    db.add(inst)
+    db.flush()
+    return inst
+
+
+def _ntp_disk_ok(monkeypatch) -> None:
+    monkeypatch.setattr("app.modules.scheduler.health_check.check_ntp_drift", lambda: _OK_NTP)
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
+    )
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.is_within_market_hours", lambda: True
+    )
+
+
+def test_market_data_staleness_no_alert_when_bar_stream_is_still_fresh(
+    db: Session, trading_session, monkeypatch
+):
+    """WS ticks stopped, but the REST-fallback keeps writing `price_bars` —
+    a healthy state, must not fire `market_data_stale`.
+    """
+    _ntp_disk_ok(monkeypatch)
+    inst = _seed_nifty(db)
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(), instrument_id=inst.id, ltp=100.0, bid=99.5, ask=100.5,
+            volume=0, oi=None, ts=datetime.now(UTC) - timedelta(seconds=4000),
+        )
+    )
+    db.add(
+        PriceBar(
+            id=uuid.uuid4(), instrument_id=inst.id, timeframe="60s",
+            bucket_start=datetime.now(UTC) - timedelta(seconds=90),
+            open=100.0, high=101.0, low=99.0, close=100.5, volume=1000,
+        )
+    )
+    db.flush()
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "market_data_stale",
+        )
+        .count()
+        == 0
+    )
+
+
+def test_market_data_staleness_alerts_when_tick_and_bar_are_both_stale(
+    db: Session, trading_session, monkeypatch
+):
+    _ntp_disk_ok(monkeypatch)
+    inst = _seed_nifty(db)
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(), instrument_id=inst.id, ltp=100.0, bid=99.5, ask=100.5,
+            volume=0, oi=None, ts=datetime.now(UTC) - timedelta(seconds=4000),
+        )
+    )
+    db.add(
+        PriceBar(
+            id=uuid.uuid4(), instrument_id=inst.id, timeframe="60s",
+            bucket_start=datetime.now(UTC) - timedelta(seconds=4000),
+            open=100.0, high=101.0, low=99.0, close=100.5, volume=1000,
+        )
+    )
+    db.flush()
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "market_data_stale",
         )
         .count()
         == 1

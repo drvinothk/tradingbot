@@ -20,7 +20,11 @@ export interface UserOut {
 }
 
 export interface ShoonyaStatusOut {
+  // `connected` = data is actually flowing right now. `session_valid` = a real
+  // broker adapter is installed and hasn't hit an auth failure (Shoonya only;
+  // Alice Blue reuses this type and omits it).
   connected: boolean
+  session_valid?: boolean
 }
 
 export interface ShoonyaLoginUrlOut {

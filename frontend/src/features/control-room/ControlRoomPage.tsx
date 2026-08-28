@@ -45,7 +45,7 @@ const EMPTY_RUNS: RunningStrategyOut[] = []
 export function ControlRoomPage() {
   const queryClient = useQueryClient()
   const { liveSession, paperSession, isLoading: bucketsLoading } = useSessionBuckets()
-  const { shoonyaConnected } = useActiveSessionMode()
+  const { shoonyaConnected, shoonyaSessionValid } = useActiveSessionMode()
   const [actionError, setActionError] = useState<string | null>(null)
   const [hiddenRowKeys, setHiddenRowKeys] = useState<Set<string>>(new Set())
   const [paperExpanded, setPaperExpanded] = useState(false)
@@ -118,6 +118,7 @@ export function ControlRoomPage() {
       <ControlRoomHeader
         liveSession={liveSession}
         shoonyaConnected={shoonyaConnected}
+        shoonyaSessionValid={shoonyaSessionValid}
         onError={setActionError}
         onChanged={invalidateTrades}
       />
@@ -166,11 +167,13 @@ export function ControlRoomPage() {
 function ControlRoomHeader({
   liveSession,
   shoonyaConnected,
+  shoonyaSessionValid,
   onError,
   onChanged,
 }: {
   liveSession: SessionOut | null
   shoonyaConnected: boolean
+  shoonyaSessionValid: boolean
   onError: (message: string | null) => void
   onChanged: () => void
 }) {
@@ -306,7 +309,12 @@ function ControlRoomHeader({
       <div className="row-actions">
         <span className="broker-status-text">
           <span className={`status-dot ${shoonyaConnected ? 'on' : 'off'}`} />{' '}
-          Broker: {shoonyaConnected ? 'Shoonya (REAL)' : 'Mock'}
+          Broker:{' '}
+          {!shoonyaSessionValid
+            ? 'Mock'
+            : shoonyaConnected
+              ? 'Shoonya (REAL)'
+              : 'Shoonya (REAL) — no data'}
         </span>
         <span className="muted">Backend/Feed latency: <span className="badge badge-wip">WIP</span></span>
         <div className="row-actions">
