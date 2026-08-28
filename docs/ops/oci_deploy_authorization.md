@@ -96,3 +96,16 @@ Approve? (yes / yes+add-allow-rules / no)
   Verified: `import app.main OK`, `/health` ok, 5 strategy runners resumed
   clean, md5 of interface.py / orb_conviction.py / strategies.py / models.py
   identical local↔OCI. `backend/scripts/*` deliberately NOT deployed.
+
+- **2026-08-28 ~22:40 IST** — `backend/app` tree at commit `05c9784`
+  (remove the `SHOONYA_WS_FRAME_DEBUG` temporary WS-frame diagnostic from
+  `shoonya/ws_client.py` + `shoonya/adapter.py`). Pure deletion, no behavior
+  change (flag off by default), no migration. Approved by operator after the
+  classifier blocked SSH. Safety gate: 22:40 IST, market closed 7h, formality.
+  Backup `app.bak-20260828-224017`. Verified: post-extract `grep -c
+  SHOONYA_WS_FRAME_DEBUG` == `0 0` both files, credentials dir intact,
+  `import app.main OK`, `systemctl restart` → `active`, `/health` ok.
+  Also ran `systemctl unset-environment SHOONYA_WS_FRAME_DEBUG` — it was
+  already absent from the systemd manager env, the unit `Environment=`, all
+  `.env` files, and (confirmed) the running process env. Flag fully retired,
+  code + config. `backend/scripts/*` deliberately NOT deployed.
