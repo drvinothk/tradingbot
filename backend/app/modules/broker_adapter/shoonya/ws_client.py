@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from collections.abc import Callable
@@ -96,23 +95,6 @@ from app.modules.broker_adapter.shoonya.normalizer import (
 OrderUpdateCallback = Callable[[dict], None]
 
 logger = logging.getLogger("app.broker_adapter.shoonya.ws")
-
-# TEMPORARY DIAGNOSTIC (2026-08-27) — set SHOONYA_WS_FRAME_DEBUG=1 to log the
-# first `_FRAME_DEBUG_MAX_PER_KEY` raw `tk`/`tf` touchline frames received per
-# subscription key, verbatim, plus the merged snapshot's `v` (volume) field.
-# Built to answer one open question during market hours: whether Shoonya's WS
-# touchline for the subscribed NIFTY/BANKNIFTY token still carries a usable
-# `v` at all (volume has read 0 on every tick since 2026-08-24, breaking
-# session-cumulative VWAP and `vwap_pullback`). Off by default, self-limiting
-# even when on, and safe to leave in — remove once the volume-source fix
-# lands and is verified.
-_FRAME_DEBUG = os.environ.get("SHOONYA_WS_FRAME_DEBUG", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-_FRAME_DEBUG_MAX_PER_KEY = 30
 
 # Reconnect backoff — capped, not exponential-forever, since a broker outage
 # lasting hours shouldn't turn into a multi-hour sleep before the next retry.
@@ -179,8 +161,6 @@ class ShoonyaWSClient:
         # carries no `v` at all, so their front-month future supplies it.
         self._volume_proxy: dict[str, str] = {}
         self._proxy_last_cum_v: dict[str, float] = {}
-        # TEMPORARY DIAGNOSTIC (2026-08-27) — see `_FRAME_DEBUG` above.
-        self._frame_debug_count: dict[str, int] = {}
         self._lock = threading.Lock()
 
         # The live connection object, set only while `_run`'s `with connect(...)`
@@ -524,20 +504,6 @@ class ShoonyaWSClient:
                 return
             merged = {**self._last_known_by_key.get(key, {}), **message}
             self._last_known_by_key[key] = merged
-            if _FRAME_DEBUG and msg_type in ("tk", "tf", "dk", "df"):
-                seen = self._frame_debug_count.get(key, 0)
-                if seen < _FRAME_DEBUG_MAX_PER_KEY:
-                    self._frame_debug_count[key] = seen + 1
-                    logger.warning(
-                        "WS FRAME DEBUG %s [%s sym=%s disp=%s] raw=%r  merged.v=%r lp=%r",
-                        msg_type,
-                        key,
-                        entry.contract_symbol,
-                        entry.dispatch,
-                        message,
-                        merged.get("v"),
-                        merged.get("lp"),
-                    )
             if not entry.dispatch:
                 # Cache-only source (volume proxy) — snapshot kept above,
                 # nothing forwarded.

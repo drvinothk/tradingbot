@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import time
 from dataclasses import replace
@@ -841,17 +840,6 @@ class ShoonyaBrokerAdapter(BrokerPort):
             self._ws_bound_on_depth = on_depth
 
         entries = [(symbol, *self._resolve_symbol_token(symbol)) for symbol in contract_symbols]
-        if os.environ.get("SHOONYA_WS_FRAME_DEBUG", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        ):
-            # TEMPORARY DIAGNOSTIC (2026-08-27) — pairs with ws_client's
-            # WS FRAME DEBUG: shows which (exchange, token) each subscribed
-            # underlying actually resolved to, so a zero-`v` frame can be
-            # attributed to "index token has no volume" vs a real data gap.
-            logger.warning("WS FRAME DEBUG subscribe resolution: %r", entries)
         self._ws.subscribe(entries)
 
         # NSE cash-index touchline carries no volume field at all (live-
