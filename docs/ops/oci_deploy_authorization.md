@@ -84,3 +84,15 @@ Commands:
 Rollback:    mv app.bak-<ts> app && systemctl restart trading-bot
 Approve? (yes / yes+add-allow-rules / no)
 ```
+
+## Deploy log
+
+- **2026-08-28 ~14:05 IST** — `backend/app` tree at commit `4eaf43f`
+  (conviction-gated ORB + ATR-breakout strategies + TradeProposal risk-overlay
+  fields + additive `ExitReason.MAX_LOSS`/`TIME_STOP`). Additive only, no
+  migration, no running strategy uses the new types. Approved by operator
+  after the classifier blocked the SSH extract. Safety gate: session
+  `paper_only`, no open live positions. Backup `app.bak-20260828-083537`.
+  Verified: `import app.main OK`, `/health` ok, 5 strategy runners resumed
+  clean, md5 of interface.py / orb_conviction.py / strategies.py / models.py
+  identical local↔OCI. `backend/scripts/*` deliberately NOT deployed.
