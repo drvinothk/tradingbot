@@ -45,6 +45,7 @@ const PRIMARY_STRATEGY_TYPES: StrategyType[] = [
   'ema_micro_pullback',
   'vwap_pullback',
   'liquidity_sweep_reversal',
+  'orb_conviction',
 ]
 const FOLDED_STRATEGY_TYPE: StrategyType = 'synthetic'
 const ALL_STRATEGY_TYPES: StrategyType[] = [...PRIMARY_STRATEGY_TYPES, FOLDED_STRATEGY_TYPE]
@@ -510,6 +511,7 @@ function CreateStrategyDefinitionRow({ onCreated }: { onCreated: () => void }) {
             {[
               'synthetic',
               'orb',
+              'orb_conviction',
               'vwap_pullback',
               'ema_micro_pullback',
               'oi_volume_confirmed',

@@ -17,6 +17,7 @@
 const STRATEGY_TYPE_LABELS: Record<string, string> = {
   synthetic: 'Synthetic',
   orb: 'ORB',
+  orb_conviction: 'ORB Conviction',
   vwap_pullback: 'VWAP Pullback',
   ema_micro_pullback: 'EMA Micro-Pullback',
   oi_volume_confirmed: 'OI/Volume Confirmed',

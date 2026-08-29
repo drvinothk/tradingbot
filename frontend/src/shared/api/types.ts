@@ -6,6 +6,7 @@ export type ExecutionMode = 'auto' | 'approval_required'
 export type StrategyType =
   | 'synthetic'
   | 'orb'
+  | 'orb_conviction'
   | 'vwap_pullback'
   | 'ema_micro_pullback'
   | 'oi_volume_confirmed'

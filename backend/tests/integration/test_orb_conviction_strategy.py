@@ -646,3 +646,28 @@ class TestPriorDayTrendGate:
         assert isinstance(s, ORBConvictionStrategy)
         assert s.require_prior_day_trend is True
         assert s.prior_day_trend_buffer_pts == 15.0
+
+    def test_build_strategy_maps_the_d_pdt_w65_paper_config(self, db, workspace):
+        """The exact params dict the shortlisted `ORB_Conviction` paper
+        config ships with (backtest sweep #3 `d_pdt_w65`, pinned to the
+        09:15-10:00 entry window) must map cleanly onto the strategy —
+        an unknown key here would raise a TypeError at start_strategy time.
+        """
+        from datetime import time as dt_time
+
+        from app.api.v1.strategies import _build_strategy
+
+        config = StrategyConfig(
+            id=uuid.uuid4(), workspace_id=workspace.id, name="ORB_Conviction",
+            strategy_type="orb_conviction",
+            params={
+                "require_prior_day_trend": True,
+                "max_or_range_nifty_points": 65,
+                "orb_entry_cutoff_time": "10:00",
+            },
+        )
+        s = _build_strategy(config, uuid.uuid4(), EXPIRY)
+        assert isinstance(s, ORBConvictionStrategy)
+        assert s.require_prior_day_trend is True
+        assert s.max_or_range_nifty_points == 65
+        assert s.orb_entry_cutoff_time == dt_time(10, 0)
