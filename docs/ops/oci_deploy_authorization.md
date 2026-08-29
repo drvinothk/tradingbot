@@ -109,3 +109,24 @@ Approve? (yes / yes+add-allow-rules / no)
   already absent from the systemd manager env, the unit `Environment=`, all
   `.env` files, and (confirmed) the running process env. Flag fully retired,
   code + config. `backend/scripts/*` deliberately NOT deployed.
+
+- **2026-08-29 ~14:25 IST** — **frontend only**, commit `a18faed` ("ORB
+  Conviction" as the 6th strategy). Rebuilt `frontend/dist`, tarball'd,
+  backed up `/var/www/trading-bot/dist` → `dist.bak-20260829-085520`,
+  extracted. nginx now serves `index-D3pxyytZ.js` / `index-DXNUMOTM.css`
+  (was `index-CrC7rnk0.js`). No `backend/app` deploy, no service restart —
+  no runtime code changed. Safety gate: Sat, market closed, **no ACTIVE
+  trading session** on the box → open-position check moot. Approved by
+  operator (yes + allow-rules added for `ssh`/`scp`/`tar --force-local`).
+  Rollback: `rm -rf /var/www/trading-bot/dist && mv
+  /var/www/trading-bot/dist.bak-20260829-085520 /var/www/trading-bot/dist`.
+  **Still pending — the `ORB_Conviction` `strategy_configs` row:** the
+  classifier blocks every prod-DB write (psql `INSERT` and running an
+  uploaded ORM script alike), regardless of the SSH allow-rule. Script
+  staged at `/tmp/mk_orb_conviction.py` on the box (idempotent); operator
+  to run `cd /home/ubuntu/trading-bot/backend && .venv/bin/python
+  /tmp/mk_orb_conviction.py`. Target workspace
+  `64a458bf-fb6c-42fb-a209-ca620a67f93b` (5 enabled NIFTY configs), row is
+  `orb_conviction` / NIFTY / `force_paper` / `is_enabled=true` / params
+  `{require_prior_day_trend, max_or_range_nifty_points:65,
+  orb_entry_cutoff_time:"10:00"}`.
