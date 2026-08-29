@@ -468,6 +468,24 @@ def _load_underlying_bars(data_dir: Path, underlying: str) -> list[Bar]:
     return bars
 
 
+def _swing_structure_level(
+    underlying_bars: list[Bar], entry_ts: datetime, *, lookback: int, is_ce: bool
+) -> float | None:
+    """W6 (2026-08-29): recent swing low (CE) / high (PE) for
+    `--exit-mode current --structure-stop-mode swing` -- the min low / max
+    high over the last `lookback` completed underlying bars strictly before
+    `entry_ts`. `None` if the window is empty (entry too near session open),
+    in which case the caller falls back to the strategy's own
+    `structure_level`. Plain min/max over N bars = "the bottom/top of the
+    nearby support/resistance candle" -- one clean param, no fractal-strength
+    knob to overfit at this trade count.
+    """
+    window = [b for b in underlying_bars if b.ts < entry_ts][-lookback:]
+    if not window:
+        return None
+    return min(b.low for b in window) if is_ce else max(b.high for b in window)
+
+
 def _discover_expiry_dir(
     data_dir: Path,
     underlying: str,
@@ -1496,6 +1514,7 @@ def _reconstruct_exit_current(
     atr_series: list[tuple[datetime, float]] | None = None,
     max_loss_per_lot: float | None = None,
     time_stop_minutes: float | None = None,
+    structure_level_override: float | None = None,
 ) -> ReconstructedTrade:
     """`--exit-mode current` (2026-08-27) — the faithful default, replacing
     `legacy` as `main()`'s own CLI default while `legacy` itself stays
@@ -1574,9 +1593,13 @@ def _reconstruct_exit_current(
     trail_stop: Decimal | None = None
 
     structure_level = (
-        Decimal(str(trade_intent.structure_level))
-        if trade_intent.structure_level is not None
-        else None
+        Decimal(str(structure_level_override))
+        if structure_level_override is not None
+        else (
+            Decimal(str(trade_intent.structure_level))
+            if trade_intent.structure_level is not None
+            else None
+        )
     )
     structure_buffer = Decimal(str(trade_intent.structure_break_buffer or 0))
     structure_persistence = float(trade_intent.structure_break_persistence_seconds or 0)
@@ -2268,6 +2291,8 @@ def _run_single_backtest(
     underlying_series: list[tuple[datetime, float]] | None = None,
     target_multiplier: float = 2.0,
     strategy_params: dict[str, object] | None = None,
+    structure_stop_mode: str = "or_boundary",
+    swing_lookback: int = 10,
 ) -> tuple[dict[str, list[ReconstructedTrade]], int, Counter[str], int]:
     """One expiry's full seed -> replay -> risk-outcome -> exit-reconstruction
     pass — the exact single-run body `main()` used to run inline, now
@@ -2554,6 +2579,37 @@ def _run_single_backtest(
 
                 if mode == "current":
                     assert underlying_series is not None  # guaranteed by main(), every call site
+                    # W6 (2026-08-29): optionally anchor the structure-break
+                    # exit to a chart level (recent swing low/high, or a
+                    # classic floor pivot) instead of the strategy's own
+                    # structure_level (opening-range boundary for ORB).
+                    # `or_boundary` (default) -> None -> byte-identical to
+                    # before this change. `None` for any other reason (empty
+                    # swing window, first-day pivot) also falls back to the
+                    # strategy's own level -- never skip a trade.
+                    structure_level_override: float | None = None
+                    if structure_stop_mode != "or_boundary":
+                        is_ce = option_type_by_intent[intent_id] == DomainOptionType.CE
+                        if structure_stop_mode == "swing":
+                            structure_level_override = _swing_structure_level(
+                                all_underlying_bars,
+                                trade_intent.created_at,
+                                lookback=swing_lookback,
+                                is_ce=is_ce,
+                            )
+                        else:  # pivot_s1r1 / pivot_s2r2
+                            entry_date = trade_intent.created_at.date()
+                            if entry_date not in pivots_by_date:
+                                ohlc = prior_day_ohlc(all_underlying_bars, entry_date)
+                                pivots_by_date[entry_date] = (
+                                    compute_floor_pivots(*ohlc) if ohlc is not None else None
+                                )
+                            pv = pivots_by_date[entry_date]
+                            if pv is not None:
+                                if structure_stop_mode == "pivot_s1r1":
+                                    structure_level_override = pv.s1 if is_ce else pv.r1
+                                else:
+                                    structure_level_override = pv.s2 if is_ce else pv.r2
                     trades_by_mode[mode].append(
                         _reconstruct_exit_current(
                             trade_intent,
@@ -2574,6 +2630,7 @@ def _run_single_backtest(
                             # separate gated follow-up (see TradeProposal docstring).
                             max_loss_per_lot=getattr(strategy_obj, "max_loss_per_lot", None),
                             time_stop_minutes=getattr(strategy_obj, "time_stop_minutes", None),
+                            structure_level_override=structure_level_override,
                         )
                     )
                     continue
@@ -2775,6 +2832,23 @@ def main() -> None:
         "chosen --strategy's own *_PARAM_KEYS allowlist accepts are forwarded to its "
         "constructor (api.v1.strategies._build_strategy); unknown keys are ignored, same "
         "as a real strategy_config.",
+    )
+    parser.add_argument(
+        "--structure-stop-mode", default="or_boundary",
+        choices=["or_boundary", "swing", "pivot_s1r1", "pivot_s2r2"],
+        help="`--exit-mode current` only (W6, 2026-08-29). What the structure-break exit's "
+        "level is anchored to. 'or_boundary' (default) = today's behaviour, byte-identical: "
+        "the strategy's own structure_level (opening-range boundary for ORB). 'swing' = the "
+        "min low (CE) / max high (PE) of the last --swing-lookback underlying 1-min bars "
+        "before entry. 'pivot_s1r1'/'pivot_s2r2' = classic floor-pivot S1/R1 or S2/R2 off the "
+        "prior trading day's OHLC (backtest_pivots.py). A None result for any reason (empty "
+        "swing window, no prior-day OHLC) falls back to the strategy's own level. Ignored by "
+        "every exit mode other than 'current'.",
+    )
+    parser.add_argument(
+        "--swing-lookback", type=int, default=10,
+        help="Only for --structure-stop-mode swing: how many prior underlying 1-min bars the "
+        "swing low/high is taken over. Default 10.",
     )
     parser.add_argument(
         "--pairs", default=None,
@@ -3032,6 +3106,8 @@ def main() -> None:
                     total_lots=args.total_lots,
                     underlying_series=underlying_series,
                     target_multiplier=args.target_multiplier,
+                    structure_stop_mode=args.structure_stop_mode,
+                    swing_lookback=args.swing_lookback,
                 )
                 total_risk_rejected += rejected
                 total_risk_rejected_reasons.update(reasons)
@@ -3104,6 +3180,8 @@ def main() -> None:
                 total_lots=args.total_lots,
                 underlying_series=underlying_series,
                 target_multiplier=args.target_multiplier,
+                structure_stop_mode=args.structure_stop_mode,
+                swing_lookback=args.swing_lookback,
             )
             total_risk_rejected += rejected
             total_risk_rejected_reasons.update(reasons)
@@ -3151,6 +3229,8 @@ def main() -> None:
                 total_lots=args.total_lots,
                 underlying_series=underlying_series,
                 target_multiplier=args.target_multiplier,
+                structure_stop_mode=args.structure_stop_mode,
+                swing_lookback=args.swing_lookback,
             )
         )
 

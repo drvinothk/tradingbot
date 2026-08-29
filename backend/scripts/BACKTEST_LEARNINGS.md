@@ -79,6 +79,364 @@ test as supporting (not decisive — n is small). At n≈20–40, every pass is
 
 ---
 
+## 2026-08-30 (~00:30 IST) — LOREN TRACK (Lorentzian Classification) — options + futures both PARK
+
+**Separate from the ORB Sweep #3 W-series.** jdehorty's ML Lorentzian
+Classification + Nadaraya-Watson kernel, ported standalone
+(`loren_backtest.py`, pandas/numpy only — no app/DB/`run_backtest.py`).
+Files: `LOREN_BACKTEST_PLAN.md`, `run_loren_options_sweep.sh`,
+`run_loren_futures_sweep.sh`, `analyze_loren_futures.py`. `--selfcheck` proves
+the kernel + k-NN prediction are non-repainting.
+
+**loren-options** (`sweep3w7_loren_20260829T132354Z`, 17 configs, real 1-yr NIFTY
+weekly option chains, `--exit-mode current`-equivalent, per-1-lot net of the
+0.5%/side option cost model):
+- Signal-only sanity (`--underlying-only`, 3.2 yr index): 53% win, +24 pts/trade,
+  PF ~3, flat across TRAIN/VALID/TEST — looked genuinely good.
+- Every one of 17 option configs **fails the robust bar**: severe IS/OOS split
+  (all profit in the last ~6 mo), bootstrap P(mean≤0) 0.27–0.39, negative
+  5th-pctile, 16–19 of ~43 expiry weeks positive, most die at 1.0%/side.
+  Spec-literal `reject if risk > 0.75·ATR14` trades only ~7×/yr. Best config
+  `l_comb_cap075` (tight structure stop + kernel-managed combined exit): +₹138/lot
+  ALL, PF 1.21, but P(mean≤0) 0.27. **PARK.**
+
+**loren-futures** (`Loren_Futures.txt` v3 — same signal on NIFTY futures, no
+Greeks, to isolate signal edge from option decay). Data reality: no multi-yr
+1-min futures on disk (Shoonya ~41 days; TrueData stitch ~56 sparse pre-expiry
+days; only the cash index has 3 yr, volume=0). The Loren signal is 100%
+price-only, so cash index = sound no-Greeks proxy (basis ~0.3%, mean-reverting,
+immaterial intraday). Real Indian-F&O futures cost model (STT sell-side
+dominates, ≈₹460/lot ≈ 7 pts).
+- **Pass 0 (edge gate) → PARK. Pass 1 (spec §6 matrix) NOT run.**
+- Spec-literal `reject` mode: **3–6 trades in 3 years** (unusable n). Only
+  `f_cap` (`risk_exceed_action:"cap"`) gives a real sample: **n=566, 26.9% win,
+  gross +6.2 pts/trade, net −0.9 pts/trade (−₹60/lot), PF 0.95, maxDD ₹127k,
+  worst streak 16.** TRAIN −129 / VALID −223 / TEST +325 Rs/lot; bootstrap
+  **P(mean≤0) = 0.68**; worse at higher slippage. Same OOS-only shape as
+  loren-options — no in-sample foundation.
+- **Verdict (matches `Loren_Futures.txt` §5):** the loren-options IS/OOS
+  collapse is NOT an option-execution artifact. On a clean instrument with tiny
+  costs the gross edge (~6 pts/trade) is too thin to clear real cost and has no
+  stable in-sample base. **The problem is in the signal/filters.** Any revival
+  fixes the signal first — do not re-test the instrument, do not run the §6 sweep.
+- Real-futures cross-check (Shoonya ~41 days) is near-useless: the file is too
+  short to warm the 2000-bar classifier (~11 tradeable days after warmup);
+  direction bias agreed (more shorts), magnitude didn't.
+
+---
+
+## 2026-08-29 (~22:45 IST) — Sweep #3 W7b: trail_lock_fraction ladder (0.7 / 0.8 / 0.9)
+
+W4+W7 only ever tested `trail_lock_fraction` 0.4 and 0.6 (0.4->0.6 was a
+consistent free gain in all 4 sweeps). W7b fills 0.7 / 0.8 / 0.9 at the W7
+lead configs — all stop 18%, no fixed target — plus `stop18+target30`. Same
+26 `d_pdt_w65` entries, pure exit-overlay re-slice. Dir
+`sweep3w7tsl2_20260829T162046Z` (12 cfg, 18-sharded). Every config 26 trades.
+
+### Lock ladder at trail-arm +12% (the "balanced" lead), stop 18, no target
+
+| lock | win% | E/lot | PF | IS E | OOS E | P(mean<=0) | 1% slip |
+|---|---|---|---|---|---|---|---|
+| 0.6 (W7) | 73.1 | +491 | 12.95 | +473 | +529 | 0.000 | ~+430 |
+| **0.7** | 73.1 | +499 | 13.17 | +483 | +537 | 0.000 | +435 |
+| **0.8** | 73.1 | +508 | 13.39 | +492 | +545 | 0.000 | +444 |
+| **0.9** | 73.1 | +517 | 13.61 | +502 | +552 | 0.000 | +453 |
+
+Same monotonic, no-turning-point pattern at every other arm too:
+arm +6% -> l07 +285 / l08 +294 (win 80.8% flat); arm +10% -> l07 +396 /
+l08 +401 (win 73.1% flat); arm +14% -> l07 +527 / l08 +539 / l09 +550
+(win 69.2% flat, but OOS weak: +432/+441/+451 vs IS +570/+582/+594);
+`stop18+target30` -> l06 +586 / l08 +600 (win 65.4% flat, IS +578/+590,
+OOS +602/+622).
+
+### Findings
+
+1. **Locking harder keeps helping, all the way to 0.9 — no turning point.**
+   ~+9/lot per 0.1 step at arm 12. **Win rate is byte-identical** (73.1%) at
+   every lock level; IS and OOS both rise proportionally; PF creeps
+   12.95 -> 13.61.
+2. **Drawdown does not move.** The losing trades are identical across all
+   lock levels (exit mix `stop: 1/0%/-425`, `eod: 1/0%/-139`,
+   `structure_break: 7/29%/+204` — unchanged l06->l09). Only the 17 winning
+   `trail` exits shift (avg net +713 -> +740 at arm12). **maxDD stays ₹425**
+   at arm 12 regardless of lock.
+3. **Why it's free here:** the trailing stop is never what turns a winner
+   into a loser in this sample — `trail` exits are 100% win at every lock
+   level. Banking a bigger fraction of the run-up just adds a few ₹ on those
+   17 trades at zero cost. The 0.4->0.6 "free gain" simply continues.
+4. **The effect is tiny** — ~₹26/lot total from lock 0.6->0.9, driven by 17
+   trail exits on n=26. Real in-sample and it replicates IS+OOS, but it is
+   not a reason to re-pick the config. Use **0.8** (conventional ceiling;
+   0.9 leaves almost no trail room) and move on.
+
+### Revised balanced tier
+
+`stop_pct:0.18, target_pct:1.0, trail_activation_fraction:0.12,
+trail_lock_fraction:0.8` — **73.1% win, +₹508/lot, PF 13.39, maxDD ₹425,
+IS +492 / OOS +545, P(mean<=0)=0.000, +₹444 at 1% slip.** Best *backtest*
+number; ~+₹17/lot over the `:0.6` variant, same on every other axis. Still
+n=26 -> paper-trade to collect data, not deploy. Nothing committed / deployed.
+
+**BUT for the actual paper test, use `trail_lock_fraction:0.6`, not 0.8.**
+The give-back room at 0.8 is only 20% of gain-beyond-arm (vs 40% at 0.6) —
+half the cushion against a sub-minute adverse wick, which the 1-min sim
+cannot see. The ₹17/lot edge rests on 17 in-sample trail exits with zero
+sub-minute visibility. Run 0.6 live; tighten to 0.8 only once real fills
+show trailing exits are clean (not chopped-then-price-ran-on). Full
+paper-test config + spike-robustness + skip-Friday reversal + day-wise
+table are in memory `project_orb_directional_filter_sweep3_2026_08_29`
+(2026-08-30 ~01:00 IST entry).
+
+---
+
+## 2026-08-29 (~21:30 IST) — Sweep #3 W6 (chart structure stop) + W7 (stop x TSL grid) RESULTS
+
+Both on the e4 VM, `--near-expiry-days 6`, `--exit-mode current`, 18-sharded,
+pure exit-overlay re-slices of the SAME 26 `d_pdt_w65` entries (`orb_conviction`
++ `{require_prior_day_trend:true, max_or_range_nifty_points:65}`). Dirs:
+`sweep3w6_structstop_20260829T135839Z` (13 cfg), `sweep3w7tsl_20260829T135042Z`
+(24 cfg). Isolation anchors both byte-identical: W6 `s_or_baseline` ==
+`x_baseline_stop15`; W7 `w7_s15_a08_l04` == `x_notgt_arm08_stop15`;
+`w7_s15_a06_l06` == `x_notgt_stop15_arm06_lock06`.
+
+### W6 -- chart-based structure stop -- NEGATIVE, doesn't beat the OR boundary
+
+New backtest-only harness flag `--structure-stop-mode {or_boundary,swing,
+pivot_s1r1,pivot_s2r2}` + `--swing-lookback` in `_reconstruct_exit_current`
+(~55 lines, no strategy code; `or_boundary` smoke byte-identical to
+`x_baseline_s0.csv`). Anchors the structure-break exit level to a recent swing
+candle low/high or a classic floor pivot instead of `orb_conviction`'s
+opening-range boundary. All configs carry `stop_pct:0.15` as a backstop.
+
+| structure stop | win% | E/lot | PF | P(mean<=0) | vs OR-boundary |
+|---|---|---|---|---|---|
+| **or_boundary** (= `x_baseline_stop15`) | 73.1 | **+400** | 5.11 | 0.002 | -- |
+| pivot S1/R1 | 73.1 | +400 | 5.11 | 0.002 | **byte-identical** |
+| pivot S2/R2 | 73.1 | +400 | 5.11 | 0.002 | **byte-identical** |
+| swing low, lookback 30 | 73.1 | +400 | 5.11 | 0.002 | **byte-identical** |
+| swing low, lookback 10/15/20 | 69.2 | +320 | 3.23 | 0.016 | **-80/lot, worse** |
+| swing low, lookback 5 | 69.2 | +362 | 4.55 | 0.002 | -38/lot, worse |
+| or_boundary + no premium stop (`stop_pct:0.9`) | 73.1 | +400 | 5.15 | 0.004 | ~identical |
+
+- **Floor pivots are pure noise.** S1/R1 sit ~100-170 NIFTY pts from spot; the
+  underlying never retraces that far inside the expiry week, so the pivot
+  structure-break never fires -> pivot stop == no structure stop == baseline
+  (byte-identical, both `pivot_s1r1` and `pivot_s2r2`).
+- **A tighter swing low (lookback 5-20) whipsaws.** Exit-mix: it converts ~1
+  winning `trail` exit/yr into a losing `structure_break`, and makes the
+  `structure_break` losses bigger (avg -22 -> -190/-239/-305). Cuts trades the
+  wider OR boundary would have let run.
+- **lookback >=30 collapses to the OR boundary** (the day's low stabilises
+  after ~10 bars) -> inert.
+- `s_swing10` / `_swing15` / `_swing20` are byte-identical to each other;
+  `s_swing10_buf0` (ATR buffer 0) == `s_swing10` == `s_swing10` with default
+  buffer -- the ATR buffer doesn't bind at this granularity either.
+
+**W6 conclusion: the opening-range boundary IS already the right chart-structure
+stop for this ORB-derived strategy. No swing or pivot level improves on
+`d_pdt_w65 + stop_pct:0.15`.** The `--structure-stop-mode` flag is kept
+(committed) for reuse, but there's no config to carry forward.
+
+### W7 -- stop {0.15,0.18} x trail-arm {6,8,10,12,14}% x lock {0.4,0.6} + 4 target anchors
+
+No fixed target on the grid (`target_pct:1.0`), so `trail_activation_fraction`
+= arm point as a fraction of entry (0.06 -> arms +6%). Completes the W4 ladder,
+which only had arm +6/+8 at stop 15/18 and no stop-18 ladder at all.
+
+- **Stop -18% beats -15% at every trail-arm >= +8%** -- a consistent
+  **+~56/lot**, and PF roughly doubles (s15_a12 PF 5.3 -> s18_a12 PF 12.5).
+  `P(mean<=0) = 0.000` across the *entire* stop-18 column. At arm +6% the stop
+  barely matters (the early trail exits everything first): s15 ~= s18 ~+277.
+- **Trail-arm is a clean monotonic win% <-> E ladder** (the "+10% dead zone"
+  from the stop-12 grid is GONE at loose stops -- it was a stop-12 artifact):
+
+  | trail arm | win% | E/lot (stop 18, lock 0.6) | PF | maxDD |
+  |---|---|---|---|---|
+  | +6% | 80.8 | +277 | 9.2 | 425 |
+  | +8% | 76.9 | +332 | 9.5 | -- |
+  | +10% | 73.1 | +390 | 10.5 | -- |
+  | **+12%** | 73.1 | **+491** | **12.95** | **425** |
+  | +14% | 69.2 | +516 | 8.2 | 942 |
+
+- **`trail_lock_fraction` 0.6 > 0.4 everywhere** (+15..25/lot, PF up,
+  P(mean<=0) down) -- 4th sweep confirming it. Free.
+- **A fixed target on the loose stop = the raw-rupee maximum, at a win-rate
+  cost:**
+  - `stop18 + target30%` -> **65.4% win, +571/lot**, PF 6.99, maxDD 942,
+    IS +567 / OOS +581 (the most regime-balanced high-E config found in any
+    sweep), +506 at 1.0% slip.
+  - `stop18 + target40%` -> **57.7% win, +687/lot**, PF 5.60, maxDD 1252,
+    IS +606 / OOS +870 (OOS-flattered), win% now < 60.
+  - `stop18 + target30 + trail arm +14%` -> +453/lot -- the late trail *clips*
+    the runners the target would have caught (571 -> 453). Don't stack an
+    aggressive target with a late trail.
+
+### Final tiers (all = `d_pdt_w65` gate + `--exit-mode current`, n=26)
+
+| objective | params on top of the gate | win% | E/lot | total (26) | PF | maxDD | P(mean<=0) |
+|---|---|---|---|---|---|---|---|
+| **Max rupee** | `stop_pct:0.18, target_pct:0.40` | 57.7 | **+687** | +17868 | 5.6 | 1252 | 0.001 |
+| **Max rupee, win >= 60%** | `stop_pct:0.18, target_pct:0.30` | 65.4 | **+571** | +14851 | 7.0 | 942 | 0.000 |
+| **Balanced (best PF + DD)** | `stop_pct:0.18, target_pct:1.0, trail_activation_fraction:0.12, trail_lock_fraction:0.6` | 73.1 | +491 | +12753 | **12.95** | **425** | 0.000 |
+| **Max win rate** | `...trail_activation_fraction:0.06, trail_lock_fraction:0.6` | 80.8 | +277 | +7208 | 9.2 | 425 | 0.000 |
+
+**Bottom line (W4+W6+W7): the exit lever for `d_pdt_w65` is LOOSEN the premium
+stop to -18%.** Then pick a spot on the win% <-> rupee curve via trail-arm
+timing (+6% -> 81% win / +277; +12% -> 73% win / +491) OR add a fixed 30%
+target (65% win / +571, best regime balance). `trail_lock_fraction:0.6`
+always. Fixed target above the trail-arm point is otherwise inert; chart-based
+structure stops (W6) add nothing. Still n=26 -- every tier is "paper-trade to
+collect live data", not "deploy" or "size up". Nothing production-wired;
+nothing deployed. `run_backtest.py`'s `--structure-stop-mode` machinery is the
+only code change (backtest-only).
+
+### Infra notes this session
+
+- Same `run_backtest.py` DB leak as the W4/W5 entry -- every `run_refined_
+  sweep_3w6/3w7*.sh` has the `reap_dbs()` + `trap ... EXIT` + per-config reap;
+  disk held flat at ~90-91 GB free throughout.
+- **scp-vs-running-sweep race**: `scp`'ing the updated `run_backtest.py` while
+  W7 was mid-flight let 18 shards of one config (`w7_s15_a06_l06`) import a
+  half-written file -> `SyntaxError` -> instant 0-trade fail. Only that one
+  config; re-run cleanly afterward (matches its sibling `w7_s18_a06_l06`
+  exactly). Lesson: deploy code changes to the VM *before* launching anything
+  that imports them, or to a staged path.
+- A separate **"W7 Lorentzian" sweep** (user's, `sweep3w7_loren_*`,
+  `loren_backtest.py`) was running in parallel and shared the `s3w7_` DB
+  prefix + `/tmp/sweep3w7_status.log`. This session's stop x TSL grid was
+  re-isolated to `s3w7t_` / `sweep3w7tsl_*` / `/tmp/sweep3w7tsl_status.log`.
+  Keep concurrent sweeps on distinct prefixes.
+
+---
+
+## 2026-08-29 (~17:15 IST) — Sweep #3 W4/W5 RESULTS: d_pdt_w65 exit-overlay grid + 4-framework deep entry
+
+All on the e4 VM, `--near-expiry-days 6`, `--exit-mode current`, 18-sharded.
+W4 = pure **exit-overlay** re-slices of the SAME 26 `d_pdt_w65` entries
+(`orb_conviction` + `{require_prior_day_trend:true, max_or_range_nifty_points:65}`)
+— entries never change, only stop/target/trail params. W5 = entry-tightening on
+the 4 framework strategies. ~55 configs total across `sweep3w4_exitgrid_*`,
+`sweep3w4_exitgrid_rerun_*`, `sweep3w4_exitgrid_extra_*`, `sweep3w4_sl_*`,
+`sweep3w5_frameworks_deep_*` (+ `_rerun_*`). Robust bar =
+`analyze_walkforward.py` (IS/OOS split at 2026-04-01 == the 6-mo halves at
+this n; bootstrap P(mean<=0); 0.3-1.0%/side cost sweep).
+
+### W4 headline — two dominant levers on d_pdt_w65's exit stack
+
+**1. The fixed TARGET is inert; loosening the premium STOP is the big win.**
+
+| variant (only the stop changed) | stop% | win% | E/lot | PF | maxDD | boot P(mean<=0) | slip@1.0% |
+|---|---|---|---|---|---|---|---|
+| x_baseline_stop10 | -10 | 57.7 | +229 | 2.35 | 1214 | 0.049 | +166 |
+| **x_baseline** (current d_pdt_w65) | -12 | 65.4 | +274 | 2.77 | 1517 | 0.028 | +210 |
+| x_baseline_stop15 | -15 | 73.1 | +400 | 5.11 | 1660 | 0.002 | +336 |
+| **x_stop18** | **-18** | **73.1** | **+456** | **12.11** | **425** | **0.000** | **+392** |
+
+Monotonic: -10 -> -12 -> -15 -> -18 improves E, PF, and P(mean<=0) every step,
+IS and OOS both. Mechanism (exit-mix): at -12% the premium stop fired ~4/yr @
+0% win, -877 avg, cutting trades that then would have recovered and trailed out
+green. At -18% only **1** trade/yr stops out (-425) — `structure_break` (6/yr,
+~neutral) + `trail` (14/yr, 100% win, +759) + occasional `target` (4/yr, +479)
+carry it; maxDD collapses to ₹425. Effectively "barely stop, let structure/
+trail/EOD handle it."
+
+- **Raise target 20% -> 30/40/50% with trail arm held at +12%: byte-identical
+  to baseline.** The trail catches everything before +20% is reached, so the
+  fixed target is dead weight.
+- **BUT the target re-activates once the stop is loose:** `x_stop15_tgt30`
+  (stop -15, target +30%) = **+₹515/lot** (65.4% win, PF 4.40, OOS +589,
+  +450 @ 1.0% slip, maxDD ₹2282) — the raw-₹ winner. More trades now survive
+  long enough to actually hit +30%. Stop and target interact; can't tune one
+  without the other.
+- **Removing the target entirely (`target_pct:1.0`) ≈ -₹8/lot vs keeping it** at
+  any given trail-arm. Genuinely inert, not harmful. Confirmed both directions.
+
+**2. Trail-arm timing is a win-rate <-> expectancy dial (at a fixed stop).**
+`trail_activation_fraction` expressed as +% of entry premium where the trail
+arms (baseline d_pdt_w65 = +12%):
+
+| trail arms at | win% | E/lot | notes |
+|---|---|---|---|
+| +4% | 77 | +103 | over-trimmed, barely clears 1% slip |
+| +6% | 77-81 | +180-260 | PF 4-10, P(mean<=0) 0.000-0.004 — tightest, most reliable |
+| +8% | 73-77 | +190-260 | |
+| **+10%** | 65 | +180-190 | **DEAD ZONE** — 65% win *and* low E, P(mean<=0) ~0.07 |
+| +12% | 65 | +274-284 | |
+| +14% | 65 | +350-373 | late trail, winners run further |
+
+- Once arm >= +10%, win rate reverts to the entry's own ~65% (trail no longer
+  intercepts before ~+20%); +10% specifically is worst-of-both.
+- **`trail_lock_fraction` 0.4 -> 0.6 is a free gain everywhere** (+₹11-23/lot,
+  PF up, P(mean<=0) down) — every batch, every arm point.
+
+### W4 lead candidates (all d_pdt_w65 gate + `--exit-mode current`, n=26)
+
+| goal | params on top of the gate | win% | E/lot | PF | maxDD | P(mean<=0) |
+|---|---|---|---|---|---|---|
+| **max ₹** | `stop_pct:0.15, target_pct:0.30` | 65 | **+515** | 4.40 | 2282 | 0.003 |
+| max ₹, low DD | `stop_pct:0.18` | 73 | +456 | 12.1 | **425** | 0.000 |
+| **max win% + robustness** | `stop_pct:0.15, trail_activation_fraction:0.30, trail_lock_fraction:0.6` | **81** | +258 | 9.2 | 364 | **0.000** |
+| ditto, no target | + `target_pct:1.0` | 81 | +280 | 9.9 | 364 | 0.000 |
+
+Every W4 cell in the stop15/18 neighbourhood has P(mean<=0) <= 0.013 — the whole
+region is solid, unlike the -12% baseline (0.028). Still n=26 → paper-trade to
+collect live data, do not size on the backtest. Not production-wired; not
+deployed.
+
+### W5 — the other 4 framework strategies, DEEP entry-tightening — ALL DEAD
+
+32 configs (existing constructor knobs only: trend lookback / side-fraction /
+crosses / body-ratio / expansion / lookback_bars / sweep-distance / range-width
+/ morning-window). Verdict, decisive:
+
+| strategy | best deep-entry variant | verdict |
+|---|---|---|
+| vwap_pullback | `lb40_side80` ALL +32 but **OOS -57**, dies @0.7% slip, P(mean<=0)=0.41 | negative |
+| ema_micro_pullback | `body50` ALL -90 / OOS +17 only; IS win 21-29% everywhere | negative |
+| oi_volume_confirmed | `body55` ALL -40 / OOS -52; everything else -96..-258 | negative |
+| liquidity_sweep_reversal | `dist10` -104; base OOS **PF 0.05**; whole family PF 0.05-0.34 | negative (worst family) |
+
+Confirms sweep #2/W2. **No framework strategy has a robust edge on current-week
+NIFTY weeklies — entry-tightening included. Permanent park, all four.** Same
+root cause the ledger already recorded for ORB: "no exit/width tweak fixes a
+weak entry" — and here the entries are wrong on 70-80% of trades in-sample.
+TSL/exit optimisation was NOT run on the frameworks and won't help: W4 proved
+exit tuning *reduces* PnL even on a genuine 65% edge; it redistributes
+outcomes, it can't manufacture winners.
+
+### Method / infra note — run_backtest.py leaks its per-run databases
+
+`run_backtest.py` calls `_ensure_backtest_database_exists(suffix)` (CREATE
+`trading_bot_backtest_<suffix>`) and **never drops it** — no `DROP DATABASE`
+anywhere in the script. Every unique `--db-suffix` leaves a 20-70 MB DB
+forever. This session's sweeps + every prior sweep on the e4 VM had
+accumulated **2,396 orphaned DBs = 92 GB**, filling the 96 GB disk mid-run
+(23/48 configs completed before it hit 100%, the rest failed instantly with
+"0 trades / merge FAILED"). Fixed: dropped all `trading_bot_backtest_*` (no
+persistent base DB exists — only `postgres`/`template0/1`; the harness
+recreates per run from the CSVs in `data/historical/`), then added a
+`reap_dbs()` + `trap reap_dbs EXIT` + per-config reap to every sweep driver
+(`run_refined_sweep_3w4_*.sh`, `3w5_*`). Disk then held flat at ~91 GB free
+across the reruns. **Durable fix still owed: a `try/finally` DROP (or
+`--keep-db` opt-out) in `run_backtest.py:main()` itself** — the driver-level
+reaper doesn't help ad-hoc invocations or `kill -9`'d runs. One self-inflicted
+mistake mid-session: launched two W4 batches sharing the `s3w4_` DB prefix
+concurrently, so one batch's start-reap dropped the other's in-flight shard
+DBs and corrupted one config (redone). Fix: each concurrent batch now uses a
+distinct prefix (`s3w4_`, `s3w4x_`, `s3w4s_`, `s3w6_`).
+
+### Next: sweep #3 W6 — chart-based structure stop (planned, not yet run)
+
+`docs`/`scripts/SWEEP_3W6_STRUCTSTOP_PLAN.md` — anchor the structure-break exit
+level to a **swing candle low/high** or **classic floor pivot S1/R1/S2/R2**
+(reusing `backtest_pivots.py`) instead of `orb_conviction`'s hard-wired opening-
+range boundary. Backtest-only harness change (`--structure-stop-mode` in
+`_reconstruct_exit_current`, ~55 lines, no strategy code). Plus one more
+framework strategy the user will supply for a W5-style run. Both to run before
+the e4 VM terminates (night of 2026-08-31).
+
+---
+
 ## 2026-08-29 (~01:00 IST) — Sweep #3 W1/W2/W3 RESULTS (near-week NIFTY + BANKNIFTY probe)
 
 All three run `--near-expiry-days 6` (current expiry week only), `--exit-mode
