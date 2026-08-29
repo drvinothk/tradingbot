@@ -650,8 +650,10 @@ class TestPriorDayTrendGate:
     def test_build_strategy_maps_the_d_pdt_w65_paper_config(self, db, workspace):
         """The exact params dict the shortlisted `ORB_Conviction` paper
         config ships with (backtest sweep #3 `d_pdt_w65`, pinned to the
-        09:15-10:00 entry window) must map cleanly onto the strategy —
-        an unknown key here would raise a TypeError at start_strategy time.
+        09:15-10:00 entry window, plus the W7 balanced exit overlay:
+        stop -18%, no effective target, trail arms at +12%, locks 0.6)
+        must map cleanly onto the strategy — an unknown key here would
+        raise a TypeError at start_strategy time.
         """
         from datetime import time as dt_time
 
@@ -664,6 +666,10 @@ class TestPriorDayTrendGate:
                 "require_prior_day_trend": True,
                 "max_or_range_nifty_points": 65,
                 "orb_entry_cutoff_time": "10:00",
+                "stop_pct": 0.18,
+                "target_pct": 1.0,
+                "trail_activation_fraction": 0.12,
+                "trail_lock_fraction": 0.6,
             },
         )
         s = _build_strategy(config, uuid.uuid4(), EXPIRY)
@@ -671,3 +677,7 @@ class TestPriorDayTrendGate:
         assert s.require_prior_day_trend is True
         assert s.max_or_range_nifty_points == 65
         assert s.orb_entry_cutoff_time == dt_time(10, 0)
+        assert s.stop_pct == 0.18
+        assert s.target_pct == 1.0
+        assert s.trail_activation_fraction == 0.12
+        assert s.trail_lock_fraction == 0.6

@@ -133,3 +133,32 @@ Approve? (yes / yes+add-allow-rules / no)
   risk, session, strategy)` to register every table in `Base.metadata`
   before `commit()`; fixed and re-run. Rollback: `DELETE FROM
   strategy_configs WHERE id='76b61473-075f-4b59-bb31-ab985195f255';`.
+
+- **2026-08-30 — PENDING prod-DB write: `ORB_Conviction` update (row
+  `76b61473-075f-4b59-bb31-ab985195f255`).** Two changes, no code deploy,
+  no migration, no restart — `strategy_configs.{runtime_mode,params}` are
+  read fresh at each auto-spawn / start_strategy. Classifier blocks the
+  write from Claude as always → operator runs the staged idempotent script:
+
+      scp backend/scripts/ops_update_orb_conviction_params.py \
+          ubuntu@144.24.137.112:/tmp/
+      ssh ubuntu@144.24.137.112 'cd /home/ubuntu/trading-bot/backend && \
+          .venv/bin/python /tmp/ops_update_orb_conviction_params.py'
+
+  1. `runtime_mode` `"force_paper"` → **NULL** — row now routes per the
+     session `SafeMode`, identical to the other 5 strategies (no
+     per-strategy override). Still runs paper while the OCI session is
+     `paper_only`; operator raises it with the other 5 via the UI master
+     switch, **not** here.
+  2. `params`: OLD `{require_prior_day_trend:true, max_or_range_nifty_points:65,
+     orb_entry_cutoff_time:"10:00"}` → NEW adds `stop_pct:0.18` (was
+     default 0.12), `target_pct:1.0` (was 0.20 — no effective fixed
+     target), `trail_activation_fraction:0.12` (was default 0.6 — no
+     effective change, 0.6×0.20 also armed at +12%), `trail_lock_fraction:0.6`
+     (was default 0.4).
+
+  Safety gate: 2026-08-30 is a Saturday, NSE closed, no ACTIVE trading
+  session — open-position pre-check moot (per the market-hours-only
+  convention). Rollback: re-run with the printed OLD values
+  (`runtime_mode` back to `"force_paper"`, params back to the OLD dict), or
+  `psql`. Local dev DB row (`e0f5d99b-…`) already updated to match.
