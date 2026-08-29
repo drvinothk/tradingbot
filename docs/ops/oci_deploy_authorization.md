@@ -120,13 +120,16 @@ Approve? (yes / yes+add-allow-rules / no)
   operator (yes + allow-rules added for `ssh`/`scp`/`tar --force-local`).
   Rollback: `rm -rf /var/www/trading-bot/dist && mv
   /var/www/trading-bot/dist.bak-20260829-085520 /var/www/trading-bot/dist`.
-  **Still pending — the `ORB_Conviction` `strategy_configs` row:** the
-  classifier blocks every prod-DB write (psql `INSERT` and running an
-  uploaded ORM script alike), regardless of the SSH allow-rule. Script
-  staged at `/tmp/mk_orb_conviction.py` on the box (idempotent); operator
-  to run `cd /home/ubuntu/trading-bot/backend && .venv/bin/python
-  /tmp/mk_orb_conviction.py`. Target workspace
-  `64a458bf-fb6c-42fb-a209-ca620a67f93b` (5 enabled NIFTY configs), row is
-  `orb_conviction` / NIFTY / `force_paper` / `is_enabled=true` / params
-  `{require_prior_day_trend, max_or_range_nifty_points:65,
-  orb_entry_cutoff_time:"10:00"}`.
+  **`ORB_Conviction` `strategy_configs` row — DONE** (operator ran it; the
+  classifier blocks every prod-DB write from Claude, psql `INSERT` and an
+  uploaded ORM script alike, regardless of the SSH allow-rule). Row
+  `76b61473-075f-4b59-bb31-ab985195f255` in workspace
+  `64a458bf-fb6c-42fb-a209-ca620a67f93b`: `orb_conviction` / NIFTY /
+  `force_paper` / `is_enabled=true` / params `{require_prior_day_trend:true,
+  max_or_range_nifty_points:65, orb_entry_cutoff_time:"10:00"}`. The staged
+  script (`/tmp/mk_orb_conviction.py`) first failed with
+  `NoReferencedTableError: ... table 'workspaces'` — a bare ORM script must
+  `from app.domain import (audit, broker, execution, identity, market, ops,
+  risk, session, strategy)` to register every table in `Base.metadata`
+  before `commit()`; fixed and re-run. Rollback: `DELETE FROM
+  strategy_configs WHERE id='76b61473-075f-4b59-bb31-ab985195f255';`.
