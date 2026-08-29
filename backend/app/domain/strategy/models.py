@@ -189,6 +189,13 @@ class Signal(Base, UUIDPkMixin):
     structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
         Numeric(6, 2), nullable=True
     )
+    # Multi-leg exit engine: the frozen per-leg exit spec this strategy
+    # proposed (list of dicts — qty_fraction + per-leg stop/target/trail/
+    # structure/max_loss/time_stop). `None` means "single full-qty exit"
+    # (today's behaviour). Serialized from `TradeProposal.exit_legs`;
+    # `TradeIntent.exit_legs` is the copy execution actually reads at
+    # dispatch, same mirror-onto-both convention as the structure_break trio.
+    exit_legs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     payload: Mapped[dict] = mapped_column(JSONB, default=dict)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -226,6 +233,10 @@ class TradeIntent(Base, UUIDPkMixin):
     structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
         Numeric(6, 2), nullable=True
     )
+    # Multi-leg exit engine — the copy `execution_engine.paper.service
+    # ._open_position_from_fill` reads to build `position_exit_legs`. `None`
+    # = single full-qty exit (today's behaviour). See Signal.exit_legs.
+    exit_legs: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[TradeIntentStatus] = mapped_column(
         String(20), default=TradeIntentStatus.PENDING_RISK
     )

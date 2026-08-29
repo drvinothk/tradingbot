@@ -27,6 +27,7 @@ and reconciliation checks it already runs there.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from datetime import date
@@ -36,8 +37,14 @@ from sqlalchemy.orm import Session
 from app.core.db.base import utcnow as _utcnow
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.domain.audit.models import ActorType, EventCategory
+from app.domain.market.models import Instrument, OptionContract
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
+from app.domain.strategy.exit_legs import (
+    build_exit_legs,
+    deserialize_exit_leg_templates,
+    serialize_exit_legs,
+)
 from app.domain.strategy.models import (
     ApprovalStatus,
     ExecutionMode,
@@ -89,6 +96,41 @@ def new_strategy_run(
     )
 
 
+def _apply_exit_leg_templates(
+    db: Session, strategy_config: StrategyConfig, proposal: TradeProposal
+) -> TradeProposal:
+    if proposal.exit_legs is not None:
+        return proposal
+    raw = (strategy_config.params or {}).get("exit_legs")
+    if raw is None:
+        return proposal
+    try:
+        templates = deserialize_exit_leg_templates(raw)
+        if not templates:
+            return proposal
+        contract = db.get(OptionContract, proposal.option_contract_id)
+        instrument = db.get(Instrument, contract.instrument_id) if contract is not None else None
+        tick_size = float(instrument.tick_size) if instrument is not None else 0.0
+        specs = build_exit_legs(
+            templates,
+            entry_price=proposal.entry_price,
+            base_stop_price=proposal.stop_price,
+            base_target_price=proposal.target_price,
+            tick_size=tick_size,
+            structure_level=proposal.structure_level,
+            structure_break_buffer=proposal.structure_break_buffer,
+            structure_break_persistence_seconds=proposal.structure_break_persistence_seconds,
+        )
+    except (ValueError, TypeError):
+        logger.exception(
+            "strategy_config %s has a malformed params.exit_legs — falling back to "
+            "single full-qty exit for this signal",
+            strategy_config.id,
+        )
+        return proposal
+    return dataclasses.replace(proposal, exit_legs=specs)
+
+
 def submit_signal(
     db: Session,
     strategy_run: StrategyRun,
@@ -100,6 +142,17 @@ def submit_signal(
 
     if proposal.payload.get("env") is None:
         logger.info("Signal created without env metrics (stubbed until VIX/PCR pipeline)")
+
+    # Multi-leg exit engine: if this strategy_config declares a static
+    # `params.exit_legs` template list and the strategy itself didn't already
+    # attach concrete legs, resolve the template into per-signal `ExitLegSpec`s
+    # here — at the one boundary that has the config, the proposal's own
+    # entry/stop/target, and (via the contract) the instrument tick size. The
+    # strategy classes stay entirely unaware of staged exits. A malformed
+    # template only ever reaches here if it slipped past create_strategy's
+    # validation (e.g. edited directly in the DB); log and fall back to a
+    # single full-qty exit rather than killing the scan cycle.
+    proposal = _apply_exit_leg_templates(db, strategy_config, proposal)
 
     signal = Signal(
         id=uuid.uuid4(),
@@ -118,6 +171,7 @@ def submit_signal(
         structure_level=proposal.structure_level,
         structure_break_buffer=proposal.structure_break_buffer,
         structure_break_persistence_seconds=proposal.structure_break_persistence_seconds,
+        exit_legs=serialize_exit_legs(proposal.exit_legs),
         payload=proposal.payload,
         generated_at=now,
     )
@@ -168,6 +222,7 @@ def submit_signal(
         structure_level=proposal.structure_level,
         structure_break_buffer=proposal.structure_break_buffer,
         structure_break_persistence_seconds=proposal.structure_break_persistence_seconds,
+        exit_legs=serialize_exit_legs(proposal.exit_legs),
         status=TradeIntentStatus.PENDING_RISK,
         created_at=now,
     )

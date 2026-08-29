@@ -23,7 +23,16 @@ from typing import TypedDict
 from sqlalchemy.orm import Session
 
 from app.domain.market.models import PriceBar
+from app.domain.strategy.exit_legs import ExitLegSpec
 from app.domain.strategy.models import SignalSide, StrategyRun
+
+__all__ = [
+    "EnvPayload",
+    "ExitLegSpec",
+    "Strategy",
+    "TradePayload",
+    "TradeProposal",
+]
 
 
 class EnvPayload(TypedDict, total=False):
@@ -104,6 +113,15 @@ class TradeProposal:
     # / the conviction-strategy plan).
     max_loss_per_lot: float | None = None
     time_stop_minutes: float | None = None
+    # Multi-leg exit engine — an ordered list of sub-lot exit legs (see
+    # `app.domain.strategy.exit_legs.ExitLegSpec`). `None` (the default, and
+    # what every strategy emits until it opts in) means a single full-qty
+    # exit driven by `stop_price`/`target_price`/`structure_level`/`trail_*`
+    # above, byte-identical to today. When set, execution ignores those
+    # scalar fields for stop/target/trail purposes and builds one
+    # `PositionExitLeg` per spec instead. `qty_fraction` values must sum to
+    # 1.0; validated by `validate_exit_leg_specs`.
+    exit_legs: list[ExitLegSpec] | None = None
     payload: TradePayload = field(default_factory=lambda: TradePayload())
 
 

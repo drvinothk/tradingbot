@@ -1229,3 +1229,56 @@ def test_power_requires_login(api_client: TestClient):
         f"/api/v1/strategies/{uuid.uuid4()}/power", json={"is_enabled": True}
     )
     assert response.status_code == 401
+
+
+# -- multi-leg exit config validation (params.exit_legs) -------------------
+
+
+def test_create_strategy_accepts_valid_exit_legs(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    resp = api_client.post(
+        "/api/v1/strategies",
+        json={
+            "name": "orb-legs-ok",
+            "strategy_type": "orb",
+            "params": {
+                "exit_legs": [
+                    {"qty_fraction": 0.3, "kind": "fixed_sl"},
+                    {"qty_fraction": 0.3, "kind": "sr_target", "target_pct": 0.15},
+                    {"qty_fraction": 0.4, "kind": "runner", "no_target": True},
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["params"]["exit_legs"]) == 3
+
+
+def test_create_strategy_rejects_exit_legs_not_summing_to_one(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    resp = api_client.post(
+        "/api/v1/strategies",
+        json={
+            "name": "orb-legs-bad-sum",
+            "strategy_type": "orb",
+            "params": {"exit_legs": [{"qty_fraction": 0.3}, {"qty_fraction": 0.3}]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "sum to 1.0" in resp.json()["detail"]
+
+
+def test_create_strategy_rejects_single_leg_staged_exit(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    resp = api_client.post(
+        "/api/v1/strategies",
+        json={
+            "name": "orb-legs-single",
+            "strategy_type": "orb",
+            "params": {"exit_legs": [{"qty_fraction": 1.0}]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "at least 2" in resp.json()["detail"]

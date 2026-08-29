@@ -27,6 +27,10 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
+from app.domain.strategy.exit_legs import (
+    deserialize_exit_leg_templates,
+    validate_exit_leg_templates,
+)
 from app.domain.strategy.models import (
     ApprovalStatus,
     ExecutionMode,
@@ -471,6 +475,19 @@ def create_strategy(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{body.strategy_type}'"
         )
+
+    # Multi-leg exit engine: validate params.exit_legs up front so a bad
+    # staged-exit config is rejected at create time, not discovered at
+    # dispatch. Absent/None = single full-qty exit (unchanged).
+    if body.params.get("exit_legs") is not None:
+        try:
+            templates = deserialize_exit_leg_templates(body.params["exit_legs"])
+            if templates is not None:
+                validate_exit_leg_templates(templates)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, f"invalid params.exit_legs: {exc}"
+            ) from exc
 
     if body.name is None:
         name = _generate_strategy_name(db, user.workspace_id, body.strategy_type)

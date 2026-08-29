@@ -24,6 +24,8 @@ from app.domain.execution.models import (
     ExitReason,
     Order,
     Position,
+    PositionExitLeg,
+    PositionExitLegStatus,
     PositionStatus,
     StopPlan,
     TradeOutcome,
@@ -103,6 +105,19 @@ class OrderOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PositionLegOut(BaseModel):
+    leg_index: int
+    kind: str
+    qty: int
+    status: str
+    stop_price: float | None = None
+    target_price: float | None = None
+    trail_stop_price: float | None = None
+    exit_reason: str | None = None
+    realized_pnl: float | None = None
+    closed_at: datetime | None = None
+
+
 class PositionOut(BaseModel):
     id: uuid.UUID
     trading_session_id: uuid.UUID
@@ -157,6 +172,11 @@ class PositionOut(BaseModel):
     # force_paper override can flip after a position already opened). This
     # is the ground truth for bucketing a position as Live vs Paper.
     mode: str | None = None
+    # Multi-leg (staged) exit: per-leg detail when this position has
+    # `position_exit_legs` (empty for a normal single-exit position).
+    # `realized_pnl`/`slippage`/`exit_reason` above are the net across all
+    # legs for a staged position (QC finding 3 — no join fan-out).
+    legs: list[PositionLegOut] = []
 
     model_config = {"from_attributes": True}
 
@@ -211,7 +231,6 @@ def list_positions(
             TradeIntent,
             StopPlan,
             TrailPlan,
-            TradeOutcome,
             Order.mode,
         )
         .join(OptionContract, Position.option_contract_id == OptionContract.id)
@@ -220,7 +239,6 @@ def list_positions(
         .outerjoin(StrategyConfig, StrategyRun.strategy_config_id == StrategyConfig.id)
         .outerjoin(StopPlan, StopPlan.position_id == Position.id)
         .outerjoin(TrailPlan, TrailPlan.position_id == Position.id)
-        .outerjoin(TradeOutcome, TradeOutcome.position_id == Position.id)
         # opening_order_id is non-nullable, but an inner join here would
         # silently drop a position if its opening Order row were ever
         # missing -- outerjoin so a data-integrity gap surfaces as mode=None
@@ -231,6 +249,26 @@ def list_positions(
         .order_by(Position.opened_at.desc())
         .all()
     )
+
+    # `TradeOutcome` and `PositionExitLeg` are 1:N with Position for a staged
+    # (multi-leg) exit, so they are batch-loaded and grouped here rather than
+    # joined into `rows` above, which would fan a staged position out into
+    # one result row per leg (QC finding 3).
+    position_ids = [position.id for position, *_rest in rows]
+    outcomes_by_position: dict[uuid.UUID, list[TradeOutcome]] = {}
+    legs_by_position: dict[uuid.UUID, list[PositionExitLeg]] = {}
+    if position_ids:
+        for oc in (
+            db.query(TradeOutcome).filter(TradeOutcome.position_id.in_(position_ids)).all()
+        ):
+            outcomes_by_position.setdefault(oc.position_id, []).append(oc)
+        for lg in (
+            db.query(PositionExitLeg)
+            .filter(PositionExitLeg.position_id.in_(position_ids))
+            .order_by(PositionExitLeg.leg_index)
+            .all()
+        ):
+            legs_by_position.setdefault(lg.position_id, []).append(lg)
 
     # One batched round-trip for every open position's latest tick, instead
     # of one query per position in the loop below -- see `_latest_ticks`'s
@@ -251,7 +289,6 @@ def list_positions(
         trade_intent,
         stop_plan,
         trail_plan,
-        outcome,
         opening_order_mode,
     ) in rows:
         out = PositionOut.model_validate(position)
@@ -268,6 +305,52 @@ def list_positions(
         if trail_plan is not None and trail_plan.current_stop_price is not None:
             out.trail_stop_price = float(trail_plan.current_stop_price)
 
+        position_legs = legs_by_position.get(position.id, [])
+        out.legs = [
+            PositionLegOut(
+                leg_index=lg.leg_index,
+                kind=lg.kind,
+                qty=lg.qty,
+                status=str(lg.status),
+                stop_price=float(lg.stop_price) if lg.stop_price is not None else None,
+                target_price=float(lg.target_price) if lg.target_price is not None else None,
+                trail_stop_price=(
+                    float(lg.trail_current_stop_price)
+                    if lg.trail_current_stop_price is not None
+                    else None
+                ),
+                exit_reason=str(lg.exit_reason) if lg.exit_reason is not None else None,
+                realized_pnl=(
+                    float(lg.realized_pnl) if lg.realized_pnl is not None else None
+                ),
+                closed_at=lg.closed_at,
+            )
+            for lg in position_legs
+        ]
+        if position_legs:
+            # Staged position: stop/target shown are the first still-open
+            # leg's (what a manual square-off decision cares about), and
+            # the trailed level is the tightest across active legs.
+            open_leg = next(
+                (lg for lg in position_legs if lg.status == PositionExitLegStatus.OPEN), None
+            )
+            if open_leg is not None:
+                if open_leg.stop_price is not None:
+                    out.stop_price = float(open_leg.stop_price)
+                if open_leg.target_price is not None:
+                    out.target_price = float(open_leg.target_price)
+            trail_levels = [
+                float(lg.trail_current_stop_price)
+                for lg in position_legs
+                if lg.trail_current_stop_price is not None
+            ]
+            if trail_levels:
+                out.trail_stop_price = (
+                    max(trail_levels)
+                    if position.side == "buy"
+                    else min(trail_levels)
+                )
+
         if position.status == PositionStatus.OPEN:
             tick = latest_ticks.get(position.option_contract_id)
             if tick is not None:
@@ -282,14 +365,23 @@ def list_positions(
                 out.unrealized_pnl = float(
                     signed_pnl(position.entry_price, ltp, position.qty, position.side)
                 )
-        elif outcome is not None:
-            out.exit_price = float(outcome.exit_price)
-            out.realized_pnl = float(outcome.realized_pnl)
-            out.exit_reason = (
-                outcome.exit_reason.value
-                if hasattr(outcome.exit_reason, "value")
-                else outcome.exit_reason
-            )
+        else:
+            position_outcomes = outcomes_by_position.get(position.id, [])
+            if position_outcomes:
+                out.realized_pnl = sum(float(o.realized_pnl) for o in position_outcomes)
+                # A single-exit position has exactly one outcome; a staged
+                # one has N — report the last leg's fill as the exit price
+                # and either its lone reason or a "staged" marker.
+                last = max(position_outcomes, key=lambda o: o.closed_at)
+                out.exit_price = float(last.exit_price)
+                if len(position_outcomes) == 1:
+                    out.exit_reason = (
+                        last.exit_reason.value
+                        if hasattr(last.exit_reason, "value")
+                        else last.exit_reason
+                    )
+                else:
+                    out.exit_reason = "staged"
 
         result.append(out)
     return result

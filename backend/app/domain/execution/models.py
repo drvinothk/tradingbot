@@ -94,6 +94,11 @@ class TrailPlanStatus(enum.StrEnum):
     TRIGGERED = "triggered"
 
 
+class PositionExitLegStatus(enum.StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
 class ExitReason(enum.StrEnum):
     STOP = "stop"
     TARGET = "target"
@@ -317,12 +322,112 @@ class TrailPlan(Base, UUIDPkMixin):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class PositionExitLeg(Base, UUIDPkMixin):
+    """One sub-lot exit leg of a staged (multi-leg) exit — see the multi-leg
+    exit engine plan. A `Position` has one or more of these, ordered by
+    `leg_index`. Each leg manages its own stop/target/structure/trail against
+    its own `qty` slice of the position, closes independently
+    (`close_position_leg`), and produces its own `TradeOutcome` row. The
+    `Position` stays `OPEN` until the last leg closes, at which point
+    `position.qty` has been decremented to 0 and the once-per-position
+    finalize (audit event, sleep-inhibitor release, net-P&L risk effects)
+    runs.
+
+    A position opened before this feature existed, or by a strategy that sets
+    no `exit_legs` spec while the migration-window dual-write is still active,
+    has exactly one leg spanning the full qty — behaviourally identical to
+    the pre-existing single `StopPlan`/`TrailPlan` path. Positions predating
+    the migration have no leg rows at all; `evaluate_open_position` keeps the
+    legacy `StopPlan`/`TrailPlan` path for those.
+
+    `resting_order_id`/`resting_order_price` are the per-leg equivalent of
+    `StopPlan`'s same-named fields — the broker's own id for this leg's
+    currently-resting LIVE protective SL-LMT order (one per leg, per the
+    plan's locked decision), `None` when there isn't one.
+    """
+
+    __tablename__ = "position_exit_legs"
+
+    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"))
+    leg_index: Mapped[int] = mapped_column(Integer)
+    # Descriptive label only — behaviour is driven by which of the config
+    # fields below are set, not by this string. "fixed_sl" / "sr_target" /
+    # "runner" / "custom" / "single" (the dual-write full-qty leg).
+    kind: Mapped[str] = mapped_column(String(20), default="single")
+    qty: Mapped[int] = mapped_column(Integer)
+
+    # Per-leg exit config — all nullable. stop_price/target_price are on the
+    # option premium; structure_level is on the underlying index. A leg with
+    # target_price None is a "runner" (no profit target). See TradeIntent's
+    # same-named fields, which the single-leg dual-write copies verbatim.
+    stop_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    target_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_level: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_break_buffer: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    structure_break_persistence_seconds: Mapped[float | None] = mapped_column(
+        Numeric(6, 2), nullable=True
+    )
+    trail_activation_fraction: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
+    trail_lock_fraction: Mapped[float | None] = mapped_column(Numeric(6, 4), nullable=True)
+    max_loss_per_lot: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    time_stop_minutes: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+
+    # Mutable trail state — the per-leg counterpart of a TrailPlan row.
+    trail_status: Mapped[TrailPlanStatus] = mapped_column(
+        String(20), default=TrailPlanStatus.INACTIVE
+    )
+    trail_activation_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    trail_current_stop_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+
+    # Mutable structure-break candidate state — per-leg counterpart of the
+    # same-named StopPlan fields (see evaluate_open_position's docstring for
+    # the candidate/confirm/reclaim state machine).
+    structure_break_candidate_since: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    structure_break_candidate_extreme: Mapped[float | None] = mapped_column(
+        Numeric(12, 4), nullable=True
+    )
+
+    # LIVE-only resting protective SL-LMT (one per leg) — see StopPlan's
+    # identically-named fields and protective_stop.py.
+    resting_order_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    resting_order_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+
+    status: Mapped[PositionExitLegStatus] = mapped_column(
+        String(10), default=PositionExitLegStatus.OPEN
+    )
+    closing_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("orders.id"), nullable=True
+    )
+    realized_pnl: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    slippage: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    exit_reason: Mapped[ExitReason | None] = mapped_column(String(20), nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("position_id", "leg_index", name="uq_exit_leg_position_index"),
+        Index("ix_position_exit_legs_position_status", "position_id", "status"),
+    )
+
+
 class TradeOutcome(Base, UUIDPkMixin):
     __tablename__ = "trade_outcomes"
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"))
     trading_session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trading_sessions.id"))
-    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"), unique=True)
+    position_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("positions.id"))
+    # Multi-leg exit engine: which staged exit leg this outcome row belongs
+    # to. `None` for a legacy single-outcome row (position predating the
+    # feature, closed via the old `_finalize_position_close` path). A staged
+    # trade produces one `TradeOutcome` per leg; reporting groups by
+    # `position_id` so a staged trade still counts as one "trade" in the
+    # scorecard (see reporting.service._compute_stats).
+    position_exit_leg_id: Mapped[uuid.UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("position_exit_legs.id"), nullable=True
+    )
     trade_intent_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("trade_intents.id"))
 
     entry_price: Mapped[float] = mapped_column(Numeric(12, 4))
@@ -335,5 +440,7 @@ class TradeOutcome(Base, UUIDPkMixin):
 
     __table_args__ = (
         Index("ix_trade_outcomes_session", "trading_session_id"),
-        UniqueConstraint("position_id", name="uq_trade_outcome_position"),
+        UniqueConstraint(
+            "position_id", "position_exit_leg_id", name="uq_trade_outcome_position_leg"
+        ),
     )

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -52,6 +53,38 @@ class Scorecard(PerformanceStats):
     filled_count: int
 
 
+@dataclass(frozen=True)
+class _TradeRow:
+    """One completed *trade* for stats purposes — either a legacy single
+    `TradeOutcome`, or all legs of a staged (multi-leg) exit collapsed into
+    one net row (QC finding 2: a 3-leg trade must count as one trade in win
+    rate / profit factor / drawdown, not three)."""
+
+    closed_at: datetime
+    realized_pnl: float
+    slippage: float
+
+
+def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
+    by_position: dict[uuid.UUID, _TradeRow] = {}
+    for o in outcomes:
+        existing = by_position.get(o.position_id)
+        if existing is None:
+            by_position[o.position_id] = _TradeRow(
+                closed_at=o.closed_at,
+                realized_pnl=float(o.realized_pnl),
+                slippage=float(o.slippage),
+            )
+        else:
+            by_position[o.position_id] = _TradeRow(
+                # A staged trade's "close time" is its last leg's.
+                closed_at=max(existing.closed_at, o.closed_at),
+                realized_pnl=existing.realized_pnl + float(o.realized_pnl),
+                slippage=existing.slippage + float(o.slippage),
+            )
+    return list(by_position.values())
+
+
 def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
     if not outcomes:
         return PerformanceStats(
@@ -67,8 +100,8 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
             total_slippage=0.0,
         )
 
-    ordered = sorted(outcomes, key=lambda o: o.closed_at)
-    pnls = [float(o.realized_pnl) for o in ordered]
+    ordered = sorted(_collapse_to_trades(outcomes), key=lambda o: o.closed_at)
+    pnls = [o.realized_pnl for o in ordered]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
 

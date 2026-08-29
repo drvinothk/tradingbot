@@ -96,6 +96,12 @@ from app.modules.broker_adapter.composition import (
     unwrap_broker,
 )
 from app.modules.broker_adapter.preflight import run_preflight_checks
+from app.modules.execution_engine.paper.exit_legs import (
+    build_position_exit_legs,
+    close_all_open_legs,
+    evaluate_leg_position,
+    position_has_exit_legs,
+)
 from app.modules.execution_engine.paper.order_helpers import (
     _apply_slippage,
     _dec,
@@ -428,6 +434,43 @@ def _open_position_from_fill(
     )
     db.add(position)
     db.flush()
+
+    # Multi-leg (staged) exit: if the TradeIntent carried a >=2-leg spec and
+    # this position is paper and large enough, create per-leg
+    # `position_exit_legs` and skip the single StopPlan/TrailPlan entirely —
+    # `evaluate_open_position`/`close_position` branch to the leg-aware path
+    # for any position that has legs. `build_position_exit_legs` returns
+    # `None` (keep the legacy path below, unchanged) for the common
+    # no-spec case, and for a LIVE/too-small position (with a one-time
+    # `exit_legs_collapsed` alert).
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    exit_legs = (
+        build_position_exit_legs(
+            db,
+            trading_session,
+            position,
+            trade_intent,
+            filled_qty=order.filled_qty,
+            lot_size=instrument.lot_size,
+            is_live=(order.mode == OrderMode.LIVE),
+        )
+        if instrument is not None
+        else None
+    )
+    if exit_legs is not None:
+        record_event(
+            db,
+            workspace_id=trading_session.workspace_id,
+            actor_type=ActorType.SYSTEM,
+            event_category=EventCategory.ORDER_LIFECYCLE,
+            event_type="position.opened",
+            entity_type="position",
+            entity_id=position.id,
+            trading_session_id=trading_session.id,
+            payload={"qty": position.qty, "entry_price": float(entry_price)},
+        )
+        get_sleep_inhibitor().acquire(f"position:{position.id}")
+        return position
 
     # StopPlan.qty is meant to be recomputed on every fill event touching
     # this position — with the mock adapter's synchronous full-fill
@@ -783,6 +826,14 @@ def close_position(
     # the broker actually resolved was the real one.
     broker = broker or resolve_broker_for_position(db, trading_session, position)
     order_mode = OrderMode.LIVE if is_execution_broker_live(broker) else OrderMode.PAPER
+
+    # Multi-leg (staged) exit: flatten every still-OPEN leg at this one
+    # `intended_price` (EOD / margin-breach / manual square-off). One price
+    # fetch by the caller, reused for each leg (QC finding 7).
+    if position_has_exit_legs(db, position.id):
+        return close_all_open_legs(
+            db, trading_session, position, exit_reason, intended_price, broker
+        )
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         if position.status != PositionStatus.OPEN:
@@ -1294,6 +1345,13 @@ def evaluate_open_position(
     """
     if position.status != PositionStatus.OPEN:
         return None
+
+    # Multi-leg (staged) exit: a position with `position_exit_legs` is driven
+    # entirely by the leg-aware evaluator; it has no StopPlan/TrailPlan.
+    if position_has_exit_legs(db, position.id):
+        return evaluate_leg_position(
+            db, trading_session, position, tick_price, broker, bid, ask, underlying_price
+        )
 
     trade_intent = db.get(TradeIntent, position.trade_intent_id)
     if trade_intent is None:
