@@ -2817,7 +2817,21 @@ def main() -> None:
         "--shard-index", type=int, default=0,
         help="Which shard (0-indexed, < --shard-count) this invocation processes.",
     )
+    parser.add_argument(
+        "--near-expiry-days", type=int, default=None,
+        help="--all-expiries only. Replay just the last N CALENDAR days before (and "
+        "including) each expiry -- i.e. only the current expiry week, not the whole "
+        "~2-week listed-contract window a weekly's data covers. NIFTY weekly expiry is "
+        "Tuesday and its trading week runs Wed->Tue, so --near-expiry-days 6 = that week "
+        "exactly. This also collapses the multi-expiry-directory overlap (a given day "
+        "then falls in only the one expiry window that actually expires that week), so "
+        "each calendar day is traded once, against the near-week contract a live run "
+        "would use. Default None = full-window replay (every prior --all-expiries run's "
+        "behaviour; measures 10-14 DTE options, not the current week).",
+    )
     args = parser.parse_args()
+    if args.near_expiry_days is not None and args.near_expiry_days < 0:
+        raise SystemExit("--near-expiry-days must be >= 0")
     if args.shard_count < 1 or not (0 <= args.shard_index < args.shard_count):
         raise SystemExit("--shard-index must be in [0, --shard-count)")
     if args.dates and not args.all_expiries:
@@ -2945,6 +2959,25 @@ def main() -> None:
                 print(f"  [{expiry_date.isoformat()}] no data in any contract file, skipping")
                 continue
             range_from, range_to = date_range
+
+            # --near-expiry-days: clamp the replay window to just the current
+            # expiry week. Real weeklies list ~2 weeks early, so the raw data
+            # range reaches back into 1-3 other expiry cycles; without this
+            # clamp --all-expiries replays each weekly from its listing day
+            # (10-14 DTE) and overlapping directories each fire independently
+            # on the same calendar day. Clamping range_from to
+            # expiry_date - N days keeps only the week that actually expires
+            # here, and makes the per-day expiry mapping 1:1.
+            if args.near_expiry_days is not None:
+                clamped_from = expiry_date - timedelta(days=args.near_expiry_days)
+                if clamped_from > range_from:
+                    range_from = clamped_from
+                if range_from > range_to:
+                    print(
+                        f"  [{expiry_date.isoformat()}] near-expiry window "
+                        f"({args.near_expiry_days}d) covers no available data, skipping"
+                    )
+                    continue
 
             # Default: one call for the whole range (unchanged from every
             # prior --all-expiries run). With --dates: one call PER

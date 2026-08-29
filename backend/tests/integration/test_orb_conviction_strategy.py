@@ -553,3 +553,96 @@ class TestFindingsDrivenGates:
         assert p is not None
         assert p.max_loss_per_lot == 2500.0
         assert p.time_stop_minutes == 90.0
+
+
+# Last completed bar strictly before OR_START's 09:15 IST session open —
+# stands in for the prior trading day's close.
+_PRIOR_DAY_TS = datetime(2026, 7, 23, 15, 29, tzinfo=IST)
+
+
+def _seed_prior_day_close(db: Session, instrument: Instrument, close: float) -> None:
+    _seed_bar(
+        db, instrument, _PRIOR_DAY_TS,
+        open=close, high=close, low=close, close=close,
+    )
+
+
+class TestPriorDayTrendGate:
+    def test_ce_breakout_blocked_below_prior_close_then_refires_above_it(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_prior_day_close(db, instrument, 22100.0)  # breakout close 22050 < 22100
+        s = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_prior_day_trend=True,
+        )
+        assert s.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is None
+        # a later bar that clears the prior close re-qualifies the CE direction
+        higher = _seed_bar(
+            db, instrument, BREAKOUT_TS + timedelta(minutes=5),
+            open=22120, high=22160, low=22110, close=22150,
+        )
+        assert s.check_setup(db, run, higher) is not None
+
+    def test_pe_breakout_blocked_when_above_prior_close(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_prior_day_close(db, instrument, 21900.0)  # bearish close 21960 > 21900
+        s = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_prior_day_trend=True,
+        )
+        assert s.check_setup(
+            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS)
+        ) is None
+
+    def test_allowed_when_price_is_above_prior_close(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_prior_day_close(db, instrument, 22000.0)  # breakout close 22050 > 22000
+        s = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_prior_day_trend=True,
+        )
+        assert s.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
+
+    def test_buffer_widens_the_block(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_prior_day_close(db, instrument, 22040.0)  # breakout close 22050, only +10
+        bar = _bullish_breakout_bar(db, instrument)
+        no_buf = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_prior_day_trend=True,
+        )
+        assert no_buf.check_setup(db, run, bar) is not None
+        with_buf = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_prior_day_trend=True, prior_day_trend_buffer_pts=15.0,
+        )
+        assert with_buf.check_setup(db, run, bar) is None
+
+    def test_build_strategy_maps_prior_day_trend_params(self, db, workspace):
+        from app.api.v1.strategies import _build_strategy
+
+        config = StrategyConfig(
+            id=uuid.uuid4(), workspace_id=workspace.id, name="d3",
+            strategy_type="orb_conviction",
+            params={"require_prior_day_trend": True, "prior_day_trend_buffer_pts": 15.0},
+        )
+        s = _build_strategy(config, uuid.uuid4(), EXPIRY)
+        assert isinstance(s, ORBConvictionStrategy)
+        assert s.require_prior_day_trend is True
+        assert s.prior_day_trend_buffer_pts == 15.0

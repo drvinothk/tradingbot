@@ -3,8 +3,9 @@
 A thin subclass of `ORBStrategy` that keeps ORB's exact opening-range /
 breakout / strike-ranking logic and layers the "few high-conviction trades"
 filters from the expert framework on top (HTF EMA-trend agreement, ATR /
-volatility expansion, volume surge, India VIX regime band, a hard
-trades-per-day cap, and an optional reward:risk target override).
+volatility expansion, volume surge, India VIX regime band, prior-day-close
+trend agreement, a hard trades-per-day cap, and an optional reward:risk
+target override).
 
 **Every gate is opt-in.** With all `require_*` flags left `False`, no
 `vix_min`/`vix_max` set, `target_r_multiple=None`, and `max_trades_per_day`
@@ -82,6 +83,9 @@ CONVICTION_PARAM_KEYS = {
     "require_drift_alignment",
     "max_loss_per_lot",
     "time_stop_minutes",
+    # 2026-08-29 — directional-regime gate (sweep #3 W1)
+    "require_prior_day_trend",
+    "prior_day_trend_buffer_pts",
 }
 
 # IST weekday names accepted by `skip_weekdays`.
@@ -110,6 +114,8 @@ class ORBConvictionStrategy(ORBStrategy):
         skip_weekdays: list[str] | None = None,
         min_breakout_strength_atr: float | None = None,
         require_drift_alignment: bool = False,
+        require_prior_day_trend: bool = False,
+        prior_day_trend_buffer_pts: float = 0.0,
         max_loss_per_lot: float | None = None,
         time_stop_minutes: float | None = None,
         **orb_kwargs: object,
@@ -131,6 +137,8 @@ class ORBConvictionStrategy(ORBStrategy):
         self.skip_weekdays = {d for d in (skip_weekdays or []) if d in _WEEKDAYS}
         self.min_breakout_strength_atr = min_breakout_strength_atr
         self.require_drift_alignment = require_drift_alignment
+        self.require_prior_day_trend = require_prior_day_trend
+        self.prior_day_trend_buffer_pts = prior_day_trend_buffer_pts
         self.max_loss_per_lot = max_loss_per_lot
         self.time_stop_minutes = time_stop_minutes
         # Per-IST-day entry counter. Same in-memory durability class as
@@ -193,6 +201,11 @@ class ORBConvictionStrategy(ORBStrategy):
 
         if self.require_drift_alignment:
             reason = self._drift_alignment_reject(db, latest_bar, option_type)
+            if reason is not None:
+                return reason
+
+        if self.require_prior_day_trend:
+            reason = self._prior_day_trend_reject(db, latest_bar, option_type)
             if reason is not None:
                 return reason
 
@@ -304,6 +317,36 @@ class ORBConvictionStrategy(ORBStrategy):
             return "drift_disagrees"
         if option_type is OptionType.PE and drift >= 0:
             return "drift_disagrees"
+        return None
+
+    def _prior_day_trend_reject(
+        self, db: Session, latest_bar: PriceBar, option_type: OptionType
+    ) -> str | None:
+        """The breakout direction must agree with where the underlying now
+        trades relative to the prior trading day's close: a CE (long)
+        breakout needs price above prior close + buffer, a PE (short)
+        breakout below prior close - buffer. This is the framework's daily
+        trend filter (Strategy A = "ORB + trend"), using the day-over-day
+        reference the 60s EMA9/EMA20 proxy cannot express.
+
+        `prior_close` is the last completed 60s bar strictly before today's
+        9:15 IST open — the prior session's close (or last available bar).
+        """
+        session_open = datetime.combine(
+            to_ist(latest_bar.bucket_start).date(), time(9, 15), tzinfo=IST
+        )
+        prior = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, until=session_open, limit=1
+        )
+        if not prior:
+            return "prior_day_not_ready"
+        prior_close = float(prior[0].close)
+        close_now = float(latest_bar.close)
+        buf = self.prior_day_trend_buffer_pts
+        if option_type is OptionType.CE and close_now <= prior_close + buf:
+            return "prior_day_trend_disagrees"
+        if option_type is OptionType.PE and close_now >= prior_close - buf:
+            return "prior_day_trend_disagrees"
         return None
 
     # --- helpers -------------------------------------------------------
