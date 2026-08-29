@@ -640,16 +640,30 @@ check, then exercise it live).
   .run_once` (also disconnects once on the awake→dormant edge and nulls
   `_last_phase` so a re-login re-triggers connect), `session.bootstrapper
   .run_daily_bootstrap`, `scheduler.contract_sync_scheduler.run_contract_sync`,
-  `HealthCheckScheduler._check_market_data_staleness` (NTP/disk body still
-  runs). **Deliberately NOT gated**: `_attempt_shoonya_reconnect_from_cache`,
+  `session.bootstrapper.run_daily_bootstrap`,
+  `scheduler.contract_sync_scheduler.run_contract_sync`. **Deliberately NOT
+  gated**: `_attempt_shoonya_reconnect_from_cache`,
   `_run_startup_recovery_check`, `resume_strategy_runners`, `PositionManager`,
   `ReconciliationLockRecoveryScheduler`, `TradeLogExportScheduler` — these
   only do real work when there is genuine open risk or a lock to clear, a
   weekend emergency you want handled, not suppressed (their SystemAlert
   rows are still written; only the Telegram push is muted while dormant, a
-  conscious trade-off). Weekday market **holidays** are not handled
+  conscious trade-off). **2026-08-29 follow-up** (commit after `efe147f`):
+  the first cut gated `HealthCheckScheduler._check_market_data_staleness` on
+  `is_dormant()` (awake-state) — but an open dashboard tab polls every ~4s,
+  which `touch()`es the activity marker and keeps a weekend "awake", so the
+  CRITICAL `market_data_stale` alert kept firing whenever the user had the
+  UI open. Fixed: that sub-check is now gated on `weekend_rest
+  .is_weekend_ist()` (calendar, *not* login state) — NSE is closed Sat/Sun,
+  a stale index feed is expected and never actionable regardless of who's
+  signed in. NTP/disk body of `_run_cycle` still runs. Same commit:
+  `HealthCheckScheduler` now polls at 1/4 the weekday cadence on weekends
+  (20 min instead of 5) via a new overridable `IntervalScheduler
+  ._wait_seconds()` hook (`WEEKEND_INTERVAL_MULTIPLIER = 4`) — one method,
+  no new thread/config/state; `ReconciliationLockRecoveryScheduler` uses
+  the default and is unchanged. Weekday market **holidays** are not handled
   (weekends only — log in to wake). No schema change, no migration, no new
-  dependency. 1270 backend tests pass (up from 1258), ruff/mypy clean;
+  dependency. 1271 backend tests pass (up from 1258), ruff/mypy clean;
   test-suite weekend-safety via a single autouse `_weekend_rest_awake`
   fixture in `conftest.py` (`touch()` per test). Not yet live-verified
   against a real weekend (deployed 2026-08-29).

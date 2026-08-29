@@ -185,6 +185,12 @@ def _ntp_disk_ok(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.modules.scheduler.health_check.is_within_market_hours", lambda: True
     )
+    # The staleness sub-check is skipped on any weekend (calendar) -- force
+    # "weekday" so these tests are deterministic whichever day CI runs on.
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.weekend_rest.is_weekend_ist",
+        lambda *a, **k: False,
+    )
 
 
 def test_market_data_staleness_no_alert_when_bar_stream_is_still_fresh(
@@ -223,16 +229,16 @@ def test_market_data_staleness_no_alert_when_bar_stream_is_still_fresh(
     )
 
 
-def test_market_data_staleness_skipped_while_weekend_rest_mode_is_dormant(
+def test_market_data_staleness_skipped_on_a_weekend_regardless_of_login(
     db: Session, trading_session, monkeypatch
 ):
-    """On a dormant weekend the feed is stale by design (nothing connects
-    it) -- the staleness sub-check must not alert, but the NTP/disk body of
-    _run_cycle still runs (metrics recorded)."""
+    """On any weekend (calendar, not the awake/dormant state) the staleness
+    sub-check is skipped -- NSE is closed, a stale index feed is expected.
+    The NTP/disk body of _run_cycle still runs (metrics recorded)."""
     import app.modules.ops.weekend_rest as weekend_rest
 
     _ntp_disk_ok(monkeypatch)
-    monkeypatch.setattr(weekend_rest, "is_dormant", lambda *a, **k: True)
+    monkeypatch.setattr(weekend_rest, "is_weekend_ist", lambda *a, **k: True)
     inst = _seed_nifty(db)
     db.add(
         QuoteTick(
@@ -298,4 +304,24 @@ def test_market_data_staleness_alerts_when_tick_and_bar_are_both_stale(
         )
         .count()
         == 1
+    )
+
+
+def test_wait_seconds_is_4x_on_a_weekend_and_normal_on_a_weekday(monkeypatch):
+    """The background _loop polls 1/4 as often on weekends; run_once() (what
+    every other test drives) is untouched."""
+    import app.modules.ops.weekend_rest as weekend_rest
+    from app.modules.scheduler.health_check import (
+        DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS,
+        WEEKEND_INTERVAL_MULTIPLIER,
+    )
+
+    sched = HealthCheckScheduler()
+
+    monkeypatch.setattr(weekend_rest, "is_weekend_ist", lambda *a, **k: False)
+    assert sched._wait_seconds() == DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS  # noqa: SLF001
+
+    monkeypatch.setattr(weekend_rest, "is_weekend_ist", lambda *a, **k: True)
+    assert sched._wait_seconds() == (  # noqa: SLF001
+        DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS * WEEKEND_INTERVAL_MULTIPLIER
     )

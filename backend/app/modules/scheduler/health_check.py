@@ -59,6 +59,13 @@ logger = logging.getLogger("app.scheduler.health_check")
 
 DEFAULT_HEALTH_CHECK_INTERVAL_SECONDS = 300.0
 
+# 2026-08-29: NSE is closed all weekend, and NTP drift / disk usage develop
+# no faster on a Saturday than a Tuesday -- poll at 1/4 the weekday cadence
+# (20 min instead of 5) so the box genuinely rests. Applied via the
+# IntervalScheduler._wait_seconds() hook, so run_once() stays unchanged and
+# every existing test that drives it directly is unaffected.
+WEEKEND_INTERVAL_MULTIPLIER = 4
+
 _DEGRADABLE_MODES = (SafeMode.LIVE_ENABLED,)
 
 # 2026-08-25: dedicated "worth alerting a human" threshold for
@@ -82,6 +89,11 @@ class HealthCheckScheduler(IntervalScheduler):
         session_factory: SessionFactory = session_scope,
     ) -> None:
         super().__init__(logger, interval_seconds, session_factory=session_factory)
+
+    def _wait_seconds(self) -> float:
+        if weekend_rest.is_weekend_ist():
+            return self._interval_seconds * WEEKEND_INTERVAL_MULTIPLIER
+        return self._interval_seconds
 
     def _run_cycle(self, db: Session) -> None:
         ntp = check_ntp_drift()
@@ -176,15 +188,18 @@ class HealthCheckScheduler(IntervalScheduler):
 
         Gated on `is_within_market_hours()` — no ticks are expected outside
         it at all, so checking then would just alert on nothing new every
-        5 minutes overnight. Also gated on `weekend_rest.is_dormant()` — on
-        a dormant weekend `MarketDataScheduler` never connects the feed, so
-        it is stale *by design*, not a fault to alert on. The NTP/disk body
-        of `_run_cycle` is unaffected and still runs. No specific position/
-        order behind this (an underlying-level feed check, not a trade), so
-        `mode` is left at its `None` default — infra-level, not
-        paper-suppressed, same reasoning as `health_check_failed` above.
+        5 minutes overnight. Also skipped on any weekend
+        (`weekend_rest.is_weekend_ist()`, calendar — *not* the awake/dormant
+        state): NSE is closed Sat/Sun, so a stale NIFTY/BANKNIFTY feed is
+        expected and never actionable, whether or not a user happens to be
+        signed in. (Weekday market holidays are not handled — same scope
+        limit as `weekend_rest` itself.) The NTP/disk body of `_run_cycle`
+        is unaffected and still runs. No specific position/order behind this
+        (an underlying-level feed check, not a trade), so `mode` is left at
+        its `None` default — infra-level, not paper-suppressed, same
+        reasoning as `health_check_failed` above.
         """
-        if not workspace_ids or not is_within_market_hours() or weekend_rest.is_dormant():
+        if not workspace_ids or not is_within_market_hours() or weekend_rest.is_weekend_ist():
             return
 
         for symbol in TRADABLE_UNDERLYINGS:

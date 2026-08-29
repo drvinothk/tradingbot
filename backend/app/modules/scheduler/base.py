@@ -59,13 +59,22 @@ class IntervalScheduler:
     def _run_cycle(self, db: Session) -> None:
         raise NotImplementedError
 
+    def _wait_seconds(self) -> float:
+        """Seconds to wait between cycles. Overridable so a subclass can
+        slow its own cadence when frequent polling has no value (e.g.
+        `HealthCheckScheduler` polls 4x slower on weekends). Defaults to the
+        fixed construction-time interval; `run_once()` is unaffected, so
+        tests that drive it directly stay deterministic.
+        """
+        return self._interval_seconds
+
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 self.run_once()
             except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
                 self._logger.exception(self._cycle_failed_log_message)
-            self._stop_event.wait(self._interval_seconds)
+            self._stop_event.wait(self._wait_seconds())
 
 
 class DailyAtTimeScheduler:
