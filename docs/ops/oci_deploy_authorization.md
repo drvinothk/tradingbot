@@ -162,3 +162,48 @@ Approve? (yes / yes+add-allow-rules / no)
   convention). Rollback: re-run with the printed OLD values
   (`runtime_mode` back to `"force_paper"`, params back to the OLD dict), or
   `psql`. Local dev DB row (`e0f5d99b-…`) already updated to match.
+
+- **2026-08-30 — PARTIALLY DEPLOYED, migration + restart PENDING (operator):
+  multi-leg (staged) exit engine, branch `feat/multi-leg-exit-engine`
+  commit `2bc01c2`.** Adds a per-strategy configurable N-leg staged exit
+  (PAPER path only; a LIVE position with an `exit_legs` spec collapses to a
+  single full-qty leg + alert). Zero behavior change until a
+  `strategy_config.params.exit_legs` is set — no config on OCI has one.
+  1309 pytest pass, ruff/mypy clean.
+
+  Safety gate (checked live): OCI session `paper_only`/active, **zero open
+  non-closed positions**, alembic at `0028`. Safe to restart.
+
+  **Done by Claude:** `feat/multi-leg-exit-engine` pushed; `.claude/
+  settings.local.json` allow-rules added; `app/` tree tarball (creds
+  excluded, verified 0) extracted into
+  `/home/ubuntu/trading-bot/backend/`; `migrations/versions/
+  0029_multi_leg_exit.py` placed; backup `app.bak-20260829-202248` taken;
+  credentials dir confirmed intact post-extract. Service NOT restarted —
+  still running old code, `/health` ok.
+
+  **PENDING (operator — classifier blocks the prod-DB write + the deploy
+  restart from Claude):**
+
+      ssh ubuntu@144.24.137.112 'set -e
+        cd /home/ubuntu/trading-bot/backend
+        .venv/bin/python -c "import app.main; print(\"import OK\")"
+        .venv/bin/alembic current                 # expect 0028 (head)
+        .venv/bin/alembic upgrade head            # 0028 -> 0029
+        .venv/bin/alembic current                 # expect 0029 (head)
+        sudo systemctl restart trading-bot
+        sleep 5 && systemctl is-active trading-bot
+        curl -s http://127.0.0.1:5000/health'
+
+  Verify after: `sudo -u postgres psql trading_bot -c "\d position_exit_legs"`
+  shows the table; journalctl shows strategy runners resumed clean.
+
+  Migration `0029` is additive (new `position_exit_legs` table; nullable
+  `trade_outcomes.position_exit_leg_id`; drop `uq_trade_outcome_position`,
+  add `uq_trade_outcome_position_leg`; nullable `signals`/`trade_intents.
+  exit_legs` JSONB). NULL-safe against existing rows, round-tripped on the
+  dev DB both directions.
+
+  Rollback: `cd /home/ubuntu/trading-bot/backend && .venv/bin/alembic
+  downgrade 0028 && rm -rf app && mv app.bak-20260829-202248 app && sudo
+  systemctl restart trading-bot`.
