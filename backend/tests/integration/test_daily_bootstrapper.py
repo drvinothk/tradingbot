@@ -405,6 +405,36 @@ def test_resume_strategy_runners_is_called(
     assert len(_no_real_resume) == 1
 
 
+def test_dormant_weekend_skips_bootstrap_entirely(
+    db: Session, workspace, broker_account, user, _no_real_resume, monkeypatch
+):
+    """On a dormant weekend the 09:00 tick creates no session, spawns
+    nothing, and does not resume runners."""
+    monkeypatch.setattr(
+        bootstrapper_module.weekend_rest, "is_system_awake", lambda *a, **k: False
+    )
+    _yesterday_session(
+        db,
+        workspace=workspace,
+        broker_account=broker_account,
+        user=user,
+        status=TradingSessionStatus.ENDED,
+    )
+
+    run_daily_bootstrap(session_factory=_same_session(db))
+
+    assert (
+        db.query(TradingSession)
+        .filter(
+            TradingSession.workspace_id == workspace.id,
+            TradingSession.status == TradingSessionStatus.ACTIVE,
+        )
+        .count()
+        == 0
+    )
+    assert _no_real_resume == []
+
+
 def test_auto_spawner_runs_against_todays_freshly_created_session(
     db: Session, workspace, broker_account, user, instrument, monkeypatch
 ):

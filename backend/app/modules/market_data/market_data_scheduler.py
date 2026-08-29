@@ -38,6 +38,7 @@ from app.modules.market_data.provider_composition import (
     get_market_data_provider,
     is_market_data_ready,
 )
+from app.modules.ops import weekend_rest
 
 logger = logging.getLogger("app.market_data.scheduler")
 
@@ -77,6 +78,21 @@ class MarketDataScheduler:
         return self._thread is not None and self._thread.is_alive()
 
     def run_once(self) -> None:
+        # Weekend rest mode: on a dormant weekend (no signed-in user) do no
+        # connect/subscribe/health-check work at all -- that churn against a
+        # closed market is what manufactures the "stale feed" the weekend
+        # Telegram spam came from. On the awake->dormant edge (e.g. a
+        # logout) tear the connection down once and null _last_phase so the
+        # next wake re-triggers a real connect transition. No-op Mon-Fri.
+        if not weekend_rest.is_system_awake():
+            if self._last_phase is not None:
+                try:
+                    get_market_data_provider().disconnect()
+                except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
+                    logger.exception("weekend-rest dormant disconnect failed")
+                self._last_phase = None
+            return
+
         phase = current_phase()
         if phase != self._last_phase:
             self._handle_transition(self._last_phase, phase)

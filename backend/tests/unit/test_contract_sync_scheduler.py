@@ -102,6 +102,23 @@ def test_run_contract_sync_skips_when_shoonya_not_connected(monkeypatch):
     assert sync_calls == []
 
 
+def test_run_contract_sync_skips_while_weekend_rest_mode_is_dormant(monkeypatch):
+    monkeypatch.setattr(
+        contract_sync_module.weekend_rest, "is_system_awake", lambda *a, **k: False
+    )
+    # Would otherwise proceed (broker "connected"), proving the weekend gate
+    # is what stops it.
+    monkeypatch.setattr(contract_sync_module, "is_execution_broker_connected", lambda: True)
+    sync_calls: list[None] = []
+    monkeypatch.setattr(
+        contract_sync_module, "sync_instrument_master", lambda *a, **kw: sync_calls.append(None)
+    )
+
+    contract_sync_module.run_contract_sync()
+
+    assert sync_calls == []
+
+
 def test_run_contract_sync_calls_sync_when_shoonya_connected(monkeypatch):
     from contextlib import contextmanager
 

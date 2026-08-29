@@ -25,6 +25,7 @@ from datetime import time
 from app.core.db.session import session_scope
 from app.domain.market.models import SyncStatus
 from app.modules.broker_adapter.composition import get_broker, is_execution_broker_connected
+from app.modules.ops import weekend_rest
 from app.modules.scheduler.base import DailyAtTimeScheduler
 from app.modules.scheduler.instrument_sync import sync_instrument_master
 
@@ -34,6 +35,12 @@ CONTRACT_SYNC_TIME = time(8, 30)
 
 
 def run_contract_sync() -> None:
+    # Weekend rest mode: no point syncing the contract master on a dormant
+    # weekend. No-op Mon-Fri.
+    if not weekend_rest.is_system_awake():
+        logger.info("Contract sync: skipped -- weekend rest mode (no signed-in user).")
+        return
+
     if not is_execution_broker_connected():
         logger.info(
             "Contract sync: Shoonya not connected -- skipping, existing local "

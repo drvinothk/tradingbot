@@ -454,6 +454,15 @@ class AppSettings(BaseSettings):
     # point, not a researched figure -- tune via APP_LIVE_LIMIT_ORDER_
     # BUFFER_PCT once live fills are observed.
     live_limit_order_buffer_pct: float = 0.005
+    # Weekend rest mode (see app.modules.ops.weekend_rest). On by default;
+    # inert Mon-Fri IST regardless. APP_WEEKEND_REST_ENABLED=false is an
+    # instant kill switch (settable via `systemctl set-environment` on the
+    # OCI box with no redeploy, same escape-hatch shape as
+    # MARKET_DATA_ALLOW_OFFHOURS_TESTING). On a Sat/Sun the system stays
+    # awake only while a signed-in user is active, and for
+    # weekend_rest_idle_minutes after their last authenticated request.
+    weekend_rest_enabled: bool = True
+    weekend_rest_idle_minutes: int = 10
 
 
 class PaperTradingSettings(BaseSettings):

@@ -56,6 +56,7 @@ from app.domain.session.models import SafeMode, TradingSession, TradingSessionSt
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
+from app.modules.ops import weekend_rest
 from app.modules.scheduler.base import DailyAtTimeScheduler
 from app.modules.strategy_engine.auto_spawner import spawn_enabled_strategies
 from app.modules.strategy_engine.recovery import resume_strategy_runners
@@ -229,6 +230,16 @@ def _bootstrap_workspace(
 
 
 def run_daily_bootstrap(*, session_factory: SessionFactory = session_scope) -> None:
+    # Weekend rest mode: the 09:00 scheduler tick does nothing on a dormant
+    # weekend -- no weekend session creation, no auto-spawn, no runner
+    # resume against a closed market. The direct callers (oauth_callback,
+    # POST /sessions/bootstrap-now) are only ever hit by a signed-in user,
+    # who has just touch()-ed the activity marker, so those still run.
+    # No-op Mon-Fri.
+    if not weekend_rest.is_system_awake():
+        logger.info("Daily bootstrap: skipped -- weekend rest mode (no signed-in user).")
+        return
+
     today_ist = now_ist().date()
     with session_factory() as db:
         # Every workspace, not just ones with existing trading_session

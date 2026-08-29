@@ -46,6 +46,10 @@ def _scheduler_with_phase_sequence(
     it = iter(phases)
     monkeypatch.setattr(scheduler_module, "current_phase", lambda: next(it))
     monkeypatch.setattr(scheduler_module, "get_market_data_provider", lambda: provider)
+    # Weekend rest mode: default every test to "awake" so the phase logic
+    # runs regardless of the real day of week. The dormancy tests below
+    # override this back to False explicitly.
+    monkeypatch.setattr(scheduler_module.weekend_rest, "is_system_awake", lambda: True)
     calls = subscribe_calls if subscribe_calls is not None else []
     monkeypatch.setattr(
         registry_module, "ensure_ingestion_running", lambda symbol: calls.append(symbol)
@@ -394,6 +398,53 @@ def test_health_check_fires_and_retries_subscription_during_active_market(monkey
     sched.run_once()
     assert provider.calls == ["connect"]  # the health check itself
     assert subscribe_calls == list(TRADABLE_UNDERLYINGS) + list(ENV_METRIC_SYMBOLS)
+
+
+def test_dormant_weekend_takes_no_action_and_never_reads_phase(monkeypatch):
+    """On a dormant weekend run_once must short-circuit before touching
+    current_phase() or the provider at all -- no connect/subscribe/health
+    churn against a closed market."""
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [], provider)
+
+    def _boom():
+        raise AssertionError("current_phase must not be consulted while dormant")
+
+    monkeypatch.setattr(scheduler_module, "current_phase", _boom)
+    monkeypatch.setattr(scheduler_module.weekend_rest, "is_system_awake", lambda: False)
+
+    sched.run_once()
+
+    assert provider.calls == []
+    assert sched._last_phase is None  # noqa: SLF001
+
+
+def test_awake_to_dormant_edge_disconnects_once_and_resets_phase(monkeypatch):
+    """A logout mid-session flips the system dormant. The next run_once
+    should tear the connection down exactly once and null _last_phase so a
+    later re-login re-triggers a real connect transition."""
+    provider = _FakeProvider()
+    awake = {"v": True}
+    sched = _scheduler_with_phase_sequence(
+        monkeypatch, [MarketPhase.ACTIVE_MARKET], provider
+    )
+    monkeypatch.setattr(
+        scheduler_module.weekend_rest, "is_system_awake", lambda: awake["v"]
+    )
+
+    sched.run_once()  # awake: from_phase=None -> ACTIVE_MARKET connect+subscribe
+    assert provider.calls == ["connect"]
+    assert sched._last_phase == MarketPhase.ACTIVE_MARKET  # noqa: SLF001
+
+    awake["v"] = False
+    provider.calls.clear()
+    sched.run_once()  # dormant edge: one disconnect, phase nulled
+    assert provider.calls == ["disconnect"]
+    assert sched._last_phase is None  # noqa: SLF001
+
+    provider.calls.clear()
+    sched.run_once()  # still dormant: nothing more
+    assert provider.calls == []
 
 
 def test_health_check_still_does_not_fire_during_closed(monkeypatch):

@@ -390,6 +390,59 @@ def test_telegram_dedup_allows_a_resend_after_the_cooldown_elapses(
     assert len(_configured) == 2
 
 
+def test_telegram_blocked_while_weekend_rest_mode_is_dormant(
+    db: Session, workspace, _configured, _within_alert_window, monkeypatch
+):
+    """A dormant weekend (no signed-in user) suppresses the push -- but the
+    SystemAlert DB row must still be written, same invariant as every other
+    gate in _should_push_to_telegram."""
+    monkeypatch.setattr(alerting_manager.weekend_rest, "is_dormant", lambda *a, **k: True)
+
+    alert = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+    )
+
+    assert _configured == []
+    assert db.get(SystemAlert, alert.id) is not None
+
+
+def test_dormant_suppression_does_not_consume_a_dedup_slot(
+    db: Session, workspace, _configured, _within_alert_window, monkeypatch
+):
+    """The dormant check sits before the dedup step, so a candidate blocked
+    while dormant must not start that issue's cooldown -- once the system is
+    awake again the first real alert still pushes."""
+    dormant = {"v": True}
+    monkeypatch.setattr(
+        alerting_manager.weekend_rest, "is_dormant", lambda *a, **k: dormant["v"]
+    )
+
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+        dedup_key="same-issue",
+    )
+    assert _configured == []
+
+    dormant["v"] = False
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+        dedup_key="same-issue",
+    )
+    assert len(_configured) == 1
+
+
 def test_send_alert_default_dedup_key_falls_back_to_session_or_workspace(
     db: Session, workspace, _configured, _within_alert_window
 ):

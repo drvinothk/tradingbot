@@ -187,6 +187,23 @@ def _force_no_telegram_dispatch(monkeypatch) -> None:
     monkeypatch.setattr(get_settings().telegram, "chat_id", "")
 
 
+@pytest.fixture(autouse=True)
+def _weekend_rest_awake() -> Generator[None, None, None]:
+    """`app.modules.ops.weekend_rest.is_system_awake()` returns `True`
+    unconditionally Mon-Fri, but this suite must also pass when CI runs on a
+    Saturday/Sunday. Marking the system active for every test (and clearing
+    it afterward) keeps `MarketDataScheduler`/`run_daily_bootstrap`/the
+    Telegram gate on their normal always-on code path regardless of the
+    real day of week. A test that specifically exercises dormancy calls
+    `weekend_rest.sleep_now()` itself -- that runs after this setup and wins.
+    """
+    from app.modules.ops import weekend_rest
+
+    weekend_rest.touch()
+    yield
+    weekend_rest.reset_for_tests()
+
+
 @pytest.fixture
 def workspace(db: Session) -> Workspace:
     ws = Workspace(id=uuid.uuid4(), name=f"test-{uuid.uuid4().hex[:8]}")

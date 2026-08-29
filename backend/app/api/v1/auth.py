@@ -67,6 +67,12 @@ def login(
     )
     db.commit()
 
+    # Wake weekend rest mode on login -- this POST doesn't go through
+    # get_current_user, so it needs its own touch(). No-op Mon-Fri.
+    from app.modules.ops import weekend_rest
+
+    weekend_rest.touch()
+
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=raw_token,
@@ -105,6 +111,12 @@ def logout(
         entity_id=user.id,
     )
     db.commit()
+
+    # Explicit logout -> weekend rest mode sleeps immediately (don't wait
+    # out the idle window). No-op Mon-Fri.
+    from app.modules.ops import weekend_rest
+
+    weekend_rest.sleep_now()
 
     response.delete_cookie(SESSION_COOKIE_NAME)
     return {"ok": True}

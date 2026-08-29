@@ -51,6 +51,7 @@ from app.modules.market_data.freshness import (
     underlying_feed_state,
 )
 from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_within_market_hours
+from app.modules.ops import weekend_rest
 from app.modules.ops.metrics_service import record_metric
 from app.modules.scheduler.base import IntervalScheduler
 
@@ -175,12 +176,15 @@ class HealthCheckScheduler(IntervalScheduler):
 
         Gated on `is_within_market_hours()` — no ticks are expected outside
         it at all, so checking then would just alert on nothing new every
-        5 minutes overnight. No specific position/order behind this (an
-        underlying-level feed check, not a trade), so `mode` is left at its
-        `None` default — infra-level, not paper-suppressed, same reasoning
-        as `health_check_failed` above.
+        5 minutes overnight. Also gated on `weekend_rest.is_dormant()` — on
+        a dormant weekend `MarketDataScheduler` never connects the feed, so
+        it is stale *by design*, not a fault to alert on. The NTP/disk body
+        of `_run_cycle` is unaffected and still runs. No specific position/
+        order behind this (an underlying-level feed check, not a trade), so
+        `mode` is left at its `None` default — infra-level, not
+        paper-suppressed, same reasoning as `health_check_failed` above.
         """
-        if not workspace_ids or not is_within_market_hours():
+        if not workspace_ids or not is_within_market_hours() or weekend_rest.is_dormant():
             return
 
         for symbol in TRADABLE_UNDERLYINGS:

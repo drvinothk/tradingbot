@@ -86,6 +86,7 @@ from app.config.settings import get_settings
 from app.core.clock import now_ist
 from app.domain.execution.models import OrderMode
 from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.modules.ops import weekend_rest
 
 logger = logging.getLogger("app.alerting.manager")
 
@@ -221,6 +222,13 @@ def _should_push_to_telegram(
     if severity != AlertSeverity.CRITICAL:
         return False
     if mode == OrderMode.PAPER and not override_paper_mode_suppression:
+        return False
+    # Weekend rest mode: while the system is dormant (a weekend with no
+    # signed-in user), suppress the push -- checked before the dedup step
+    # below so a suppressed candidate never consumes/extends a dedup slot,
+    # same ordering rationale as the time-window check. The SystemAlert DB
+    # row is still written unconditionally by send_alert. No-op Mon-Fri.
+    if weekend_rest.is_dormant():
         return False
     now = now_ist()
     if not _within_alert_window(now):

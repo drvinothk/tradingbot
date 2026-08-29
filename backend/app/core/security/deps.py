@@ -24,4 +24,10 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     if user is None or not user.is_active:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
 
+    # Single auth chokepoint -- every authenticated request (the dashboard's
+    # own poll included) marks the user active, which is what keeps the
+    # system awake through the weekend idle window. No-op Mon-Fri.
+    from app.modules.ops import weekend_rest
+
+    weekend_rest.touch()
     return user

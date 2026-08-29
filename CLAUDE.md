@@ -614,6 +614,46 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-08-29: weekend rest mode — implemented, tested, DEPLOYED to OCI.**
+  Root cause of weekend Telegram spam: every time-of-day gate in the
+  codebase (`market_data.market_hours` 08:30–16:00, `alerting.manager`'s
+  09:00–15:30 window, `core.clock`'s trade window) checks the *hour* but
+  never the *day of week*, so a Saturday/Sunday behaved exactly like a
+  trading day — `MarketDataScheduler` connected Shoonya, got no ticks, and
+  `HealthCheckScheduler._check_market_data_staleness` then fired a CRITICAL
+  `market_data_stale` alert to Telegram every 5 minutes. Fix: new in-memory
+  module `app/modules/ops/weekend_rest.py` with `is_system_awake()` —
+  returns `True` unconditionally Mon–Fri IST (**zero behavior change on a
+  trading day**), and on a weekend returns `True` only while a signed-in
+  user is active. `core.security.deps.get_current_user` + `api.v1.auth.login`
+  call `weekend_rest.touch()` (any authenticated request, dashboard poll
+  included, marks activity); `api.v1.auth.logout` calls `sleep_now()`
+  (immediate sleep); otherwise the system sleeps `APP_WEEKEND_REST_IDLE_MINUTES`
+  (default 10) after the last authenticated request. `APP_WEEKEND_REST_ENABLED`
+  (default `true`) is an instant kill switch — `false` makes `is_system_awake()`
+  always `True`, byte-identical to pre-change behavior, settable via
+  `systemctl set-environment` with no redeploy (same escape-hatch shape as
+  `MARKET_DATA_ALLOW_OFFHOURS_TESTING`). Gate points (all `if not
+  is_system_awake(): skip`, so weekday/disabled = untouched):
+  `alerting.manager._should_push_to_telegram` (SystemAlert DB row still
+  written unconditionally — only the push is muted), `MarketDataScheduler
+  .run_once` (also disconnects once on the awake→dormant edge and nulls
+  `_last_phase` so a re-login re-triggers connect), `session.bootstrapper
+  .run_daily_bootstrap`, `scheduler.contract_sync_scheduler.run_contract_sync`,
+  `HealthCheckScheduler._check_market_data_staleness` (NTP/disk body still
+  runs). **Deliberately NOT gated**: `_attempt_shoonya_reconnect_from_cache`,
+  `_run_startup_recovery_check`, `resume_strategy_runners`, `PositionManager`,
+  `ReconciliationLockRecoveryScheduler`, `TradeLogExportScheduler` — these
+  only do real work when there is genuine open risk or a lock to clear, a
+  weekend emergency you want handled, not suppressed (their SystemAlert
+  rows are still written; only the Telegram push is muted while dormant, a
+  conscious trade-off). Weekday market **holidays** are not handled
+  (weekends only — log in to wake). No schema change, no migration, no new
+  dependency. 1270 backend tests pass (up from 1258), ruff/mypy clean;
+  test-suite weekend-safety via a single autouse `_weekend_rest_awake`
+  fixture in `conftest.py` (`touch()` per test). Not yet live-verified
+  against a real weekend (deployed 2026-08-29).
+
 - **2026-08-27: phantom `reconciliation_mismatch` from the execution mock's
   position book being wiped on restart — root-caused, fixed, DEPLOYED to
   OCI + live-verified.** Symptom: a CRITICAL `reconciliation_mismatch`

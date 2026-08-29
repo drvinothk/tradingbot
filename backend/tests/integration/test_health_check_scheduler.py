@@ -223,6 +223,51 @@ def test_market_data_staleness_no_alert_when_bar_stream_is_still_fresh(
     )
 
 
+def test_market_data_staleness_skipped_while_weekend_rest_mode_is_dormant(
+    db: Session, trading_session, monkeypatch
+):
+    """On a dormant weekend the feed is stale by design (nothing connects
+    it) -- the staleness sub-check must not alert, but the NTP/disk body of
+    _run_cycle still runs (metrics recorded)."""
+    import app.modules.ops.weekend_rest as weekend_rest
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(weekend_rest, "is_dormant", lambda *a, **k: True)
+    inst = _seed_nifty(db)
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(), instrument_id=inst.id, ltp=100.0, bid=99.5, ask=100.5,
+            volume=0, oi=None, ts=datetime.now(UTC) - timedelta(seconds=4000),
+        )
+    )
+    db.add(
+        PriceBar(
+            id=uuid.uuid4(), instrument_id=inst.id, timeframe="60s",
+            bucket_start=datetime.now(UTC) - timedelta(seconds=4000),
+            open=100.0, high=101.0, low=99.0, close=100.5, volume=1000,
+        )
+    )
+    db.flush()
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "market_data_stale",
+        )
+        .count()
+        == 0
+    )
+    assert (
+        db.query(MetricSeries)
+        .filter(MetricSeries.workspace_id == trading_session.workspace_id)
+        .count()
+        > 0
+    )
+
+
 def test_market_data_staleness_alerts_when_tick_and_bar_are_both_stale(
     db: Session, trading_session, monkeypatch
 ):
