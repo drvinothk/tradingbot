@@ -265,7 +265,19 @@ export interface SquareOffPositionOut {
 
 export interface DailyLimitsOut {
   daily_budget_amount: number
-  daily_max_lots: number
+  daily_target_profit: number
+  daily_loss_cap: number
+  funding_mode: string
+}
+
+export interface UnderlyingFeedTelemetryOut {
+  symbol: string
+  feed_age_seconds: number | null
+  feed_state: string
+}
+
+export interface MarketDataTelemetryOut {
+  underlyings: UnderlyingFeedTelemetryOut[]
 }
 
 export interface PerformanceStatsOut {

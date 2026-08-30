@@ -89,6 +89,44 @@ def get_provider_preference(
     )
 
 
+class UnderlyingFeedTelemetryOut(BaseModel):
+    symbol: str
+    feed_age_seconds: float | None
+    feed_state: str
+
+
+class MarketDataTelemetryOut(BaseModel):
+    underlyings: list[UnderlyingFeedTelemetryOut]
+
+
+@router.get("/telemetry", response_model=MarketDataTelemetryOut)
+def get_market_data_telemetry(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> MarketDataTelemetryOut:
+    """2026-08-30, activating the Advanced page's telemetry card. Reuses
+    `market_data.freshness.underlying_feed_freshness` -- the exact same
+    function `GET /shoonya/status`'s `feed_age_seconds`/`feed_state`
+    already calls -- just per-underlying instead of that endpoint's
+    best-of-both-underlyings single value, so NIFTY and BANKNIFTY staleness
+    are distinguishable here. No new tables, no new background service:
+    purely a read over `quote_ticks`/`price_bars`. Active-provider/
+    live-active-leg is deliberately NOT duplicated here -- the frontend
+    already fetches that from `GET /market-data/provider-preference`
+    (used by the Global settings card) and shares the cache.
+    """
+    from app.modules.market_data.freshness import underlying_feed_freshness
+    from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS
+
+    underlyings = []
+    for symbol in TRADABLE_UNDERLYINGS:
+        age, state = underlying_feed_freshness(db, (symbol,))
+        underlyings.append(
+            UnderlyingFeedTelemetryOut(symbol=symbol, feed_age_seconds=age, feed_state=state.value)
+        )
+    return MarketDataTelemetryOut(underlyings=underlyings)
+
+
 @router.patch("/provider-preference", response_model=ProviderPreferenceOut)
 def set_provider_preference(
     body: SetProviderPreferenceRequest,

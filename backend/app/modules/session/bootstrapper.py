@@ -51,7 +51,7 @@ from app.core.db.session import SessionFactory, session_scope
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.identity.models import Workspace
-from app.domain.ops.models import AlertSeverity
+from app.domain.ops.models import AlertSeverity, GlobalDailyLimitsConfig
 from app.domain.session.models import SafeMode, TradingSession, TradingSessionStatus
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.alerting.manager import send_alert
@@ -191,7 +191,23 @@ def _bootstrap_workspace(
         )
         return None
 
+    # 2026-08-30: prefer the workspace's own GlobalDailyLimitsConfig row
+    # (runtime-editable via the Advanced page's Daily settings console)
+    # over RiskDefaults (env-settings, needs a restart to change) --
+    # falling back to RiskDefaults only for a workspace that's never
+    # touched that console. funding_mode deliberately stays sourced from
+    # `most_recent.funding_mode` (the prior session's own value), not this
+    # config -- that "sticky, carries forward automatically" behavior
+    # already exists and predates this change; the console's own
+    # funding_mode field only matters for a workspace's genuinely first
+    # session (api.v1.sessions.create_session's own fallback path, which
+    # has no prior session to inherit from).
     defaults = get_settings().risk_defaults
+    global_daily = (
+        db.query(GlobalDailyLimitsConfig)
+        .filter(GlobalDailyLimitsConfig.workspace_id == workspace_id)
+        .one_or_none()
+    )
     new_session = TradingSession(
         id=uuid.uuid4(),
         workspace_id=workspace_id,
@@ -199,9 +215,17 @@ def _bootstrap_workspace(
         started_by_user_id=most_recent.started_by_user_id,
         mode=SafeMode.PAPER_ONLY,
         started_at=datetime.now(UTC),
-        budget_amount=defaults.default_budget,
-        daily_target_profit=defaults.daily_target_profit,
-        daily_loss_cap=defaults.daily_loss_cap,
+        budget_amount=(
+            float(global_daily.daily_budget_amount) if global_daily else defaults.default_budget
+        ),
+        daily_target_profit=(
+            float(global_daily.daily_target_profit)
+            if global_daily
+            else defaults.daily_target_profit
+        ),
+        daily_loss_cap=(
+            float(global_daily.daily_loss_cap) if global_daily else defaults.daily_loss_cap
+        ),
         funding_mode=most_recent.funding_mode,
     )
     db.add(new_session)

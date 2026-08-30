@@ -75,6 +75,7 @@ from app.modules.market_data.freshness import (
     check_price_drift,
     fresh_reference_premium,
 )
+from app.modules.strategy_engine.sizing import resolve_qty_lots
 
 logger = logging.getLogger("app.risk_engine")
 
@@ -470,6 +471,7 @@ def evaluate_trade_intent(
             raise ValueError(f"unknown option_contract_id {trade_intent.option_contract_id}")
 
         risk_config = get_active_risk_limit_config(db, trading_session.workspace_id)
+        strategy_config = db.get(StrategyConfig, strategy_run.strategy_config_id)
 
         analytics = compute_pre_trade_analytics(
             db,
@@ -604,7 +606,31 @@ def evaluate_trade_intent(
         # The mode-aware default's own comment already says paper is
         # "risk-service-exempt" for this cap; this was the missing half of
         # that design.
-        if is_live and trade_intent.qty_lots > risk_config.per_trade_lot_cap:
+        #
+        # 2026-08-30: the ceiling itself changed from one workspace-wide
+        # `risk_config.per_trade_lot_cap` to `min(that, this strategy's own
+        # resolve_qty_lots(...))`. Closes a real gap raised by the user:
+        # once strategies run at genuinely different per-strategy lot
+        # sizes (`params["qty_lots"]`, exposed as Strategy Control's Lots
+        # column), a single global cap sized to the *largest* strategy's
+        # allowance no longer protects any of the *smaller* ones from a
+        # wrong/oversized entry -- raising the cap to fit strategy A's 5
+        # lots would silently also let strategy B (configured for 1 lot)
+        # place a 5-lot trade. Reusing `resolve_qty_lots` (not a new
+        # concept) means each strategy's own configured size doubles as
+        # its own hard ceiling, independent of every other strategy's.
+        # `min()` keeps `risk_config.per_trade_lot_cap` as an outer,
+        # workspace-wide backstop -- unchanged, still the binding value in
+        # the common case (its default of 1 matches
+        # DEFAULT_QTY_LOTS_LIVE, so this is a no-op until a strategy's
+        # qty_lots is actually raised above it).
+        per_strategy_cap = (
+            resolve_qty_lots(strategy_config, trading_session, strategy_run)
+            if strategy_config is not None
+            else risk_config.per_trade_lot_cap
+        )
+        effective_lot_cap = min(risk_config.per_trade_lot_cap, per_strategy_cap)
+        if is_live and trade_intent.qty_lots > effective_lot_cap:
             reasons.append("per_trade_lot_cap_exceeded")
 
         # Safe against every current test/live-paper path, not just

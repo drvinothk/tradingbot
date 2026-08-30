@@ -7,10 +7,12 @@ directly controls which instruments real money can flow to -- a
 risk-governance action, not a connectivity toggle.
 
 2026-08-20: `GET`/`PATCH /system-settings/daily-limits` added, same file,
-same router, same `risk.override` gate -- the global "total daily budget"/
-"total lots per day" settings surface from the UI dashboard plan. See
-`GlobalDailyLimitsConfig`'s own docstring (`app.domain.ops.models`) for why
-it's a new table rather than a rename of an existing risk-engine concept.
+same router, same `risk.override` gate -- originally the global "total
+daily budget"/"total lots per day" settings surface from the UI dashboard
+plan. 2026-08-30: consolidated into the session Daily Plan's default
+values (budget/target/loss-cap/funding-mode) -- see
+`GlobalDailyLimitsConfig`'s own docstring (`app.domain.ops.models`) for
+the full design.
 """
 
 from __future__ import annotations
@@ -35,10 +37,13 @@ from app.domain.market.models import OptionContract
 from app.domain.ops.models import (
     DEFAULT_ACTIVE_LIVE_INSTRUMENTS,
     DEFAULT_DAILY_BUDGET_AMOUNT,
-    DEFAULT_DAILY_MAX_LOTS,
+    DEFAULT_DAILY_LOSS_CAP,
+    DEFAULT_DAILY_TARGET_PROFIT,
+    DEFAULT_FUNDING_MODE,
     GlobalDailyLimitsConfig,
     InstrumentFirewallConfig,
 )
+from app.domain.session.models import FundingMode
 from app.modules.audit_service.service import record_event
 
 router = APIRouter(prefix="/system-settings", tags=["system-settings"])
@@ -150,12 +155,16 @@ def set_instrument_firewall(
 
 class DailyLimitsOut(BaseModel):
     daily_budget_amount: float
-    daily_max_lots: int
+    daily_target_profit: float
+    daily_loss_cap: float
+    funding_mode: str
 
 
 class SetDailyLimitsRequest(BaseModel):
     daily_budget_amount: float = Field(gt=0)
-    daily_max_lots: int = Field(gt=0)
+    daily_target_profit: float = Field(gt=0)
+    daily_loss_cap: float = Field(gt=0)
+    funding_mode: FundingMode = FundingMode.CASH
 
 
 @router.get("/daily-limits", response_model=DailyLimitsOut)
@@ -163,13 +172,13 @@ def get_daily_limits(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("risk.override")),
 ) -> DailyLimitsOut:
-    """2026-08-20 addition -- global "total daily budget" / "total lots per
-    day" settings surface, same GET-returns-row-or-documented-default shape
+    """2026-08-20 addition, consolidated 2026-08-30 -- the default Daily
+    Plan values (budget/target/loss-cap/funding-mode) a newly-created
+    session starts with, same GET-returns-row-or-documented-default shape
     as get_instrument_firewall above. See GlobalDailyLimitsConfig's own
-    docstring (app.domain.ops.models) for why this is a new table, not a
-    rename of RiskLimitConfig.per_trade_lot_cap or
-    TradingSession.budget_amount -- and why it's a settings surface only,
-    not yet wired into any pre-trade enforcement path.
+    docstring (app.domain.ops.models) for the full design, including why
+    this only ever seeds a *new* session and never rewrites an
+    already-active one's own (still independently editable) Daily Plan.
     """
     config = (
         db.query(GlobalDailyLimitsConfig)
@@ -179,11 +188,15 @@ def get_daily_limits(
     if config is None:
         return DailyLimitsOut(
             daily_budget_amount=DEFAULT_DAILY_BUDGET_AMOUNT,
-            daily_max_lots=DEFAULT_DAILY_MAX_LOTS,
+            daily_target_profit=DEFAULT_DAILY_TARGET_PROFIT,
+            daily_loss_cap=DEFAULT_DAILY_LOSS_CAP,
+            funding_mode=DEFAULT_FUNDING_MODE,
         )
     return DailyLimitsOut(
         daily_budget_amount=float(config.daily_budget_amount),
-        daily_max_lots=config.daily_max_lots,
+        daily_target_profit=float(config.daily_target_profit),
+        daily_loss_cap=float(config.daily_loss_cap),
+        funding_mode=config.funding_mode,
     )
 
 
@@ -191,7 +204,9 @@ def _upsert_daily_limits(
     db: Session,
     workspace_id: uuid.UUID,
     daily_budget_amount: float,
-    daily_max_lots: int,
+    daily_target_profit: float,
+    daily_loss_cap: float,
+    funding_mode: str,
 ) -> tuple[GlobalDailyLimitsConfig, dict]:
     """select-then-insert, guarded against the real DB unique constraint on
     `GlobalDailyLimitsConfig.workspace_id`. Two concurrent `PATCH` calls
@@ -215,19 +230,25 @@ def _upsert_daily_limits(
     previous = (
         {
             "daily_budget_amount": float(config.daily_budget_amount),
-            "daily_max_lots": config.daily_max_lots,
+            "daily_target_profit": float(config.daily_target_profit),
+            "daily_loss_cap": float(config.daily_loss_cap),
+            "funding_mode": config.funding_mode,
         }
         if config is not None
         else {
             "daily_budget_amount": DEFAULT_DAILY_BUDGET_AMOUNT,
-            "daily_max_lots": DEFAULT_DAILY_MAX_LOTS,
+            "daily_target_profit": DEFAULT_DAILY_TARGET_PROFIT,
+            "daily_loss_cap": DEFAULT_DAILY_LOSS_CAP,
+            "funding_mode": DEFAULT_FUNDING_MODE,
         }
     )
     if config is None:
         config = GlobalDailyLimitsConfig(
             workspace_id=workspace_id,
             daily_budget_amount=daily_budget_amount,
-            daily_max_lots=daily_max_lots,
+            daily_target_profit=daily_target_profit,
+            daily_loss_cap=daily_loss_cap,
+            funding_mode=funding_mode,
         )
         db.add(config)
         try:
@@ -240,11 +261,15 @@ def _upsert_daily_limits(
                 .one()
             )
             config.daily_budget_amount = daily_budget_amount
-            config.daily_max_lots = daily_max_lots
+            config.daily_target_profit = daily_target_profit
+            config.daily_loss_cap = daily_loss_cap
+            config.funding_mode = funding_mode
             db.flush()
     else:
         config.daily_budget_amount = daily_budget_amount
-        config.daily_max_lots = daily_max_lots
+        config.daily_target_profit = daily_target_profit
+        config.daily_loss_cap = daily_loss_cap
+        config.funding_mode = funding_mode
         db.flush()
     return config, previous
 
@@ -256,7 +281,12 @@ def set_daily_limits(
     user: User = Depends(require_permission("risk.override")),
 ) -> DailyLimitsOut:
     config, previous = _upsert_daily_limits(
-        db, user.workspace_id, body.daily_budget_amount, body.daily_max_lots
+        db,
+        user.workspace_id,
+        body.daily_budget_amount,
+        body.daily_target_profit,
+        body.daily_loss_cap,
+        body.funding_mode.value,
     )
 
     record_event(
@@ -272,7 +302,9 @@ def set_daily_limits(
             "previous": previous,
             "new": {
                 "daily_budget_amount": body.daily_budget_amount,
-                "daily_max_lots": body.daily_max_lots,
+                "daily_target_profit": body.daily_target_profit,
+                "daily_loss_cap": body.daily_loss_cap,
+                "funding_mode": body.funding_mode.value,
             },
         },
     )
@@ -280,7 +312,9 @@ def set_daily_limits(
     db.refresh(config)
     return DailyLimitsOut(
         daily_budget_amount=float(config.daily_budget_amount),
-        daily_max_lots=config.daily_max_lots,
+        daily_target_profit=float(config.daily_target_profit),
+        daily_loss_cap=float(config.daily_loss_cap),
+        funding_mode=config.funding_mode,
     )
 
 

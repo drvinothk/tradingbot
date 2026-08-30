@@ -966,6 +966,71 @@ def test_per_trade_lot_cap_does_not_block_a_paper_routed_strategy(
     assert "per_trade_lot_cap_exceeded" not in decision.reasons
 
 
+def test_per_trade_lot_cap_is_scoped_per_strategy_not_just_the_workspace_wide_number(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
+):
+    """2026-08-30: closes the real gap raised in review -- once the
+    workspace-wide `per_trade_lot_cap` is raised to fit one strategy's
+    larger configured size (5, here), a *different* strategy left at its
+    smaller/default size (1, unset here) must still be capped at its own
+    size, not silently allowed up to the now-larger workspace number. Before
+    this fix, `min()` didn't exist and the workspace number alone gated
+    every strategy identically.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    risk_config = get_active_risk_limit_config(db, workspace.id)
+    risk_config.per_trade_lot_cap = 5  # raised to fit a *different* strategy's own 5-lot config
+    db.add(risk_config)
+    strategy_config.params = {}  # this strategy has no override -- mode-aware default (1, live)
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=3
+    )
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "per_trade_lot_cap_exceeded" in decision.reasons
+
+
+def test_per_trade_lot_cap_allows_a_strategys_own_configured_qty_lots(
+    db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
+    strategy_config, option_contract, monkeypatch,
+):
+    """The other half of the same fix: a strategy explicitly configured for
+    5 lots (`params["qty_lots"]`) is allowed to trade its own configured
+    size once the workspace-wide cap is raised to accommodate it -- the
+    ceiling is `min(workspace cap, this strategy's own resolved qty_lots)`,
+    not the workspace number alone.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    risk_config = get_active_risk_limit_config(db, workspace.id)
+    risk_config.per_trade_lot_cap = 5
+    db.add(risk_config)
+    strategy_config.params = {"qty_lots": 5}
+    db.add(strategy_config)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=5
+    )
+    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
+
+    assert "per_trade_lot_cap_exceeded" not in decision.reasons
+
+
 def test_evaluate_trade_intent_budget_exceeded(
     db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
     strategy_config, option_contract, monkeypatch,

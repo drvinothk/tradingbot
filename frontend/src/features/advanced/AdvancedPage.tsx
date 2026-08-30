@@ -14,6 +14,7 @@ import type {
   ExecutionMode,
   InstrumentFirewallOut,
   InstrumentOut,
+  MarketDataTelemetryOut,
   ProviderPreferenceOut,
   RuntimeMode,
   SessionOut,
@@ -21,6 +22,7 @@ import type {
   StrategyConfigOut,
   StrategyRunOut,
   StrategyType,
+  SystemAlertOut,
   UnderlyingSymbol,
 } from '../../shared/api/types'
 
@@ -57,19 +59,35 @@ export function AdvancedPage() {
         <h2>Advanced</h2>
       </div>
 
-      <GlobalDailyLimitsCard />
+      {/* Global, workspace-wide controls -- Daily settings, Live instrument
+          firewall, Main data provider -- grouped in one ribbon at the top
+          instead of scattered through the page, since none of these are
+          tied to any one session/strategy. Grid wraps to 1-2 columns
+          depending on width (see .global-controls-strip). */}
+      <div className="global-controls-strip">
+        <GlobalDailyLimitsCard />
+        <GlobalSettingsCard />
+      </div>
+
       <StrategyControlCard />
       <SystemErrorsCard />
+
+      {/* Backend restart is the emergency-adjacent sibling of Reconciliation
+          & Recovery -- kept beside it rather than at the very bottom, but
+          narrower since Reconciliation & Recovery's own tables need the
+          width (see .recovery-restart-row). */}
+      <div className="recovery-restart-row">
+        <ReconciliationAndRecoveryCard />
+        <BackendRestartCard />
+      </div>
+
+      <MarketDataTelemetryCard />
       <GlobalExecutionTimingsPlaceholder />
-      <ReconciliationAndRecoveryCard />
-      <GlobalSettingsCard />
-      <MarketDataTelemetryPlaceholder />
-      <BackendRestartCard />
     </div>
   )
 }
 
-// ---------- Global daily settings ----------
+// ---------- Daily settings (session Daily Plan defaults) ----------
 
 function GlobalDailyLimitsCard() {
   const { data, isLoading } = useDailyLimits()
@@ -81,21 +99,27 @@ function GlobalDailyLimitsCard() {
   // way it used to, which made the field impossible to fully clear before
   // typing a new number).
   const [budget, setBudget] = useState<string | null>(null)
-  const [lots, setLots] = useState<string | null>(null)
+  const [target, setTarget] = useState<string | null>(null)
+  const [lossCap, setLossCap] = useState<string | null>(null)
+  const [fundingMode, setFundingMode] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const effectiveBudget = budget ?? (data ? String(data.daily_budget_amount) : '')
-  const effectiveLots = lots ?? (data ? String(data.daily_max_lots) : '')
+  const effectiveTarget = target ?? (data ? String(data.daily_target_profit) : '')
+  const effectiveLossCap = lossCap ?? (data ? String(data.daily_loss_cap) : '')
+  const effectiveFundingMode = fundingMode ?? data?.funding_mode ?? 'cash'
 
   function handleSave(event: FormEvent) {
     event.preventDefault()
     setError(null)
     const body: DailyLimitsOut = {
       daily_budget_amount: Number(effectiveBudget),
-      daily_max_lots: Number(effectiveLots),
+      daily_target_profit: Number(effectiveTarget),
+      daily_loss_cap: Number(effectiveLossCap),
+      funding_mode: effectiveFundingMode,
     }
-    if (!body.daily_budget_amount || !body.daily_max_lots) {
-      setError('Both fields are required and must be greater than zero.')
+    if (!body.daily_budget_amount || !body.daily_target_profit || !body.daily_loss_cap) {
+      setError('Budget, target profit, and loss cap are all required and must be greater than zero.')
       return
     }
     setLimits.mutate(body, {
@@ -105,28 +129,58 @@ function GlobalDailyLimitsCard() {
 
   return (
     <div className="card">
-      <h3>Global daily settings</h3>
-      <p className="muted">Total daily budget and total lots per day, across every strategy.</p>
-      <form onSubmit={handleSave} className="row-actions" style={{ alignItems: 'flex-end' }}>
+      <h3>Daily settings</h3>
+      <p className="muted">
+        Default budget / target profit / loss cap / funding mode for a newly-created session's{' '}
+        <strong>Daily plan</strong> (Reconciliation &amp; Recovery, below) — that Daily Plan is what
+        Risk Service actually enforces live. Editing this changes what the <em>next</em> new session
+        starts with; today's already-active session stays independently editable and untouched.
+      </p>
+      <form onSubmit={handleSave} className="row-actions" style={{ alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="form-row" style={{ marginBottom: 0 }}>
-          <label htmlFor="daily-budget">Daily budget (₹)</label>
+          <label htmlFor="daily-budget">Budget (₹)</label>
           <input
             id="daily-budget"
             type="number"
             disabled={isLoading}
             value={effectiveBudget}
             onChange={(e) => setBudget(e.target.value)}
+            style={{ width: '110px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
-          <label htmlFor="daily-lots">Total lots / day</label>
+          <label htmlFor="daily-target">Target profit (₹)</label>
           <input
-            id="daily-lots"
+            id="daily-target"
             type="number"
             disabled={isLoading}
-            value={effectiveLots}
-            onChange={(e) => setLots(e.target.value)}
+            value={effectiveTarget}
+            onChange={(e) => setTarget(e.target.value)}
+            style={{ width: '110px' }}
           />
+        </div>
+        <div className="form-row" style={{ marginBottom: 0 }}>
+          <label htmlFor="daily-loss-cap">Loss cap (₹)</label>
+          <input
+            id="daily-loss-cap"
+            type="number"
+            disabled={isLoading}
+            value={effectiveLossCap}
+            onChange={(e) => setLossCap(e.target.value)}
+            style={{ width: '110px' }}
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 0 }}>
+          <label htmlFor="daily-funding-mode">Funding</label>
+          <select
+            id="daily-funding-mode"
+            disabled={isLoading}
+            value={effectiveFundingMode}
+            onChange={(e) => setFundingMode(e.target.value)}
+          >
+            <option value="cash">Cash</option>
+            <option value="mtf">MTF</option>
+          </select>
         </div>
         <button type="submit" disabled={setLimits.isPending || isLoading}>
           Save
@@ -177,18 +231,23 @@ function StrategyControlCard() {
         "Execution mode" select on each row only applies to the explicit Start button below it, not
         to Power.
       </p>
-      {ALL_STRATEGY_TYPES.map((type) => (
-        <StrategyTypeGroup
-          key={type}
-          type={type}
-          configs={byType.get(type) ?? []}
-          runs={runs}
-          instruments={instruments}
-          liveSession={liveSession}
-          paperSession={paperSession}
-          onChanged={invalidate}
-        />
-      ))}
+      {/* Only ~2 strategy-type groups visible at once -- the rest scroll
+          inside this frame instead of growing the whole page. Per-row
+          Mode/Instrument/Execution-mode selects are unchanged. */}
+      <div className="strategy-scroll">
+        {ALL_STRATEGY_TYPES.map((type) => (
+          <StrategyTypeGroup
+            key={type}
+            type={type}
+            configs={byType.get(type) ?? []}
+            runs={runs}
+            instruments={instruments}
+            liveSession={liveSession}
+            paperSession={paperSession}
+            onChanged={invalidate}
+          />
+        ))}
+      </div>
 
       <CreateStrategyDefinitionRow onCreated={invalidate} />
     </div>
@@ -224,7 +283,7 @@ function StrategyTypeGroup({
 
   return (
     <div style={{ marginBottom: '1rem' }}>
-      <div className="section-title">{strategyTypeLabel(type)}</div>
+      <div className="section-title section-title-bright">{strategyTypeLabel(type)}</div>
       {configs.length === 0 ? (
         <p className="muted">No strategy config of this type exists yet.</p>
       ) : (
@@ -238,6 +297,7 @@ function StrategyTypeGroup({
                   <th>Power</th>
                   <th>Mode</th>
                   <th>Instrument</th>
+                  <th>Lots</th>
                   <th>Running</th>
                   <th></th>
                 </tr>
@@ -287,6 +347,9 @@ function StrategyConfigRow({
   const [powerDetail, setPowerDetail] = useState<string | null>(null)
   const [executionMode, setExecutionMode] = useState<ExecutionMode>('auto')
   const [startError, setStartError] = useState<string | null>(null)
+  // `null` = not yet touched, falls back to the server value -- same
+  // pattern as GlobalDailyLimitsCard's budget/target/loss-cap fields.
+  const [lotsInput, setLotsInput] = useState<string | null>(null)
 
   // Both mutations below write the real server response straight into the
   // `['strategies']` list cache via setQueryData, same pattern
@@ -429,6 +492,36 @@ function StrategyConfigRow({
           </select>
         </td>
         <td>
+          <input
+            type="number"
+            min={1}
+            className="lots-input"
+            placeholder={isPaperMode ? '10' : '1'}
+            value={lotsInput ?? (typeof config.params.qty_lots === 'number' ? String(config.params.qty_lots) : '')}
+            disabled={patchMutation.isPending}
+            onChange={(e) => setLotsInput(e.target.value)}
+            onBlur={() => {
+              if (lotsInput === null) return
+              const trimmed = lotsInput.trim()
+              if (trimmed === '') {
+                patchMutation.mutate({ qty_lots: null })
+              } else {
+                const parsed = Number(trimmed)
+                // Not a valid positive integer -- revert silently rather than
+                // sending NaN (which JSON.stringify would silently turn into
+                // null, clearing the override instead of rejecting the input).
+                if (Number.isInteger(parsed) && parsed > 0) {
+                  patchMutation.mutate({ qty_lots: parsed })
+                }
+              }
+              setLotsInput(null)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+            }}
+          />
+        </td>
+        <td>
           {run ? (
             <span className="badge badge-success">{run.status}</span>
           ) : (
@@ -461,7 +554,7 @@ function StrategyConfigRow({
       </tr>
       {(powerDetail || startError) && (
         <tr>
-          <td colSpan={6} className="muted" style={{ fontSize: '0.8rem' }}>
+          <td colSpan={7} className="muted" style={{ fontSize: '0.8rem' }}>
             {startError ?? powerDetail}
           </td>
         </tr>
@@ -540,18 +633,89 @@ function CreateStrategyDefinitionRow({ onCreated }: { onCreated: () => void }) {
 
 // ---------- System errors ----------
 
+// Groups repeated occurrences of the same underlying issue (e.g. a
+// recurring "market data stale for NIFTY" warning firing every few
+// minutes) into one incident row instead of one row per raw alert --
+// `/system-alerts` already caps at 100 rows (see its own `limit` default),
+// and a single noisy category can easily fill that cap on its own,
+// crowding out genuinely distinct issues. Grouping key is
+// category + message with numbers stripped, so "...(42s)" and "...(61s)"
+// collapse together but two different messages/categories don't. Purely
+// client-side -- no backend change, the underlying SystemAlert rows are
+// untouched.
+function normalizeMessageForGrouping(message: string): string {
+  return message
+    .replace(/\d+(\.\d+)?/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function severityRank(severity: string): number {
+  return severity === 'critical' ? 2 : severity === 'warning' ? 1 : 0
+}
+
+interface AlertIncident {
+  key: string
+  severity: string
+  category: string
+  message: string
+  count: number
+  lastSeen: string
+  occurrences: SystemAlertOut[]
+}
+
+function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertIncident[] {
+  const byKey = new Map<string, AlertIncident>()
+  for (const alert of alerts) {
+    const key = `${alert.category}::${normalizeMessageForGrouping(alert.message)}`
+    const existing = byKey.get(key)
+    if (!existing) {
+      byKey.set(key, {
+        key,
+        severity: alert.severity,
+        category: alert.category,
+        message: alert.message,
+        count: 1,
+        lastSeen: alert.created_at,
+        occurrences: [alert],
+      })
+      continue
+    }
+    existing.count += 1
+    existing.occurrences.push(alert)
+    if (new Date(alert.created_at) > new Date(existing.lastSeen)) {
+      existing.lastSeen = alert.created_at
+      existing.message = alert.message
+    }
+    if (severityRank(alert.severity) > severityRank(existing.severity)) {
+      existing.severity = alert.severity
+    }
+  }
+  return Array.from(byKey.values()).sort(
+    (a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime(),
+  )
+}
+
 function SystemErrorsCard() {
   const alertsQuery = useSystemAlerts()
   const [expanded, setExpanded] = useState(false)
+  const [openIncidentKey, setOpenIncidentKey] = useState<string | null>(null)
   const alerts = alertsQuery.data ?? []
-  const visible = expanded ? alerts : alerts.slice(0, 5)
+  const incidents = groupAlertsIntoIncidents(alerts)
+  const visible = expanded ? incidents : incidents.slice(0, 5)
 
   return (
     <div className="card">
       <h3>System errors</h3>
+      {incidents.length > 0 && (
+        <p className="muted">
+          Repeated occurrences of the same issue are grouped into one incident — use "Details" to
+          see every individual occurrence.
+        </p>
+      )}
       {alertsQuery.isLoading ? (
         <p className="muted">Loading...</p>
-      ) : alerts.length === 0 ? (
+      ) : incidents.length === 0 ? (
         <p className="muted">None — nothing currently needs attention.</p>
       ) : (
         <>
@@ -561,32 +725,92 @@ function SystemErrorsCard() {
                 <th>Severity</th>
                 <th>Category</th>
                 <th>Message</th>
-                <th>When</th>
+                <th>Count</th>
+                <th>Last seen</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
-              {visible.map((alert) => (
-                <tr key={alert.id}>
-                  <td>
-                    <span className={alert.severity === 'critical' ? 'badge badge-live' : 'badge'}>
-                      {alert.severity}
-                    </span>
-                  </td>
-                  <td>{alert.category}</td>
-                  <td>{alert.message}</td>
-                  <td>{new Date(alert.created_at).toLocaleTimeString()}</td>
-                </tr>
+              {visible.map((incident) => (
+                <IncidentRows
+                  key={incident.key}
+                  incident={incident}
+                  isOpen={openIncidentKey === incident.key}
+                  onToggle={() =>
+                    setOpenIncidentKey((k) => (k === incident.key ? null : incident.key))
+                  }
+                />
               ))}
             </tbody>
           </table>
-          {alerts.length > 5 && (
+          {incidents.length > 5 && (
             <button className="btn-ghost" onClick={() => setExpanded((v) => !v)}>
-              {expanded ? 'Show fewer' : `Show all ${alerts.length}`}
+              {expanded
+                ? 'Show fewer'
+                : `Show all ${incidents.length} incidents (${alerts.length} events)`}
             </button>
           )}
         </>
       )}
     </div>
+  )
+}
+
+function IncidentRows({
+  incident,
+  isOpen,
+  onToggle,
+}: {
+  incident: AlertIncident
+  isOpen: boolean
+  onToggle: () => void
+}) {
+  return (
+    <>
+      <tr>
+        <td>
+          <span className={incident.severity === 'critical' ? 'badge badge-live' : 'badge'}>
+            {incident.severity}
+          </span>
+        </td>
+        <td>{incident.category}</td>
+        <td>{incident.message}</td>
+        <td>{incident.count > 1 ? `×${incident.count}` : '—'}</td>
+        <td>{new Date(incident.lastSeen).toLocaleTimeString()}</td>
+        <td>
+          {incident.count > 1 && (
+            <button className="btn-ghost" onClick={onToggle}>
+              {isOpen ? 'Hide' : 'Details'}
+            </button>
+          )}
+        </td>
+      </tr>
+      {isOpen && (
+        <tr className="trade-row-legs">
+          <td colSpan={6}>
+            <table className="leg-detail-table">
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Message</th>
+                </tr>
+              </thead>
+              <tbody>
+                {incident.occurrences
+                  .slice()
+                  .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+                  .map((occurrence) => (
+                    <tr key={occurrence.id}>
+                      <td>{new Date(occurrence.created_at).toLocaleTimeString()}</td>
+                      <td>{occurrence.message}</td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </td>
+        </tr>
+      )}
+    </>
   )
 }
 
@@ -683,6 +907,11 @@ function ReconciliationAndRecoveryCard() {
   return (
     <div className="card">
       <h3>Reconciliation &amp; Recovery</h3>
+      <p className="muted">
+        Each active session's <strong>Daily plan</strong> below (budget / target / loss cap) is
+        enforced live by Risk Service. The <strong>Daily settings</strong> card at the top of the
+        page only sets the defaults a <em>new</em> session starts with.
+      </p>
 
       {error && <p className="error">{error}</p>}
 
@@ -1007,19 +1236,86 @@ function GlobalSettingsCard() {
   )
 }
 
-function MarketDataTelemetryPlaceholder() {
+// ---------- Market data telemetry ----------
+
+const FEED_STATE_LABEL: Record<string, string> = {
+  live: 'Live',
+  degraded: 'Degraded',
+  stale: 'Stale',
+  dead: 'Dead',
+}
+
+function feedStateBadgeClass(state: string): string {
+  if (state === 'live') return 'badge badge-success'
+  if (state === 'degraded') return 'badge badge-warning'
+  return 'badge badge-live' // stale/dead -- same "needs attention" red as elsewhere on this page
+}
+
+function formatFeedAge(seconds: number | null): string {
+  if (seconds === null) return 'no data'
+  if (seconds < 60) return `${Math.round(seconds)}s ago`
+  return `${Math.round(seconds / 60)}m ago`
+}
+
+function MarketDataTelemetryCard() {
+  const telemetryQuery = useQuery({
+    queryKey: ['market-data', 'telemetry'],
+    queryFn: () => api.get<MarketDataTelemetryOut>('/market-data/telemetry'),
+    refetchInterval: 15_000,
+  })
+  // Same queryKey GlobalSettingsCard's providerPrefQuery uses -- shares its
+  // cache/network request rather than fetching this twice per page load.
+  const providerPrefQuery = useQuery({
+    queryKey: ['market-data', 'provider-preference'],
+    queryFn: () => api.get<ProviderPreferenceOut>('/market-data/provider-preference'),
+  })
+
+  const underlyings = telemetryQuery.data?.underlyings ?? []
+
   return (
     <div className="card">
-      <h3>
-        Market Data Adapter telemetry <span className="badge badge-wip">WIP</span>
-      </h3>
-      <div className="wip-panel">
-        <h4>No telemetry counters exist yet</h4>
-        <p>
-          Tick/feed-quality counters need the deque + periodic-flush telemetry infra described in
-          the plan (reusing metric_series) — not built yet.
-        </p>
+      <h3>Market Data Adapter telemetry</h3>
+      <p className="muted">
+        Live per-underlying feed freshness, reusing the same staleness classification the trading
+        gates themselves use — not a separate counter system.
+      </p>
+      <div className="form-row">
+        <label>Active provider</label>
+        <span>
+          {providerPrefQuery.data?.active_provider ?? 'Automatic'}
+          {providerPrefQuery.data?.live_active_leg && (
+            <span className="badge" style={{ marginLeft: '0.5rem' }}>
+              live: {providerPrefQuery.data.live_active_leg}
+            </span>
+          )}
+        </span>
       </div>
+      {telemetryQuery.isLoading ? (
+        <p className="muted">Loading...</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Underlying</th>
+              <th>Feed state</th>
+              <th>Last tick/bar</th>
+            </tr>
+          </thead>
+          <tbody>
+            {underlyings.map((u) => (
+              <tr key={u.symbol}>
+                <td>{u.symbol}</td>
+                <td>
+                  <span className={feedStateBadgeClass(u.feed_state)}>
+                    {FEED_STATE_LABEL[u.feed_state] ?? u.feed_state}
+                  </span>
+                </td>
+                <td>{formatFeedAge(u.feed_age_seconds)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }

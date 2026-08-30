@@ -621,6 +621,14 @@ class UpdateStrategyRequest(BaseModel):
     is_enabled: bool | None = None
     runtime_mode: StrategyRuntimeMode | None = None
     underlying_symbol: str | None = None
+    # 2026-08-30: writes into params["qty_lots"] -- see
+    # strategy_engine.sizing.resolve_qty_lots's own docstring for the
+    # mode-aware default this overrides (10 lots paper / 1 lot live) and
+    # risk_engine.service's per-trade-lot-cap check, which now enforces
+    # this value (not just sizes trades to it) once set. `qty_lots: null`
+    # clears the override back to the mode-aware default, same
+    # clear-vs-omit convention as runtime_mode/underlying_symbol above.
+    qty_lots: int | None = None
 
 
 @router.patch("/strategies/{strategy_id}", response_model=StrategyConfigOut)
@@ -631,14 +639,16 @@ def update_strategy(
     user: User = Depends(require_permission("strategy.edit")),
 ) -> StrategyConfig:
     """Ops-Hardening Phase 1 (`is_enabled`/`runtime_mode`) + Phase 6
-    (`underlying_symbol`). `strategy_type`/`params` are untouched here,
-    deliberately not folded into one catch-all PATCH.
+    (`underlying_symbol`) + 2026-08-30 (`qty_lots`, the one field that does
+    touch `params`, narrowly -- everything else in `params` is still
+    untouched here, deliberately not folded into one catch-all PATCH).
 
-    `runtime_mode: null`/`underlying_symbol: null` explicitly clear the
-    field, distinct from omitting it entirely (which leaves it untouched) —
-    distinguished via `model_fields_set` since both parse to the same
-    Python `None` otherwise. `is_enabled` has no such "clear" case (it's a
-    plain, non-nullable bool), so a plain `is not None` check is enough.
+    `runtime_mode: null`/`underlying_symbol: null`/`qty_lots: null`
+    explicitly clear the field, distinct from omitting it entirely (which
+    leaves it untouched) — distinguished via `model_fields_set` since both
+    parse to the same Python `None` otherwise. `is_enabled` has no such
+    "clear" case (it's a plain, non-nullable bool), so a plain `is not
+    None` check is enough.
 
     `runtime_mode` feeds `broker_adapter.composition.get_execution_broker`'s
     live-routing check (Phase 6); `underlying_symbol` feeds the daily
@@ -666,6 +676,19 @@ def update_strategy(
     if "underlying_symbol" in fields_set and body.underlying_symbol != config.underlying_symbol:
         changes["underlying_symbol"] = body.underlying_symbol
         config.underlying_symbol = body.underlying_symbol
+
+    if "qty_lots" in fields_set:
+        if body.qty_lots is not None and body.qty_lots <= 0:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "qty_lots must be positive")
+        current_qty_lots = (config.params or {}).get("qty_lots")
+        if body.qty_lots != current_qty_lots:
+            new_params = dict(config.params or {})
+            if body.qty_lots is None:
+                new_params.pop("qty_lots", None)
+            else:
+                new_params["qty_lots"] = body.qty_lots
+            changes["qty_lots"] = body.qty_lots
+            config.params = new_params
 
     if changes:
         db.flush()

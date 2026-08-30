@@ -33,6 +33,7 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, User
+from app.domain.ops.models import GlobalDailyLimitsConfig
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
@@ -169,7 +170,28 @@ def create_session(
                 "Broker account already has an active trading session today",
             )
 
+        # 2026-08-30: prefer the workspace's own GlobalDailyLimitsConfig row
+        # (Advanced page's Daily settings console) over RiskDefaults, same
+        # resolution order as session.bootstrapper._bootstrap_workspace --
+        # an explicit value in the request body still wins over either.
         defaults = get_settings().risk_defaults
+        global_daily = (
+            db.query(GlobalDailyLimitsConfig)
+            .filter(GlobalDailyLimitsConfig.workspace_id == user.workspace_id)
+            .one_or_none()
+        )
+        resolved_budget = (
+            float(global_daily.daily_budget_amount) if global_daily else defaults.default_budget
+        )
+        resolved_target = (
+            float(global_daily.daily_target_profit)
+            if global_daily
+            else defaults.daily_target_profit
+        )
+        resolved_loss_cap = (
+            float(global_daily.daily_loss_cap) if global_daily else defaults.daily_loss_cap
+        )
+
         trading_session = TradingSession(
             id=uuid.uuid4(),
             workspace_id=user.workspace_id,
@@ -177,9 +199,9 @@ def create_session(
             started_by_user_id=user.id,
             mode=SafeMode.PAPER_ONLY,
             started_at=_utcnow(),
-            budget_amount=body.budget_amount or defaults.default_budget,
-            daily_target_profit=body.daily_target_profit or defaults.daily_target_profit,
-            daily_loss_cap=body.daily_loss_cap or defaults.daily_loss_cap,
+            budget_amount=body.budget_amount or resolved_budget,
+            daily_target_profit=body.daily_target_profit or resolved_target,
+            daily_loss_cap=body.daily_loss_cap or resolved_loss_cap,
             funding_mode=body.funding_mode,
         )
         db.add(trading_session)

@@ -871,6 +871,47 @@ def test_patch_sets_and_clears_runtime_mode(api_client: TestClient, seeded_admin
     assert clear_resp.json()["runtime_mode"] is None
 
 
+def test_patch_sets_and_clears_qty_lots(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-patch-qty-lots"}).json()[
+        "id"
+    ]
+
+    set_resp = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"qty_lots": 3})
+    assert set_resp.status_code == 200
+    assert set_resp.json()["params"]["qty_lots"] == 3
+
+    # Explicit null clears the override back to the mode-aware default,
+    # same clear-vs-omit convention as runtime_mode.
+    clear_resp = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"qty_lots": None})
+    assert clear_resp.status_code == 200
+    assert "qty_lots" not in clear_resp.json()["params"]
+
+
+def test_patch_rejects_non_positive_qty_lots(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-qty-lots-invalid"}
+    ).json()["id"]
+
+    response = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"qty_lots": 0})
+
+    assert response.status_code == 400
+
+
+def test_patch_qty_lots_leaves_other_params_untouched(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies",
+        json={"name": "orb-patch-qty-lots-preserve", "params": {"some_other_param": 42}},
+    ).json()["id"]
+
+    response = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"qty_lots": 5})
+
+    assert response.status_code == 200
+    assert response.json()["params"] == {"some_other_param": 42, "qty_lots": 5}
+
+
 def test_patch_omitting_a_field_leaves_it_untouched(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     strategy_id = api_client.post("/api/v1/strategies", json={"name": "orb-patch-partial"}).json()[

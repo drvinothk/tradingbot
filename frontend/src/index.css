@@ -506,6 +506,66 @@ tbody tr:hover {
   margin-bottom: 1.25rem;
 }
 
+/* ---------- Advanced page: Global Controls ribbon ---------- */
+/* Global daily settings + Global settings (firewall/provider) side by
+   side at the top of Advanced instead of scattered through the page --
+   wraps to 1 column on narrow widths, 2-3 as more cards join it. */
+.global-controls-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  align-items: start;
+}
+
+.global-controls-strip > .card {
+  margin-bottom: 0;
+}
+
+/* Strategy Control: only ~2 strategy-type groups visible at once, the
+   rest scroll inside this frame rather than growing the whole page. Not
+   table-specific like .trade-table-scroll since this wraps several
+   stacked per-type <table>s, not one table with a sticky header. */
+.strategy-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+  padding-right: 0.25rem;
+}
+
+/* Strategy type headers (ORB, OI/Volume Confirmed, ...) read as more
+   prominent than a generic muted .section-title -- these are the actual
+   row-group identity inside a scrolling frame, not a minor subsection
+   label. */
+.section-title-bright {
+  color: var(--text-main);
+  font-weight: 700;
+}
+
+.lots-input {
+  width: 55px;
+}
+
+/* Reconciliation & Recovery gets the width (its own tables need it);
+   Backend restart sits beside it, narrower -- not a 50/50 split. Wraps to
+   a single column once there's no room for both side by side. */
+.recovery-restart-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 1rem;
+  align-items: start;
+  margin-bottom: 1.25rem;
+}
+
+.recovery-restart-row > .card {
+  margin-bottom: 0;
+}
+
+@media (max-width: 900px) {
+  .recovery-restart-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ---------- Badges ---------- */
 .badge {
   display: inline-block;

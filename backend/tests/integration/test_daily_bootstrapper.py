@@ -312,6 +312,44 @@ def test_creates_todays_session_continuing_from_most_recent(
     assert new_session.funding_mode == FundingMode.MTF  # carried from previous session
 
 
+def test_creates_todays_session_from_global_daily_limits_config_when_present(
+    db: Session, workspace, broker_account, user
+):
+    """2026-08-30 consolidation: a workspace that's touched the Advanced
+    page's Daily settings console (GlobalDailyLimitsConfig) gets its
+    budget/target/loss-cap from that row instead of RiskDefaults --
+    funding_mode still comes from the previous session (unchanged).
+    """
+    from app.domain.ops.models import GlobalDailyLimitsConfig
+
+    _yesterday_session(
+        db, workspace=workspace, broker_account=broker_account, user=user,
+        status=TradingSessionStatus.ENDED,
+    )
+    db.add(
+        GlobalDailyLimitsConfig(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            daily_budget_amount=123_000,
+            daily_target_profit=9_000,
+            daily_loss_cap=8_000,
+            funding_mode="cash",
+        )
+    )
+    db.flush()
+
+    run_daily_bootstrap(session_factory=_same_session(db))
+
+    todays = (
+        db.query(TradingSession)
+        .filter(TradingSession.workspace_id == workspace.id, TradingSession.status == "active")
+        .one()
+    )
+    assert float(todays.budget_amount) == pytest.approx(123_000)
+    assert float(todays.daily_target_profit) == pytest.approx(9_000)
+    assert float(todays.daily_loss_cap) == pytest.approx(8_000)
+
+
 def test_does_not_create_a_second_session_if_todays_already_exists(
     db: Session, workspace, broker_account, user
 ):

@@ -13,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -127,52 +127,58 @@ class InstrumentFirewallConfig(Base, UUIDPkMixin, TimestampMixin):
     active_live_instruments: Mapped[list[str]] = mapped_column(JSONB)
 
 
-# 2026-08-20: seed/fallback values for GlobalDailyLimitsConfig below --
-# same values as RiskDefaults.default_budget (settings.py) and
-# RiskLimitConfig.per_trade_lot_cap's own default (1), reused here only as
-# starting points for a *separate* concept (see that class's own
-# docstring for why this isn't just an alias of either).
+# 2026-08-20 originals, still the seed/fallback values -- match
+# RiskDefaults (settings.py) so a freshly-bootstrapped workspace with no
+# row here yet behaves identically to before this table existed.
 DEFAULT_DAILY_BUDGET_AMOUNT: float = 50_000.0
-DEFAULT_DAILY_MAX_LOTS: int = 1
+DEFAULT_DAILY_TARGET_PROFIT: float = 5_000.0
+DEFAULT_DAILY_LOSS_CAP: float = 5_000.0
+DEFAULT_FUNDING_MODE: str = "cash"  # FundingMode.CASH.value -- see module note below
 
 
 class GlobalDailyLimitsConfig(Base, UUIDPkMixin, TimestampMixin):
-    """One row per workspace -- a read/update-able global settings surface
-    for "total daily budget" and "total lots per day", following the exact
-    same DB-backed-settings-row pattern as `InstrumentFirewallConfig`/
-    `MarketDataProviderPreference` above (GET returns the row or a
-    documented default when none exists yet, PATCH upserts + audits).
+    """One row per workspace -- a read/update-able settings surface for the
+    session Daily Plan's *default* values (budget, target profit, loss cap,
+    funding mode), following the exact same DB-backed-settings-row pattern
+    as `InstrumentFirewallConfig`/`MarketDataProviderPreference` above (GET
+    returns the row or a documented default when none exists yet, PATCH
+    upserts + audits).
 
-    Deliberately NOT a rename of an existing concept -- checked both
-    candidates in `app.modules.risk_engine` before adding this table:
-    `RiskLimitConfig.per_trade_lot_cap` caps lots *per individual trade*
-    (versioned, already enforced in `evaluate_trade_intent`'s
-    `per_trade_lot_cap_exceeded` check), not a running total across a
-    day's worth of trades; `TradingSession.budget_amount` is a *per-session*
-    value seeded once at session-creation time from
-    `RiskDefaults.default_budget` (`app.config.settings`), not a live,
-    workspace-wide setting a user can change mid-day the way this table's
-    PATCH allows. Neither is "total lots dispatched today" or "the daily
-    budget right now" in the workspace-global, always-current sense the UI
-    dashboard plan asked for.
-
-    Scope note: this is a settings surface only (mirrors the UI plan's
-    "small new settings surface... displayed above the Strategy Control
-    card" spec) -- reading/writing the two values, nothing more. It is not
-    wired into any pre-trade enforcement path (unlike `per_trade_lot_cap`/
-    `budget_amount`, which already are); wiring a real "total lots used
-    today" / "total budget committed today" check into
-    `risk_engine.evaluate_trade_intent` is a separate, not-yet-scoped
-    follow-up, same "settings surface first, enforcement later" shape this
-    codebase's own Global Execution Timings item is flagged the same way
-    in the build plan.
+    2026-08-30 consolidation: originally shipped 2026-08-20 as "total daily
+    budget" + "total lots per day", a settings surface with no enforcement
+    wiring at all (see git history for that version's docstring). Redesigned
+    after a design discussion landed on a clearer split of concerns:
+    - `daily_max_lots` is dropped entirely -- superseded by a genuine
+      per-strategy lot cap (`StrategyConfig.params["qty_lots"]`, enforced in
+      `risk_engine.service.evaluate_trade_intent` via `resolve_qty_lots`),
+      which closes the real gap a single global lot number never could (a
+      wrong-sized entry on strategy A no longer needs to be judged against
+      every other strategy's combined allowance).
+    - `daily_budget_amount`/`daily_target_profit`/`daily_loss_cap`/
+      `funding_mode` now mirror `TradingSession`'s own Daily Plan fields
+      1:1 (see that class's docstring) and serve as their **default
+      values** -- read by `session.bootstrapper._bootstrap_workspace` (the
+      path that actually creates each day's session) and
+      `api.v1.sessions.create_session`, falling back to `RiskDefaults`
+      (env-settings, requires a restart to change) only when no row exists
+      yet for the workspace. This is still a defaults surface, not a
+      second enforcement path -- the *actual* daily_loss_cap/
+      daily_target_profit/budget_amount checks in `risk_engine.service`
+      read the values already sitting on that day's `TradingSession` row
+      (set from these defaults at creation, then independently editable
+      per-session via `POST /sessions/{id}/daily-plan` same as before).
+      Editing this console changes what *tomorrow's* (or the next
+      freshly-created) session starts with; it never rewrites an
+      already-active session's own Daily Plan.
     """
 
     __tablename__ = "global_daily_limits_configs"
 
     workspace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("workspaces.id"), unique=True)
     daily_budget_amount: Mapped[float] = mapped_column(Numeric(14, 2))
-    daily_max_lots: Mapped[int] = mapped_column(Integer)
+    daily_target_profit: Mapped[float] = mapped_column(Numeric(14, 2))
+    daily_loss_cap: Mapped[float] = mapped_column(Numeric(14, 2))
+    funding_mode: Mapped[str] = mapped_column(String(10), default=DEFAULT_FUNDING_MODE)
 
 
 class MarketDataDiagnosticRun(Base, UUIDPkMixin, TimestampMixin):

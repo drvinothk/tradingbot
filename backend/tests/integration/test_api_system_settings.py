@@ -218,7 +218,9 @@ def test_get_daily_limits_with_no_row_defaults(api_client: TestClient, seeded_ad
     assert response.status_code == 200
     body = response.json()
     assert body["daily_budget_amount"] == 50000.0
-    assert body["daily_max_lots"] == 1
+    assert body["daily_target_profit"] == 5000.0
+    assert body["daily_loss_cap"] == 5000.0
+    assert body["funding_mode"] == "cash"
 
 
 def test_patch_sets_the_daily_limits(api_client: TestClient, seeded_admin):
@@ -226,18 +228,27 @@ def test_patch_sets_the_daily_limits(api_client: TestClient, seeded_admin):
 
     response = api_client.patch(
         "/api/v1/system-settings/daily-limits",
-        json={"daily_budget_amount": 75000, "daily_max_lots": 3},
+        json={
+            "daily_budget_amount": 75000,
+            "daily_target_profit": 6000,
+            "daily_loss_cap": 4000,
+            "funding_mode": "mtf",
+        },
     )
 
     assert response.status_code == 200
     body = response.json()
     assert body["daily_budget_amount"] == 75000.0
-    assert body["daily_max_lots"] == 3
+    assert body["daily_target_profit"] == 6000.0
+    assert body["daily_loss_cap"] == 4000.0
+    assert body["funding_mode"] == "mtf"
 
     get_response = api_client.get("/api/v1/system-settings/daily-limits")
     get_body = get_response.json()
     assert get_body["daily_budget_amount"] == 75000.0
-    assert get_body["daily_max_lots"] == 3
+    assert get_body["daily_target_profit"] == 6000.0
+    assert get_body["daily_loss_cap"] == 4000.0
+    assert get_body["funding_mode"] == "mtf"
 
 
 def test_patch_daily_limits_rejects_non_positive_budget(api_client: TestClient, seeded_admin):
@@ -245,18 +256,18 @@ def test_patch_daily_limits_rejects_non_positive_budget(api_client: TestClient, 
 
     response = api_client.patch(
         "/api/v1/system-settings/daily-limits",
-        json={"daily_budget_amount": 0, "daily_max_lots": 1},
+        json={"daily_budget_amount": 0, "daily_target_profit": 5000, "daily_loss_cap": 5000},
     )
 
     assert response.status_code == 422
 
 
-def test_patch_daily_limits_rejects_non_positive_lots(api_client: TestClient, seeded_admin):
+def test_patch_daily_limits_rejects_non_positive_loss_cap(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
 
     response = api_client.patch(
         "/api/v1/system-settings/daily-limits",
-        json={"daily_budget_amount": 50000, "daily_max_lots": 0},
+        json={"daily_budget_amount": 50000, "daily_target_profit": 5000, "daily_loss_cap": 0},
     )
 
     assert response.status_code == 422
@@ -267,15 +278,20 @@ def test_patch_daily_limits_twice_updates_the_same_row(api_client: TestClient, s
 
     api_client.patch(
         "/api/v1/system-settings/daily-limits",
-        json={"daily_budget_amount": 60000, "daily_max_lots": 2},
+        json={"daily_budget_amount": 60000, "daily_target_profit": 5500, "daily_loss_cap": 4500},
     )
     second = api_client.patch(
         "/api/v1/system-settings/daily-limits",
-        json={"daily_budget_amount": 90000, "daily_max_lots": 4},
+        json={"daily_budget_amount": 90000, "daily_target_profit": 7000, "daily_loss_cap": 3000},
     )
 
     assert second.status_code == 200
-    assert second.json() == {"daily_budget_amount": 90000.0, "daily_max_lots": 4}
+    assert second.json() == {
+        "daily_budget_amount": 90000.0,
+        "daily_target_profit": 7000.0,
+        "daily_loss_cap": 3000.0,
+        "funding_mode": "cash",
+    }
 
 
 def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin, monkeypatch):
@@ -301,7 +317,9 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
     import app.api.v1.system_settings as system_settings_module
     from app.domain.ops.models import (
         DEFAULT_DAILY_BUDGET_AMOUNT,
-        DEFAULT_DAILY_MAX_LOTS,
+        DEFAULT_DAILY_LOSS_CAP,
+        DEFAULT_DAILY_TARGET_PROFIT,
+        DEFAULT_FUNDING_MODE,
         GlobalDailyLimitsConfig,
     )
 
@@ -316,7 +334,11 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
             triggered["done"] = True
             db_b.add(
                 GlobalDailyLimitsConfig(
-                    workspace_id=workspace_id, daily_budget_amount=40000, daily_max_lots=1
+                    workspace_id=workspace_id,
+                    daily_budget_amount=40000,
+                    daily_target_profit=4000,
+                    daily_loss_cap=4000,
+                    funding_mode="cash",
                 )
             )
             db_b.commit()
@@ -327,7 +349,7 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
     try:
         with session_factory() as db_a:
             result_config, previous = system_settings_module._upsert_daily_limits(
-                db_a, workspace_id, 75000.0, 3
+                db_a, workspace_id, 75000.0, 6000.0, 3000.0, "mtf"
             )
             db_a.commit()
 
@@ -336,10 +358,14 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
             # correct given what A actually saw, at the time it saw it.
             assert previous == {
                 "daily_budget_amount": DEFAULT_DAILY_BUDGET_AMOUNT,
-                "daily_max_lots": DEFAULT_DAILY_MAX_LOTS,
+                "daily_target_profit": DEFAULT_DAILY_TARGET_PROFIT,
+                "daily_loss_cap": DEFAULT_DAILY_LOSS_CAP,
+                "funding_mode": DEFAULT_FUNDING_MODE,
             }
             assert float(result_config.daily_budget_amount) == pytest.approx(75000.0)
-            assert result_config.daily_max_lots == 3
+            assert float(result_config.daily_target_profit) == pytest.approx(6000.0)
+            assert float(result_config.daily_loss_cap) == pytest.approx(3000.0)
+            assert result_config.funding_mode == "mtf"
         assert triggered["done"] is True  # the race was actually exercised
     finally:
         db_b.close()
@@ -352,7 +378,9 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
         )
         assert len(rows) == 1
         assert float(rows[0].daily_budget_amount) == pytest.approx(75000.0)
-        assert rows[0].daily_max_lots == 3
+        assert float(rows[0].daily_target_profit) == pytest.approx(6000.0)
+        assert float(rows[0].daily_loss_cap) == pytest.approx(3000.0)
+        assert rows[0].funding_mode == "mtf"
 
 
 # -- POST /system-settings/restart-backend -----------------------------------
