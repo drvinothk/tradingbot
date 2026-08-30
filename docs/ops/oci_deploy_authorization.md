@@ -463,3 +463,61 @@ Approve? (yes / yes+add-allow-rules / no)
 
   Rollback: `cd /home/ubuntu/trading-bot/backend && rm -rf app && mv
   app.bak-20260830-235500 app && sudo systemctl restart trading-bot`.
+
+- **2026-08-31 ~01:24 IST — wired Sweep #4's winners as 5 new conviction
+  strategies, branch `feat/multi-leg-exit-engine` commit `51f8d77`.**
+  Frontend-only code change (no backend restart — `KNOWN_STRATEGY_TYPES`
+  already covered all 4 `*_conviction` types since `c1fb60c`): added the 4
+  types to `StrategyType`/`friendlyLabel`/`PRIMARY_STRATEGY_TYPES`
+  (positions 7-10) and the Create Strategy Definition dropdown; archived
+  `synthetic` from all three lists (its one DB row, `Test 5`, was already
+  `is_enabled=false` — zero live impact).
+
+  Separately, **5 new `strategy_configs` rows created via a direct,
+  hand-validated SQL `INSERT`** (not the app's own API — avoids touching
+  any session/credentials): `OI_Volume_Conviction`, `EMA_Micro_Conviction`,
+  `EMA_Micro_Conviction_PCR`, `VWAP_Conviction`, `Liquidity_Sweep_Conviction`
+  — entry-gate + exit-leg params sourced from today's Sweep #4 Phase 2/3
+  results (see `BACKTEST_LEARNINGS.md`'s 2026-08-30 entry and
+  `backend/scripts/create_conviction_strategies.sql`-equivalent, not
+  committed). All 5: `runtime_mode='force_paper'`, `underlying_symbol='NIFTY'`,
+  `qty_lots=10`, `is_enabled=true` (auto-spawns via tomorrow's 09:00 IST
+  `DailyBootstrapScheduler`). 4 of the 5 use the multi-leg exit engine
+  (`params.exit_legs`, 3 legs each, 0.4/0.3/0.3 fractions across different
+  stop widths, `trail_lock_fraction=0.8` — the universal winner across all
+  12 lock-refinement configs tested today, `use_structure:true` on every
+  leg to preserve the structure-break exit path that was a real, frequent
+  exit reason in every backtest); `Liquidity_Sweep_Conviction` is
+  deliberately single-leg (only 1 of 3 tested stop widths was actually
+  profitable — a forced 3-way split would have put real weight on two
+  net-losing configs).
+
+  Tested/verified: `npm run build` clean (`tsc -b && vite build`); all 5
+  rows dry-run constructed via `_build_strategy` (a `SimpleNamespace`
+  standing in for the real `StrategyConfig` row) + `validate_exit_leg_templates`
+  on the 4 multi-leg configs — all 5 passed with zero errors, no strategy
+  actually started. `SELECT ... WHERE name LIKE '%Conviction%'` confirmed
+  all 6 rows (5 new + existing `ORB_Conviction`) match spec exactly,
+  `runtime_mode='force_paper'` on every one.
+
+  Safety gate: backend was NOT restarted (no backend code changed), so the
+  live-position pre-restart check doesn't strictly apply; the DB insert
+  itself is a plain additive `INSERT` with no lock contention against any
+  running process. Frontend backup `dist.bak.20260830T195436Z`.
+
+  Commands run (frontend): `npm run build` locally → tarball `dist/` → scp
+  → `sudo cp -r` backup → `sudo rm -rf` + `sudo mv` swap-in → `sudo chown
+  -R www-data:www-data` → verified live: `curl .../` returned
+  `index-IIDmYp7p.js` (matching the local build hash exactly), and that
+  bundle's content greps confirmed `oi_volume_confirmed_conviction` /
+  `liquidity_sweep_reversal_conviction` present. Commands run (DB): `scp`
+  a hand-written `.sql` file to `/tmp` → `sudo -u postgres psql -d
+  trading_bot -v ON_ERROR_STOP=1 -f` → `INSERT 0 5` → temp file removed
+  from the box afterward.
+
+  Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist && sudo mv
+  /var/www/trading-bot/dist.bak.20260830T195436Z /var/www/trading-bot/dist`.
+  Rollback (DB rows): `DELETE FROM strategy_configs WHERE name IN
+  ('OI_Volume_Conviction','EMA_Micro_Conviction','EMA_Micro_Conviction_PCR','VWAP_Conviction','Liquidity_Sweep_Conviction')`
+  — safe any time before 09:00 IST tomorrow (none has run yet); after a run
+  starts, stop it via the UI first.
