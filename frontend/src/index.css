@@ -368,16 +368,6 @@ tbody tr:hover {
   font-weight: 600;
 }
 
-/* The routine "Shoonya (REAL)" broker badge here is deliberately white,
-   not the --danger red .badge-live normally means -- that red signals a
-   genuine warning (critical alerts, a rejected trade) elsewhere this same
-   class is used; a connected real broker in the everyday case isn't a
-   warning, so this scoped override keeps it out of that visual language
-   without touching .badge-live's other, still-legitimate uses. */
-.mode-banner .badge-live {
-  color: var(--text-main);
-}
-
 /* Broker connection ribbon (Market Terminal) -- status text is the thing
    that matters at a glance, so it gets full brightness/weight; the
    Connect/Reconnect button next to it is deliberately de-emphasized

@@ -45,7 +45,9 @@ from app.domain.execution.models import (
     PositionExitLeg,
     PositionExitLegStatus,
     PositionStatus,
+    StopPlan,
     TradeOutcome,
+    TrailPlan,
     TrailPlanStatus,
 )
 from app.domain.market.models import Instrument, OptionContract
@@ -76,6 +78,60 @@ def position_has_exit_legs(db: Session, position_id: uuid.UUID) -> bool:
         .first()
         is not None
     )
+
+
+def compute_position_open_risk(db: Session, position: Position) -> float | None:
+    """Rupees at risk if every open leg's (or the position's single) stop
+    hits right now: Σ max(0, entry_price − effective_stop) × qty. `qty` is
+    already the absolute, lot-multiplied quantity (`qty = trade_intent
+    .qty_lots * instrument.lot_size`, set at dispatch in `paper.service`),
+    the same unit `Position.unrealized_pnl`/`realized_pnl` are computed in —
+    do not multiply by lot_size again here.
+
+    `effective_stop` prefers an ACTIVE trailing stop over the fixed stop
+    price, since that's the tighter, currently-live invalidation level for
+    that leg/position. A leg/position with no stop configured at all
+    contributes nothing and, if *no* leg/the position has one, this returns
+    `None` (not 0) so callers can render "no stop data" instead of a
+    misleading "₹0 at risk".
+    """
+    if position_has_exit_legs(db, position.id):
+        legs = (
+            db.query(PositionExitLeg)
+            .filter(
+                PositionExitLeg.position_id == position.id,
+                PositionExitLeg.status == PositionExitLegStatus.OPEN,
+            )
+            .all()
+        )
+        total = Decimal("0")
+        found_stop = False
+        for leg in legs:
+            effective_stop = (
+                leg.trail_current_stop_price
+                if leg.trail_status == TrailPlanStatus.ACTIVE
+                and leg.trail_current_stop_price is not None
+                else leg.stop_price
+            )
+            if effective_stop is None:
+                continue
+            found_stop = True
+            total += max(Decimal("0"), _dec(position.entry_price) - _dec(effective_stop)) * leg.qty
+        return float(total) if found_stop else None
+
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).first()
+    if stop_plan is None:
+        return None
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).first()
+    effective_stop = (
+        trail_plan.current_stop_price
+        if trail_plan is not None
+        and trail_plan.status == TrailPlanStatus.ACTIVE
+        and trail_plan.current_stop_price is not None
+        else stop_plan.stop_price
+    )
+    risk = max(Decimal("0"), _dec(position.entry_price) - _dec(effective_stop)) * stop_plan.qty
+    return float(risk)
 
 
 def build_position_exit_legs(

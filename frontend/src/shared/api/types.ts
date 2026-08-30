@@ -103,6 +103,10 @@ export interface RunningPositionOut {
   side: string
   qty: number
   entry_price: number
+  // Rupees at risk if the current stop (or every open multi-leg stop)
+  // hits right now -- null when there's no stop data to compute from at
+  // all, distinct from a genuine 0.
+  open_risk: number | null
 }
 
 export interface PendingApprovalOut {
@@ -127,6 +131,11 @@ export interface RunningStrategyOut {
   open_position: RunningPositionOut | null
   pending_approvals: PendingApprovalOut[]
   data_freshness: string | null
+  // Whether a new dispatch for this run would resolve to the real broker
+  // right now -- not just "session is live_enabled" (a FORCE_PAPER
+  // strategy inside a live session is not). See
+  // broker_adapter.composition.is_strategy_routed_live.
+  is_live: boolean
 }
 
 export interface StrategyRunOut {

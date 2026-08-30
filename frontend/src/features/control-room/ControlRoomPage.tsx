@@ -5,7 +5,7 @@ import { useSessionBuckets } from '../../shared/hooks/useSessionBuckets'
 import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
 import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPositions'
 import { useInstruments } from '../../shared/hooks/useInstruments'
-import { useActiveSessionMode } from '../../shared/hooks/useActiveSessionMode'
+import { useSystemAlerts } from '../../shared/hooks/useRecovery'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
 import { exitReasonLabel, stagedExitSummary, strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
@@ -56,7 +56,6 @@ const EMPTY_RUNS: RunningStrategyOut[] = []
 export function ControlRoomPage() {
   const queryClient = useQueryClient()
   const { liveSession, paperSession, isLoading: bucketsLoading } = useSessionBuckets()
-  const { shoonyaConnected, shoonyaSessionValid, feedAgeSeconds, feedState } = useActiveSessionMode()
   const [actionError, setActionError] = useState<string | null>(null)
   const [hiddenRowKeys, setHiddenRowKeys] = useState<Set<string>>(new Set())
 
@@ -127,17 +126,24 @@ export function ControlRoomPage() {
     <div>
       <ControlRoomHeader
         liveSession={liveSession}
-        shoonyaConnected={shoonyaConnected}
-        shoonyaSessionValid={shoonyaSessionValid}
-        feedAgeSeconds={feedAgeSeconds}
-        feedState={feedState}
         onError={setActionError}
         onChanged={invalidateTrades}
       />
 
       {actionError && <p className="error">{actionError}</p>}
 
-      <MetricsStrip liveRows={liveRows} liveSessionId={liveSession?.id ?? null} />
+      <TodaysActivityCard
+        runs={runs}
+        liveRows={liveRows}
+        paperRows={paperRows}
+        liveSessionId={liveSession?.id ?? null}
+        paperSessionId={paperSession?.id ?? null}
+      />
+
+      <div className="grid-2">
+        <StrategyStatusCard runs={runs} />
+        <AttentionCard runs={runs} />
+      </div>
 
       <LiveTradesByStrategy liveRows={liveRows} />
 
@@ -176,18 +182,10 @@ export function ControlRoomPage() {
 
 function ControlRoomHeader({
   liveSession,
-  shoonyaConnected,
-  shoonyaSessionValid,
-  feedAgeSeconds,
-  feedState,
   onError,
   onChanged,
 }: {
   liveSession: SessionOut | null
-  shoonyaConnected: boolean
-  shoonyaSessionValid: boolean
-  feedAgeSeconds: number | null
-  feedState: 'live' | 'degraded' | 'stale' | 'dead' | null
   onError: (message: string | null) => void
   onChanged: () => void
 }) {
@@ -321,41 +319,29 @@ function ControlRoomHeader({
     <div className="page-header">
       <h2>Control Room</h2>
       <div className="row-actions">
-        <span className="broker-status-text">
-          <span className={`status-dot ${shoonyaConnected ? 'on' : 'off'}`} />{' '}
-          Broker:{' '}
-          {!shoonyaSessionValid
-            ? 'Mock'
-            : shoonyaConnected
-              ? 'Shoonya (REAL)'
-              : 'Shoonya (REAL) — no data'}
-        </span>
-        <FeedLatencyBadge feedAgeSeconds={feedAgeSeconds} feedState={feedState} />
-        <div className="row-actions">
-          <button
-            className="btn-start"
-            disabled={goLiveMutation.isPending || isLive || isEmergency}
-            onClick={handleGoLive}
-            title={liveSession ? '' : 'No Live-bucket session found'}
-          >
-            Go Live
-          </button>
-          <button
-            className="btn-ghost"
-            disabled={goPaperMutation.isPending || !isLive || isEmergency}
-            onClick={handleGoPaper}
-          >
-            Go Paper
-          </button>
-          <button
-            className={killClassName}
-            disabled={!liveSession}
-            onClick={handleKillSwitchClick}
-            onBlur={() => setKillArmed(false)}
-          >
-            {killArmed ? 'Confirm Kill Switch?' : 'Kill Switch'}
-          </button>
-        </div>
+        <button
+          className="btn-start"
+          disabled={goLiveMutation.isPending || isLive || isEmergency}
+          onClick={handleGoLive}
+          title={liveSession ? '' : 'No Live-bucket session found'}
+        >
+          Go Live
+        </button>
+        <button
+          className="btn-ghost"
+          disabled={goPaperMutation.isPending || !isLive || isEmergency}
+          onClick={handleGoPaper}
+        >
+          Go Paper
+        </button>
+        <button
+          className={killClassName}
+          disabled={!liveSession}
+          onClick={handleKillSwitchClick}
+          onBlur={() => setKillArmed(false)}
+        >
+          {killArmed ? 'Confirm Kill Switch?' : 'Kill Switch'}
+        </button>
       </div>
       {isEmergency && liveSession && (
         <p className="muted" style={{ marginTop: '0.4rem' }}>
@@ -367,98 +353,258 @@ function ControlRoomHeader({
   )
 }
 
-const FEED_STATE_BADGE_CLASS: Record<'live' | 'degraded' | 'stale' | 'dead', string> = {
-  live: 'badge-success',
-  degraded: 'badge-warning',
-  // Stale and dead both mean "don't trust this" -- same treatment as the
-  // rejected-trade badge elsewhere on this page (STATUS_BADGE_CLASS.rejected
-  // reuses badge-live the same way, for the same "something's wrong" red).
-  stale: 'badge-live',
-  dead: 'badge-live',
-}
-
-function formatFeedAge(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s ago`
-  return `${Math.round(seconds / 60)}m ago`
-}
-
-function FeedLatencyBadge({
-  feedAgeSeconds,
-  feedState,
-}: {
-  feedAgeSeconds: number | null
-  feedState: 'live' | 'degraded' | 'stale' | 'dead' | null
-}) {
-  return (
-    <span className="muted">
-      Feed:{' '}
-      {feedAgeSeconds !== null && feedState !== null ? (
-        <span className={`badge ${FEED_STATE_BADGE_CLASS[feedState]}`}>{formatFeedAge(feedAgeSeconds)}</span>
-      ) : (
-        <span className="badge">no data</span>
-      )}
-    </span>
-  )
-}
-
-function MetricsStrip({
+// "Today's Activity" -- consolidates the old Net P&L / Margin Utilized /
+// Live Trades Today / Max Drawdown boxes into one card with 5 fields
+// (total + per-lot P&L, total trades, win rate, max drawdown, open risk),
+// scoped to whichever of Live/Paper is actually where the action is: if any
+// running strategy is genuinely routed live right now (RunningStrategyOut
+// .is_live -- NOT just "session is live_enabled", see that field's own
+// comment in shared/api/types.ts), show Live data; otherwise show Paper.
+// Margin Utilized is dropped outright -- it was a non-functional WIP stub,
+// and open risk is the meaningful real-money replacement.
+function TodaysActivityCard({
+  runs,
   liveRows,
+  paperRows,
   liveSessionId,
+  paperSessionId,
 }: {
+  runs: RunningStrategyOut[]
   liveRows: TradeRow[]
+  paperRows: TradeRow[]
   liveSessionId: string | null
+  paperSessionId: string | null
 }) {
+  const anyLive = runs.some((r) => r.is_live)
+  const scopeRows = anyLive ? liveRows : paperRows
+  const scopeSessionId = anyLive ? liveSessionId : paperSessionId
+  const scopeLabel = anyLive ? 'Live' : 'Paper'
+
   const dailyReportQuery = useQuery({
-    queryKey: ['reports', 'daily', liveSessionId],
-    queryFn: () => api.get<DailyReportOut>(`/reports/sessions/${liveSessionId}/daily`),
-    enabled: liveSessionId != null,
+    queryKey: ['reports', 'daily', scopeSessionId],
+    queryFn: () => api.get<DailyReportOut>(`/reports/sessions/${scopeSessionId}/daily`),
+    enabled: scopeSessionId != null,
     refetchInterval: 15_000,
   })
 
-  const realTradeRows = liveRows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
+  const realTradeRows = scopeRows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
   const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
   const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
   const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
 
+  // Open risk is scoped the same way -- only positions belonging to
+  // strategies in the scope currently being shown, so it never mixes a
+  // live position's risk into a paper-scoped card or vice versa.
+  const scopeOpenRisks = runs
+    .filter((r) => r.is_live === anyLive)
+    .map((r) => r.open_position?.open_risk)
+    .filter((v): v is number => v != null)
+  const totalOpenRisk = scopeOpenRisks.reduce((sum, v) => sum + v, 0)
+
   return (
-    <div className="metrics-strip">
-      <div className="metric-box">
-        <div className="metric-label">Net P&amp;L (MTM)</div>
-        <div className="metric-value">
-          <span className={totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-            {totalPnl >= 0 ? '+' : ''}
-            {totalPnl.toFixed(2)}
-          </span>
-        </div>
-        <div className="metric-subvalue muted">
-          {perLotPnl !== null
-            ? `${perLotPnl >= 0 ? '+' : ''}${perLotPnl.toFixed(2)} / lot`
-            : '— / lot'}
-        </div>
+    <div className="card">
+      <div className="card-header">
+        <h3>Today&apos;s Activity</h3>
+        <span className="muted">({scopeLabel})</span>
       </div>
+      <div className="metrics-strip">
+        <div className="metric-box">
+          <div className="metric-label">P&amp;L</div>
+          <div className="metric-value">
+            <span className={totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {totalPnl >= 0 ? '+' : ''}
+              {totalPnl.toFixed(2)}
+            </span>
+          </div>
+          <div className="metric-subvalue muted">
+            {perLotPnl !== null
+              ? `${perLotPnl >= 0 ? '+' : ''}${perLotPnl.toFixed(2)} / lot`
+              : '— / lot'}
+          </div>
+        </div>
 
-      <div className="metric-box">
-        <div className="metric-label">Margin Utilized</div>
-        <div className="metric-value muted">
-          — <span className="badge badge-wip">WIP</span>
+        <div className="metric-box">
+          <div className="metric-label">Total Trades</div>
+          <div className="metric-value">
+            {scopeSessionId === null
+              ? realTradeRows.length
+              : (dailyReportQuery.data?.trade_count ?? realTradeRows.length)}
+          </div>
+        </div>
+
+        <div className="metric-box">
+          <div className="metric-label">Win Rate</div>
+          <div className="metric-value">
+            {scopeSessionId === null
+              ? '—'
+              : dailyReportQuery.data
+                ? `${Math.round(dailyReportQuery.data.win_rate * 100)}%`
+                : '…'}
+          </div>
+        </div>
+
+        <div className="metric-box">
+          <div className="metric-label">Max Drawdown</div>
+          <div className="metric-value">
+            {scopeSessionId === null
+              ? '—'
+              : dailyReportQuery.data
+                ? dailyReportQuery.data.max_drawdown.toFixed(2)
+                : '…'}
+          </div>
+        </div>
+
+        <div className="metric-box">
+          <div className="metric-label">Open Risk</div>
+          <div className="metric-value">
+            {scopeOpenRisks.length > 0 ? totalOpenRisk.toFixed(2) : '—'}
+          </div>
         </div>
       </div>
+    </div>
+  )
+}
 
-      <div className="metric-box">
-        <div className="metric-label">Live Trades Today</div>
-        <div className="metric-value">{realTradeRows.length}</div>
-      </div>
+const RUN_STATUS_LABELS: Record<string, string> = {
+  scanning: 'Scanning',
+  in_position: 'In Position',
+  paused: 'Paused',
+  stopped: 'Stopped',
+}
 
-      <div className="metric-box">
-        <div className="metric-label">Max Drawdown</div>
-        <div className="metric-value">
-          {liveSessionId === null
-            ? '—'
-            : dailyReportQuery.data
-              ? dailyReportQuery.data.max_drawdown.toFixed(2)
-              : '…'}
-        </div>
+const FRESHNESS_BADGE_CLASS: Record<string, string> = {
+  live: 'badge-success',
+  degraded: 'badge-warning',
+  stale: 'badge-live',
+  dead: 'badge-live',
+}
+
+// A strategy is healthy if it's actively working (scanning/in_position) and
+// its data isn't stale/dead -- `data_freshness === null` (no live runner
+// registered, e.g. briefly right after a restart) is treated as healthy
+// too, since it's not evidence of a problem on its own.
+function isStrategyHealthy(run: RunningStrategyOut): boolean {
+  const statusOk = run.status === 'scanning' || run.status === 'in_position'
+  const freshnessOk = run.data_freshness === null || run.data_freshness === 'live' || run.data_freshness === 'degraded'
+  return statusOk && freshnessOk
+}
+
+function StrategyStatusCard({ runs }: { runs: RunningStrategyOut[] }) {
+  const unhealthy = runs.filter((r) => !isStrategyHealthy(r))
+  const [expanded, setExpanded] = useState(unhealthy.length > 0)
+
+  useEffect(() => {
+    if (unhealthy.length > 0) setExpanded(true)
+  }, [unhealthy.length])
+
+  return (
+    <div className="card">
+      <div className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+        <h3>Strategy Status</h3>
+        <span className={`chevron ${expanded ? 'open' : ''}`}>▶</span>
       </div>
+      {runs.length === 0 ? (
+        <p className="muted">No strategies running.</p>
+      ) : unhealthy.length === 0 ? (
+        <p className="muted">
+          <span className="badge badge-success">OK</span> All {runs.length} strateg
+          {runs.length === 1 ? 'y' : 'ies'} scanning normally.
+        </p>
+      ) : (
+        <p className="muted">
+          <span className="badge badge-live">Attention</span> {unhealthy.length} of {runs.length}{' '}
+          strateg{runs.length === 1 ? 'y' : 'ies'} need{unhealthy.length === 1 ? 's' : ''} a look.
+        </p>
+      )}
+      {expanded && runs.length > 0 && (
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Status</th>
+              <th>Feed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((run) => (
+              <tr key={run.strategy_run_id}>
+                <td>{strategyTypeLabel(run.strategy_type)}</td>
+                <td>
+                  <span className={isStrategyHealthy(run) ? 'badge' : 'badge badge-live'}>
+                    {RUN_STATUS_LABELS[run.status] ?? run.status}
+                  </span>
+                </td>
+                <td>
+                  {run.data_freshness !== null ? (
+                    <span className={`badge ${FRESHNESS_BADGE_CLASS[run.data_freshness] ?? 'badge'}`}>
+                      {run.data_freshness}
+                    </span>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
+  const alertsQuery = useSystemAlerts()
+  const alerts = alertsQuery.data ?? []
+  const pendingApprovalCount = runs.reduce((sum, r) => sum + r.pending_approvals.length, 0)
+
+  const nothingToShow = alerts.length === 0 && pendingApprovalCount === 0
+
+  return (
+    <div className="card">
+      <h3>Attention Required</h3>
+      {alertsQuery.isLoading ? (
+        <p className="muted">Loading...</p>
+      ) : nothingToShow ? (
+        <p className="muted">Nothing needs attention.</p>
+      ) : (
+        <>
+          {pendingApprovalCount > 0 && (
+            <p>
+              <span className="badge badge-warning">{pendingApprovalCount}</span> trade
+              {pendingApprovalCount === 1 ? '' : 's'} awaiting approval — see Today&apos;s Trades below.
+            </p>
+          )}
+          {alerts.length > 0 && (
+            <table>
+              <thead>
+                <tr>
+                  <th>Severity</th>
+                  <th>Category</th>
+                  <th>Message</th>
+                  <th>When</th>
+                </tr>
+              </thead>
+              <tbody>
+                {alerts.slice(0, 5).map((alert) => (
+                  <tr key={alert.id}>
+                    <td>
+                      <span className={alert.severity === 'critical' ? 'badge badge-live' : 'badge'}>
+                        {alert.severity}
+                      </span>
+                    </td>
+                    <td>{alert.category}</td>
+                    <td>{alert.message}</td>
+                    <td>{new Date(alert.created_at).toLocaleTimeString()}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {alerts.length > 5 && (
+            <p className="muted">+{alerts.length - 5} more — see Advanced → System errors.</p>
+          )}
+        </>
+      )}
     </div>
   )
 }

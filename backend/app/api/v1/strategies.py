@@ -44,7 +44,8 @@ from app.domain.strategy.models import (
 )
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.composition import get_broker, is_strategy_routed_live
+from app.modules.execution_engine.paper.exit_legs import compute_position_open_risk
 from app.modules.execution_engine.paper.registry import ensure_position_manager_running
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.market_data import record_option_chain_snapshot
@@ -974,6 +975,12 @@ class RunningPositionOut(BaseModel):
     side: str
     qty: int
     entry_price: float
+    # Rupees at risk if the current stop (or, per open multi-leg, every
+    # open leg's own stop) hits right now — see
+    # execution_engine.paper.exit_legs.compute_position_open_risk. `None`
+    # when there's no stop data to compute from at all, distinct from a
+    # genuine ₹0.
+    open_risk: float | None
 
 
 class PendingApprovalOut(BaseModel):
@@ -998,6 +1005,14 @@ class RunningStrategyOut(BaseModel):
     open_position: RunningPositionOut | None
     pending_approvals: list[PendingApprovalOut]
     data_freshness: str | None
+    # Whether a *new* dispatch for this run would resolve to the real
+    # broker right now -- i.e. genuinely trading real money, not just
+    # "session is live_enabled" (a FORCE_PAPER strategy inside a live
+    # session is not). See broker_adapter.composition.is_strategy_routed_live,
+    # the same predicate get_execution_broker itself uses, added after two
+    # real opposite-direction incidents (2026-08-19) from this distinction
+    # being computed ad hoc elsewhere.
+    is_live: bool
 
 
 @router.get("/strategies/running", response_model=list[RunningStrategyOut])
@@ -1032,6 +1047,8 @@ def list_running_strategies(
             continue
 
         position = get_open_position_for_run(db, run)
+        trading_session = db.get(TradingSession, run.trading_session_id)
+        is_live = trading_session is not None and is_strategy_routed_live(trading_session, run)
         pending_rows = (
             db.query(PendingTradeApproval, TradeIntent)
             .join(TradeIntent, PendingTradeApproval.trade_intent_id == TradeIntent.id)
@@ -1082,6 +1099,7 @@ def list_running_strategies(
                         side=str(position.side),
                         qty=position.qty,
                         entry_price=float(position.entry_price),
+                        open_risk=compute_position_open_risk(db, position),
                     )
                     if position is not None
                     else None
@@ -1099,6 +1117,7 @@ def list_running_strategies(
                     for approval, trade_intent in pending_rows
                 ],
                 data_freshness=data_freshness,
+                is_live=is_live,
             )
         )
 
