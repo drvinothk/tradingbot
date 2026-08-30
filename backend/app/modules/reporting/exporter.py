@@ -46,12 +46,13 @@ from pathlib import Path
 
 import openpyxl
 from openpyxl.worksheet.worksheet import Worksheet
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config.settings import BACKEND_ROOT_DIR
 from app.core.clock import IST, now_ist, to_ist
 from app.core.db.session import SessionFactory, session_scope
-from app.domain.execution.models import Order, Position, TradeOutcome
+from app.domain.execution.models import Order, Position, PositionExitLeg, TradeOutcome
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
 from app.modules.strategy_engine.env_metrics import (
@@ -65,6 +66,14 @@ logger = logging.getLogger("app.reporting.exporter")
 
 REPORTS_DIR = BACKEND_ROOT_DIR / "reports"
 
+# Multi-leg exit engine: "Leg"/"Leg Kind" were added after this file had
+# already been exporting daily to a real, live `trade_log_<workspace_id>
+# .xlsx` for months. A naive positional column append would break
+# idempotency on that pre-existing file -- see `_sheet_headers`/
+# `_existing_trade_ids`'s own docstrings for why every column is resolved
+# by header *name* within each sheet's own row 1, not by a fixed global
+# index, and why an already-existing sheet deliberately never gains these
+# two new columns (it just keeps behaving exactly as it always has).
 _HEADERS = [
     "Strategy",
     "Underlying",
@@ -87,9 +96,11 @@ _HEADERS = [
     "OI (at entry)",
     "PCR - OI (at entry)",
     "PCR - Volume (at entry)",
+    "Leg",
+    "Leg Kind",
     "Trade ID (internal)",
 ]
-_TRADE_ID_COLUMN_INDEX = len(_HEADERS)  # 1-indexed, last column
+_TRADE_ID_HEADER = "Trade ID (internal)"
 
 
 @dataclass(frozen=True)
@@ -127,6 +138,14 @@ class TradeLogRow:
     oi: int | None
     pcr_oi: float | None
     pcr_vol: float | None
+    # Multi-leg exit engine: "<leg_index+1>/<total legs for this position>"
+    # (e.g. "2/3") for a staged-exit leg; "1/1" for a legacy single-outcome
+    # trade with no PositionExitLeg row at all.
+    leg_label: str
+    # PositionExitLeg.kind ("fixed_sl"/"sr_target"/"runner"/"custom"/
+    # "single") for a staged leg; "—" for a legacy row with no
+    # position_exit_leg_id.
+    leg_kind: str
 
 
 def _day_bounds_utc(target_date: date) -> tuple[datetime, datetime]:
@@ -156,6 +175,7 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
             StrategyRun,
             StrategyConfig,
             Order,
+            PositionExitLeg,
         )
         .join(Position, TradeOutcome.position_id == Position.id)
         .join(OptionContract, Position.option_contract_id == OptionContract.id)
@@ -164,13 +184,40 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
         .join(StrategyRun, TradeIntent.strategy_run_id == StrategyRun.id)
         .join(StrategyConfig, StrategyRun.strategy_config_id == StrategyConfig.id)
         .join(Order, Position.opening_order_id == Order.id)
+        # Nullable -- None for a legacy single-outcome row with no
+        # position_exit_leg_id (see TradeOutcome's own docstring).
+        .outerjoin(PositionExitLeg, TradeOutcome.position_exit_leg_id == PositionExitLeg.id)
         .filter(TradeOutcome.closed_at >= start_utc, TradeOutcome.closed_at < end_utc)
         .order_by(TradeOutcome.closed_at)
         .all()
     )
 
+    # One extra batched query (not per-row) for "how many legs does this
+    # position have in total" -- same batch-by-position_id.in_(...) idiom
+    # `api.v1.execution.list_positions` already uses for `legs_by_position`.
+    position_ids = [position.id for _, position, *_rest in query_rows]
+    leg_counts_by_position: dict[uuid.UUID, int] = {}
+    if position_ids:
+        for leg_position_id, leg_count in (
+            db.query(PositionExitLeg.position_id, func.count())
+            .filter(PositionExitLeg.position_id.in_(position_ids))
+            .group_by(PositionExitLeg.position_id)
+            .all()
+        ):
+            leg_counts_by_position[leg_position_id] = leg_count
+
     rows = []
-    for outcome, position, contract, instrument, intent, run, config, opening_order in query_rows:
+    for (
+        outcome,
+        position,
+        contract,
+        instrument,
+        intent,
+        run,
+        config,
+        opening_order,
+        exit_leg,
+    ) in query_rows:
         # As of this trade's own entry time, not "current" -- see
         # get_chain_data_as_of/get_vix_as_of's own docstrings for the
         # as_of_utc reconstruction. Two extra queries per row (VIX tick +
@@ -181,6 +228,12 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
         chain_data = get_chain_data_as_of(db, instrument.id, contract.expiry_date, as_of_utc=as_of)
         pcr_oi, pcr_vol = compute_pcr(chain_data) if chain_data is not None else (None, None)
         oi = get_contract_oi(chain_data, contract.symbol) if chain_data is not None else None
+        if exit_leg is not None:
+            leg_label = f"{exit_leg.leg_index + 1}/{leg_counts_by_position.get(position.id, 1)}"
+            leg_kind = exit_leg.kind
+        else:
+            leg_label = "1/1"
+            leg_kind = "—"
         rows.append(
             # `.value`, not a bare attribute -- these columns are all plain
             # String(N) (no native SQLAlchemy Enum type), so a value freshly
@@ -202,7 +255,13 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
                 strike=float(contract.strike),
                 expiry_date=contract.expiry_date,
                 side=str(position.side),
-                qty=position.qty,
+                # `outcome.qty`, not `position.qty` -- the latter is
+                # decremented toward 0 as each staged-exit leg closes (see
+                # exit_legs.py), so it no longer reflects this specific
+                # leg's own fill size once other legs have also closed.
+                # `TradeOutcome.qty` is always the correct per-leg (or,
+                # for a legacy trade, whole-position) quantity.
+                qty=outcome.qty,
                 entry_price=float(outcome.entry_price),
                 entry_time_utc=position.opened_at,
                 exit_price=float(outcome.exit_price),
@@ -214,6 +273,8 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
                 oi=oi,
                 pcr_oi=pcr_oi,
                 pcr_vol=pcr_vol,
+                leg_label=leg_label,
+                leg_kind=leg_kind,
             )
         )
     return rows
@@ -225,37 +286,80 @@ def _sanitize_sheet_name(name: str) -> str:
     return name[:31]
 
 
-def _row_values(row: TradeLogRow) -> list:
-    return [
-        row.strategy_name,
-        row.underlying_symbol,
-        row.expiry_date.isoformat(),
-        row.execution_mode,
-        row.trade_mode,
-        row.contract_symbol,
-        row.option_type,
-        row.strike,
-        row.side,
-        row.qty,
-        row.entry_price,
-        to_ist(row.entry_time_utc).replace(tzinfo=None),
-        row.exit_price,
-        to_ist(row.exit_time_utc).replace(tzinfo=None),
-        row.exit_reason,
-        row.realized_pnl,
-        row.slippage,
-        row.vix,
-        row.oi,
-        row.pcr_oi,
-        row.pcr_vol,
-        str(row.trade_outcome_id),
-    ]
+def _row_field_map(row: TradeLogRow) -> dict[str, object]:
+    """Header label -> value, for every column this file has ever had or
+    currently has. Resolving columns by *name* (see `_row_values_for_sheet`/
+    `_existing_trade_ids` below) rather than a fixed position is what lets a
+    header set grow over time (e.g. the "Leg"/"Leg Kind" addition) without
+    corrupting a sheet that was created under an older, narrower `_HEADERS`.
+    """
+    return {
+        "Strategy": row.strategy_name,
+        "Underlying": row.underlying_symbol,
+        "Expiry": row.expiry_date.isoformat(),
+        "Execution Mode": row.execution_mode,
+        "Paper/Live": row.trade_mode,
+        "Contract Symbol": row.contract_symbol,
+        "Option Type": row.option_type,
+        "Strike": row.strike,
+        "Side": row.side,
+        "Qty": row.qty,
+        "Entry Price": row.entry_price,
+        "Entry Time (IST)": to_ist(row.entry_time_utc).replace(tzinfo=None),
+        "Exit Price": row.exit_price,
+        "Exit Time (IST)": to_ist(row.exit_time_utc).replace(tzinfo=None),
+        "Exit Reason": row.exit_reason,
+        "Realized PnL": row.realized_pnl,
+        "Slippage": row.slippage,
+        "VIX (at entry)": row.vix,
+        "OI (at entry)": row.oi,
+        "PCR - OI (at entry)": row.pcr_oi,
+        "PCR - Volume (at entry)": row.pcr_vol,
+        "Leg": row.leg_label,
+        "Leg Kind": row.leg_kind,
+        _TRADE_ID_HEADER: str(row.trade_outcome_id),
+    }
 
 
-def _existing_trade_ids(ws: Worksheet) -> set[str]:
+def _row_values_for_sheet(row: TradeLogRow, headers: list[str]) -> list:
+    """Builds the row to append in *this sheet's own* header order. A
+    header in `headers` that this file no longer writes would map to
+    `None` (doesn't happen in practice -- headers are only ever added, not
+    renamed/removed); a header in `_row_field_map` that this particular
+    sheet doesn't have yet (e.g. "Leg"/"Leg Kind" on a sheet created before
+    they existed) is simply omitted for that sheet, which is the point --
+    see `_HEADERS`'s own module-level comment.
+    """
+    field_map = _row_field_map(row)
+    return [field_map.get(h) for h in headers]
+
+
+def _sheet_headers(ws: Worksheet) -> list[str]:
+    return [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+
+def _existing_trade_ids(ws: Worksheet, headers: list[str]) -> set[str]:
+    """Resolves the Trade-ID column by *this sheet's own* header row, not a
+    fixed global index -- a sheet created under an older, narrower
+    `_HEADERS` still has its real Trade ID data at its own original
+    position, which a global `len(_HEADERS)`-based index would get wrong
+    the moment new columns are added (see `_HEADERS`'s own comment). Falls
+    back to an empty set (never crashes) if a sheet somehow has no such
+    column at all -- shouldn't happen since every version of this file has
+    always had it, but re-exporting into a genuinely foreign/hand-edited
+    sheet should degrade to "nothing recognized as already exported"
+    rather than raise.
+    """
+    if _TRADE_ID_HEADER not in headers:
+        logger.warning(
+            "Sheet has no %r column -- treating every row as not-yet-exported",
+            _TRADE_ID_HEADER,
+        )
+        return set()
+    column_index = headers.index(_TRADE_ID_HEADER)
     ids: set[str] = set()
     for row_cells in ws.iter_rows(min_row=2):
-        cell = row_cells[_TRADE_ID_COLUMN_INDEX - 1]
+        cell = row_cells[column_index]
         if cell.value:
             ids.add(str(cell.value))
     return ids
@@ -286,7 +390,9 @@ def _write_csv_fallback(
         writer = csv.writer(f)
         writer.writerow(_HEADERS)
         for row in rows:
-            writer.writerow(_row_values(row))
+            # Always a brand-new file -- no pre-existing header to be
+            # compatible with, so always the full current `_HEADERS`.
+            writer.writerow(_row_values_for_sheet(row, _HEADERS))
     return path
 
 
@@ -319,11 +425,12 @@ def export_trade_log_for_workspace(
     appended = 0
     for sheet_name, sheet_rows in by_sheet.items():
         ws = _get_or_create_sheet(wb, sheet_name)
-        existing_ids = _existing_trade_ids(ws)
+        headers = _sheet_headers(ws)
+        existing_ids = _existing_trade_ids(ws, headers)
         for row in sheet_rows:
             if str(row.trade_outcome_id) in existing_ids:
                 continue
-            ws.append(_row_values(row))
+            ws.append(_row_values_for_sheet(row, headers))
             appended += 1
 
     if appended == 0:

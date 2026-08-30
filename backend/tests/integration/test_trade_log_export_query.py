@@ -20,6 +20,8 @@ from app.domain.execution.models import (
     OrderStatus,
     OrderType,
     Position,
+    PositionExitLeg,
+    PositionExitLegStatus,
     PositionStatus,
     TradeOutcome,
 )
@@ -516,3 +518,256 @@ def test_export_completed_trades_for_day_no_trades_touches_no_file(
     export_completed_trades_for_day(date(2026, 8, 18), session_factory=_same_session)
 
     assert list(tmp_path.iterdir()) == []
+
+
+def test_legacy_single_outcome_row_reports_correct_qty_and_no_leg(
+    db: Session, workspace, user, trading_session, option_contract
+):
+    """Guards the exact bug being fixed: the row's qty must come from
+    TradeOutcome.qty, not Position.qty -- for a legacy (non-staged) trade
+    the two happen to be equal, so this only proves `outcome.qty` is the
+    source, not that it produces the same number as before by accident."""
+    _seed_completed_trade(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb",
+        closed_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+    )
+
+    rows = fetch_completed_trades_for_day(db, date(2026, 8, 18))
+
+    assert len(rows) == 1
+    assert rows[0].qty == 25
+    assert rows[0].leg_label == "1/1"
+    assert rows[0].leg_kind == "—"
+
+
+def _seed_staged_trade_with_legs(
+    db: Session,
+    *,
+    workspace,
+    user: User,
+    trading_session: TradingSession,
+    option_contract: OptionContract,
+    strategy_name: str,
+    closed_at: datetime,
+) -> tuple[TradeOutcome, TradeOutcome]:
+    """Same chain as `_seed_completed_trade`, but for a staged (multi-leg)
+    exit: one Position (qty already decremented to 0, matching the real
+    `exit_legs.py` behavior once every leg has closed) with two
+    PositionExitLeg rows and one TradeOutcome per leg, each with its own
+    qty and pointing at its own leg via position_exit_leg_id."""
+    config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name=strategy_name)
+    db.add(config)
+    db.flush()
+
+    run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=closed_at,
+        started_by_user_id=user.id,
+    )
+    db.add(run)
+    db.flush()
+
+    signal = Signal(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        strategy_config_id=config.id,
+        strategy_run_id=run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        side=SignalSide.BUY,
+        entry_price=80.0,
+        stop_price=60.0,
+        target_price=120.0,
+        qty_lots=1,
+        generated_at=closed_at,
+    )
+    db.add(signal)
+    db.flush()
+
+    intent = TradeIntent(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        signal_id=signal.id,
+        strategy_run_id=run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        idempotency_key=f"test-{uuid.uuid4()}",
+        side=SignalSide.BUY,
+        qty_lots=1,
+        entry_price=80.0,
+        stop_price=60.0,
+        target_price=120.0,
+        status=TradeIntentStatus.DISPATCHED,
+        created_at=closed_at,
+        dispatched_at=closed_at,
+    )
+    db.add(intent)
+    db.flush()
+
+    opening_order = Order(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        trade_intent_id=intent.id,
+        idempotency_key=f"test-open-{uuid.uuid4()}",
+        mode=OrderMode.PAPER,
+        side=OrderSide.BUY,
+        order_type=OrderType.MARKET,
+        qty=25,
+        status=OrderStatus.FILLED,
+        filled_qty=25,
+        avg_fill_price=80.0,
+        submitted_at=closed_at,
+        updated_at=closed_at,
+    )
+    db.add(opening_order)
+    db.flush()
+
+    position = Position(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        trade_intent_id=intent.id,
+        opening_order_id=opening_order.id,
+        side=OrderSide.BUY,
+        qty=0,  # decremented to 0 once every leg has closed -- see exit_legs.py
+        entry_price=80.0,
+        status=PositionStatus.CLOSED,
+        opened_at=closed_at,
+        closed_at=closed_at,
+    )
+    db.add(position)
+    db.flush()
+
+    leg0 = PositionExitLeg(
+        id=uuid.uuid4(),
+        position_id=position.id,
+        leg_index=0,
+        kind="fixed_sl",
+        qty=10,
+        status=PositionExitLegStatus.CLOSED,
+        exit_reason=ExitReason.STOP,
+        realized_pnl=-50.0,
+        slippage=0.0,
+        closed_at=closed_at,
+        created_at=closed_at,
+        updated_at=closed_at,
+    )
+    leg1 = PositionExitLeg(
+        id=uuid.uuid4(),
+        position_id=position.id,
+        leg_index=1,
+        kind="runner",
+        qty=15,
+        status=PositionExitLegStatus.CLOSED,
+        exit_reason=ExitReason.TRAIL,
+        realized_pnl=300.0,
+        slippage=0.0,
+        closed_at=closed_at,
+        created_at=closed_at,
+        updated_at=closed_at,
+    )
+    db.add_all([leg0, leg1])
+    db.flush()
+
+    closing_order = Order(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        position_id=position.id,
+        idempotency_key=f"test-close-{uuid.uuid4()}",
+        mode=OrderMode.PAPER,
+        side=OrderSide.SELL,
+        order_type=OrderType.MARKET,
+        qty=25,
+        status=OrderStatus.FILLED,
+        filled_qty=25,
+        avg_fill_price=95.0,
+        submitted_at=closed_at,
+        updated_at=closed_at,
+    )
+    db.add(closing_order)
+    db.flush()
+    position.closing_order_id = closing_order.id
+    db.flush()
+
+    outcome0 = TradeOutcome(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        position_id=position.id,
+        position_exit_leg_id=leg0.id,
+        trade_intent_id=intent.id,
+        entry_price=80.0,
+        exit_price=75.0,
+        qty=10,
+        realized_pnl=-50.0,
+        slippage=0.0,
+        exit_reason=ExitReason.STOP,
+        closed_at=closed_at,
+    )
+    outcome1 = TradeOutcome(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        trading_session_id=trading_session.id,
+        position_id=position.id,
+        position_exit_leg_id=leg1.id,
+        trade_intent_id=intent.id,
+        entry_price=80.0,
+        exit_price=100.0,
+        qty=15,
+        realized_pnl=300.0,
+        slippage=0.0,
+        exit_reason=ExitReason.TRAIL,
+        closed_at=closed_at,
+    )
+    db.add_all([outcome0, outcome1])
+    db.flush()
+    return outcome0, outcome1
+
+
+def test_staged_multi_leg_rows_each_report_their_own_legs_qty_and_kind(
+    db: Session, workspace, user, trading_session, option_contract
+):
+    """Directly guards the bug the qty fix addresses: with Position.qty
+    already decremented to 0 (the real post-close state for a staged
+    trade), each leg's exported row must still show its OWN qty -- not 0,
+    and not the other leg's qty."""
+    outcome0, outcome1 = _seed_staged_trade_with_legs(
+        db,
+        workspace=workspace,
+        user=user,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        strategy_name="orb",
+        closed_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+    )
+
+    rows = fetch_completed_trades_for_day(db, date(2026, 8, 18))
+
+    by_id = {r.trade_outcome_id: r for r in rows}
+    assert len(rows) == 2
+
+    row0 = by_id[outcome0.id]
+    assert row0.qty == 10
+    assert row0.qty not in (0, 15)
+    assert row0.leg_label == "1/2"
+    assert row0.leg_kind == "fixed_sl"
+
+    row1 = by_id[outcome1.id]
+    assert row1.qty == 15
+    assert row1.qty not in (0, 10)
+    assert row1.leg_label == "2/2"
+    assert row1.leg_kind == "runner"

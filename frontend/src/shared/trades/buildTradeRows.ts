@@ -1,4 +1,10 @@
-import type { InstrumentOut, OrderOut, PositionOut, RunningStrategyOut } from '../api/types'
+import type {
+  InstrumentOut,
+  OrderOut,
+  PositionLegOut,
+  PositionOut,
+  RunningStrategyOut,
+} from '../api/types'
 import { friendlyTradeLabel } from '../format/friendlyLabel'
 
 export type TradeRowStatus =
@@ -63,6 +69,11 @@ export interface TradeRow {
   // can't be resolved), so such a row still appears somewhere rather than
   // silently vanishing from both buckets.
   sessionId: string | null
+  // Per-leg detail for a staged (multi-leg) exit -- always `[]` for
+  // approval/order rows (they have no legs) and for a legacy single-exit
+  // position. `legs.length > 1` is what the UI treats as "this was a
+  // staged exit" (see ControlRoomPage's Exit Via cell / expand toggle).
+  legs: PositionLegOut[]
 }
 
 const STATUS_ORDER: Record<TradeRowStatus, number> = {
@@ -170,6 +181,7 @@ export function buildTradeRows(
         approvalId: approval.approval_id,
         mode: sessionModeById.get(run.trading_session_id) ?? null,
         sessionId: run.trading_session_id,
+        legs: [],
       })
     }
   }
@@ -224,6 +236,7 @@ export function buildTradeRows(
         timestamp: order.submitted_at,
         mode: order.mode === 'live' ? 'live' : 'paper',
         sessionId: order.trading_session_id,
+        legs: [],
       })
       continue
     }
@@ -257,6 +270,7 @@ export function buildTradeRows(
       timestamp: order.submitted_at,
       mode: order.mode === 'live' ? 'live' : 'paper',
       sessionId: order.trading_session_id,
+      legs: [],
     })
   }
 
@@ -268,6 +282,15 @@ export function buildTradeRows(
       : `Position · ${position.side} · ${new Date(position.opened_at).toLocaleTimeString()}`
     const isOpen = position.status === 'open'
     const positionLotSize = resolveLotSize(position.contract_symbol, instruments)
+    // `position.qty` is the *remaining open* qty -- decremented toward 0 as
+    // each staged-exit leg closes (see exit_legs.py on the backend), so a
+    // fully-closed staged position has `qty === 0`. Sum each leg's own qty
+    // instead when legs exist, so a closed multi-leg trade's Lots column
+    // shows its real original size, not 0.
+    const totalQty =
+      position.legs.length > 0
+        ? position.legs.reduce((sum, leg) => sum + leg.qty, 0)
+        : position.qty
     rows.push({
       key: `position-${position.id}`,
       status: isOpen ? 'position_open' : 'closed',
@@ -276,7 +299,7 @@ export function buildTradeRows(
       strike: position.strike,
       expiryDate: position.expiry_date,
       optionType: position.option_type,
-      lots: qtyToLots(position.qty, positionLotSize),
+      lots: qtyToLots(totalQty, positionLotSize),
       lotSize: positionLotSize,
       entryPrice: position.entry_price,
       ltp: isOpen ? position.ltp : position.exit_price,
@@ -293,6 +316,7 @@ export function buildTradeRows(
       hasPendingExit: isOpen && positionIdsWithPendingExit.has(position.id),
       mode: position.mode === 'live' ? 'live' : position.mode === 'paper' ? 'paper' : null,
       sessionId: position.trading_session_id,
+      legs: position.legs,
     })
   }
 

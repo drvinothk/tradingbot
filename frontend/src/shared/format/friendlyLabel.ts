@@ -68,3 +68,21 @@ export function exitReasonLabel(exitReason: string | null): string {
   if (!exitReason) return '—'
   return EXIT_REASON_LABELS[exitReason] ?? exitReason
 }
+
+// A staged (multi-leg) position's PositionOut.exit_reason is the literal
+// sentinel "staged" once more than one leg has closed -- not something a
+// human should ever see verbatim. This builds a real, friendly summary of
+// what actually happened instead, e.g. "Target ×1, Trail ×1". Legs still
+// OPEN (exit_reason === null) are excluded -- the position as a whole is
+// still 'position_open' in that case, and the "N/M legs closed" badge
+// (ControlRoomPage) covers that detail separately.
+export function stagedExitSummary(legs: { exit_reason: string | null }[]): string {
+  const closedLegs = legs.filter((leg) => leg.exit_reason !== null)
+  if (closedLegs.length === 0) return '—'
+  const counts = new Map<string, number>()
+  for (const leg of closedLegs) {
+    const label = exitReasonLabel(leg.exit_reason)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  return [...counts.entries()].map(([label, count]) => `${label} ×${count}`).join(', ')
+}

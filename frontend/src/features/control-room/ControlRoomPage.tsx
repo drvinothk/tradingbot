@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, ApiError } from '../../shared/api/client'
 import { useSessionBuckets } from '../../shared/hooks/useSessionBuckets'
 import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
@@ -7,7 +7,7 @@ import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPosition
 import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useActiveSessionMode } from '../../shared/hooks/useActiveSessionMode'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
-import { exitReasonLabel, strategyTypeLabel } from '../../shared/format/friendlyLabel'
+import { exitReasonLabel, stagedExitSummary, strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
   DailyReportOut,
   RunningStrategyOut,
@@ -59,7 +59,6 @@ export function ControlRoomPage() {
   const { shoonyaConnected, shoonyaSessionValid, feedAgeSeconds, feedState } = useActiveSessionMode()
   const [actionError, setActionError] = useState<string | null>(null)
   const [hiddenRowKeys, setHiddenRowKeys] = useState<Set<string>>(new Set())
-  const [paperExpanded, setPaperExpanded] = useState(false)
 
   const runningQuery = useRunningStrategies()
   const runs = runningQuery.data ?? EMPTY_RUNS
@@ -146,7 +145,6 @@ export function ControlRoomPage() {
         title="Today's Trades (Live)"
         session={liveSession}
         rows={liveRows}
-        defaultExpanded
         hiddenRowKeys={hiddenRowKeys}
         onHideRow={hideRow}
         onChanged={invalidateTrades}
@@ -164,9 +162,6 @@ export function ControlRoomPage() {
         title="Today's Paper Trades"
         session={paperSession}
         rows={paperRows}
-        defaultExpanded={false}
-        expanded={paperExpanded}
-        onToggleExpanded={() => setPaperExpanded((v) => !v)}
         hiddenRowKeys={hiddenRowKeys}
         onHideRow={hideRow}
         onChanged={invalidateTrades}
@@ -554,9 +549,6 @@ function TradeBucketCard({
   title,
   session,
   rows,
-  defaultExpanded,
-  expanded: expandedProp,
-  onToggleExpanded,
   hiddenRowKeys,
   onHideRow,
   onChanged,
@@ -566,18 +558,21 @@ function TradeBucketCard({
   title: string
   session: SessionOut | null
   rows: TradeRow[]
-  defaultExpanded: boolean
-  expanded?: boolean
-  onToggleExpanded?: () => void
   hiddenRowKeys: Set<string>
   onHideRow: (key: string) => void
   onChanged: () => void
   onError: (message: string | null) => void
   emptyHint: string
 }) {
-  const [localExpanded, setLocalExpanded] = useState(defaultExpanded)
-  const isExpanded = expandedProp ?? localExpanded
-  const toggle = onToggleExpanded ?? (() => setLocalExpanded((v) => !v))
+  // Both Live and Paper start collapsed. The first time this card actually
+  // has trades to show (including at initial load, if any already exist),
+  // it auto-opens once -- `hasAutoExpanded` + `userToggledRef` make sure
+  // that only ever happens once, and never overrides a deliberate manual
+  // collapse/expand afterward (a ~4s poll refetch must not snap a
+  // user-collapsed card back open).
+  const [localExpanded, setLocalExpanded] = useState(false)
+  const [hasAutoExpanded, setHasAutoExpanded] = useState(false)
+  const userToggledRef = useRef(false)
 
   // Independent per card instance -- Live and Paper each get their own
   // filter state, so filtering one never affects the other.
@@ -585,6 +580,20 @@ function TradeBucketCard({
   const [strategyFilter, setStrategyFilter] = useState<string>('all')
 
   const unhiddenRows = rows.filter((r) => !hiddenRowKeys.has(r.key))
+
+  useEffect(() => {
+    if (!userToggledRef.current && !hasAutoExpanded && unhiddenRows.length > 0) {
+      setLocalExpanded(true)
+      setHasAutoExpanded(true)
+    }
+  }, [unhiddenRows.length, hasAutoExpanded])
+
+  const isExpanded = localExpanded
+  const toggle = () => {
+    userToggledRef.current = true
+    setLocalExpanded((v) => !v)
+  }
+
   const strategyOptions = [
     ...new Set(unhiddenRows.map((r) => r.strategyType).filter((s): s is string => s !== null)),
   ]
@@ -676,59 +685,61 @@ function TradeBucketCard({
               : 'No trades match the selected filters.'}
           </p>
         ) : (
-          <table className="trade-table">
-            <colgroup>
-              <col style={{ width: '18%' }} />
-              <col style={{ width: '6%' }} />
-              <col style={{ width: '8%' }} />
-              <col style={{ width: '8%' }} />
-              <col style={{ width: '13%' }} />
-              <col style={{ width: '9%' }} />
-              <col style={{ width: '8%' }} />
-              <col style={{ width: '9%' }} />
-              <col style={{ width: '10%' }} />
-              <col style={{ width: '11%' }} />
-            </colgroup>
-            <thead>
-              <tr>
-                <th>Trade</th>
-                <th>Lots</th>
-                <th>Entry Price</th>
-                <th>LTP</th>
-                <th>Target / SL-TSL</th>
-                <th>P&amp;L</th>
-                <th>Exit Via</th>
-                <th>Entry / Exit</th>
-                <th>Status</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {visibleRows.map((row) => (
-                <TradeRowView
-                  key={row.key}
-                  row={row}
-                  onApprove={() => {
-                    if (!row.approvalId) return
-                    setActingRowKey(row.key)
-                    approveMutation.mutate(row.approvalId)
-                  }}
-                  onReject={() => {
-                    if (!row.approvalId) return
-                    setActingRowKey(row.key)
-                    rejectMutation.mutate(row.approvalId)
-                  }}
-                  onSquareOff={() => {
-                    if (!row.positionId) return
-                    setActingRowKey(row.key)
-                    squareOffMutation.mutate(row.positionId)
-                  }}
-                  onHide={() => onHideRow(row.key)}
-                  isPending={actingRowKey === row.key}
-                />
-              ))}
-            </tbody>
-          </table>
+          <div className="trade-table-scroll">
+            <table className="trade-table">
+              <colgroup>
+                <col style={{ width: '18%' }} />
+                <col style={{ width: '6%' }} />
+                <col style={{ width: '8%' }} />
+                <col style={{ width: '8%' }} />
+                <col style={{ width: '13%' }} />
+                <col style={{ width: '9%' }} />
+                <col style={{ width: '8%' }} />
+                <col style={{ width: '9%' }} />
+                <col style={{ width: '10%' }} />
+                <col style={{ width: '11%' }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Trade</th>
+                  <th>Lots</th>
+                  <th>Entry Price</th>
+                  <th>LTP</th>
+                  <th>Target / SL-TSL</th>
+                  <th>P&amp;L</th>
+                  <th>Exit Via</th>
+                  <th>Entry / Exit</th>
+                  <th>Status</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRows.map((row) => (
+                  <TradeRowView
+                    key={row.key}
+                    row={row}
+                    onApprove={() => {
+                      if (!row.approvalId) return
+                      setActingRowKey(row.key)
+                      approveMutation.mutate(row.approvalId)
+                    }}
+                    onReject={() => {
+                      if (!row.approvalId) return
+                      setActingRowKey(row.key)
+                      rejectMutation.mutate(row.approvalId)
+                    }}
+                    onSquareOff={() => {
+                      if (!row.positionId) return
+                      setActingRowKey(row.key)
+                      squareOffMutation.mutate(row.positionId)
+                    }}
+                    onHide={() => onHideRow(row.key)}
+                    isPending={actingRowKey === row.key}
+                  />
+                ))}
+              </tbody>
+            </table>
+          </div>
         ))}
     </div>
   )
@@ -750,11 +761,16 @@ function TradeRowView({
   isPending: boolean
 }) {
   const [showMore, setShowMore] = useState(false)
+  const [legsExpanded, setLegsExpanded] = useState(false)
 
   const slTsl = row.trailStopPrice ?? row.stopPrice
   const slTslLabel = row.trailStopPrice !== null ? 'TSL' : 'SL'
 
+  const isStaged = row.legs.length > 1
+  const closedLegCount = row.legs.filter((leg) => leg.status === 'closed').length
+
   return (
+    <>
     <tr>
       <td>{row.label}</td>
       <td>
@@ -804,13 +820,18 @@ function TradeRowView({
           '—'
         )}
       </td>
-      <td>{exitReasonLabel(row.exitReason)}</td>
+      <td>{isStaged ? stagedExitSummary(row.legs) : exitReasonLabel(row.exitReason)}</td>
       <td style={{ fontSize: '0.8rem' }}>
         <div>{row.openedAt ? new Date(row.openedAt).toLocaleTimeString() : '—'}</div>
         <div className="muted">{row.closedAt ? new Date(row.closedAt).toLocaleTimeString() : '—'}</div>
       </td>
       <td>
         <span className={`badge ${STATUS_BADGE_CLASS[row.status]}`}>{STATUS_LABELS[row.status]}</span>
+        {row.status === 'position_open' && isStaged && closedLegCount > 0 && (
+          <span className="badge badge-wip" style={{ marginLeft: '0.35rem' }}>
+            {closedLegCount}/{row.legs.length} legs closed
+          </span>
+        )}
       </td>
       <td>
         {row.status === 'pending_approval' && (
@@ -848,7 +869,60 @@ function TradeRowView({
             {row.hasPendingExit ? 'Exit sent...' : 'Square off'}
           </button>
         )}
+        {isStaged && (
+          <button className="btn-ghost" onClick={() => setLegsExpanded((v) => !v)}>
+            {legsExpanded ? 'Hide legs' : `${row.legs.length} legs`}
+          </button>
+        )}
       </td>
     </tr>
+    {isStaged && legsExpanded && (
+      // colSpan matches the parent <table>'s own 10-column <colgroup>
+      // above -- keep the two in sync if that column count ever changes.
+      <tr className="trade-row-legs">
+        <td colSpan={10}>
+          <table className="leg-detail-table">
+            <thead>
+              <tr>
+                <th>Leg</th>
+                <th>Kind</th>
+                <th>Qty</th>
+                <th>Stop</th>
+                <th>Target</th>
+                <th>Exit Via</th>
+                <th>P&amp;L</th>
+                <th>Closed</th>
+              </tr>
+            </thead>
+            <tbody>
+              {row.legs.map((leg) => (
+                <tr key={leg.leg_index}>
+                  <td>
+                    {leg.leg_index + 1}/{row.legs.length}
+                  </td>
+                  <td>{leg.kind}</td>
+                  <td>{leg.qty}</td>
+                  <td>{leg.stop_price !== null ? leg.stop_price.toFixed(2) : '—'}</td>
+                  <td>{leg.target_price !== null ? leg.target_price.toFixed(2) : '—'}</td>
+                  <td>{exitReasonLabel(leg.exit_reason)}</td>
+                  <td>
+                    {leg.realized_pnl !== null ? (
+                      <span className={leg.realized_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                        {leg.realized_pnl >= 0 ? '+' : ''}
+                        {leg.realized_pnl.toFixed(2)}
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                  <td>{leg.closed_at ? new Date(leg.closed_at).toLocaleTimeString() : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </td>
+      </tr>
+    )}
+    </>
   )
 }

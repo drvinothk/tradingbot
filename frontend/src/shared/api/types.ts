@@ -160,6 +160,19 @@ export interface OrderOut {
   strategy_type: string | null
 }
 
+export interface PositionLegOut {
+  leg_index: number
+  kind: string
+  qty: number
+  status: string
+  stop_price: number | null
+  target_price: number | null
+  trail_stop_price: number | null
+  exit_reason: string | null
+  realized_pnl: number | null
+  closed_at: string | null
+}
+
 export interface PositionOut {
   id: string
   trading_session_id: string
@@ -192,6 +205,10 @@ export interface PositionOut {
   // config (which can drift after the fact). Ground truth for Live vs
   // Paper bucketing.
   mode: string | null
+  // One row per staged exit leg (empty for a legacy single-exit position).
+  // `legs.length > 1` is the UI's own signal that this trade was a staged
+  // (multi-leg) exit -- see PositionExitLeg's own docstring on the backend.
+  legs: PositionLegOut[]
 }
 
 export interface SquareOffPositionOut {
