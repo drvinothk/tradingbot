@@ -31,14 +31,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import re
 from datetime import date
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-BROKERAGE_PER_TRADE = 5.0                  # flat, real Shoonya rate (user-confirmed 2026-08-30) -- per round-trip trade, not per leg
+# flat, real Shoonya rate (user-confirmed 2026-08-30) -- per round-trip trade, not per leg
+BROKERAGE_PER_TRADE = 5.0
 EXCHANGE_TXN_PCT = 0.0005                  # of premium, each side
 GST_PCT = 0.18                             # on (brokerage + exchange txn)
 STAMP_DUTY_BUY_PCT = 0.00003               # of buy-side premium only
@@ -64,7 +64,9 @@ def load(path: Path) -> pd.DataFrame:
     df["entry_time"] = pd.to_datetime(df["entry_time"], utc=True).dt.tz_convert("Asia/Kolkata")
     df["entry_date"] = df["entry_time"].dt.date
     df["cost"] = df.apply(
-        lambda r: _cost_per_trade(r["entry_price"], r["exit_price"], int(r["lot_size"]), r["entry_date"]),
+        lambda r: _cost_per_trade(
+            r["entry_price"], r["exit_price"], int(r["lot_size"]), r["entry_date"]
+        ),
         axis=1,
     )
     df["net_pnl"] = df["pnl"] - df["cost"]
@@ -121,26 +123,36 @@ def report(df: pd.DataFrame, label: str, oos_from: date, slippage_extra_pct: flo
     survives, e_all, e_trim = _tail_dependence_guard(net)
     p5, p_le0 = _bootstrap(net)
 
-    print(f"\n=== {label} ===  ({len(df)} trades, {df['entry_date'].min()}..{df['entry_date'].max()})")
+    print(
+        f"\n=== {label} ===  "
+        f"({len(df)} trades, {df['entry_date'].min()}..{df['entry_date'].max()})"
+    )
     print("  ALL   ", _seg(net))
     print("  IS    ", _seg(net[is_mask.to_numpy()]))
     print("  OOS   ", _seg(net[~is_mask.to_numpy()]))
     print(f"  tail-dependence guard: {'PASS' if survives else 'FAIL'}  "
           f"(E_all={e_all:.1f}, E_excl_top2={e_trim:.1f})")
     print(f"  bootstrap: 5th-pctile mean={p5:.1f}  P(mean<=0)={p_le0:.3f}")
-    print("  by exit reason:", df.groupby("exit_reason")["net_pnl"].agg(["count", "mean"]).round(1).to_dict("index"))
-    print("  by weekday:    ", df.assign(wd=df["entry_time"].dt.day_name())
-          .groupby("wd")["net_pnl"].agg(["count", "mean"]).round(1).to_dict("index"))
+    by_reason = df.groupby("exit_reason")["net_pnl"].agg(["count", "mean"]).round(1)
+    print("  by exit reason:", by_reason.to_dict("index"))
+    by_weekday = (
+        df.assign(wd=df["entry_time"].dt.day_name())
+        .groupby("wd")["net_pnl"].agg(["count", "mean"]).round(1)
+    )
+    print("  by weekday:    ", by_weekday.to_dict("index"))
     if "trigger_type" in df.columns:
-        print("  by trigger:    ", df.groupby("trigger_type")["net_pnl"].agg(["count", "mean"]).round(1).to_dict("index"))
+        by_trigger = df.groupby("trigger_type")["net_pnl"].agg(["count", "mean"]).round(1)
+        print("  by trigger:    ", by_trigger.to_dict("index"))
 
+    oos_net = net[~is_mask.to_numpy()]
+    is_net = net[is_mask.to_numpy()]
     return {
         "label": label, "n": len(df), "win_pct": round(100 * (net > 0).mean(), 1),
         "expectancy": round(float(net.mean()), 1), "total": round(float(net.sum()), 1),
         "pf": round(_pf(net), 2), "tail_guard": survives,
         "boot_p5": round(p5, 1), "boot_p_le0": round(p_le0, 3),
-        "oos_expectancy": round(float(net[~is_mask.to_numpy()].mean()), 1) if (~is_mask).any() else float("nan"),
-        "is_expectancy": round(float(net[is_mask.to_numpy()].mean()), 1) if is_mask.any() else float("nan"),
+        "oos_expectancy": round(float(oos_net.mean()), 1) if (~is_mask).any() else float("nan"),
+        "is_expectancy": round(float(is_net.mean()), 1) if is_mask.any() else float("nan"),
     }
 
 

@@ -60,7 +60,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
@@ -103,7 +103,7 @@ class Config:
 
     # entry window (IST "HH:MM")
     entry_earliest: str = "13:45"
-    entry_latest: str = "15:00"                       # JSON default 15:15; capped, see module docstring
+    entry_latest: str = "15:00"                       # JSON default 15:15; capped, see docstring
 
     # strike selection
     max_distance_points: float = 50.0                 # 100 = negative control, never "best"
@@ -130,11 +130,11 @@ class Config:
     fixed_stop_pct: float = 50.0
     hard_stop_pct: float = 50.0                       # always-on backstop regardless of exit_mode
     hard_target_pct: float = 200.0                    # always-on backstop regardless of exit_mode
-    force_exit_time: str = "15:09"                    # system-realistic default; see module docstring
+    force_exit_time: str = "15:09"                    # system-realistic default; see docstring
 
     # re-entry
     max_attempts_per_expiry: int = 2                  # total entries = 1 + this
-    cooldown_minutes_after_exit: int = 3               # "cooldown_bars_after_exit" on 1-min spot bars
+    cooldown_minutes_after_exit: int = 3               # "cooldown_bars_after_exit" on 1-min bars
     direction_flip_allowed: bool = True
 
     # fill / costs (costs applied in analyze_gamma_blast.py, not here -- same
@@ -194,7 +194,9 @@ def _bs_price(spot: float, strike: float, t_years: float, sigma: float, is_ce: b
     return disc_k * _norm_cdf(-d2) - spot * _norm_cdf(-d1)
 
 
-def time_to_expiry_years(now_ist: datetime, expiry: date, time_floor_minutes: float = 30.0) -> float:
+def time_to_expiry_years(
+    now_ist: datetime, expiry: date, time_floor_minutes: float = 30.0
+) -> float:
     """Minutes from `now_ist` to real market close (15:30 IST) on `expiry`,
     floored at `time_floor_minutes` (prevents T->0 blowups seconds before
     close), converted via the spec's 252-trading-day x 375-min/day year.
@@ -465,15 +467,16 @@ def run_expiry(
             elif close[idx] < active_range_lo:
                 direction = -1
         elif cfg.trigger_type == "ema_cross":
-            if idx >= 1 and ema_fast[idx] > ema_slow[idx] and ema_fast[idx - 1] <= ema_slow[idx - 1]:
+            crossed_up = ema_fast[idx] > ema_slow[idx] and ema_fast[idx - 1] <= ema_slow[idx - 1]
+            crossed_dn = ema_fast[idx] < ema_slow[idx] and ema_fast[idx - 1] >= ema_slow[idx - 1]
+            if idx >= 1 and crossed_up:
                 direction = 1
-            elif idx >= 1 and ema_fast[idx] < ema_slow[idx] and ema_fast[idx - 1] >= ema_slow[idx - 1]:
+            elif idx >= 1 and crossed_dn:
                 direction = -1
         if direction == 0:
             continue
-        if attempts_used > 0 and not cfg.direction_flip_allowed and direction != trades[-1].__dict__.get(
-            "_direction", direction
-        ):
+        prev_direction = trades[-1].__dict__.get("_direction", direction) if trades else direction
+        if attempts_used > 0 and not cfg.direction_flip_allowed and direction != prev_direction:
             continue
 
         is_ce = direction == 1
@@ -501,7 +504,9 @@ def run_expiry(
         iv = delta = gamma = None
         if cfg.arm_mode == "gamma_threshold":
             t_years = time_to_expiry_years(trigger_ts.replace(tzinfo=IST), expiry)
-            greeks = black_scholes_iv_greeks(cand_premium, close[idx], float(strike), t_years, is_ce)
+            greeks = black_scholes_iv_greeks(
+                cand_premium, close[idx], float(strike), t_years, is_ce
+            )
             if greeks is None:
                 arm_ok = False
             else:
@@ -616,7 +621,9 @@ def _walk_exit(
                 break
             if bar_high >= use_target:
                 exit_time = bts
-                exit_price = max(float(row["open"]), use_target) * (1 - cfg.exit_slippage_pct / 100.0)
+                exit_price = (
+                    max(float(row["open"]), use_target) * (1 - cfg.exit_slippage_pct / 100.0)
+                )
                 reason = "hard_target"
                 break
 

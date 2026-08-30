@@ -12,7 +12,8 @@ ranked summary CSV (`--out-dir/summary.csv`) via `analyze_gamma_blast.py`'s
 cost model + robustness checks.
 
 Usage:
-    python scripts/run_gamma_blast_sweep.py --out-dir data/historical/backtest_reports/gamma_blast_p1 --phase 1
+    python scripts/run_gamma_blast_sweep.py \
+        --out-dir data/historical/backtest_reports/gamma_blast_p1 --phase 1
 """
 
 from __future__ import annotations
@@ -23,12 +24,14 @@ import multiprocessing as mp
 from datetime import date
 from pathlib import Path
 
+import analyze_gamma_blast as ag
+import gamma_blast_backtest as gb
 import pandas as pd
 
-import gamma_blast_backtest as gb
-import analyze_gamma_blast as ag
-
-DEFAULT_OUT = Path(__file__).resolve().parent.parent / "data" / "historical" / "backtest_reports" / "gamma_blast"
+DEFAULT_OUT = (
+    Path(__file__).resolve().parent.parent
+    / "data" / "historical" / "backtest_reports" / "gamma_blast"
+)
 
 
 def _baseline() -> dict:
@@ -180,7 +183,7 @@ def main() -> None:
     )
     summary_path = args.out_dir / "summary.csv"
     summary_df.to_csv(summary_path, index=False)
-    print(f"\n=== RANKED SUMMARY (by net expectancy/lot) ===")
+    print("\n=== RANKED SUMMARY (by net expectancy/lot) ===")
     print(summary_df.to_string(index=False))
     print(f"\nwrote {summary_path}")
 
