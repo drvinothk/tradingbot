@@ -298,3 +298,60 @@ Approve? (yes / yes+add-allow-rules / no)
   trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
   && sudo mv /var/www/trading-bot/dist.bak-20260830-102321
   /var/www/trading-bot/dist`.
+
+- **2026-08-30 ~18:15 IST — Control Room UI refinement (3-card layout +
+  ribbon dedup), branch `feat/multi-leg-exit-engine` commit `28c139d`.**
+  Replaces the Net P&L/Margin Utilized(WIP)/Live Trades Today/Max Drawdown
+  boxes with one "Today's Activity" card (P&L, total trades, win rate, max
+  drawdown, open risk — scoped to Live or Paper based on whether any
+  strategy is genuinely routed live right now), adds "Strategy Status"
+  (per-run status/data-freshness) and "Attention Required" (unresolved
+  alerts + pending approvals) cards, and removes the duplicated Shoonya
+  broker-status block from Control Room's own header — the global
+  `ModeBanner` ribbon now shows Feed health (state/age + active provider)
+  and Shoonya REST status separately, on every page. Backend additions on
+  `GET /strategies/running`: `RunningStrategyOut.is_live` (reuses the
+  existing `is_strategy_routed_live` predicate) and
+  `RunningPositionOut.open_risk` (new `compute_position_open_risk` helper
+  in `execution_engine/paper/exit_legs.py`, handling both the legacy
+  StopPlan/TrailPlan path and the multi-leg PositionExitLeg path).
+  Additive only, no migration, no schema change.
+
+  This commit was staged in isolation from unrelated, still-uncommitted
+  conviction-gate-strategy work sitting in the same working tree
+  (`backend/app/api/v1/strategies.py` had pre-existing local, uncommitted
+  changes from that separate effort) — reset the file to HEAD, reapplied
+  only this task's edits, committed, then restored the original working
+  copy so the conviction-gate work is untouched and still uncommitted.
+  `backend/scripts/*` (also pre-existing, unrelated) not part of this or
+  any deploy.
+
+  Tested: 1355/1355 backend pytest pass (up from 1344 — 11 new tests:
+  `test_open_risk.py`, `test_running_strategies_is_live.py`), ruff/mypy
+  clean, frontend `tsc -b && vite build` clean. **Not browser-verified
+  locally before deploy** — no shared browser session was available this
+  session; verified live instead (below).
+
+  Safety gate (checked live): Sunday, `paper_only`/active session, **zero
+  open positions**, alembic already at `0029` (head, no migration in this
+  deploy). Backup `app.bak-20260830-181525` (backend) /
+  `dist.bak-20260830-181725` (frontend).
+
+  Commands run (backend): tarball `app/` (creds excluded, verified 0) →
+  scp → backup → extract → credentials-survived check (11 files) → grep
+  confirmed `open_risk`/`is_strategy_routed_live`/`compute_position_open_risk`
+  present → `import app.main` sanity check → `sudo systemctl restart
+  trading-bot` → `active`, `NRestarts=0`, `/health` → `{"status":"ok"}`.
+  Startup log shows the expected weekend-idle Shoonya `Session Expired`
+  lines (no fresh login yet today) — unrelated to this deploy, same as the
+  prior weekend entry above. Commands run (frontend): `npm run build` →
+  tarball `dist/` → scp → backup → swap in new `dist/`. Verified live:
+  `https://144-24-137-112.sslip.io/` → `200`,
+  `https://144-24-137-112.sslip.io/control-room` → `200`, served
+  `index-B4plQovL.js`/`index-BolzA5kw.css` matching the local build exactly.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260830-181525 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
+  && sudo mv /var/www/trading-bot/dist.bak-20260830-181725
+  /var/www/trading-bot/dist`.
