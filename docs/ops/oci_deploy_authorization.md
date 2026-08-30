@@ -207,3 +207,47 @@ Approve? (yes / yes+add-allow-rules / no)
   Rollback: `cd /home/ubuntu/trading-bot/backend && .venv/bin/alembic
   downgrade 0028 && rm -rf app && mv app.bak-20260829-202248 app && sudo
   systemctl restart trading-bot`.
+
+- **2026-08-30 ~07:40 IST — multi-leg exit engine migration + restart
+  CONFIRMED DONE** (by the operator, independently of Claude, between the
+  entry above and this one). Live-checked at deploy time: `alembic current`
+  → `0029 (head)`, `position_exit_legs` table exists, `trading-bot.service`
+  `ActiveEnterTimestamp` 2026-08-29 20:41:03 UTC (a restart already
+  happened). No further action needed on that item.
+
+- **2026-08-30 ~07:46 IST — Control Room UI deploy, branch
+  `feat/multi-leg-exit-engine` commit `0eb708d`.** Real metric tiles (Net
+  P&L MTM + per-lot, Live Trades Today, Max Drawdown; Margin Utilized stays
+  WIP), a collapsed-by-default per-strategy breakdown, independent status/
+  strategy filters on the Live and Paper trade tables, and a real
+  feed-latency badge (new `underlying_feed_freshness()` helper +
+  `feed_age_seconds`/`feed_state` on `GET /shoonya/status`). Additive only,
+  no migration, no schema change. `backend/scripts/*` not part of this (or
+  any) deploy — the standard `tar ... app` procedure only ever packages the
+  `app` subtree.
+
+  Tested: 1341/1341 backend pytest pass (3 pre-existing `/shoonya/status`
+  tests updated for the new response fields, 5 new dedicated tests for
+  `underlying_feed_freshness`), ruff/mypy clean, frontend `tsc -b && vite
+  build` clean. Browser-verified locally against the real dev DB (zero
+  live trades today) — every new tile/section degrades gracefully to
+  `0`/`—`/empty-state text, no console errors, `/shoonya/status` and
+  `/reports/sessions/{id}/daily` both 200.
+
+  Safety gate (checked live): session `paper_only`/active, **zero open
+  positions**, alembic already at `0029` (head, no migration in this
+  deploy). Backup `app.bak-20260830-074610` (backend) /
+  `dist.bak-20260830-074755` (frontend).
+
+  Commands run (backend): tarball `app/` (creds excluded, verified 0) →
+  scp → backup → extract → `import app.main` sanity check → `sudo
+  systemctl restart trading-bot` → `active`, `/health` ok. Commands run
+  (frontend): `npm run build` → tarball `dist/` → scp → backup → swap in
+  new `dist/`. Verified live: `https://144-24-137-112.sslip.io/` → `200`,
+  login page renders correctly.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260830-074610 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
+  && sudo mv /var/www/trading-bot/dist.bak-20260830-074755
+  /var/www/trading-bot/dist`.
