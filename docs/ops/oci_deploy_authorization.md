@@ -408,3 +408,58 @@ Approve? (yes / yes+add-allow-rules / no)
   trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
   && sudo mv /var/www/trading-bot/dist.bak-20260830-190927
   /var/www/trading-bot/dist`.
+
+- **2026-08-30 ~23:50 IST — reconciliation note: OCI was already ahead of
+  this log.** Before deploying the fix below, a direct check of the live
+  box found `alembic current` at `0030 (head)` and both
+  `max_trades_per_day`/`daily_target_profit` present in the deployed
+  `system_settings.py`/`ops/models.py` — i.e. commits `899a4bd`/`77e2363`
+  (Advanced settings consolidation, migration `0030`, max-trades-per-day
+  setting) plus the icon/panel-reorder commits (`30e5183`/`1e86d69`) were
+  already live, deployed outside this log (no entry above records it —
+  most likely deployed directly by the operator). Recorded here so this
+  log stays the source of truth going forward; no action was needed since
+  the code matched local HEAD exactly (`import app.main` sanity + the
+  same content greps used for every other entry here).
+
+- **2026-08-30 ~23:55 IST — alerting fix, branch
+  `feat/multi-leg-exit-engine` commit `699bb5b`.** Found during a QC pass
+  over the multi-leg exit engine: `exit_legs.py._alert_collapsed` hardcoded
+  `mode=OrderMode.PAPER` on every staged-exit collapse reason, including
+  the LIVE-position one — the case that actually matters (a live strategy's
+  staged-exit risk config silently ignored). Since `send_alert` always
+  paper-suppresses a `mode=PAPER` alert, the LIVE case was permanently
+  unpushable to Telegram regardless of severity/allowlist. Fixed: severity
+  and mode both now driven by the same `is_live` flag already in hand — the
+  two paper-only collapse reasons stay `WARNING`/`PAPER` (unchanged), the
+  LIVE-position reason is now `CRITICAL`/`LIVE`, and `exit_legs_collapsed`
+  joins `TELEGRAM_ALLOWED_CATEGORIES`. Zero production impact today — no
+  `strategy_config` anywhere sets `params.exit_legs`, so
+  `build_position_exit_legs` returns `None` before `_alert_collapsed` is
+  ever reached; confirmed no live trigger exists to test during market
+  hours (see `docs/ops/pending_market_hours_verification.md`). Additive
+  only, no migration, no schema change, backend-only (no frontend change).
+
+  Tested: 1375/1375 backend pytest pass (up from 1373 — 2 new tests
+  end-to-end through `send_alert` for the real category name, plus the two
+  existing `test_exit_legs.py` collapse tests strengthened to assert
+  severity), ruff/mypy clean.
+
+  Safety gate (checked live, twice — once before building the tarball,
+  once immediately before the restart): session `paper_only`/active, zero
+  open positions (`positions.status <> 'closed'` — empty), alembic already
+  at `0030` (head, no migration in this deploy). Backup
+  `app.bak-20260830-235500`.
+
+  Commands run: tarball `app/` (creds excluded, verified 0) → scp → backup
+  → extract → credentials-survived check (11 files) → grep confirmed
+  `exit_legs_collapsed` present in both `alerting/manager.py` and
+  `exit_legs.py` → `import app.main` sanity check → `sudo systemctl
+  restart trading-bot` → `active`, `NRestarts=0`, `/health` →
+  `{"status":"ok"}`. Startup log shows the expected weekend-idle Shoonya
+  `SearchScrip: Session Expired` lines (no fresh login yet today) and
+  weekend-rest-gated bootstrap/contract-sync skips — same pattern as every
+  other weekend deploy above, nothing new or unexpected.
+
+  Rollback: `cd /home/ubuntu/trading-bot/backend && rm -rf app && mv
+  app.bak-20260830-235500 app && sudo systemctl restart trading-bot`.
