@@ -156,52 +156,7 @@ export function MarketTerminalPage() {
       </div>
 
       <div className="grid-2">
-        <div className="card">
-          <div className="card-header">
-            <h3>
-              {underlying === 'NIFTY' ? 'Nifty' : 'Bank Nifty'} Option Chain{' '}
-              <span className="badge badge-wip">WIP</span>
-            </h3>
-          </div>
-          <div className="wip-panel">
-            <h4>Live option chain not wired up yet</h4>
-            <p>
-              No backend endpoint returns live option-chain/depth data today — this needs a real
-              candle-history + option-chain read path before this table can show anything but a
-              static demo. The rows below illustrate the intended depth-bar layout only.
-            </p>
-          </div>
-          <table style={{ opacity: 0.55, marginTop: '0.75rem' }}>
-            <thead>
-              <tr>
-                <th>Call Depth</th>
-                <th>Call LTP</th>
-                <th style={{ textAlign: 'center' }}>Strike</th>
-                <th>Put LTP</th>
-                <th>Put Depth</th>
-              </tr>
-            </thead>
-            <tbody>
-              {DEMO_STRIKES.map((row) => (
-                <tr
-                  key={row.strike}
-                  style={{ cursor: 'pointer' }}
-                  onClick={() => setChartLabel(`${row.strike} demo`)}
-                >
-                  <td>
-                    <div className={`depth-bar depth-bar-${row.callSide}`}>{row.callRatio}</div>
-                  </td>
-                  <td>—</td>
-                  <td style={{ textAlign: 'center', fontWeight: 700 }}>{row.strike}</td>
-                  <td>—</td>
-                  <td>
-                    <div className={`depth-bar depth-bar-${row.putSide}`}>{row.putRatio}</div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <SignalPanel />
 
         <div className="card">
           <div className="card-header">
@@ -216,7 +171,58 @@ export function MarketTerminalPage() {
         </div>
       </div>
 
-      <SignalPanel />
+      {/* Moved to the bottom (2026-08-30) -- still fake demo data, not
+          wired to a real option-chain endpoint yet. Revisit once the real
+          ATM +/- N strikes table (LTP/OI/OI-delta/volume/spread) is built;
+          see the Market Terminal design discussion for why this was
+          deliberately deferred rather than built alongside the chart/
+          signal panel. */}
+      <div className="card">
+        <div className="card-header">
+          <h3>
+            {underlying === 'NIFTY' ? 'Nifty' : 'Bank Nifty'} Option Chain{' '}
+            <span className="badge badge-wip">WIP</span>
+          </h3>
+        </div>
+        <div className="wip-panel">
+          <h4>Live option chain not wired up yet</h4>
+          <p>
+            No backend endpoint returns live option-chain/depth data today — this needs a real
+            candle-history + option-chain read path before this table can show anything but a
+            static demo. The rows below illustrate the intended depth-bar layout only.
+          </p>
+        </div>
+        <table style={{ opacity: 0.55, marginTop: '0.75rem' }}>
+          <thead>
+            <tr>
+              <th>Call Depth</th>
+              <th>Call LTP</th>
+              <th style={{ textAlign: 'center' }}>Strike</th>
+              <th>Put LTP</th>
+              <th>Put Depth</th>
+            </tr>
+          </thead>
+          <tbody>
+            {DEMO_STRIKES.map((row) => (
+              <tr
+                key={row.strike}
+                style={{ cursor: 'pointer' }}
+                onClick={() => setChartLabel(`${row.strike} demo`)}
+              >
+                <td>
+                  <div className={`depth-bar depth-bar-${row.callSide}`}>{row.callRatio}</div>
+                </td>
+                <td>—</td>
+                <td style={{ textAlign: 'center', fontWeight: 700 }}>{row.strike}</td>
+                <td>—</td>
+                <td>
+                  <div className={`depth-bar depth-bar-${row.putSide}`}>{row.putRatio}</div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
