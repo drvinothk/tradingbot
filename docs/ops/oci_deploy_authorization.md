@@ -251,3 +251,50 @@ Approve? (yes / yes+add-allow-rules / no)
   trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
   && sudo mv /var/www/trading-bot/dist.bak-20260830-074755
   /var/www/trading-bot/dist`.
+
+- **2026-08-30 ~10:23 IST — multi-leg trade-log/UI reporting fix, branch
+  `feat/multi-leg-exit-engine` commit `192406e`.** Fixes a real bug in the
+  Excel trade-log exporter: it wrote `Position.qty` (decremented toward 0
+  as each staged-exit leg closes) instead of `TradeOutcome.qty`, so every
+  leg's exported row showed the wrong, decaying quantity. Fixed, plus added
+  `Leg`/`Leg Kind` columns — resolved by header *name* per-sheet (not a
+  fixed index) specifically so the already-exporting production
+  `trade_log_<workspace_id>.xlsx` (old 22-column header) keeps its
+  idempotency intact instead of re-exporting its whole history as
+  duplicates on the next run; that sheet simply doesn't gain the two new
+  columns, by design. Frontend: `PositionOut`/`TradeRow` now carry
+  `legs[]` (the backend already sent it, nothing consumed it before);
+  Control Room's Exit Via cell shows a real summary ("Target ×1, Trail
+  ×1") instead of the raw `"staged"` sentinel, with an expandable per-leg
+  breakdown and a partial-close badge for an open staged position. Fixed
+  the same qty-decrement bug in the frontend's own Lots calculation (a
+  closed staged position was reading 0 lots). Live/Paper trade cards now
+  start collapsed and auto-expand once there are trades, capped to a
+  scrollable ~6 rows. Additive only, no migration, no schema change.
+
+  Tested: 1344/1344 backend pytest pass (up from 1341 — a new backward-
+  compatibility test simulates the real old-schema sheet and asserts no
+  column shift/duplication), ruff/mypy clean, frontend `tsc -b && vite
+  build` clean.
+
+  Safety gate (checked live): zero open positions, alembic already at
+  `0029` (head, no migration in this deploy). Backup
+  `app.bak-20260830-102235` (backend) / `dist.bak-20260830-102321`
+  (frontend).
+
+  Commands run (backend): tarball `app/` (creds excluded, verified 0) →
+  scp → backup → extract → credentials-survived check (11 files) →
+  `import app.main` sanity check → `sudo systemctl restart trading-bot` →
+  `active`, `/health` ok. Commands run (frontend): `npm run build` →
+  tarball `dist/` → scp → backup → swap in new `dist/`. Verified live:
+  `https://144-24-137-112.sslip.io/` → `200`,
+  `https://144-24-137-112.sslip.io/control-room` → `200`. The Shoonya
+  `SearchScrip: Session Expired` line in the post-restart log is the
+  pre-existing weekend-idle condition (no fresh login yet today) — expected,
+  unrelated to this deploy.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260830-102235 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
+  && sudo mv /var/www/trading-bot/dist.bak-20260830-102321
+  /var/www/trading-bot/dist`.
