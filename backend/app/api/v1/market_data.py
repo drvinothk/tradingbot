@@ -12,6 +12,8 @@ manages which feed is live" concern, not a risk-governance action.
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -21,9 +23,11 @@ from app.core.db.session import get_db
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
+from app.domain.market.models import PriceBar
 from app.domain.ops.models import MarketDataProviderPreference
 from app.modules.audit_service.service import record_event
 from app.modules.market_data import diagnostic_session
+from app.modules.market_data import registry as market_data_registry
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.failover import FailoverMarketDataProvider
 
@@ -206,3 +210,68 @@ def stop_diagnostic(
 @router.get("/diagnostic/status")
 def get_diagnostic_status(user: User = Depends(require_permission("session.start"))) -> dict:
     return diagnostic_session.status()
+
+
+class CandleOut(BaseModel):
+    bucket_start: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
+
+    # Serialized straight from PriceBar ORM rows below (Decimal-backed
+    # Numeric columns coerce to float fine under Pydantic's from_attributes
+    # validation) -- same pattern StrategyConfigOut already uses.
+    model_config = {"from_attributes": True}
+
+
+class StreamingSymbolsOut(BaseModel):
+    symbols: list[str]
+
+
+# Market Terminal's own-data live chart (2026-08-30) — read-only reads
+# against price_bars, gated on strategy.view (matching /strategies/running
+# and /instruments's own convention for "view live trading state") rather
+# than this router's own session.start default, which is scoped to who
+# manages broker/provider connectivity, a different concern.
+@router.get("/candles", response_model=list[CandleOut])
+def get_candles(
+    instrument_id: uuid.UUID,
+    # "60s" -- strategy_engine.common_rules.BAR_TIMEFRAME, the only
+    # timeframe anything in this codebase persists (see that module's own
+    # comment). Not imported from there directly -- this API layer
+    # shouldn't depend on strategy_engine for a plain string literal.
+    timeframe: str = "60s",
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.view")),
+) -> list[PriceBar]:
+    """Most recent `limit` completed bars for `instrument_id`/`timeframe`,
+    chronological order. `price_bars` only accumulates while
+    `MarketDataIngestionService` is actually running for this instrument
+    (see `market_data.registry`'s own docstring) — an instrument with no
+    strategy currently scanning it returns an empty list, not an error;
+    the frontend's own `PriceChart` renders an explicit "not streaming"
+    empty state for that case rather than a blank chart.
+    """
+    rows = (
+        db.query(PriceBar)
+        .filter(PriceBar.instrument_id == instrument_id, PriceBar.timeframe == timeframe)
+        .order_by(PriceBar.bucket_start.desc())
+        .limit(limit)
+        .all()
+    )
+    return list(reversed(rows))
+
+
+@router.get("/streaming-symbols", response_model=StreamingSymbolsOut)
+def get_streaming_symbols(
+    user: User = Depends(require_permission("strategy.view")),
+) -> StreamingSymbolsOut:
+    """The underlying symbols `market_data.registry` is actually ingesting
+    right now — drives the chart's symbol picker so it never offers one
+    that's genuinely dead. See `registry.subscribed_symbols`'s own
+    docstring.
+    """
+    return StreamingSymbolsOut(symbols=sorted(market_data_registry.subscribed_symbols()))

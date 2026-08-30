@@ -69,6 +69,61 @@ export function exitReasonLabel(exitReason: string | null): string {
   return EXIT_REASON_LABELS[exitReason] ?? exitReason
 }
 
+// Market Terminal signal panel (2026-08-30) -- reason codes from
+// ConvictionGateMixin._conviction_reject_reason (backend
+// conviction_gates.py) plus each *_conviction strategy's own extra native
+// gates. A `conviction_` prefix wraps most of the shared codes at their
+// call site (e.g. "conviction_vix_below_band") -- stripped here before
+// lookup so one map entry covers both the bare and prefixed form. Anything
+// unmapped (a future gate, or an early base-strategy gate that only ever
+// logs via _log_once with its own ad hoc key) falls back to a title-cased
+// version of the raw code rather than showing nothing.
+const SIGNAL_REASON_LABELS: Record<string, string> = {
+  vix_below_band: 'VIX below band',
+  vix_above_band: 'VIX above band',
+  pcr_below_band: 'PCR below band',
+  pcr_above_band: 'PCR above band',
+  prior_day_trend_disagrees: 'Prior-day trend disagrees',
+  prior_day_not_ready: 'Prior-day data not ready',
+  htf_ema_trend_disagrees: 'EMA trend disagrees',
+  htf_ema_not_ready: 'EMA trend not ready',
+  atr_not_expanding: 'ATR not expanding',
+  atr_not_ready: 'ATR not ready',
+  volume_not_surging: 'Volume not surging',
+  volume_not_ready: 'Volume data not ready',
+  skip_weekday: 'Skipped weekday',
+  max_trades_per_day: 'Max trades/day reached',
+  max_trades: 'Max trades/session reached',
+  ce_only: 'CE-only filter',
+  min_bars_since_open: 'Waiting for more bars since open',
+  min_ema_spread_atr_ratio: 'EMA9/EMA20 spread too tight',
+  oi_price_misaligned: 'OI/price not aligned',
+  breakout_too_weak: 'Breakout too weak',
+  breakout_strength_not_ready: 'Breakout strength not ready',
+  drift_disagrees: 'Underlying drift disagrees',
+  drift_not_ready: 'Underlying drift not ready',
+  min_displacement_atr: 'Confirmation candle too small',
+  time_window: 'Outside trade window',
+  range_filter: 'Range width out of band',
+  body_ratio: 'Candle body ratio too low',
+  vwap_stale: 'VWAP data stale',
+}
+
+function titleCaseReasonCode(reasonCode: string): string {
+  return reasonCode
+    .replace(/^conviction_/, '')
+    .split('_')
+    .filter(Boolean)
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join(' ')
+}
+
+export function signalReasonLabel(reasonCode: string | null): string {
+  if (!reasonCode) return '—'
+  const bare = reasonCode.replace(/^conviction_/, '')
+  return SIGNAL_REASON_LABELS[bare] ?? titleCaseReasonCode(reasonCode)
+}
+
 // A staged (multi-leg) position's PositionOut.exit_reason is the literal
 // sentinel "staged" once more than one leg has closed -- not something a
 // human should ever see verbatim. This builds a real, friendly summary of

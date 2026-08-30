@@ -2,7 +2,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
 import { api, ApiError } from '../../shared/api/client'
 import { BrokerConnectionRow } from '../../shared/components/BrokerConnectionRow'
-import type { DiagnosticRole, DiagnosticStatusOut, UnderlyingSymbol } from '../../shared/api/types'
+import type {
+  DiagnosticRole,
+  DiagnosticStatusOut,
+  RunningStrategyOut,
+  UnderlyingSymbol,
+} from '../../shared/api/types'
+import { signalReasonLabel, strategyTypeLabel } from '../../shared/format/friendlyLabel'
+import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
+import { useStreamingSymbols } from '../../shared/hooks/useStreamingSymbols'
+import { PriceChart } from './PriceChart'
 
 type DiagnosticMode = 'default' | 'failback' | 'both'
 
@@ -87,11 +96,6 @@ function WsQualityTestControl() {
   )
 }
 
-const TRADINGVIEW_SYMBOL: Record<UnderlyingSymbol, string> = {
-  NIFTY: 'NSE:NIFTY',
-  BANKNIFTY: 'NSE:BANKNIFTY',
-}
-
 // Demo-only rows so the depth-bar/table styling described in the plan is
 // visible even though the real option-chain endpoint doesn't exist yet —
 // clearly labeled WIP, never presented as live data.
@@ -104,6 +108,8 @@ const DEMO_STRIKES = [
 export function MarketTerminalPage() {
   const [underlying, setUnderlying] = useState<UnderlyingSymbol>('NIFTY')
   const [chartLabel, setChartLabel] = useState<string | null>(null)
+  const streamingSymbolsQuery = useStreamingSymbols()
+  const streamingSymbols = streamingSymbolsQuery.data?.symbols ?? []
 
   return (
     <div>
@@ -139,8 +145,12 @@ export function MarketTerminalPage() {
               setChartLabel(null)
             }}
           >
-            <option value="NIFTY">Nifty</option>
-            <option value="BANKNIFTY">Bank Nifty</option>
+            <option value="NIFTY" disabled={!streamingSymbols.includes('NIFTY')}>
+              Nifty{streamingSymbols.includes('NIFTY') ? '' : ' (not streaming)'}
+            </option>
+            <option value="BANKNIFTY" disabled={!streamingSymbols.includes('BANKNIFTY')}>
+              Bank Nifty{streamingSymbols.includes('BANKNIFTY') ? '' : ' (not streaming)'}
+            </option>
           </select>
         </div>
       </div>
@@ -197,20 +207,92 @@ export function MarketTerminalPage() {
           <div className="card-header">
             <h3>Chart{chartLabel ? `: ${chartLabel}` : ''}</h3>
           </div>
-          {/* TradingView's own iframe embed needs no backend work at all —
-              live and fully functional, per the plan's explicit note that
-              this is the one Market Terminal piece buildable without the
-              option-chain endpoint. */}
-          <iframe
-            title="TradingView chart"
-            src={`https://s.tradingview.com/widgetembed/?frameElementId=tv-chart&symbol=${encodeURIComponent(
-              TRADINGVIEW_SYMBOL[underlying],
-            )}&interval=5&hidesidetoolbar=1&hidetoptoolbar=0&symboledit=1&saveimage=0&toolbarbg=110e1b&studies=%5B%5D&theme=dark&style=1&timezone=Asia%2FKolkata`}
-            style={{ width: '100%', height: '520px', border: 'none', borderRadius: '6px' }}
-            allowFullScreen
-          />
+          {/* Own-data chart (2026-08-30) -- lightweight-charts (TradingView's
+              open-source lib) fed by this system's real price_bars via
+              polling, replacing the third-party TradingView embed. See
+              PriceChart's own docstring for why an empty result is an
+              expected state, not an error. */}
+          <PriceChart underlying={underlying} />
         </div>
       </div>
+
+      <SignalPanel />
     </div>
+  )
+}
+
+// Market Terminal signal panel (2026-08-30) -- live visibility into why a
+// scanning strategy hasn't fired: reason code, plus (when already resolved
+// at that point) the exact candidate strike/CE-PE/expiry/LTP/planned
+// entry/stop/target. Reuses the existing useRunningStrategies() poll (same
+// /strategies/running the Advanced/Control Room pages already share) --
+// no new network traffic beyond what's already firing wherever those pages
+// happen to be open.
+function SignalPanel() {
+  const runningQuery = useRunningStrategies()
+  const runs = runningQuery.data ?? []
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <h3>Signal Panel</h3>
+      </div>
+      {runs.length === 0 ? (
+        <p className="muted">No strategies running right now.</p>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th>
+              <th>Status</th>
+              <th>Reason</th>
+              <th>Candidate</th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.map((run) => (
+              <SignalPanelRow key={run.strategy_run_id} run={run} />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function SignalPanelRow({ run }: { run: RunningStrategyOut }) {
+  const signal = run.last_signal
+
+  return (
+    <tr>
+      <td>
+        {run.strategy_name}
+        <div className="muted" style={{ fontSize: '0.85em' }}>
+          {strategyTypeLabel(run.strategy_type)}
+        </div>
+      </td>
+      <td>
+        <span className={`badge ${run.status === 'in_position' ? 'badge-success' : ''}`}>
+          {run.status === 'in_position' ? 'In Position' : 'Scanning'}
+        </span>
+      </td>
+      <td>{signal ? signalReasonLabel(signal.reason_code) : <span className="muted">—</span>}</td>
+      <td>
+        {signal && signal.side && signal.strike !== null ? (
+          <div style={{ fontSize: '0.9em' }}>
+            <div>
+              {signal.strike} {signal.side}
+              {signal.expiry_date ? ` · ${signal.expiry_date}` : ''}
+            </div>
+            <div className="muted">
+              LTP {signal.ltp ?? '—'} · Entry {signal.planned_entry ?? '—'} · SL{' '}
+              {signal.stop_price ?? '—'} · Tgt {signal.target_price ?? '—'}
+            </div>
+          </div>
+        ) : (
+          <span className="muted">—</span>
+        )}
+      </td>
+    </tr>
   )
 }

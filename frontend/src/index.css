@@ -355,11 +355,20 @@ tbody tr:hover {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.35rem 1.5rem;
-  font-size: 0.82rem;
+  padding: 0.65rem 1.5rem;
+  font-size: 1rem;
   border-bottom: 1px solid var(--border);
   background: rgba(139, 92, 246, 0.06);
   color: var(--text-main);
+}
+
+.mode-banner .row-actions {
+  gap: 1rem;
+}
+
+.mode-banner .badge {
+  font-size: 0.88rem;
+  padding: 0.22rem 0.75rem;
 }
 
 .mode-banner-alarm {
@@ -472,8 +481,9 @@ tbody tr:hover {
 }
 
 .metric-box .metric-label {
-  color: var(--text-muted);
+  color: var(--text-main);
   font-size: 0.78rem;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.03em;
   margin-bottom: 0.3rem;
@@ -540,6 +550,72 @@ tbody tr:hover {
   background: rgba(148, 163, 184, 0.08);
   color: var(--text-muted);
   border: 1px dashed var(--text-muted);
+}
+
+/* ---------- Attention Required card ---------- */
+.attention-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.attention-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-height: 220px;
+  overflow-y: auto;
+  margin-top: 0.75rem;
+  padding-right: 0.25rem;
+}
+
+.attention-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.attention-message {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attention-when {
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+@keyframes blink-anim {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+.attention-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  animation: blink-anim 1.2s ease-in-out infinite;
+}
+
+.attention-dot.danger {
+  background: var(--danger);
+  box-shadow: 0 0 6px rgba(224, 108, 117, 0.7);
+}
+
+.attention-dot.warning {
+  background: var(--warning);
+  box-shadow: 0 0 6px rgba(245, 158, 11, 0.7);
 }
 
 /* ---------- Depth bars (Market Terminal) ---------- */

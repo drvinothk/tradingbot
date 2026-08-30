@@ -46,10 +46,11 @@ from typing import Literal, TypeVar
 
 from sqlalchemy.orm import Session
 
+from app.core.clock import now_ist
 from app.domain.execution.models import Position, PositionStatus
 from app.domain.market.models import IndicatorSnapshot, PriceBar
 from app.domain.strategy.models import StrategyRun, TradeIntent
-from app.modules.strategy_engine.interface import Strategy, TradeProposal
+from app.modules.strategy_engine.interface import SignalStatus, Strategy, TradeProposal
 
 # Matches the timeframe string market_data.ingestion writes
 # (f"{IndicatorEngine.timeframe_seconds}s") for the system-wide 60s bar —
@@ -359,6 +360,9 @@ class ConfirmationFilterStrategy(Strategy):
         self.timeframe = timeframe
         self._last_seen_bucket_start: datetime | None = None
         self._logged_keys: set[str] = set()
+        # Market Terminal signal panel (2026-08-30) -- see interface
+        # .SignalStatus's own docstring for the full contract.
+        self.last_signal_status: SignalStatus = SignalStatus()
 
     def _log_once(self, logger: logging.Logger, key: str, msg: str, *args: object) -> None:
         """Logs `msg % args` at most once per `key` for this strategy
@@ -371,7 +375,18 @@ class ConfirmationFilterStrategy(Strategy):
         distinguishes independent skip reasons (e.g. "cutoff" vs
         "range_filter") so each logs its own first occurrence once,
         independent of the others.
+
+        Also updates `self.last_signal_status` (Market Terminal signal
+        panel, 2026-08-30) — deliberately *unconditional*, before the
+        dedup gate below, since the panel needs the true *current* reason
+        every cycle even though the console log itself stays deduped.
+        Always starts a fresh `SignalStatus` (`candidate=None`) — a caller
+        that already has a resolved `TradeProposal` in scope at this
+        rejection point (every `*_conviction` strategy's own gates) must
+        set `self.last_signal_status.candidate` itself, immediately after
+        this call returns, never before.
         """
+        self.last_signal_status = SignalStatus(reason_code=key, evaluated_at=now_ist())
         if key in self._logged_keys:
             return
         self._logged_keys.add(key)
@@ -402,7 +417,15 @@ class ConfirmationFilterStrategy(Strategy):
             return None
         self._last_seen_bucket_start = bar.bucket_start
 
-        return self.check_setup(db, strategy_run, bar)
+        result = self.check_setup(db, strategy_run, bar)
+        if result is not None:
+            # A real signal fired this cycle -- clear any stale rejection
+            # reason so it doesn't linger next to a just-fired/pending
+            # signal (matters most in approval-required mode, where
+            # `strategy_run.status` stays SCANNING for the whole approval
+            # window, not IN_POSITION). See interface.SignalStatus.
+            self.last_signal_status = SignalStatus()
+        return result
 
     @abstractmethod
     def check_setup(

@@ -755,6 +755,7 @@ def evaluate_trade_intent(
             db.add(trade_intent)
             db.flush()
 
+            approval_expires_at = _utcnow() + approval_window
             db.add(
                 PendingTradeApproval(
                     id=uuid.uuid4(),
@@ -764,8 +765,34 @@ def evaluate_trade_intent(
                     capital_required=analytics.capital_required,
                     breakeven_price=analytics.breakeven_price,
                     pnl_scenarios=analytics.pnl_scenarios,
-                    expires_at=_utcnow() + approval_window,
+                    expires_at=approval_expires_at,
                 )
+            )
+
+            # Telegram-notify a genuinely live-routed approval -- paper
+            # approvals never reach Telegram at all (mode=PAPER, same
+            # blanket paper-suppression every other alert already gets),
+            # since there's no real money waiting on a decision. Dedup key
+            # is per trade_intent, so a still-pending approval re-notifies
+            # after the standard 15-min cooldown rather than going silent
+            # until it's decided or expires.
+            label = _friendly_trade_intent_label(db, trade_intent, strategy_run, option_contract)
+            send_alert(
+                db,
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="trade_approval_pending",
+                message=(
+                    f"Approval needed for {label} ({trade_intent.id}) -- expires "
+                    f"{to_ist(approval_expires_at).strftime('%H:%M')} IST."
+                ),
+                mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
+                dedup_key=f"trade_approval_pending:{trade_intent.id}",
+                payload={
+                    "trade_intent_id": str(trade_intent.id),
+                    "expires_at": approval_expires_at.isoformat(),
+                },
             )
 
             record_event(

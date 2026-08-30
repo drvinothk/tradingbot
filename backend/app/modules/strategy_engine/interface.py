@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import TypedDict
 
 from sqlalchemy.orm import Session
@@ -29,6 +29,7 @@ from app.domain.strategy.models import SignalSide, StrategyRun
 __all__ = [
     "EnvPayload",
     "ExitLegSpec",
+    "SignalStatus",
     "Strategy",
     "TradePayload",
     "TradeProposal",
@@ -123,6 +124,35 @@ class TradeProposal:
     # 1.0; validated by `validate_exit_leg_specs`.
     exit_legs: list[ExitLegSpec] | None = None
     payload: TradePayload = field(default_factory=lambda: TradePayload())
+
+
+@dataclass
+class SignalStatus:
+    """Market Terminal's "signal panel" (2026-08-30): the most recent
+    reason a `ConfirmationFilterStrategy` didn't fire this cycle, plus —
+    when already resolved at that rejection point — the exact candidate
+    that was rejected. Deliberately not part of the `Strategy`/`evaluate()`
+    contract itself (no new abstract method, no signature change): every
+    `ConfirmationFilterStrategy` instance just carries one of these as a
+    plain mutable attribute (`self.last_signal_status`,
+    `common_rules.ConfirmationFilterStrategy.__init__`), updated from
+    inside `_log_once` and read externally via
+    `strategy_engine.runner.StrategyRunner.last_signal_status`.
+    `SyntheticStrategy` has no such attribute at all — callers use
+    `getattr(strategy, "last_signal_status", None)`.
+
+    `reason_code=None` means nothing has been rejected yet this run (still
+    within the "just running, nothing to report" state the signal panel
+    treats as plain Scanning). `candidate` is `None` whenever the
+    rejection fired before a `TradeProposal` was resolved (e.g. an early
+    "not enough bars yet" gate) — only conviction-gate-style rejections
+    that run *after* a base strategy's own `check_setup` has already built
+    one carry a candidate.
+    """
+
+    reason_code: str | None = None
+    candidate: TradeProposal | None = None
+    evaluated_at: datetime | None = None
 
 
 class Strategy(ABC):

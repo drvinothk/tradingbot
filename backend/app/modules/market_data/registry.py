@@ -50,6 +50,16 @@ def ensure_ingestion_running(
     return _service
 
 
+def subscribed_symbols() -> set[str]:
+    """Market Terminal's live chart (2026-08-30) — the underlyings actually
+    ingesting right now, so the frontend's symbol dropdown never offers one
+    that's genuinely dead. A plain copy of `_subscribed_symbols`, same
+    read-only style `reset_subscriptions_for_new_day` already uses against
+    this same module-level set.
+    """
+    return set(_subscribed_symbols)
+
+
 def unsubscribe_symbol(symbol: str) -> None:
     """The close-position half of `PositionManager`'s per-position
     subscription lifecycle (see its own docstring) — a symbol only ever

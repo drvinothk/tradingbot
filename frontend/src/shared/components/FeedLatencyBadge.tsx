@@ -26,7 +26,7 @@ export function FeedLatencyBadge({
 }) {
   return (
     <span className="muted">
-      Feed:{' '}
+      WS Feed:{' '}
       {feedAgeSeconds !== null && feedState !== null ? (
         <span className={`badge ${FEED_STATE_BADGE_CLASS[feedState]}`}>{formatFeedAge(feedAgeSeconds)}</span>
       ) : (

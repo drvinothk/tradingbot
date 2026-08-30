@@ -42,15 +42,21 @@ export function ModeBanner() {
   const activeLeg = providerQuery.data?.live_active_leg ?? null
   const providerSuffix = activeLeg ? ` (${PROVIDER_LABELS[activeLeg] ?? activeLeg})` : ''
 
-  // The order-execution-path signal, kept separate from feed health: REST
-  // failing blocks live order placement even if market data is still fine
-  // via a WS failback, so collapsing the two into one dot would hide that.
-  // badge-success (not badge-live) for the good case -- badge-live means
-  // "something's wrong" everywhere else in this app (rejected trades, a
-  // stale/dead feed, both also shown in this same ribbon now), so reusing
-  // it here for a routine "connected" state would collide with that.
-  const restClass = !shoonyaSessionValid ? 'badge' : shoonyaConnected ? 'badge-success' : 'badge-warning'
-  const restText = !shoonyaSessionValid ? 'Shoonya: Mock' : 'Shoonya: Connected'
+  // Broker/REST -- the order-execution path (this is what actually places
+  // orders), kept separate from WS feed health above: REST failing blocks
+  // live order placement even if market data is still fine via a WS
+  // failback. Three states mapped from the two booleans /shoonya/status
+  // actually gives us: no valid session at all -> red "Not Connected";
+  // session valid and data flowing -> green "Connected"; session valid but
+  // no fresh data yet (a reconnect/retry in progress) -> amber
+  // "Connecting...". badge-live is this app's standing "something's wrong"
+  // red (reused for a stale/dead feed, a rejected trade, etc.).
+  const brokerClass = !shoonyaSessionValid ? 'badge-live' : shoonyaConnected ? 'badge-success' : 'badge-warning'
+  const brokerText = !shoonyaSessionValid
+    ? 'Broker: Shoonya (Not Connected)'
+    : shoonyaConnected
+      ? 'Broker: Shoonya (Connected)'
+      : 'Broker: Shoonya (Connecting...)'
 
   return (
     <div className={`mode-banner${isAlarming ? ' mode-banner-alarm' : ''}`}>
@@ -60,7 +66,7 @@ export function ModeBanner() {
           <FeedLatencyBadge feedAgeSeconds={feedAgeSeconds} feedState={feedState} />
           {providerSuffix}
         </span>
-        <span className={`badge ${restClass}`}>{restText}</span>
+        <span className={`badge ${brokerClass}`}>{brokerText}</span>
       </span>
     </div>
   )

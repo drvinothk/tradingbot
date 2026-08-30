@@ -67,14 +67,19 @@ from app.modules.strategy_engine.service import new_strategy_run
 from app.modules.strategy_engine.sizing import resolve_qty_lots
 from app.modules.strategy_engine.strategies import (
     ATR_BREAKOUT_PARAM_KEYS,
+    CONVICTION_GATE_PARAM_KEYS,
     CONVICTION_PARAM_KEYS,
     ATRBreakoutStrategy,
+    EMAMicroPullbackConvictionStrategy,
     EMAMicroPullbackStrategy,
+    LiquiditySweepReversalConvictionStrategy,
     LiquiditySweepReversalStrategy,
+    OIVolumeConfirmedConvictionStrategy,
     OIVolumeConfirmedStrategy,
     ORBConvictionStrategy,
     ORBStrategy,
     SyntheticStrategy,
+    VWAPPullbackConvictionStrategy,
     VWAPPullbackStrategy,
 )
 
@@ -213,6 +218,33 @@ LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
 # future phase adds -- same "inert JSON, no matching constructor kwarg"
 # reasoning as ORB's own expiry-day-only config hooks.
 
+# The four `*_conviction` subclasses (2026-08-30) each accept their own base
+# strategy's native params plus every shared gate `conviction_gates
+# .ConvictionGateMixin` adds -- same union-of-two-explicit-literals shape
+# `ORB_CONVICTION_PARAM_KEYS` already established for `orb_conviction`.
+#
+# 2026-08-30 (Phase 1.5): each also gained one strategy-specific native
+# param of its own (not a shared gate) -- see each `*_conviction.py` file's
+# own module docstring for the research/reasoning behind each one.
+VWAP_PULLBACK_CONVICTION_PARAM_KEYS = (
+    VWAP_PULLBACK_PARAM_KEYS | CONVICTION_GATE_PARAM_KEYS | {"min_bars_since_open"}
+)
+EMA_MICRO_PULLBACK_CONVICTION_PARAM_KEYS = (
+    EMA_MICRO_PULLBACK_PARAM_KEYS
+    | CONVICTION_GATE_PARAM_KEYS
+    | {"min_ema_spread_atr_ratio"}
+)
+OI_VOLUME_CONFIRMED_CONVICTION_PARAM_KEYS = (
+    OI_VOLUME_CONFIRMED_PARAM_KEYS
+    | CONVICTION_GATE_PARAM_KEYS
+    | {"require_oi_price_alignment", "oi_alignment_lookback_bars"}
+)
+LIQUIDITY_SWEEP_REVERSAL_CONVICTION_PARAM_KEYS = (
+    LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS
+    | CONVICTION_GATE_PARAM_KEYS
+    | {"min_displacement_atr"}
+)
+
 
 def _build_strategy(
     strategy_config: StrategyConfig,
@@ -267,11 +299,31 @@ def _build_strategy(
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in VWAP_PULLBACK_PARAM_KEYS},
         )
+    if strategy_type == "vwap_pullback_conviction":
+        return VWAPPullbackConvictionStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{
+                k: v
+                for k, v in params.items()
+                if k in VWAP_PULLBACK_CONVICTION_PARAM_KEYS
+            },
+        )
     if strategy_type == "ema_micro_pullback":
         return EMAMicroPullbackStrategy(
             instrument_id=instrument_id,
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in EMA_MICRO_PULLBACK_PARAM_KEYS},
+        )
+    if strategy_type == "ema_micro_pullback_conviction":
+        return EMAMicroPullbackConvictionStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{
+                k: v
+                for k, v in params.items()
+                if k in EMA_MICRO_PULLBACK_CONVICTION_PARAM_KEYS
+            },
         )
     if strategy_type == "oi_volume_confirmed":
         return OIVolumeConfirmedStrategy(
@@ -279,11 +331,31 @@ def _build_strategy(
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in OI_VOLUME_CONFIRMED_PARAM_KEYS},
         )
+    if strategy_type == "oi_volume_confirmed_conviction":
+        return OIVolumeConfirmedConvictionStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{
+                k: v
+                for k, v in params.items()
+                if k in OI_VOLUME_CONFIRMED_CONVICTION_PARAM_KEYS
+            },
+        )
     if strategy_type == "liquidity_sweep_reversal":
         return LiquiditySweepReversalStrategy(
             instrument_id=instrument_id,
             expiry_date=expiry_date,
             **{k: v for k, v in params.items() if k in LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS},
+        )
+    if strategy_type == "liquidity_sweep_reversal_conviction":
+        return LiquiditySweepReversalConvictionStrategy(
+            instrument_id=instrument_id,
+            expiry_date=expiry_date,
+            **{
+                k: v
+                for k, v in params.items()
+                if k in LIQUIDITY_SWEEP_REVERSAL_CONVICTION_PARAM_KEYS
+            },
         )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown strategy_type '{strategy_type}'")
 
@@ -294,9 +366,13 @@ KNOWN_STRATEGY_TYPES = {
     "orb_conviction",
     "atr_breakout",
     "vwap_pullback",
+    "vwap_pullback_conviction",
     "ema_micro_pullback",
+    "ema_micro_pullback_conviction",
     "oi_volume_confirmed",
+    "oi_volume_confirmed_conviction",
     "liquidity_sweep_reversal",
+    "liquidity_sweep_reversal_conviction",
 }
 
 
@@ -993,6 +1069,29 @@ class PendingApprovalOut(BaseModel):
     expires_at: datetime
 
 
+class LastSignalOut(BaseModel):
+    """Market Terminal signal panel (2026-08-30) — the most recent reason a
+    scanning run's strategy didn't fire, plus (when already resolved at
+    that rejection point) the exact candidate that was rejected. See
+    `strategy_engine.interface.SignalStatus`'s own docstring for the full
+    contract this mirrors. Only ever built when `reason_code` is present —
+    "nothing to report yet" is `RunningStrategyOut.last_signal is None`,
+    not an empty `LastSignalOut`.
+    """
+
+    reason_code: str
+    evaluated_at: datetime
+    option_contract_id: uuid.UUID | None
+    side: str | None  # "CE" / "PE"
+    strike: float | None
+    expiry_date: date | None
+    symbol: str | None
+    planned_entry: float | None
+    ltp: float | None  # fresh reference premium, not the possibly-stale planned_entry
+    stop_price: float | None
+    target_price: float | None
+
+
 class RunningStrategyOut(BaseModel):
     strategy_run_id: uuid.UUID
     strategy_config_id: uuid.UUID
@@ -1013,6 +1112,77 @@ class RunningStrategyOut(BaseModel):
     # real opposite-direction incidents (2026-08-19) from this distinction
     # being computed ad hoc elsewhere.
     is_live: bool
+    last_signal: LastSignalOut | None = None
+
+
+def _build_last_signal_out(
+    db: Session, run: StrategyRun, runner: StrategyRunner | None
+) -> LastSignalOut | None:
+    """Market Terminal signal panel (2026-08-30) — only populated when this
+    run is actively SCANNING (a stale reject reason has no business showing
+    next to an open position or a resolved run) and a live runner thread is
+    registered for it (nothing to read otherwise, e.g. right after a
+    restart before startup-recovery resumes runs — same `runner is None`
+    guard `data_freshness` above already uses). See
+    `strategy_engine.interface.SignalStatus`'s own docstring for what
+    `runner.last_signal_status` carries and why `.candidate` can be `None`
+    even when `.reason_code` is set (an early gate rejected before any
+    `TradeProposal` existed to attach).
+    """
+    if run.status != StrategyRunStatus.SCANNING or runner is None:
+        return None
+    status = runner.last_signal_status
+    if status is None or status.reason_code is None or status.evaluated_at is None:
+        return None
+
+    candidate = status.candidate
+    if candidate is None:
+        return LastSignalOut(
+            reason_code=status.reason_code,
+            evaluated_at=status.evaluated_at,
+            option_contract_id=None,
+            side=None,
+            strike=None,
+            expiry_date=None,
+            symbol=None,
+            planned_entry=None,
+            ltp=None,
+            stop_price=None,
+            target_price=None,
+        )
+
+    contract = db.get(OptionContract, candidate.option_contract_id)
+    ltp = (
+        fresh_reference_premium(
+            db,
+            option_contract_id=candidate.option_contract_id,
+            instrument_id=contract.instrument_id,
+            expiry_date=contract.expiry_date,
+            contract_symbol=contract.symbol,
+        )
+        if contract is not None
+        else None
+    )
+    return LastSignalOut(
+        reason_code=status.reason_code,
+        evaluated_at=status.evaluated_at,
+        option_contract_id=candidate.option_contract_id,
+        # str(), not .value -- same reason as execution_mode/status above:
+        # OptionContract.option_type is a plain String(2) column with a
+        # StrEnum type hint, and a freshly-queried row (this db.get) comes
+        # back as a raw str with no .value attribute.
+        side=str(contract.option_type) if contract is not None else None,
+        # Numeric(12, 2) reads back as Decimal, not float, despite the
+        # Mapped[float] hint -- same explicit cast RunningPositionOut.entry_price
+        # already needs a few lines below.
+        strike=float(contract.strike) if contract is not None else None,
+        expiry_date=contract.expiry_date if contract is not None else None,
+        symbol=contract.symbol if contract is not None else None,
+        planned_entry=candidate.entry_price,
+        ltp=ltp,
+        stop_price=candidate.stop_price,
+        target_price=candidate.target_price,
+    )
 
 
 @router.get("/strategies/running", response_model=list[RunningStrategyOut])
@@ -1118,6 +1288,7 @@ def list_running_strategies(
                 ],
                 data_freshness=data_freshness,
                 is_live=is_live,
+                last_signal=_build_last_signal_out(db, run, runner),
             )
         )
 

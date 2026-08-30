@@ -119,6 +119,20 @@ export interface PendingApprovalOut {
   expires_at: string
 }
 
+export interface LastSignalOut {
+  reason_code: string
+  evaluated_at: string
+  option_contract_id: string | null
+  side: string | null // "CE" / "PE"
+  strike: number | null
+  expiry_date: string | null
+  symbol: string | null
+  planned_entry: number | null
+  ltp: number | null // fresh reference premium, not the possibly-stale planned_entry
+  stop_price: number | null
+  target_price: number | null
+}
+
 export interface RunningStrategyOut {
   strategy_run_id: string
   strategy_config_id: string
@@ -136,6 +150,24 @@ export interface RunningStrategyOut {
   // strategy inside a live session is not). See
   // broker_adapter.composition.is_strategy_routed_live.
   is_live: boolean
+  // Market Terminal signal panel (2026-08-30) -- why a SCANNING run
+  // hasn't fired, plus (when already resolved at that point) the exact
+  // candidate that was rejected. `null` = nothing to report yet, or this
+  // run isn't SCANNING right now.
+  last_signal: LastSignalOut | null
+}
+
+export interface CandleOut {
+  bucket_start: string
+  open: number
+  high: number
+  low: number
+  close: number
+  volume: number
+}
+
+export interface StreamingSymbolsOut {
+  symbols: string[]
 }
 
 export interface StrategyRunOut {

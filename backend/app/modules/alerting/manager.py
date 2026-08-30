@@ -114,6 +114,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "broker_disconnected",
         "market_data_stale",
         "market_data_failover_switch",
+        "trade_approval_pending",
     }
 )
 
@@ -186,6 +187,9 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "market_data_failover_switch": (
         "The backup market-data provider is now active -- confirm the primary "
         "provider's health before switching back."
+    ),
+    "trade_approval_pending": (
+        "Open Control Room and Approve/Reject before the approval window expires."
     ),
 }
 

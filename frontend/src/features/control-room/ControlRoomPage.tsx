@@ -552,59 +552,110 @@ function StrategyStatusCard({ runs }: { runs: RunningStrategyOut[] }) {
   )
 }
 
+// Mirrors backend alerting/manager.py's TELEGRAM_ALLOWED_CATEGORIES --
+// deliberately excludes 'trade_approval_pending' even though that category
+// IS telegram-eligible server-side: a pending approval is already
+// represented here directly from the live `pending_approvals` data (below),
+// which is ground truth and always current, so showing the alert row too
+// would just duplicate/stale-shadow the same event. Keep this list in sync
+// with the backend's if that allowlist changes.
+const ATTENTION_ALERT_CATEGORIES = new Set([
+  'strategy_run_stalled',
+  'stale_session_not_closed',
+  'protective_stop_placement_failed',
+  'protective_stop_cancel_failed',
+  'protective_stop_cancel_unresolved',
+  'exit_order_unfilled',
+  'margin_breach_square_off',
+  'daily_loss_cap_breached',
+  'reconciliation_mismatch',
+  'health_check_failed',
+  'order_rejected',
+  'broker_disconnected',
+  'market_data_stale',
+  'market_data_failover_switch',
+])
+
+interface AttentionItem {
+  key: string
+  kind: 'approval' | 'alert'
+  badgeLabel: string
+  message: string
+  whenLabel: string
+  sortValue: number
+}
+
 function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
   const alertsQuery = useSystemAlerts()
-  const alerts = alertsQuery.data ?? []
-  const pendingApprovalCount = runs.reduce((sum, r) => sum + r.pending_approvals.length, 0)
+  const [expanded, setExpanded] = useState(false)
 
-  const nothingToShow = alerts.length === 0 && pendingApprovalCount === 0
+  const relevantAlerts = (alertsQuery.data ?? []).filter(
+    (a) => a.severity === 'critical' && ATTENTION_ALERT_CATEGORIES.has(a.category),
+  )
+
+  const approvalItems: AttentionItem[] = runs.flatMap((run) =>
+    run.pending_approvals.map((approval) => ({
+      key: `approval:${approval.approval_id}`,
+      kind: 'approval' as const,
+      badgeLabel: 'Approval',
+      message: `${strategyTypeLabel(run.strategy_type)} ${approval.side} ${approval.qty_lots} lot${approval.qty_lots === 1 ? '' : 's'} @ ${approval.entry_price.toFixed(2)}`,
+      whenLabel: `expires ${new Date(approval.expires_at).toLocaleTimeString()}`,
+      sortValue: new Date(approval.expires_at).getTime(),
+    })),
+  )
+  const alertItems: AttentionItem[] = relevantAlerts.map((alert) => ({
+    key: `alert:${alert.id}`,
+    kind: 'alert' as const,
+    badgeLabel: alert.category,
+    message: alert.message,
+    whenLabel: new Date(alert.created_at).toLocaleTimeString(),
+    sortValue: new Date(alert.created_at).getTime(),
+  }))
+
+  // Pending approvals first (soonest-expiring first -- most urgent to
+  // decide on), then alerts most-recent-first.
+  approvalItems.sort((a, b) => a.sortValue - b.sortValue)
+  alertItems.sort((a, b) => b.sortValue - a.sortValue)
+  const items = [...approvalItems, ...alertItems]
+
+  const nothingToShow = items.length === 0
 
   return (
     <div className="card">
-      <h3>Attention Required</h3>
+      <div className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+        <h3>Attention Required</h3>
+        <span className={`chevron ${expanded ? 'open' : ''}`}>▶</span>
+      </div>
       {alertsQuery.isLoading ? (
         <p className="muted">Loading...</p>
       ) : nothingToShow ? (
         <p className="muted">Nothing needs attention.</p>
+      ) : !expanded ? (
+        <div className="attention-preview">
+          {items.slice(0, 2).map((item) => (
+            <AttentionPreviewRow key={item.key} item={item} />
+          ))}
+        </div>
       ) : (
-        <>
-          {pendingApprovalCount > 0 && (
-            <p>
-              <span className="badge badge-warning">{pendingApprovalCount}</span> trade
-              {pendingApprovalCount === 1 ? '' : 's'} awaiting approval — see Today&apos;s Trades below.
-            </p>
-          )}
-          {alerts.length > 0 && (
-            <table>
-              <thead>
-                <tr>
-                  <th>Severity</th>
-                  <th>Category</th>
-                  <th>Message</th>
-                  <th>When</th>
-                </tr>
-              </thead>
-              <tbody>
-                {alerts.slice(0, 5).map((alert) => (
-                  <tr key={alert.id}>
-                    <td>
-                      <span className={alert.severity === 'critical' ? 'badge badge-live' : 'badge'}>
-                        {alert.severity}
-                      </span>
-                    </td>
-                    <td>{alert.category}</td>
-                    <td>{alert.message}</td>
-                    <td>{new Date(alert.created_at).toLocaleTimeString()}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-          {alerts.length > 5 && (
-            <p className="muted">+{alerts.length - 5} more — see Advanced → System errors.</p>
-          )}
-        </>
+        <div className="attention-scroll">
+          {items.map((item) => (
+            <AttentionPreviewRow key={item.key} item={item} />
+          ))}
+        </div>
       )}
+    </div>
+  )
+}
+
+function AttentionPreviewRow({ item }: { item: AttentionItem }) {
+  return (
+    <div className="attention-row">
+      <span className={`attention-dot ${item.kind === 'approval' ? 'warning' : 'danger'}`} />
+      <span className={`badge ${item.kind === 'approval' ? 'badge-warning' : 'badge-live'}`}>
+        {item.badgeLabel}
+      </span>
+      <span className="attention-message">{item.message}</span>
+      <span className="muted attention-when">{item.whenLabel}</span>
     </div>
   )
 }

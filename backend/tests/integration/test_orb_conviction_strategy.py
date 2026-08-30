@@ -402,6 +402,53 @@ class TestVixBandGate:
         assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
 
 
+class TestSignalStatus:
+    """Market Terminal signal panel (2026-08-30) -- `last_signal_status` is
+    populated with the real rejection reason and a resolved candidate
+    `TradeProposal` at the exact point a conviction gate rejects an
+    otherwise-valid ORB breakout, and cleared again once a signal actually
+    fires.
+    """
+
+    def test_candidate_and_reason_captured_on_conviction_reject(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "ATR14", [10.0] * 6, OR_START)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_atr_expansion=True, atr_expansion_lookback=5,
+        )
+        result = strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument))
+        assert result is None
+
+        status = strategy.last_signal_status
+        assert status.reason_code == "conviction_atr_not_expanding"
+        assert status.evaluated_at is not None
+        assert status.candidate is not None
+        assert status.candidate.option_contract_id is not None
+        assert status.candidate.entry_price > 0
+
+    def test_cleared_once_a_signal_actually_fires(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(instrument.id, EXPIRY, or_minutes=OR_MINUTES)
+        result = strategy.evaluate(db, run, _bullish_breakout_bar(db, instrument))
+
+        assert result is not None
+        assert strategy.last_signal_status.reason_code is None
+        assert strategy.last_signal_status.candidate is None
+
+
 class TestTargetRMultiple:
     def test_target_is_recomputed_from_risk_multiple(
         self, db, instrument, option_contract_ce, option_contract_pe, trading_session,

@@ -49,7 +49,7 @@ from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
     get_recent_completed_bars,
 )
-from app.modules.strategy_engine.interface import Strategy
+from app.modules.strategy_engine.interface import SignalStatus, Strategy
 from app.modules.strategy_engine.service import submit_signal
 from app.modules.strategy_engine.sizing import resolve_qty_lots
 
@@ -427,6 +427,14 @@ class StrategyRunner:
     @property
     def expiry_date(self) -> date:
         return self._strategy.expiry_date
+
+    @property
+    def last_signal_status(self) -> SignalStatus | None:
+        """Market Terminal signal panel (2026-08-30) -- `None` for
+        `SyntheticStrategy`, which isn't a `ConfirmationFilterStrategy` and
+        carries no such attribute at all.
+        """
+        return getattr(self._strategy, "last_signal_status", None)
 
     def start(self) -> None:
         self._stop_event.clear()

@@ -1302,6 +1302,20 @@ def test_evaluate_trade_intent_approval_required_creates_pending_approval(
     )
     assert pending.capital_required == pytest.approx(float(decision.capital_required))
 
+    # 2026-08-30: a genuinely live-routed pending approval also raises a
+    # trade_approval_pending SystemAlert (mode=LIVE, so it reaches
+    # Telegram -- paper approvals never do, see the sibling test below).
+    alert = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "trade_approval_pending",
+        )
+        .one()
+    )
+    assert str(trade_intent.id) in alert.message
+    assert alert.payload["trade_intent_id"] == str(trade_intent.id)
+
 
 def test_evaluate_trade_intent_approval_required_still_auto_dispatches_when_paper(
     db: Session, trading_session, strategy_config, user: User, option_contract
