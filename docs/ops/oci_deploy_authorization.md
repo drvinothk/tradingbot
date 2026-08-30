@@ -355,3 +355,56 @@ Approve? (yes / yes+add-allow-rules / no)
   trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
   && sudo mv /var/www/trading-bot/dist.bak-20260830-181725
   /var/www/trading-bot/dist`.
+
+- **2026-08-30 ~19:09 IST — combined deploy (user requested syncing this
+  round's UI polish together with other in-progress work from the same
+  branch, backtest scripts excluded), branch `feat/multi-leg-exit-engine`
+  commit `c1fb60c`.** Four parts:
+  1. Control Room ribbon: relabeled "WS Feed"/"Broker: Shoonya", proper
+     3-color (green/orange/red) connection mapping, larger ribbon/font
+     sizing; metric-box labels brightened.
+  2. "Attention Required" card rebuilt as collapsible (blinking top-2
+     preview in the header, full list scrolls inside a fixed-height frame
+     when expanded), scoped to pending approvals + alerts matching
+     Telegram's own CRITICAL+allowlisted-category profile.
+  3. New `trade_approval_pending` CRITICAL alert (added to
+     `TELEGRAM_ALLOWED_CATEGORIES`) raised for a genuinely live-routed
+     pending approval — paper approvals stay silent, same paper-suppression
+     rule as every other alert.
+  4. Bundled from a concurrent effort on the same branch (not authored this
+     session, verified via the full test suite before deploy): four new
+     conviction-gated strategy variants (VWAP Pullback, EMA Micro-Pullback,
+     OI/Volume Confirmed, Liquidity Sweep/Reversal) wired into
+     `KNOWN_STRATEGY_TYPES`; a Market Terminal "last signal" panel plus a
+     real candlestick chart (`lightweight-charts`, new candle/streaming-
+     symbols endpoints).
+
+  Additive only, no migration (alembic already at `0029`, confirmed before
+  and after). `backend/scripts/*` and `_paidvm_data_snapshot_2026-08-27/`
+  deliberately excluded from both the commit and this deploy.
+
+  Tested: 1363/1363 backend pytest pass, ruff/mypy clean (fresh runs
+  immediately before commit), frontend `tsc -b && vite build` clean.
+
+  Safety gate (checked live): Sunday, `paper_only`/active session, **zero
+  open positions**, alembic already at `0029` (head, no migration in this
+  deploy). Backup `app.bak-20260830-190750` (backend) /
+  `dist.bak-20260830-190927` (frontend).
+
+  Commands run (backend): tarball `app/` (creds excluded, verified 0) →
+  scp → backup → extract → credentials-survived check (11 files) → grep
+  confirmed `trade_approval_pending`/`vwap_pullback_conviction` present →
+  `import app.main` sanity check → `sudo systemctl restart trading-bot` →
+  `active`, `NRestarts=0`, `/health` → `{"status":"ok"}`. Startup log shows
+  only the expected weekend-idle Shoonya `Session Expired` lines, same as
+  every other weekend entry above — nothing new or unexpected. Commands run
+  (frontend): `npm run build` → tarball `dist/` → scp → backup → swap in
+  new `dist/`. Verified live: `https://144-24-137-112.sslip.io/` → `200`,
+  `/control-room` → `200`, `/market-terminal` → `200`, served
+  `index-DK567ma1.js`/`index-DX3ZWzUk.css` matching the local build exactly.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260830-190750 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf /var/www/trading-bot/dist
+  && sudo mv /var/www/trading-bot/dist.bak-20260830-190927
+  /var/www/trading-bot/dist`.
