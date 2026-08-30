@@ -29,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.db.session import get_db
+from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
@@ -45,6 +46,10 @@ from app.domain.ops.models import (
 )
 from app.domain.session.models import FundingMode
 from app.modules.audit_service.service import record_event
+from app.modules.risk_engine.service import (
+    create_new_risk_limit_config_version,
+    get_active_risk_limit_config,
+)
 
 router = APIRouter(prefix="/system-settings", tags=["system-settings"])
 
@@ -316,6 +321,58 @@ def set_daily_limits(
         daily_loss_cap=float(config.daily_loss_cap),
         funding_mode=config.funding_mode,
     )
+
+
+# -- GET/PATCH /system-settings/max-trades-per-day ---------------------------
+# 2026-08-30: exposes RiskLimitConfig.max_trades_per_day -- the field
+# evaluate_trade_intent's max_trades_per_day_reached check actually enforces
+# (per-strategy: each StrategyConfig's own dispatched-today count against
+# this one number), previously only settable via RiskDefaults (env-settings,
+# needs a restart). This reads/writes the real enforced value directly, not
+# a preview/default of it (unlike daily-limits above, which only seeds a
+# *new* session's Daily Plan) -- there's no separate "default" concept here
+# since RiskLimitConfig has no per-session override of its own.
+
+
+class MaxTradesPerDayOut(BaseModel):
+    max_trades_per_day: int
+
+
+class SetMaxTradesPerDayRequest(BaseModel):
+    max_trades_per_day: int = Field(gt=0)
+
+
+@router.get("/max-trades-per-day", response_model=MaxTradesPerDayOut)
+def get_max_trades_per_day(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> MaxTradesPerDayOut:
+    config = get_active_risk_limit_config(db, user.workspace_id)
+    db.commit()  # get_active_risk_limit_config may lazily seed version 1
+    return MaxTradesPerDayOut(max_trades_per_day=config.max_trades_per_day)
+
+
+@router.patch("/max-trades-per-day", response_model=MaxTradesPerDayOut)
+def set_max_trades_per_day(
+    body: SetMaxTradesPerDayRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> MaxTradesPerDayOut:
+    """create_new_risk_limit_config_version's own docstring flags it as not
+    concurrency-safe on its own (an unlocked read-current/deactivate/insert
+    sequence) -- wrapped in LOCK_RISK_EVALUATION_QUEUE, the same lock
+    evaluate_trade_intent itself holds, per that warning.
+    """
+    with advisory_lock(db, LOCK_RISK_EVALUATION_QUEUE):
+        new_config = create_new_risk_limit_config_version(
+            db,
+            user.workspace_id,
+            actor_user=user,
+            reason="Advanced page: max trades per strategy per day",
+            max_trades_per_day=body.max_trades_per_day,
+        )
+        db.commit()
+    return MaxTradesPerDayOut(max_trades_per_day=new_config.max_trades_per_day)
 
 
 class RestartBackendRequest(BaseModel):

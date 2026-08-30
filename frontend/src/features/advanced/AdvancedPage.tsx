@@ -15,6 +15,7 @@ import type {
   InstrumentFirewallOut,
   InstrumentOut,
   MarketDataTelemetryOut,
+  MaxTradesPerDayOut,
   ProviderPreferenceOut,
   RuntimeMode,
   SessionOut,
@@ -60,10 +61,11 @@ export function AdvancedPage() {
       </div>
 
       {/* Global, workspace-wide controls -- Daily settings, Live instrument
-          firewall, Main data provider -- grouped in one ribbon at the top
-          instead of scattered through the page, since none of these are
-          tied to any one session/strategy. Grid wraps to 1-2 columns
-          depending on width (see .global-controls-strip). */}
+          firewall (NIFTY/BANKNIFTY toggles), Main data provider -- grouped
+          in one ribbon at the top instead of scattered through the page,
+          since none of these are tied to any one session/strategy. Grid
+          wraps to 1-2 columns depending on width (see
+          .global-controls-strip). */}
       <div className="global-controls-strip">
         <GlobalDailyLimitsCard />
         <GlobalSettingsCard />
@@ -90,8 +92,18 @@ export function AdvancedPage() {
 // ---------- Daily settings (session Daily Plan defaults) ----------
 
 function GlobalDailyLimitsCard() {
+  const queryClient = useQueryClient()
   const { data, isLoading } = useDailyLimits()
   const setLimits = useSetDailyLimits()
+  const maxTradesQuery = useQuery({
+    queryKey: ['system-settings', 'max-trades-per-day'],
+    queryFn: () => api.get<MaxTradesPerDayOut>('/system-settings/max-trades-per-day'),
+  })
+  const setMaxTrades = useMutation({
+    mutationFn: (max_trades_per_day: number) =>
+      api.patch<MaxTradesPerDayOut>('/system-settings/max-trades-per-day', { max_trades_per_day }),
+    onSuccess: (data) => queryClient.setQueryData(['system-settings', 'max-trades-per-day'], data),
+  })
   // `null` means "not yet touched by the user" -- falls back to the
   // fetched value. Once the user types anything, including clearing the
   // field to '', the state itself becomes the source of truth (`??`, not
@@ -101,40 +113,57 @@ function GlobalDailyLimitsCard() {
   const [budget, setBudget] = useState<string | null>(null)
   const [target, setTarget] = useState<string | null>(null)
   const [lossCap, setLossCap] = useState<string | null>(null)
-  const [fundingMode, setFundingMode] = useState<string | null>(null)
+  const [maxTrades, setMaxTradesInput] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const effectiveBudget = budget ?? (data ? String(data.daily_budget_amount) : '')
   const effectiveTarget = target ?? (data ? String(data.daily_target_profit) : '')
   const effectiveLossCap = lossCap ?? (data ? String(data.daily_loss_cap) : '')
-  const effectiveFundingMode = fundingMode ?? data?.funding_mode ?? 'cash'
+  const effectiveMaxTrades =
+    maxTrades ?? (maxTradesQuery.data ? String(maxTradesQuery.data.max_trades_per_day) : '')
 
-  function handleSave(event: FormEvent) {
+  async function handleSave(event: FormEvent) {
     event.preventDefault()
     setError(null)
     const body: DailyLimitsOut = {
       daily_budget_amount: Number(effectiveBudget),
       daily_target_profit: Number(effectiveTarget),
       daily_loss_cap: Number(effectiveLossCap),
-      funding_mode: effectiveFundingMode,
+      // Not exposed here -- funding mode is a broker-level concern, not
+      // something this app should let a user toggle per day.
+      funding_mode: 'cash',
     }
+    const maxTradesValue = Number(effectiveMaxTrades)
     if (!body.daily_budget_amount || !body.daily_target_profit || !body.daily_loss_cap) {
       setError('Budget, target profit, and loss cap are all required and must be greater than zero.')
       return
     }
-    setLimits.mutate(body, {
-      onError: (err) => setError(err instanceof ApiError ? err.message : 'Save failed'),
-    })
+    if (!maxTradesValue || !Number.isInteger(maxTradesValue)) {
+      setError('Max trades / strategy / day must be a whole number greater than zero.')
+      return
+    }
+    try {
+      await Promise.all([
+        setLimits.mutateAsync(body),
+        setMaxTrades.mutateAsync(maxTradesValue),
+      ])
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : 'Save failed')
+    }
   }
+
+  const loading = isLoading || maxTradesQuery.isLoading
+  const saving = setLimits.isPending || setMaxTrades.isPending
 
   return (
     <div className="card">
       <h3>Daily settings</h3>
       <p className="muted">
-        Default budget / target profit / loss cap / funding mode for a newly-created session's{' '}
+        Default budget / target profit / loss cap for a newly-created session's{' '}
         <strong>Daily plan</strong> (Reconciliation &amp; Recovery, below) — that Daily Plan is what
         Risk Service actually enforces live. Editing this changes what the <em>next</em> new session
-        starts with; today's already-active session stays independently editable and untouched.
+        starts with; today's already-active session stays independently editable and untouched. Max
+        trades / strategy / day applies immediately, across every strategy.
       </p>
       <form onSubmit={handleSave} className="row-actions" style={{ alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="form-row" style={{ marginBottom: 0 }}>
@@ -142,7 +171,7 @@ function GlobalDailyLimitsCard() {
           <input
             id="daily-budget"
             type="number"
-            disabled={isLoading}
+            disabled={loading}
             value={effectiveBudget}
             onChange={(e) => setBudget(e.target.value)}
             style={{ width: '110px' }}
@@ -153,7 +182,7 @@ function GlobalDailyLimitsCard() {
           <input
             id="daily-target"
             type="number"
-            disabled={isLoading}
+            disabled={loading}
             value={effectiveTarget}
             onChange={(e) => setTarget(e.target.value)}
             style={{ width: '110px' }}
@@ -164,25 +193,25 @@ function GlobalDailyLimitsCard() {
           <input
             id="daily-loss-cap"
             type="number"
-            disabled={isLoading}
+            disabled={loading}
             value={effectiveLossCap}
             onChange={(e) => setLossCap(e.target.value)}
             style={{ width: '110px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
-          <label htmlFor="daily-funding-mode">Funding</label>
-          <select
-            id="daily-funding-mode"
-            disabled={isLoading}
-            value={effectiveFundingMode}
-            onChange={(e) => setFundingMode(e.target.value)}
-          >
-            <option value="cash">Cash</option>
-            <option value="mtf">MTF</option>
-          </select>
+          <label htmlFor="daily-max-trades">Max trades / strategy / day</label>
+          <input
+            id="daily-max-trades"
+            type="number"
+            min={1}
+            disabled={loading}
+            value={effectiveMaxTrades}
+            onChange={(e) => setMaxTradesInput(e.target.value)}
+            style={{ width: '110px' }}
+          />
         </div>
-        <button type="submit" disabled={setLimits.isPending || isLoading}>
+        <button type="submit" disabled={saving || loading}>
           Save
         </button>
       </form>
@@ -848,7 +877,10 @@ function ReconciliationAndRecoveryCard() {
   // or filters the underlying data (SessionOut has no timestamp field to
   // sort by), it's purely how many of the already-returned rows render.
   const [showAllSessions, setShowAllSessions] = useState(false)
-  const SESSIONS_VISIBLE_DEFAULT = 5
+  // Sessions are already returned most-recent-first (list_sessions orders by
+  // started_at desc) -- showing just the last one by default is "today's
+  // session" at a glance, with older ones folded into "show more".
+  const SESSIONS_VISIBLE_DEFAULT = 1
 
   const sessions = sessionsQuery.data ?? []
   const visibleSessions = showAllSessions ? sessions : sessions.slice(0, SESSIONS_VISIBLE_DEFAULT)
@@ -1192,8 +1224,10 @@ function GlobalSettingsCard() {
       <h3>Global settings</h3>
       {error && <p className="error">{error}</p>}
 
-      <div className="form-row">
-        <label>Live instrument firewall</label>
+      {/* Two halves divided by a vertical line rather than stacked rows --
+          keeps this card's height in line with Daily settings next to it
+          in the ribbon. */}
+      <div className="global-settings-split">
         <div className="row-actions">
           {UNDERLYING_SYMBOLS.map((symbol) => (
             <label key={symbol} style={{ display: 'flex', gap: '0.3rem', alignItems: 'center' }}>
@@ -1207,31 +1241,33 @@ function GlobalSettingsCard() {
             </label>
           ))}
         </div>
-      </div>
 
-      <div className="form-row">
-        <label htmlFor="failover-override">Main data provider</label>
-        <select
-          id="failover-override"
-          value={providerPrefQuery.data?.active_provider ?? ''}
-          disabled={providerPrefMutation.isPending || providerPrefQuery.isLoading}
-          onChange={(e) => providerPrefMutation.mutate(e.target.value || null)}
-        >
-          {MAIN_PROVIDER_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-        {providerPrefQuery.data?.live_active_leg && (
-          <span className="badge">live: {providerPrefQuery.data.live_active_leg}</span>
-        )}
-        <p className="muted" style={{ fontSize: '0.75rem', margin: '0.35rem 0 0' }}>
-          Automatic is the only self-healing mode. “Shoonya only” / “Alice Blue only”
-          pin the feed and disable switching both ways. “Alice Blue only” needs a live
-          Alice Blue session — connect it on the Market Terminal first.
-        </p>
+        <div className="form-row" style={{ marginBottom: 0 }}>
+          <label htmlFor="failover-override">Main data provider</label>
+          <select
+            id="failover-override"
+            value={providerPrefQuery.data?.active_provider ?? ''}
+            disabled={providerPrefMutation.isPending || providerPrefQuery.isLoading}
+            onChange={(e) => providerPrefMutation.mutate(e.target.value || null)}
+          >
+            {MAIN_PROVIDER_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+          {providerPrefQuery.data?.live_active_leg && (
+            <span className="badge" style={{ marginLeft: '0.5rem' }}>
+              live: {providerPrefQuery.data.live_active_leg}
+            </span>
+          )}
+        </div>
       </div>
+      <p className="muted" style={{ fontSize: '0.75rem', margin: '0.5rem 0 0' }}>
+        Automatic is the only self-healing mode. "Shoonya only" / "Alice Blue only" pin the feed and
+        disable switching both ways. "Alice Blue only" needs a live Alice Blue session — connect it
+        on the Market Terminal first.
+      </p>
     </div>
   )
 }

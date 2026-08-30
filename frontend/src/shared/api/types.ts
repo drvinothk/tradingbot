@@ -270,6 +270,10 @@ export interface DailyLimitsOut {
   funding_mode: string
 }
 
+export interface MaxTradesPerDayOut {
+  max_trades_per_day: number
+}
+
 export interface UnderlyingFeedTelemetryOut {
   symbol: string
   feed_age_seconds: number | null

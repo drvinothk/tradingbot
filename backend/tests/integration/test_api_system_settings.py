@@ -40,6 +40,7 @@ from app.domain.identity.models import (
 )
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import GlobalDailyLimitsConfig, InstrumentFirewallConfig
+from app.domain.risk.models import RiskLimitConfig
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
     ExecutionMode,
@@ -129,6 +130,17 @@ def seeded_admin(engine):
         ).delete()
         cleanup_db.query(GlobalDailyLimitsConfig).filter(
             GlobalDailyLimitsConfig.workspace_id == ids["workspace_id"]
+        ).delete()
+        # 2026-08-30: found via the new max-trades-per-day endpoint's own
+        # tests -- the first thing in this file to ever create a
+        # RiskLimitConfig row (get_active_risk_limit_config's lazy seed).
+        # Without this delete, the Workspace delete below fails its FK
+        # constraint, silently rolling back this entire teardown
+        # transaction (including the Permission delete), leaking a
+        # "risk.override"-coded row into the next test's seeded_admin,
+        # which then 500s on its own duplicate-key insert.
+        cleanup_db.query(RiskLimitConfig).filter(
+            RiskLimitConfig.workspace_id == ids["workspace_id"]
         ).delete()
         cleanup_db.query(LoginSession).filter(LoginSession.user_id == ids["user_id"]).delete()
         cleanup_db.query(UserRole).filter(UserRole.user_id == ids["user_id"]).delete()
@@ -381,6 +393,53 @@ def test_set_daily_limits_survives_a_concurrent_create_race(engine, seeded_admin
         assert float(rows[0].daily_target_profit) == pytest.approx(6000.0)
         assert float(rows[0].daily_loss_cap) == pytest.approx(3000.0)
         assert rows[0].funding_mode == "mtf"
+
+
+# -- GET/PATCH /system-settings/max-trades-per-day ---------------------------
+
+
+def test_get_max_trades_per_day_lazily_seeds_from_risk_defaults(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+
+    response = api_client.get("/api/v1/system-settings/max-trades-per-day")
+
+    assert response.status_code == 200
+    assert response.json() == {"max_trades_per_day": 5}  # RiskDefaults.max_trades_per_day
+
+
+def test_patch_max_trades_per_day_creates_a_new_risk_limit_config_version(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    # Seed version 1 first, same as any other real usage.
+    api_client.get("/api/v1/system-settings/max-trades-per-day")
+
+    response = api_client.patch(
+        "/api/v1/system-settings/max-trades-per-day", json={"max_trades_per_day": 8}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"max_trades_per_day": 8}
+
+    get_response = api_client.get("/api/v1/system-settings/max-trades-per-day")
+    assert get_response.json() == {"max_trades_per_day": 8}
+
+
+def test_patch_max_trades_per_day_rejects_non_positive(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/system-settings/max-trades-per-day", json={"max_trades_per_day": 0}
+    )
+
+    assert response.status_code == 422
+
+
+def test_get_max_trades_per_day_requires_login(api_client: TestClient):
+    response = api_client.get("/api/v1/system-settings/max-trades-per-day")
+    assert response.status_code == 401
 
 
 # -- POST /system-settings/restart-backend -----------------------------------

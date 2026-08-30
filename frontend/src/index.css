@@ -522,6 +522,25 @@ tbody tr:hover {
   margin-bottom: 0;
 }
 
+/* Global settings card: NIFTY/BANKNIFTY firewall + Main data provider side
+   by side, divided by a vertical line, instead of stacked rows -- keeps
+   this card's height in line with Daily settings next to it. */
+.global-settings-split {
+  display: flex;
+  gap: 1.5rem;
+  flex-wrap: wrap;
+}
+
+.global-settings-split > div {
+  flex: 1;
+  min-width: 140px;
+}
+
+.global-settings-split > div + div {
+  border-left: 1px solid var(--border);
+  padding-left: 1.5rem;
+}
+
 /* Strategy Control: only ~2 strategy-type groups visible at once, the
    rest scroll inside this frame rather than growing the whole page. Not
    table-specific like .trade-table-scroll since this wraps several
