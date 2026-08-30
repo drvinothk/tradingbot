@@ -39,9 +39,11 @@ const MAIN_PROVIDER_OPTIONS: { value: string; label: string }[] = [
   { value: 'alice_blue', label: 'Alice Blue only (temporary)' },
 ]
 
-// The user's real current 5 strategy types plus Synthetic, folded at the
-// bottom — see the plan's "Advanced" section. Order matters: it's the
-// fixed row order the plan specifies, not alphabetical/DB order.
+// The 10 real strategy types (6 original + 4 conviction-gated, added
+// 2026-08-31 after Sweep #4's entry/exit-tuning results). `synthetic` (the
+// Phase-2 pipeline-proof stub) is archived out of this list — its existing
+// DB row is left untouched (already disabled), just no longer shown here.
+// Order matters: fixed row order, not alphabetical/DB order.
 const PRIMARY_STRATEGY_TYPES: StrategyType[] = [
   'orb',
   'oi_volume_confirmed',
@@ -49,9 +51,11 @@ const PRIMARY_STRATEGY_TYPES: StrategyType[] = [
   'vwap_pullback',
   'liquidity_sweep_reversal',
   'orb_conviction',
+  'oi_volume_confirmed_conviction',
+  'ema_micro_pullback_conviction',
+  'vwap_pullback_conviction',
+  'liquidity_sweep_reversal_conviction',
 ]
-const FOLDED_STRATEGY_TYPE: StrategyType = 'synthetic'
-const ALL_STRATEGY_TYPES: StrategyType[] = [...PRIMARY_STRATEGY_TYPES, FOLDED_STRATEGY_TYPE]
 
 export function AdvancedPage() {
   return (
@@ -264,7 +268,7 @@ function StrategyControlCard() {
           inside this frame instead of growing the whole page. Per-row
           Mode/Instrument/Execution-mode selects are unchanged. */}
       <div className="strategy-scroll">
-        {ALL_STRATEGY_TYPES.map((type) => (
+        {PRIMARY_STRATEGY_TYPES.map((type) => (
           <StrategyTypeGroup
             key={type}
             type={type}
@@ -594,7 +598,7 @@ function StrategyConfigRow({
 
 function CreateStrategyDefinitionRow({ onCreated }: { onCreated: () => void }) {
   const [expanded, setExpanded] = useState(false)
-  const [strategyType, setStrategyType] = useState<StrategyType>('synthetic')
+  const [strategyType, setStrategyType] = useState<StrategyType>('orb')
   const [paramsText, setParamsText] = useState('{}')
   const [error, setError] = useState<string | null>(null)
 
@@ -631,13 +635,16 @@ function CreateStrategyDefinitionRow({ onCreated }: { onCreated: () => void }) {
         <div className="row-actions" style={{ marginTop: '0.5rem', flexWrap: 'wrap' }}>
           <select value={strategyType} onChange={(e) => setStrategyType(e.target.value as StrategyType)}>
             {[
-              'synthetic',
               'orb',
               'orb_conviction',
               'vwap_pullback',
+              'vwap_pullback_conviction',
               'ema_micro_pullback',
+              'ema_micro_pullback_conviction',
               'oi_volume_confirmed',
+              'oi_volume_confirmed_conviction',
               'liquidity_sweep_reversal',
+              'liquidity_sweep_reversal_conviction',
             ].map((type) => (
               <option key={type} value={type}>
                 {strategyTypeLabel(type)}

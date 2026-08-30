@@ -19,9 +19,13 @@ const STRATEGY_TYPE_LABELS: Record<string, string> = {
   orb: 'ORB',
   orb_conviction: 'ORB Conviction',
   vwap_pullback: 'VWAP Pullback',
+  vwap_pullback_conviction: 'VWAP Pullback (Conviction)',
   ema_micro_pullback: 'EMA Micro-Pullback',
+  ema_micro_pullback_conviction: 'EMA Micro-Pullback (Conviction)',
   oi_volume_confirmed: 'OI/Volume Confirmed',
+  oi_volume_confirmed_conviction: 'OI/Volume Confirmed (Conviction)',
   liquidity_sweep_reversal: 'Liquidity Sweep/Reversal',
+  liquidity_sweep_reversal_conviction: 'Liquidity Sweep/Reversal (Conviction)',
 }
 
 export function strategyTypeLabel(strategyType: string): string {

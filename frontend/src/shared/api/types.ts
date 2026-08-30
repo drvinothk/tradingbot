@@ -8,9 +8,13 @@ export type StrategyType =
   | 'orb'
   | 'orb_conviction'
   | 'vwap_pullback'
+  | 'vwap_pullback_conviction'
   | 'ema_micro_pullback'
+  | 'ema_micro_pullback_conviction'
   | 'oi_volume_confirmed'
+  | 'oi_volume_confirmed_conviction'
   | 'liquidity_sweep_reversal'
+  | 'liquidity_sweep_reversal_conviction'
 export type RuntimeMode = 'force_paper'
 export type UnderlyingSymbol = 'NIFTY' | 'BANKNIFTY'
 
