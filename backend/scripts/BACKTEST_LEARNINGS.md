@@ -79,6 +79,81 @@ test as supporting (not decisive — n is small). At n≈20–40, every pass is
 
 ---
 
+## 2026-08-30 (~09:30 IST) — GAMMA BLAST v2.1 (expiry-day NIFTY options) — PARK, no config clears the tail-dependence guard
+
+User-supplied spec (`D:\Documents\Trading Bot_Oracle\gamma_blast_config_v2_1.json`):
+buy-only ATM NIFTY option, **expiry day only** (13:45-15:15 IST), gated by a
+range-compression precondition + a Black-Scholes gamma/premium-band "arm"
+condition + a spot breakout trigger, exited via momentum-stall (premium ROC
+decay) or fixed %. New standalone harness (`gamma_blast_backtest.py` +
+`analyze_gamma_blast.py` + `run_gamma_blast_sweep.py`, pandas/numpy only, same
+shape as `loren_backtest.py`) — trades ONLY the expiry day itself, so unlike
+ORB/Loren there is no multi-day warmup at all, making this the cheapest
+backtest in the ledger (~1-2s/config across all 47 expiries).
+
+**Data-availability finding (why this needed a from-scratch Greeks module)**:
+neither Shoonya nor Alice Blue returns IV/delta/gamma anywhere — confirmed by
+reading both brokers' tick/quote normalizer code directly, not assumed.
+`black_scholes_iv_greeks()` (Newton-Raphson + bisection fallback, T =
+minutes-to-15:30-close / (252x375), floored 30min, IV clipped [1%,150%]) is
+the actual live-viable answer — same function a real implementation would
+call each cycle, no vendor shortcut exists on this broker set.
+
+**System-cutoff correction**: JSON's `force_exit_time` (15:15/20/25) and
+`entry_window.latest` (15:15) sit past this system's real EOD cutoff
+(15:09 IST). Headlined config always caps at 15:09; JSON-literal 15:20 kept
+only as a labelled reference point (`..._NOTDEPLOYABLE` suffix), never
+recommended.
+
+**Phase 1 (entry conviction, single-axis off baseline)**: every axis is either
+structurally inert or an OOS trap. `max_distance_points`/`arm_mode=off`/every
+`gamma_threshold` value all produced **byte-identical** results to baseline —
+`atm_heuristic` strike selection always lands exactly on ATM (distance 0), and
+near-expiry ATM gamma is essentially always above the 0.001-0.004 threshold
+band, so neither lever ever actually rejects a candidate on real data.
+`precondition_threshold_pct:0.4` and `precondition_measure:day_range` both
+looked promising IS (+83, +101) but flipped deeply negative OOS (-463, -601)
+— the same "positive IS, dead OOS" shape this ledger already learned to
+distrust from sweep #2's stacked-combo trap. `ema_cross` trigger and both
+tighter/looser `volume_spike_mult` settings were all worse than baseline.
+Baseline itself (net of the JSON's own precise cost model — brokerage +
+date-switched STT + exchange txn + GST + stamp duty, slippage already baked
+into the fill model, not double-counted): **n=29, win 17.2%, E -215/lot,
+PF 0.48** — real, not thin-sample noise, 12 `hard_stop` losses averaging
+-673/lot against only 16 `momentum_stall` wins averaging +117/lot.
+
+**Phase 2 (exit optimization) + Phase 3 (confirmatory grid, ~70 configs
+total across both e4-VM runs and a local refinement pass)**: the exit-mix
+asymmetry from Phase 1 (loose 50% stop vs a fast 30%-stall exit) is real and
+tunable — `exit_mode:fixed` with `target_pct:100, stop_pct:15` gets to
+**E +90.5/lot, PF 1.37, ALL positive**. But **every single positive-headline
+config found anywhere in the search — the fixed-exit grid, entry-window
+narrowing (13:45-14:30/45), and stacking the "promising" Phase-1 precondition
+variants on top — fails the tail-dependence guard**: removing just the top-2
+trades flips every one of them negative (e.g. t100s15: E_all=+90.5 ->
+E_excl_top2=-83.6). The pattern is structural, not a fluke of one config:
+3-5 large `hard_target` wins (+1600 to +2200/lot, an option genuinely
+exploding into the close) carry an otherwise net-losing book of many more
+`hard_stop` losses (-295 to -330/lot each). Bootstrap P(mean<=0) for every
+positive config sits at 21-48% — nowhere near this ledger's own robustness
+bar (<=~0.15). `ema_cross` combined with the tuned exit is unambiguously
+worse (E -276 to -337/lot, ~6% win rate) — cleanly ruled out, not just
+untested.
+
+**Verdict: PARK.** No axis, and no combination of axes, produces a config
+that is both net-positive after realistic costs AND survives removing its
+best 2 trades. This looks structurally like "expiry-day ATM options
+occasionally explode 15-20x and everything else bleeds slowly to a stop" —
+real, but not a systematic edge this spec's own filters (precondition/arm/
+trigger as specified) manage to isolate in advance. Full config grid + raw
+trade CSVs: `data/historical/backtest_reports/gamma_blast/{p0,p1,p2,p3}/`.
+Revival path, if ever revisited: the arm/gamma filter needs a real
+discriminating signal (it currently never binds) or a fundamentally
+different entry-quality lever, not more exit tuning — exit tuning already
+found its ceiling here and that ceiling is a tail-dependence artifact.
+
+---
+
 ## 2026-08-30 (~00:30 IST) — LOREN TRACK (Lorentzian Classification) — options + futures both PARK
 
 **Separate from the ORB Sweep #3 W-series.** jdehorty's ML Lorentzian
