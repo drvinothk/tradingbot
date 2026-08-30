@@ -172,6 +172,7 @@ def build_position_exit_legs(
             trading_session,
             position,
             "multi-leg staged exit is not yet supported for LIVE positions",
+            is_live=True,
         )
         return None
 
@@ -184,6 +185,7 @@ def build_position_exit_legs(
             position,
             f"position has {total_lots} lot(s), too few to stage across "
             f"{len(specs)} exit legs",
+            is_live=False,
         )
         return None
     if total_lots * lot_size != filled_qty:
@@ -197,6 +199,7 @@ def build_position_exit_legs(
             trading_session,
             position,
             f"filled qty {filled_qty} is not a whole multiple of lot size {lot_size}",
+            is_live=False,
         )
         return None
 
@@ -262,20 +265,34 @@ def build_position_exit_legs(
 
 
 def _alert_collapsed(
-    db: Session, trading_session: TradingSession, position: Position, why: str
+    db: Session, trading_session: TradingSession, position: Position, why: str, *, is_live: bool
 ) -> None:
+    """`is_live` drives both `severity` and `mode`, not just the message text.
+    The two paper-only collapse reasons (position too small, fill not a lot
+    multiple) are a harmless, expected fallback — WARNING, `mode=PAPER`,
+    never pushed to Telegram, unchanged from before. The LIVE-position
+    reason is different in kind: a strategy's staged-exit *risk config* was
+    silently ignored on a real-money position, which the operator should
+    actually be told about — CRITICAL, `mode=LIVE`, eligible for Telegram
+    once `exit_legs_collapsed` is on `TELEGRAM_ALLOWED_CATEGORIES` (all
+    other gates — window, dedup — still apply as normal). Found via a 2026-
+    08-30 QC pass: every call site previously hardcoded `mode=OrderMode
+    .PAPER` regardless of which case fired, silently making the LIVE case
+    unable to ever reach Telegram even after allowlisting, since `send_alert`
+    always paper-suppresses a `mode=PAPER` alert.
+    """
     logger.warning("exit_legs collapsed for position %s: %s", position.id, why)
     send_alert(
         db,
         workspace_id=trading_session.workspace_id,
         trading_session_id=trading_session.id,
-        severity=AlertSeverity.WARNING,
+        severity=AlertSeverity.CRITICAL if is_live else AlertSeverity.WARNING,
         category="exit_legs_collapsed",
         message=(
             f"Staged exit config ignored for position {position.id}; "
             f"using a single full-qty exit instead ({why})."
         ),
-        mode=OrderMode.PAPER,
+        mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
         dedup_key=f"exit_legs_collapsed:{position.id}",
     )
 

@@ -24,7 +24,7 @@ from app.domain.execution.models import (
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
-from app.domain.ops.models import SystemAlert
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.exit_legs import ExitLegSpec, serialize_exit_legs
 from app.domain.strategy.models import (
@@ -246,6 +246,9 @@ def test_too_small_position_collapses_to_legacy_with_alert(
         .one_or_none()
     )
     assert alert is not None
+    # Paper-only collapse reason: harmless, expected fallback — stays
+    # WARNING (never Telegram-eligible), unchanged by the 2026-08-30 fix.
+    assert alert.severity == AlertSeverity.WARNING
 
 
 def test_build_legs_returns_none_for_live_position(
@@ -267,9 +270,14 @@ def test_build_legs_returns_none_for_live_position(
         db, trading_session, position, intent, filled_qty=250, lot_size=25, is_live=True
     )
     assert out is None
-    assert (
-        db.query(SystemAlert).filter(SystemAlert.category == "exit_legs_collapsed").count() == 1
+    alert = (
+        db.query(SystemAlert).filter(SystemAlert.category == "exit_legs_collapsed").one()
     )
+    # LIVE collapse reason: a real position's staged-exit risk config was
+    # silently ignored — CRITICAL + mode=LIVE so it's actually Telegram-
+    # eligible (2026-08-30 fix; previously always tagged mode=PAPER here,
+    # which made it permanently unpushable regardless of severity).
+    assert alert.severity == AlertSeverity.CRITICAL
 
 
 def test_leg_creation_is_idempotent(

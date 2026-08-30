@@ -466,3 +466,42 @@ def test_send_alert_default_dedup_key_falls_back_to_session_or_workspace(
     )
 
     assert len(_configured) == 2
+
+
+# 2026-08-30: exit_legs_collapsed was added to the allowlist alongside a fix
+# to exit_legs.py._alert_collapsed, which previously hardcoded mode=PAPER
+# for every collapse reason -- including the LIVE-position one, which made
+# it permanently un-pushable regardless of severity/allowlist since a
+# mode=PAPER alert is always suppressed. These prove the real category name
+# end-to-end through send_alert, not just the generic _ALLOWED_CATEGORY
+# stand-in the rest of this file uses.
+def test_telegram_allowed_for_exit_legs_collapsed_on_a_live_position(
+    db: Session, workspace, _configured, _within_alert_window
+):
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_legs_collapsed",
+        message="y",
+        mode=OrderMode.LIVE,
+    )
+
+    assert len(_configured) == 1
+
+
+def test_telegram_blocked_for_exit_legs_collapsed_on_a_paper_position(
+    db: Session, workspace, _configured, _within_alert_window
+):
+    """The two paper-only collapse reasons stay WARNING + mode=PAPER --
+    never pushed, matching every other paper-suppressed alert."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="exit_legs_collapsed",
+        message="y",
+        mode=OrderMode.PAPER,
+    )
+
+    assert _configured == []

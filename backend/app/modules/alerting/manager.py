@@ -115,6 +115,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "market_data_stale",
         "market_data_failover_switch",
         "trade_approval_pending",
+        "exit_legs_collapsed",
     }
 )
 
@@ -190,6 +191,10 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     ),
     "trade_approval_pending": (
         "Open Control Room and Approve/Reject before the approval window expires."
+    ),
+    "exit_legs_collapsed": (
+        "A live position's staged-exit config was ignored -- it is running on a single "
+        "full-qty stop/target instead. Review params.exit_legs for this strategy."
     ),
 }
 
