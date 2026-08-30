@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 import { api, ApiError } from '../../shared/api/client'
 import { useSessionBuckets } from '../../shared/hooks/useSessionBuckets'
@@ -7,8 +7,19 @@ import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPosition
 import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useActiveSessionMode } from '../../shared/hooks/useActiveSessionMode'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
-import { exitReasonLabel } from '../../shared/format/friendlyLabel'
-import type { RunningStrategyOut, SessionOut, SquareOffPositionOut } from '../../shared/api/types'
+import { exitReasonLabel, strategyTypeLabel } from '../../shared/format/friendlyLabel'
+import type {
+  DailyReportOut,
+  RunningStrategyOut,
+  SessionOut,
+  SquareOffPositionOut,
+} from '../../shared/api/types'
+
+// Rows that actually reached a live position today -- excludes
+// 'pending_approval' (nothing fired yet) and 'rejected' (never became a
+// trade). Shared by the Live Trades Today tile, the per-strategy table, and
+// the MTM per-lot calc so all three numbers agree with each other.
+const REAL_TRADE_STATUSES = new Set<TradeRowStatus>(['position_open', 'closing', 'closed'])
 
 const STATUS_LABELS: Record<TradeRowStatus, string> = {
   pending_approval: 'Pending Approval',
@@ -45,7 +56,7 @@ const EMPTY_RUNS: RunningStrategyOut[] = []
 export function ControlRoomPage() {
   const queryClient = useQueryClient()
   const { liveSession, paperSession, isLoading: bucketsLoading } = useSessionBuckets()
-  const { shoonyaConnected, shoonyaSessionValid } = useActiveSessionMode()
+  const { shoonyaConnected, shoonyaSessionValid, feedAgeSeconds, feedState } = useActiveSessionMode()
   const [actionError, setActionError] = useState<string | null>(null)
   const [hiddenRowKeys, setHiddenRowKeys] = useState<Set<string>>(new Set())
   const [paperExpanded, setPaperExpanded] = useState(false)
@@ -119,13 +130,17 @@ export function ControlRoomPage() {
         liveSession={liveSession}
         shoonyaConnected={shoonyaConnected}
         shoonyaSessionValid={shoonyaSessionValid}
+        feedAgeSeconds={feedAgeSeconds}
+        feedState={feedState}
         onError={setActionError}
         onChanged={invalidateTrades}
       />
 
       {actionError && <p className="error">{actionError}</p>}
 
-      <MetricsStripPlaceholder />
+      <MetricsStrip liveRows={liveRows} liveSessionId={liveSession?.id ?? null} />
+
+      <LiveTradesByStrategy liveRows={liveRows} />
 
       <TradeBucketCard
         title="Today's Trades (Live)"
@@ -168,12 +183,16 @@ function ControlRoomHeader({
   liveSession,
   shoonyaConnected,
   shoonyaSessionValid,
+  feedAgeSeconds,
+  feedState,
   onError,
   onChanged,
 }: {
   liveSession: SessionOut | null
   shoonyaConnected: boolean
   shoonyaSessionValid: boolean
+  feedAgeSeconds: number | null
+  feedState: 'live' | 'degraded' | 'stale' | 'dead' | null
   onError: (message: string | null) => void
   onChanged: () => void
 }) {
@@ -316,7 +335,7 @@ function ControlRoomHeader({
               ? 'Shoonya (REAL)'
               : 'Shoonya (REAL) — no data'}
         </span>
-        <span className="muted">Backend/Feed latency: <span className="badge badge-wip">WIP</span></span>
+        <FeedLatencyBadge feedAgeSeconds={feedAgeSeconds} feedState={feedState} />
         <div className="row-actions">
           <button
             className="btn-start"
@@ -353,18 +372,167 @@ function ControlRoomHeader({
   )
 }
 
-function MetricsStripPlaceholder() {
-  const metrics = ['Net P&L (MTM)', 'Margin Utilized', 'Trades vs. Limit', 'Max Drawdown']
+const FEED_STATE_BADGE_CLASS: Record<'live' | 'degraded' | 'stale' | 'dead', string> = {
+  live: 'badge-success',
+  degraded: 'badge-warning',
+  // Stale and dead both mean "don't trust this" -- same treatment as the
+  // rejected-trade badge elsewhere on this page (STATUS_BADGE_CLASS.rejected
+  // reuses badge-live the same way, for the same "something's wrong" red).
+  stale: 'badge-live',
+  dead: 'badge-live',
+}
+
+function formatFeedAge(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s ago`
+  return `${Math.round(seconds / 60)}m ago`
+}
+
+function FeedLatencyBadge({
+  feedAgeSeconds,
+  feedState,
+}: {
+  feedAgeSeconds: number | null
+  feedState: 'live' | 'degraded' | 'stale' | 'dead' | null
+}) {
+  return (
+    <span className="muted">
+      Feed:{' '}
+      {feedAgeSeconds !== null && feedState !== null ? (
+        <span className={`badge ${FEED_STATE_BADGE_CLASS[feedState]}`}>{formatFeedAge(feedAgeSeconds)}</span>
+      ) : (
+        <span className="badge">no data</span>
+      )}
+    </span>
+  )
+}
+
+function MetricsStrip({
+  liveRows,
+  liveSessionId,
+}: {
+  liveRows: TradeRow[]
+  liveSessionId: string | null
+}) {
+  const dailyReportQuery = useQuery({
+    queryKey: ['reports', 'daily', liveSessionId],
+    queryFn: () => api.get<DailyReportOut>(`/reports/sessions/${liveSessionId}/daily`),
+    enabled: liveSessionId != null,
+    refetchInterval: 15_000,
+  })
+
+  const realTradeRows = liveRows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
+  const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
+  const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
+
   return (
     <div className="metrics-strip">
-      {metrics.map((label) => (
-        <div className="metric-box" key={label}>
-          <div className="metric-label">{label}</div>
-          <div className="metric-value muted">
-            — <span className="badge badge-wip">WIP</span>
-          </div>
+      <div className="metric-box">
+        <div className="metric-label">Net P&amp;L (MTM)</div>
+        <div className="metric-value">
+          <span className={totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+            {totalPnl >= 0 ? '+' : ''}
+            {totalPnl.toFixed(2)}
+          </span>
         </div>
-      ))}
+        <div className="metric-subvalue muted">
+          {perLotPnl !== null
+            ? `${perLotPnl >= 0 ? '+' : ''}${perLotPnl.toFixed(2)} / lot`
+            : '— / lot'}
+        </div>
+      </div>
+
+      <div className="metric-box">
+        <div className="metric-label">Margin Utilized</div>
+        <div className="metric-value muted">
+          — <span className="badge badge-wip">WIP</span>
+        </div>
+      </div>
+
+      <div className="metric-box">
+        <div className="metric-label">Live Trades Today</div>
+        <div className="metric-value">{realTradeRows.length}</div>
+      </div>
+
+      <div className="metric-box">
+        <div className="metric-label">Max Drawdown</div>
+        <div className="metric-value">
+          {liveSessionId === null
+            ? '—'
+            : dailyReportQuery.data
+              ? dailyReportQuery.data.max_drawdown.toFixed(2)
+              : '…'}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function LiveTradesByStrategy({ liveRows }: { liveRows: TradeRow[] }) {
+  const [expanded, setExpanded] = useState(false)
+
+  const byStrategy = new Map<
+    string,
+    { trades: number; pnl: number; closedWins: number; closedTotal: number }
+  >()
+  for (const row of liveRows) {
+    if (row.strategyType === null || !REAL_TRADE_STATUSES.has(row.status)) continue
+    const entry = byStrategy.get(row.strategyType) ?? {
+      trades: 0,
+      pnl: 0,
+      closedWins: 0,
+      closedTotal: 0,
+    }
+    entry.trades += 1
+    entry.pnl += row.pnl ?? 0
+    if (row.status === 'closed') {
+      entry.closedTotal += 1
+      if ((row.pnl ?? 0) > 0) entry.closedWins += 1
+    }
+    byStrategy.set(row.strategyType, entry)
+  }
+  const strategyRows = [...byStrategy.entries()]
+
+  return (
+    <div className="card">
+      <div className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+        <h3>Live Trades by Strategy</h3>
+        <span className={`chevron ${expanded ? 'open' : ''}`}>▶</span>
+      </div>
+      {expanded &&
+        (strategyRows.length === 0 ? (
+          <p className="muted">No live trades yet today.</p>
+        ) : (
+          <table className="trade-table">
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Trades</th>
+                <th>P&amp;L</th>
+                <th>Win %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {strategyRows.map(([strategyType, stats]) => (
+                <tr key={strategyType}>
+                  <td>{strategyTypeLabel(strategyType)}</td>
+                  <td>{stats.trades}</td>
+                  <td>
+                    <span className={stats.pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                      {stats.pnl >= 0 ? '+' : ''}
+                      {stats.pnl.toFixed(2)}
+                    </span>
+                  </td>
+                  <td>
+                    {stats.closedTotal > 0
+                      ? `${Math.round((stats.closedWins / stats.closedTotal) * 100)}%`
+                      : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ))}
     </div>
   )
 }
@@ -411,7 +579,20 @@ function TradeBucketCard({
   const isExpanded = expandedProp ?? localExpanded
   const toggle = onToggleExpanded ?? (() => setLocalExpanded((v) => !v))
 
-  const visibleRows = rows.filter((r) => !hiddenRowKeys.has(r.key))
+  // Independent per card instance -- Live and Paper each get their own
+  // filter state, so filtering one never affects the other.
+  const [statusFilter, setStatusFilter] = useState<TradeRowStatus | 'all'>('all')
+  const [strategyFilter, setStrategyFilter] = useState<string>('all')
+
+  const unhiddenRows = rows.filter((r) => !hiddenRowKeys.has(r.key))
+  const strategyOptions = [
+    ...new Set(unhiddenRows.map((r) => r.strategyType).filter((s): s is string => s !== null)),
+  ]
+  const visibleRows = unhiddenRows.filter(
+    (r) =>
+      (statusFilter === 'all' || r.status === statusFilter) &&
+      (strategyFilter === 'all' || r.strategyType === strategyFilter),
+  )
 
   // Which single row is currently being acted on -- Approve/Reject/
   // Square-off all share these three mutation objects, but their own
@@ -455,6 +636,29 @@ function TradeBucketCard({
         </h3>
         <span className={`chevron ${isExpanded ? 'open' : ''}`}>▶</span>
       </div>
+      {isExpanded && unhiddenRows.length > 0 && (
+        <div className="row-actions trade-filters">
+          <select
+            value={statusFilter}
+            onChange={(e) => setStatusFilter(e.target.value as TradeRowStatus | 'all')}
+          >
+            <option value="all">All statuses</option>
+            {(Object.keys(STATUS_LABELS) as TradeRowStatus[]).map((s) => (
+              <option key={s} value={s}>
+                {STATUS_LABELS[s]}
+              </option>
+            ))}
+          </select>
+          <select value={strategyFilter} onChange={(e) => setStrategyFilter(e.target.value)}>
+            <option value="all">All strategies</option>
+            {strategyOptions.map((s) => (
+              <option key={s} value={s}>
+                {strategyTypeLabel(s)}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
       {isExpanded &&
         // Rows are bucketed by each trade's own recorded mode now, not by
         // this session existing (see buildTradeRows' own docstring) -- a
@@ -464,7 +668,13 @@ function TradeBucketCard({
         // on `!session` here would hide genuinely real trades behind a
         // stale "no session" message -- check rows first, always.
         (visibleRows.length === 0 ? (
-          <p className="muted">{session ? 'No trades yet today.' : emptyHint}</p>
+          <p className="muted">
+            {unhiddenRows.length === 0
+              ? session
+                ? 'No trades yet today.'
+                : emptyHint
+              : 'No trades match the selected filters.'}
+          </p>
         ) : (
           <table className="trade-table">
             <colgroup>

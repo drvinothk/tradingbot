@@ -26,6 +26,11 @@ export interface ShoonyaStatusOut {
   // Alice Blue reuses this type and omits it).
   connected: boolean
   session_valid?: boolean
+  // Age (seconds) and classification of whichever signal (streamed tick or
+  // REST-fallback bar) is freshest right now, across the tradable
+  // underlyings -- Shoonya only, Alice Blue omits both, same as session_valid.
+  feed_age_seconds?: number | null
+  feed_state?: 'live' | 'degraded' | 'stale' | 'dead' | null
 }
 
 export interface ShoonyaLoginUrlOut {

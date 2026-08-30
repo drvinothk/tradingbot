@@ -212,17 +212,34 @@ def get_status(
     cheap read off `quote_ticks`/`price_bars`, so a stalled feed reports
     `connected: false` within one poll and flips back on its own the moment
     the WS reconnect (or REST fallback, or a manual re-login) resumes writing.
+
+    `feed_age_seconds`/`feed_state` (added for Control Room's feed-latency
+    badge) expose the same underlying freshness check as an actual number
+    instead of just the `connected` boolean — see
+    `market_data.freshness.underlying_feed_freshness`. Both `None` when
+    `session_valid` is `False`.
     """
     session_valid = is_shoonya_configured()
     if not session_valid:
-        return {"connected": False, "session_valid": False}
+        return {
+            "connected": False,
+            "session_valid": False,
+            "feed_age_seconds": None,
+            "feed_state": None,
+        }
 
-    from app.modules.market_data.freshness import any_underlying_feed_fresh
+    from app.modules.market_data.freshness import (
+        any_underlying_feed_fresh,
+        underlying_feed_freshness,
+    )
     from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS
 
+    feed_age_seconds, feed_state = underlying_feed_freshness(db, TRADABLE_UNDERLYINGS)
     return {
         "connected": any_underlying_feed_fresh(db, TRADABLE_UNDERLYINGS),
         "session_valid": True,
+        "feed_age_seconds": feed_age_seconds,
+        "feed_state": feed_state.value,
     }
 
 

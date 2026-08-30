@@ -107,14 +107,7 @@ def fresh_tick_or_none(tick: Tick | None, now: datetime) -> Tick | None:
     return None
 
 
-def classify_latest_tick(
-    db: Session, instrument_id: uuid.UUID, *, thresholds: FreshnessThresholds = TICK_THRESHOLDS
-) -> FreshnessState:
-    """Read-only classification of the latest underlying `QuoteTick` — no
-    refresh action exists for a stalled tick stream (unlike the option-chain
-    case below), so a caller finding this STALE/DEAD is a real ingestion-
-    health signal, not something to silently paper over.
-    """
+def _latest_tick_ts(db: Session, instrument_id: uuid.UUID) -> datetime | None:
     from app.domain.market.models import QuoteTick
 
     latest = (
@@ -123,9 +116,44 @@ def classify_latest_tick(
         .order_by(QuoteTick.ts.desc())
         .first()
     )
+    return latest.ts if latest is not None else None
+
+
+def _latest_bar_effective_ts(
+    db: Session, instrument_id: uuid.UUID, *, timeframe_seconds: int = 60
+) -> datetime | None:
+    """A completed bucket represents data through `bucket_start + timeframe`,
+    so that sum is the effective "as of" time (`price_bars` has no write
+    timestamp column).
+    """
+    from app.domain.market.models import PriceBar
+
+    latest = (
+        db.query(PriceBar)
+        .filter(
+            PriceBar.instrument_id == instrument_id,
+            PriceBar.timeframe == f"{timeframe_seconds}s",
+        )
+        .order_by(PriceBar.bucket_start.desc())
+        .first()
+    )
     if latest is None:
+        return None
+    return latest.bucket_start + timedelta(seconds=timeframe_seconds)
+
+
+def classify_latest_tick(
+    db: Session, instrument_id: uuid.UUID, *, thresholds: FreshnessThresholds = TICK_THRESHOLDS
+) -> FreshnessState:
+    """Read-only classification of the latest underlying `QuoteTick` — no
+    refresh action exists for a stalled tick stream (unlike the option-chain
+    case below), so a caller finding this STALE/DEAD is a real ingestion-
+    health signal, not something to silently paper over.
+    """
+    ts = _latest_tick_ts(db, instrument_id)
+    if ts is None:
         return FreshnessState.DEAD
-    return classify_age(latest.ts, datetime.now(UTC), thresholds)
+    return classify_age(ts, datetime.now(UTC), thresholds)
 
 
 def classify_latest_bar(
@@ -142,26 +170,11 @@ def classify_latest_bar(
     when `quote_ticks` have stopped, so a caller that treats a stale tick
     stream as "feed dead" without also checking this would misread a healthy
     REST-fallback period.
-
-    A completed bucket represents data through `bucket_start + timeframe`, so
-    that sum is the effective "as of" time (`price_bars` has no write
-    timestamp column).
     """
-    from app.domain.market.models import PriceBar
-
-    latest = (
-        db.query(PriceBar)
-        .filter(
-            PriceBar.instrument_id == instrument_id,
-            PriceBar.timeframe == f"{timeframe_seconds}s",
-        )
-        .order_by(PriceBar.bucket_start.desc())
-        .first()
-    )
-    if latest is None:
+    ts = _latest_bar_effective_ts(db, instrument_id, timeframe_seconds=timeframe_seconds)
+    if ts is None:
         return FreshnessState.DEAD
-    effective_ts = latest.bucket_start + timedelta(seconds=timeframe_seconds)
-    return classify_age(effective_ts, datetime.now(UTC), thresholds)
+    return classify_age(ts, datetime.now(UTC), thresholds)
 
 
 def underlying_feed_state(
@@ -197,6 +210,39 @@ def any_underlying_feed_fresh(db: Session, symbols: tuple[str, ...]) -> bool:
         ):
             return True
     return False
+
+
+def underlying_feed_freshness(
+    db: Session, symbols: tuple[str, ...]
+) -> tuple[float | None, FreshnessState]:
+    """The age (seconds) and `FreshnessState` of whichever signal — streamed
+    tick or REST-fallback bar, across every symbol in `symbols` — is
+    freshest right now. Same "either source, any underlying" logic as
+    `any_underlying_feed_fresh`, but returns the actual number for display
+    (`GET /shoonya/status`'s feed-latency badge) instead of a boolean.
+    `(None, FreshnessState.DEAD)` means no tick/bar exists for any symbol.
+    """
+    now = datetime.now(UTC)
+    best_state = FreshnessState.DEAD
+    best_ts: datetime | None = None
+    for symbol in symbols:
+        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+        if instrument is None:
+            continue
+        for ts, thresholds in (
+            (_latest_tick_ts(db, instrument.id), UI_TICK_FRESH_THRESHOLDS),
+            (_latest_bar_effective_ts(db, instrument.id), UI_BAR_FRESH_THRESHOLDS),
+        ):
+            if ts is None:
+                continue
+            state = classify_age(ts, now, thresholds)
+            is_better = best_ts is None or _SEVERITY[state] < _SEVERITY[best_state]
+            is_tied_but_newer = best_ts is not None and state == best_state and ts > best_ts
+            if is_better or is_tied_but_newer:
+                best_state, best_ts = state, ts
+    if best_ts is None:
+        return None, FreshnessState.DEAD
+    return max((now - best_ts).total_seconds(), 0.0), best_state
 
 
 def _latest_chain_snapshot(

@@ -20,6 +20,11 @@ export interface ActiveSessionMode {
   // stays true through a brief feed stall, so the "Shoonya (REAL)" vs "Mock"
   // identity label doesn't flip to "Mock" just because ticks paused.
   shoonyaSessionValid: boolean
+  // Age (seconds) of the freshest tick/bar across the tradable underlyings,
+  // and its classification -- null/null when no session or no data exists
+  // yet. Drives Control Room's "Feed: Xs ago" header badge.
+  feedAgeSeconds: number | null
+  feedState: 'live' | 'degraded' | 'stale' | 'dead' | null
 }
 
 export function useActiveSessionMode(): ActiveSessionMode {
@@ -55,5 +60,7 @@ export function useActiveSessionMode(): ActiveSessionMode {
     activeSession,
     shoonyaConnected: shoonyaStatusQuery.data?.connected ?? false,
     shoonyaSessionValid: shoonyaStatusQuery.data?.session_valid ?? false,
+    feedAgeSeconds: shoonyaStatusQuery.data?.feed_age_seconds ?? null,
+    feedState: shoonyaStatusQuery.data?.feed_state ?? null,
   }
 }

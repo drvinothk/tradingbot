@@ -18,6 +18,7 @@ from app.modules.market_data.freshness import (
     FreshnessThresholds,
     any_underlying_feed_fresh,
     classify_latest_bar,
+    underlying_feed_freshness,
     underlying_feed_state,
 )
 
@@ -144,3 +145,53 @@ def test_any_underlying_feed_fresh_false_when_all_stale(db: Session):
 
 def test_any_underlying_feed_fresh_false_when_symbols_are_unknown(db: Session):
     assert any_underlying_feed_fresh(db, ("NO-SUCH-SYMBOL",)) is False
+
+
+# --- underlying_feed_freshness (Control Room's "Feed: Xs ago" badge) -----
+
+
+def test_underlying_feed_freshness_dead_with_no_data(db: Session):
+    _instrument(db, "NIFTY-AGE-1")
+    age, state = underlying_feed_freshness(db, ("NIFTY-AGE-1",))
+    assert age is None
+    assert state == FreshnessState.DEAD
+
+
+def test_underlying_feed_freshness_reports_age_of_a_fresh_tick(db: Session):
+    inst = _instrument(db, "NIFTY-AGE-2")
+    _tick(db, inst.id, seconds_ago=4)
+    age, state = underlying_feed_freshness(db, ("NIFTY-AGE-2",))
+    assert age is not None
+    assert 0 <= age < 15  # generous window for real wall-clock skew
+    assert state == FreshnessState.LIVE
+
+
+def test_underlying_feed_freshness_picks_the_freshest_across_symbols(db: Session):
+    stale = _instrument(db, "NIFTY-AGE-3")
+    fresh = _instrument(db, "BANKNIFTY-AGE-3")
+    _tick(db, stale.id, seconds_ago=6000)
+    _tick(db, fresh.id, seconds_ago=2)
+    age, state = underlying_feed_freshness(db, ("NIFTY-AGE-3", "BANKNIFTY-AGE-3"))
+    assert age is not None
+    assert age < 15
+    assert state == FreshnessState.LIVE
+
+
+def test_underlying_feed_freshness_prefers_the_better_state_over_a_stale_tick(db: Session):
+    """A dead tick stream shouldn't win over a genuinely live REST-fallback
+    bar just because both exist -- the better (fresher-classified) source
+    wins, matching `underlying_feed_state`'s own tick-or-bar logic.
+    """
+    inst = _instrument(db, "NIFTY-AGE-4")
+    _tick(db, inst.id, seconds_ago=6000)  # ancient -> DEAD
+    _bar(db, inst.id, bucket_seconds_ago=70)  # effective_ts ~10s ago -> LIVE
+    age, state = underlying_feed_freshness(db, ("NIFTY-AGE-4",))
+    assert age is not None
+    assert age < 20
+    assert state == FreshnessState.LIVE
+
+
+def test_underlying_feed_freshness_dead_when_symbols_are_unknown(db: Session):
+    age, state = underlying_feed_freshness(db, ("NO-SUCH-SYMBOL",))
+    assert age is None
+    assert state == FreshnessState.DEAD

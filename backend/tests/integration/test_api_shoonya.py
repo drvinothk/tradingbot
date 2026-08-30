@@ -230,7 +230,12 @@ def test_status_reports_not_connected_by_default(api_client: TestClient, seeded_
     _login(api_client, seeded_admin)
     response = api_client.get("/shoonya/status")
     assert response.status_code == 200
-    assert response.json() == {"connected": False, "session_valid": False}
+    assert response.json() == {
+        "connected": False,
+        "session_valid": False,
+        "feed_age_seconds": None,
+        "feed_state": None,
+    }
 
 
 def test_status_connected_when_configured_and_feed_is_fresh(
@@ -240,12 +245,22 @@ def test_status_connected_when_configured_and_feed_is_fresh(
 
     monkeypatch.setattr(shoonya_module, "is_shoonya_configured", lambda: True)
     monkeypatch.setattr(freshness_module, "any_underlying_feed_fresh", lambda db, symbols: True)
+    monkeypatch.setattr(
+        freshness_module,
+        "underlying_feed_freshness",
+        lambda db, symbols: (3.0, freshness_module.FreshnessState.LIVE),
+    )
 
     _login(api_client, seeded_admin)
     response = api_client.get("/shoonya/status")
 
     assert response.status_code == 200
-    assert response.json() == {"connected": True, "session_valid": True}
+    assert response.json() == {
+        "connected": True,
+        "session_valid": True,
+        "feed_age_seconds": 3.0,
+        "feed_state": "live",
+    }
 
 
 def test_status_session_valid_but_not_connected_when_feed_is_stale(
@@ -258,12 +273,22 @@ def test_status_session_valid_but_not_connected_when_feed_is_stale(
 
     monkeypatch.setattr(shoonya_module, "is_shoonya_configured", lambda: True)
     monkeypatch.setattr(freshness_module, "any_underlying_feed_fresh", lambda db, symbols: False)
+    monkeypatch.setattr(
+        freshness_module,
+        "underlying_feed_freshness",
+        lambda db, symbols: (None, freshness_module.FreshnessState.DEAD),
+    )
 
     _login(api_client, seeded_admin)
     response = api_client.get("/shoonya/status")
 
     assert response.status_code == 200
-    assert response.json() == {"connected": False, "session_valid": True}
+    assert response.json() == {
+        "connected": False,
+        "session_valid": True,
+        "feed_age_seconds": None,
+        "feed_state": "dead",
+    }
 
 
 def test_login_url_returns_409_when_credentials_not_configured(

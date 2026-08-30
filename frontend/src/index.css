@@ -459,6 +459,11 @@ tbody tr:hover {
   font-weight: 700;
 }
 
+.metric-box .metric-subvalue {
+  font-size: 0.78rem;
+  margin-top: 0.2rem;
+}
+
 .metrics-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -551,6 +556,15 @@ tbody tr:hover {
   gap: 0.4rem;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.trade-filters {
+  margin: 0.6rem 0 0.8rem;
+}
+
+.trade-filters select {
+  font-size: 0.85rem;
+  padding: 0.3rem 0.5rem;
 }
 
 .grid-2 {
