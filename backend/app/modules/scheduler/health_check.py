@@ -42,6 +42,7 @@ from app.core.locking import (
     LOCK_AUDIT_CHAIN,
     LOCK_EXECUTION_SINGLETON,
     LOCK_RISK_EVALUATION_QUEUE,
+    pop_lock_hold_stats,
     pop_lock_wait_stats,
 )
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
@@ -106,6 +107,13 @@ _POOL_SATURATION_ALERT_RATIO = 0.8
 # 70% of core.locking.LOCK_ACQUIRE_TIMEOUT (10s) -- worth a human's attention
 # before a dispatch actually starts failing with a lock-timeout error.
 _LOCK_WAIT_ALERT_THRESHOLD_SECONDS = 7.0
+# A place_order/close_position broker call holding LOCK_EXECUTION_SINGLETON
+# this long is already anomalously slow on its own -- worth surfacing before
+# it also starts causing other callers' *wait* time to approach the timeout
+# above. WARNING, not CRITICAL (see _check_lock_hold_time) -- this is a
+# root-cause/diagnostic signal, distinct from "something is actively being
+# blocked right now," which _check_lock_contention above already covers.
+_LOCK_HOLD_ALERT_THRESHOLD_SECONDS = 5.0
 # Only the real, named locks this system relies on (core/locking.py's own
 # "add new ones here rather than inventing ad-hoc strings" list) -- filters
 # out any other lock name (a test's own throwaway lock, or any future ad-hoc
@@ -147,6 +155,7 @@ class HealthCheckScheduler(IntervalScheduler):
         self._check_market_data_staleness(db, workspace_ids)
         self._check_db_pool_saturation(db, workspace_ids, recorded_at)
         self._check_lock_contention(db, workspace_ids, recorded_at)
+        self._check_lock_hold_time(db, workspace_ids, recorded_at)
 
         for workspace_id in workspace_ids:
             record_metric(
@@ -376,6 +385,62 @@ class HealthCheckScheduler(IntervalScheduler):
                     category="lock_contention_high",
                     message=message,
                     dedup_key=f"lock_contention_high:{lock_name}:{workspace_id}",
+                )
+
+    def _check_lock_hold_time(
+        self, db: Session, workspace_ids: set[uuid.UUID], recorded_at: datetime
+    ) -> None:
+        """2026-08-31: root-cause counterpart to `_check_lock_contention` --
+        that one measures how long callers *wait* to acquire a lock; this
+        measures how long a caller actually *holds* one once acquired
+        (`core.locking.pop_lock_hold_stats()`, same drain-on-read/1s-gate
+        design as the wait-side tracker). Answers the question this whole
+        investigation started from directly: is a slow acquire actually
+        caused by a slow broker call while the lock is held? See
+        `advisory_lock`'s own docstring for the one caveat -- this
+        undercounts hold time for the few call sites that commit early,
+        inside the `with` block, by design (not `dispatch_trade_intent`/
+        `close_position`, the two this exists to diagnose).
+
+        WARNING, not CRITICAL, and deliberately outside `TELEGRAM_ALLOWED_
+        CATEGORIES` -- a single slow broker call with nobody else contending
+        for the lock isn't yet causing any real queuing (that's what
+        `lock_contention_high` above alerts CRITICAL for); this is a
+        diagnostic signal for the dashboard/audit trail, not a phone page.
+        Same `_MONITORED_LOCK_NAMES` filter as `_check_lock_contention`, for
+        the same reason (a throwaway test lock name must never surface here).
+        """
+        for lock_name, (max_hold, slow_count) in pop_lock_hold_stats().items():
+            if lock_name not in _MONITORED_LOCK_NAMES:
+                continue
+
+            for workspace_id in workspace_ids:
+                record_metric(
+                    db,
+                    workspace_id=workspace_id,
+                    metric_name="lock_hold_max_seconds",
+                    value=max_hold,
+                    recorded_at=recorded_at,
+                    tags={"lock_name": lock_name, "slow_count": slow_count},
+                )
+
+            if max_hold < _LOCK_HOLD_ALERT_THRESHOLD_SECONDS:
+                continue
+
+            message = (
+                f"Advisory lock '{lock_name}' was held for up to {max_hold:.1f}s "
+                f"({slow_count} slow hold(s) since last check) -- likely a slow "
+                f"broker call while the lock was held, not just contention."
+            )
+            logger.warning("Health check: %s", message)
+            for workspace_id in workspace_ids:
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.WARNING,
+                    category="lock_hold_high",
+                    message=message,
+                    dedup_key=f"lock_hold_high:{lock_name}:{workspace_id}",
                 )
 
 

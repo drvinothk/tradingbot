@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.core.clock import ClockCheckResult, DiskCheckResult
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, PriceBar, QuoteTick
-from app.domain.ops.models import MetricSeries, SystemAlert
+from app.domain.ops.models import AlertSeverity, MetricSeries, SystemAlert
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
@@ -90,11 +90,14 @@ def test_run_once_records_metrics_for_active_sessions_workspace(
     )
     # Deterministic regardless of what any other test (e.g. test_locking.py's
     # slow-second-session test) may have left in the real, process-wide
-    # lock-wait-stats dict -- pop_lock_wait_stats() is a real module-level
-    # store shared by anything that calls advisory_lock, so this test must
-    # not assume it starts empty.
+    # lock-wait/hold-stats dicts -- pop_lock_wait_stats()/pop_lock_hold_stats()
+    # are real module-level stores shared by anything that calls
+    # advisory_lock, so this test must not assume they start empty.
     monkeypatch.setattr(
         "app.modules.scheduler.health_check.pop_lock_wait_stats", lambda: {}
+    )
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.pop_lock_hold_stats", lambda: {}
     )
 
     _scheduler_for(db).run_once()
@@ -448,6 +451,88 @@ def test_lock_contention_ignores_unmonitored_lock_names(
     )
     assert (
         db.query(MetricSeries).filter(MetricSeries.metric_name == "lock_wait_max_seconds").count()
+        == 0
+    )
+
+
+def test_lock_hold_time_alerts_when_max_hold_exceeds_threshold(
+    db: Session, trading_session, monkeypatch
+):
+    """2026-08-31: root-cause counterpart to lock_contention_high -- answers
+    whether a slow acquire was actually caused by a slow broker call while
+    the lock was held. WARNING severity, per _check_lock_hold_time's own
+    docstring, so this never reaches Telegram regardless of dedup/window --
+    only the SystemAlert row is asserted here.
+    """
+    import app.modules.scheduler.health_check as hc
+    from app.core.locking import LOCK_EXECUTION_SINGLETON
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {})
+    monkeypatch.setattr(
+        hc, "pop_lock_hold_stats", lambda: {LOCK_EXECUTION_SINGLETON: (6.4, 2)}
+    )
+
+    _scheduler_for(db).run_once()
+
+    alerts = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "lock_hold_high",
+        )
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.WARNING
+    assert LOCK_EXECUTION_SINGLETON in alerts[0].message
+
+
+def test_lock_hold_time_records_metric_but_no_alert_below_threshold(
+    db: Session, trading_session, monkeypatch
+):
+    import app.modules.scheduler.health_check as hc
+    from app.core.locking import LOCK_EXECUTION_SINGLETON
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {})
+    monkeypatch.setattr(
+        hc, "pop_lock_hold_stats", lambda: {LOCK_EXECUTION_SINGLETON: (1.2, 1)}
+    )
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert).filter(SystemAlert.category == "lock_hold_high").count() == 0
+    )
+    assert (
+        db.query(MetricSeries)
+        .filter(
+            MetricSeries.workspace_id == trading_session.workspace_id,
+            MetricSeries.metric_name == "lock_hold_max_seconds",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_lock_hold_time_ignores_unmonitored_lock_names(
+    db: Session, trading_session, monkeypatch
+):
+    """Same filter as test_lock_contention_ignores_unmonitored_lock_names,
+    proven independently for the hold-time side of the tracker.
+    """
+    import app.modules.scheduler.health_check as hc
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {})
+    monkeypatch.setattr(hc, "pop_lock_hold_stats", lambda: {"some_other_lock": (9.0, 3)})
+
+    _scheduler_for(db).run_once()
+
+    assert db.query(SystemAlert).filter(SystemAlert.category == "lock_hold_high").count() == 0
+    assert (
+        db.query(MetricSeries).filter(MetricSeries.metric_name == "lock_hold_max_seconds").count()
         == 0
     )
 

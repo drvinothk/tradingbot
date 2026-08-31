@@ -114,6 +114,37 @@ def pop_lock_wait_stats() -> dict[str, tuple[float, int]]:
     return stats
 
 
+# 2026-08-31: hold-time tracking, added alongside the wait-time tracker above
+# to answer the question that started this whole investigation directly,
+# rather than just inferring it: is a slow *acquire* actually caused by a
+# slow *broker call* while the lock is held? Same in-memory-only shape, same
+# guard, same drain-on-read contract. Deliberately a second dict rather than
+# folding into `_lock_wait_stats` -- wait and hold are different signals
+# (HealthCheckScheduler alerts on them at different severities), and keeping
+# them separate keeps each one independently readable/testable.
+_SLOW_HOLD_THRESHOLD_SECONDS = 1.0
+_lock_hold_stats: dict[str, tuple[float, int]] = {}  # name -> (max_hold_seconds, slow_count)
+
+
+def _record_hold(name: str, hold_seconds: float) -> None:
+    if hold_seconds < _SLOW_HOLD_THRESHOLD_SECONDS:
+        return
+    with _lock_stats_guard:
+        max_hold, slow_count = _lock_hold_stats.get(name, (0.0, 0))
+        _lock_hold_stats[name] = (max(max_hold, hold_seconds), slow_count + 1)
+
+
+def pop_lock_hold_stats() -> dict[str, tuple[float, int]]:
+    """Returns and clears every lock name's accumulated (max_hold_seconds,
+    slow_count) since the last call — same drain-on-read contract as
+    `pop_lock_wait_stats`, read by the same periodic caller.
+    """
+    with _lock_stats_guard:
+        stats = dict(_lock_hold_stats)
+        _lock_hold_stats.clear()
+    return stats
+
+
 @contextmanager
 def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
     """Transaction-scoped advisory lock — released automatically at whatever
@@ -125,6 +156,16 @@ def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
     `LOCK_ACQUIRE_TIMEOUT` — callers needing a non-blocking attempt should use
     try_advisory_lock instead (session-scoped; only `LOCK_PROCESS_SINGLETON`
     uses it, see that constant's own docstring for why it's different).
+
+    Also times how long the caller spends inside the `with` block itself
+    (`pop_lock_hold_stats`) — a faithful measure of real hold time for
+    callers that commit at their own surrounding session boundary rather
+    than inside this block (`dispatch_trade_intent`/`close_position`, the
+    two call sites this exists to diagnose), but an underestimate for the
+    few call sites that commit *early*, inside the block, by design
+    (`start_strategy`/`approve_trade_approval`/`reject_trade_approval`/
+    `create_session` — see this module's own docstring above) — the lock is
+    actually released at that inner commit, before the `with` block exits.
     """
     key = _lock_key(name)
     # SET LOCAL doesn't accept bind parameters in Postgres (it's a utility
@@ -141,7 +182,18 @@ def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
         # Never raises itself: a pure in-memory dict/lock update must not be
         # able to mask the real exception this finally block re-propagates.
         _record_acquire_wait(name, time.monotonic() - started)
-    yield
+
+    hold_started = time.monotonic()
+    try:
+        yield
+    finally:
+        # Runs even when the caller's own block body raises -- standard
+        # @contextmanager semantics (the exception is thrown into this
+        # generator at the yield above), already exercised today by every
+        # existing `raise ValueError(...)` inside a `with advisory_lock(...)`
+        # block elsewhere in this codebase. Never raises itself, same
+        # reasoning as _record_acquire_wait above.
+        _record_hold(name, time.monotonic() - hold_started)
 
 
 def try_advisory_lock(db: Session, name: str) -> bool:

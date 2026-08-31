@@ -37,7 +37,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.locking import (
     _record_acquire_wait,  # noqa: SLF001 - white-box test of the tracker itself
+    _record_hold,  # noqa: SLF001 - white-box test of the tracker itself
     advisory_lock,
+    pop_lock_hold_stats,
     pop_lock_wait_stats,
     try_advisory_lock,
 )
@@ -396,3 +398,70 @@ def test_advisory_lock_records_a_slow_wait_on_real_contention(real_commit_factor
     max_wait, slow_count = stats[TEST_LOCK_NAME]
     assert max_wait >= 1.0
     assert slow_count >= 1
+
+
+def test_record_hold_ignores_fast_acquisitions():
+    """Same gating as _record_acquire_wait -- below _SLOW_HOLD_THRESHOLD_
+    SECONDS (1.0s), nothing is tracked, keeping the overhead at zero for the
+    overwhelming majority of (fast) held sections.
+    """
+    pop_lock_hold_stats()  # drain whatever any earlier test left behind
+    _record_hold("unit_test_fast_lock", 0.05)
+    assert "unit_test_fast_lock" not in pop_lock_hold_stats()
+
+
+def test_pop_lock_hold_stats_drains_and_tracks_max_and_count():
+    pop_lock_hold_stats()  # drain whatever any earlier test left behind
+    _record_hold("unit_test_slow_lock", 1.5)
+    _record_hold("unit_test_slow_lock", 4.1)
+    _record_hold("unit_test_slow_lock", 2.0)
+
+    stats = pop_lock_hold_stats()
+    assert stats["unit_test_slow_lock"] == (4.1, 3)
+
+    # Draining clears it -- a second read sees nothing left over.
+    assert "unit_test_slow_lock" not in pop_lock_hold_stats()
+
+
+def test_advisory_lock_records_a_slow_hold_on_a_real_slow_body(real_commit_factory):
+    """The actual `advisory_lock()` context manager, not just the tracker
+    functions directly -- a `with` block body that itself takes >= 1s (e.g.
+    a slow broker call in the real dispatch_trade_intent/close_position
+    shape) must show up in pop_lock_hold_stats(), independent of whether
+    anyone else was even contending for the lock.
+    """
+    import time
+
+    pop_lock_hold_stats()  # drain whatever any earlier test left behind
+
+    with real_commit_factory() as db:
+        with advisory_lock(db, TEST_LOCK_NAME):
+            time.sleep(1.2)
+
+    stats = pop_lock_hold_stats()
+    assert TEST_LOCK_NAME in stats
+    max_hold, slow_count = stats[TEST_LOCK_NAME]
+    assert max_hold >= 1.0
+    assert slow_count >= 1
+
+
+def test_advisory_lock_records_hold_time_even_when_the_body_raises(real_commit_factory):
+    """The finally-around-yield must run (and must not swallow the real
+    exception) even when the caller's own block body raises -- the same
+    shape every existing dispatch_trade_intent call site already relies on
+    (it raises ValueError inside this exact block for an unknown contract).
+    """
+    import time
+
+    pop_lock_hold_stats()  # drain whatever any earlier test left behind
+
+    with pytest.raises(ValueError, match="boom"):
+        with real_commit_factory() as db:
+            with advisory_lock(db, TEST_LOCK_NAME):
+                time.sleep(1.2)
+                raise ValueError("boom")
+
+    stats = pop_lock_hold_stats()
+    assert TEST_LOCK_NAME in stats
+    max_hold, _slow_count = stats[TEST_LOCK_NAME]
+    assert max_hold >= 1.0
