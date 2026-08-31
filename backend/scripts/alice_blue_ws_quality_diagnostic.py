@@ -233,7 +233,9 @@ def _run_connectivity_probe(client: AliceBlueWSClient) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--until", default="15:15", help="IST wall-clock stop time HH:MM (default 15:15)")
+    parser.add_argument(
+        "--until", default="15:15", help="IST wall-clock stop time HH:MM (default 15:15)"
+    )
     args = parser.parse_args()
     stop_at = _parse_until(args.until)
 

@@ -19,7 +19,7 @@ import argparse
 import csv
 import sys
 from datetime import date as date_cls
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -103,7 +103,7 @@ def main() -> None:
     if idx_rows:
         _write_csv(idx_rows, out_dir / "underlyings" / f"{args.underlying}_1min.csv")
 
-    print("\n=== India VIX (token {}) ===".format(args.vix_token))
+    print(f"\n=== India VIX (token {args.vix_token}) ===")
     vix_rows = _fetch_one(client, auth.account_id, "NSE", args.vix_token, day)
     print(f"  {len(vix_rows)} rows")
     if vix_rows:
@@ -121,10 +121,8 @@ def main() -> None:
         rows = _fetch_one(client, auth.account_id, "NFO", token, day)
         if rows:
             fetched += 1
-            _write_csv(
-                rows,
-                out_dir / "options_1min_past" / args.underlying / expiry.isoformat() / f"{symbol}.csv",
-            )
+            leg_dir = out_dir / "options_1min_past" / args.underlying / expiry.isoformat()
+            _write_csv(rows, leg_dir / f"{symbol}.csv")
         print(f"  {symbol} (token {token}): {len(rows)} rows")
 
     print(f"\n{fetched}/{len(contracts)} contracts had real data. Written under {out_dir}")

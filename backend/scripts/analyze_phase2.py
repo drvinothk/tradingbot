@@ -14,7 +14,12 @@ FLAT_COST_PER_LOT = 40.0
 PROPORTIONAL_RATE = 0.0004
 STT_RATE = 0.001
 
-STRATEGY_PREFIX = {"v": "vwap_pullback", "e": "ema_micro_pullback", "o": "oi_volume_confirmed", "l": "liquidity_sweep_reversal"}
+STRATEGY_PREFIX = {
+    "v": "vwap_pullback",
+    "e": "ema_micro_pullback",
+    "o": "oi_volume_confirmed",
+    "l": "liquidity_sweep_reversal",
+}
 
 
 def cost(entry: float, exit_: float, ls: float) -> float:
@@ -29,7 +34,16 @@ def pf(p: np.ndarray) -> float:
 def analyze(path: Path) -> dict:
     df = pd.read_csv(path)
     if df.empty:
-        return {"n": 0, "win_rate": 0.0, "raw_pnl": 0.0, "net_pnl": 0.0, "net_per_trade": 0.0, "pf": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
+        return {
+            "n": 0,
+            "win_rate": 0.0,
+            "raw_pnl": 0.0,
+            "net_pnl": 0.0,
+            "net_per_trade": 0.0,
+            "pf": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+        }
     ppl = df["pnl"] / df["qty_lots"].clip(lower=1)
     c = df.apply(lambda r: cost(r["entry_price"], r["exit_price"], r["lot_size"]), axis=1)
     net = (ppl - c).to_numpy()
@@ -58,9 +72,12 @@ def main():
             continue
         strat_letter, _digit, cohort_raw, stop_variant = m.groups()
         strategy = STRATEGY_PREFIX[strat_letter]
-        cohort = f"{strat_letter}{_digit}_{cohort_raw}" if cohort_raw else f"{strat_letter}{_digit}_base"
+        cohort = (
+            f"{strat_letter}{_digit}_{cohort_raw}" if cohort_raw else f"{strat_letter}{_digit}_base"
+        )
         stats = analyze(f)
-        rows.append({"strategy": strategy, "cohort": cohort, "stop_variant": stop_variant, "config": name, **stats})
+        row = {"strategy": strategy, "cohort": cohort, "stop_variant": stop_variant, "config": name}
+        rows.append({**row, **stats})
 
     out = pd.DataFrame(rows)
     out.to_csv("/tmp/phase2_summary.csv", index=False)
@@ -68,7 +85,8 @@ def main():
     for strat in out["strategy"].unique():
         print(f"\n=== {strat} ===")
         sub = out[out["strategy"] == strat].sort_values(["cohort", "stop_variant"])
-        print(sub[["cohort", "stop_variant", "n", "win_rate", "net_pnl", "net_per_trade", "pf"]].to_string(index=False))
+        cols = ["cohort", "stop_variant", "n", "win_rate", "net_pnl", "net_per_trade", "pf"]
+        print(sub[cols].to_string(index=False))
 
 
 if __name__ == "__main__":

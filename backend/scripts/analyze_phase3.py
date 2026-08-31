@@ -1,6 +1,7 @@
 from __future__ import annotations
-import re
+
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
@@ -33,7 +34,8 @@ for f in sorted(RESULTS_DIR.glob("x3_*_current.csv")):
     name = f.stem.replace("_current", "")
     df = pd.read_csv(f)
     if df.empty:
-        rows.append({"config": name, "n": 0, "win_rate": 0, "net_pnl": 0, "net_per_trade": 0, "pf": 0, "max_dd": 0})
+        empty_row = {"config": name, "n": 0, "win_rate": 0, "net_pnl": 0, "net_per_trade": 0}
+        rows.append({**empty_row, "pf": 0, "max_dd": 0})
         continue
     ppl = df["pnl"] / df["qty_lots"].clip(lower=1)
     c = df.apply(lambda r: cost(r["entry_price"], r["exit_price"], r["lot_size"]), axis=1)
