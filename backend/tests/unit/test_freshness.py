@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import uuid
+from datetime import UTC, date, datetime, timedelta
 
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
 from app.modules.broker_adapter.base.contracts import Tick
 from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
+    _refresh_lock_for,
     _snapshot_has_live_prices,
     better_of,
     check_price_drift,
@@ -115,3 +117,31 @@ def test_snapshot_has_live_prices_false_when_every_entry_is_zero():
 
 def test_snapshot_has_live_prices_false_when_chain_is_empty():
     assert _snapshot_has_live_prices(_snapshot([])) is False
+
+
+def test_refresh_lock_for_same_key_returns_the_same_lock():
+    """The coalescing lock's whole point is that concurrent callers for the
+    identical (instrument, expiry) contend on one lock -- confirming the
+    same key always maps to the same lock instance is the basis for that.
+    """
+    instrument_id = uuid.uuid4()
+    expiry = date(2026, 9, 1)
+    assert _refresh_lock_for(instrument_id, expiry) is _refresh_lock_for(instrument_id, expiry)
+
+
+def test_refresh_lock_for_different_expiry_returns_a_different_lock():
+    """Two expiries for the same instrument (e.g. a base strategy vs. a
+    Conviction variant on a different expiry) must not false-share one lock
+    -- each chain refreshes independently.
+    """
+    instrument_id = uuid.uuid4()
+    lock_a = _refresh_lock_for(instrument_id, date(2026, 9, 1))
+    lock_b = _refresh_lock_for(instrument_id, date(2026, 9, 8))
+    assert lock_a is not lock_b
+
+
+def test_refresh_lock_for_different_instrument_returns_a_different_lock():
+    expiry = date(2026, 9, 1)
+    lock_a = _refresh_lock_for(uuid.uuid4(), expiry)
+    lock_b = _refresh_lock_for(uuid.uuid4(), expiry)
+    assert lock_a is not lock_b

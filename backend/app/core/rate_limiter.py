@@ -94,5 +94,27 @@ def make_broker_call_limiter() -> TokenBucket:
     it's the one-`GetQuotes`-call-per-strike design of `get_option_chain`
     itself, which would need addressing next (e.g. Shoonya's own possible
     multi-quote/batched endpoint, not yet checked).
+
+    **2026-08-31 — that prediction came true, live incident.** 2 concurrent
+    strategies at the time of the note above became 11 (real strategy-config
+    growth since 2026-08-20), all sharing one NIFTY expiry, and
+    `RateLimitExceeded` errors recurred — but the "contained, not a crash"
+    claim two paragraphs up was itself wrong: `RateLimitExceeded` is a plain
+    `Exception`, not a `BrokerError`, so `ensure_fresh_option_chain` was
+    never actually catching it — it propagated uncaught out of
+    `StrategyRunner.run_cycle`, crashing the entire cycle (not just the
+    option-chain check), a real gap present since this very capacity fix
+    landed on 2026-08-20 and never previously verified. Root-caused and
+    fixed the same day: `ensure_fresh_option_chain` now also catches
+    `RateLimitExceeded` (matching what this docstring always claimed), and
+    a new in-process, non-blocking coalescing lock keyed by
+    `(instrument_id, expiry_date)` (`market_data.freshness
+    ._refresh_lock_for`) means only one of the N strategies sharing a chain
+    actually calls the broker per refresh window — the other N-1 just read
+    the row it writes. `OPTION_CHAIN_THRESHOLDS.degraded_after_seconds`
+    also lowered 120s -> 60s the same day once the coalescing landed (safe
+    now that refresh cost no longer multiplies by strategy count) — see
+    that constant's own comment in `market_data.freshness` for the
+    escalation plan if this recurs again.
     """
     return TokenBucket(capacity=50, refill_rate_per_second=6.0)

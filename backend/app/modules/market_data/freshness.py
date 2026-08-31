@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -20,6 +21,7 @@ from datetime import UTC, date, datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.core.db.session import session_scope
+from app.core.rate_limiter import RateLimitExceeded
 from app.domain.market.models import Instrument
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
@@ -48,8 +50,20 @@ class FreshnessThresholds:
 # pictures refreshed on demand rather than per-tick, so their thresholds are
 # far more generous by design, not because staleness matters less there.
 TICK_THRESHOLDS = FreshnessThresholds(degraded_after_seconds=10.0, stale_after_seconds=60.0)
+# degraded_after_seconds is also the real-world refresh cadence per
+# (instrument, expiry): ensure_fresh_option_chain only attempts a refresh
+# once the latest snapshot ages past this, and _refresh_lock_for coalesces
+# every strategy sharing that key down to one broker call per window (see
+# ensure_fresh_option_chain's own docstring). Lowered 120s -> 60s on
+# 2026-08-31 once that coalescing landed -- safe to do because the cost of
+# tightening it no longer multiplies by how many strategies share the
+# chain, just the one shared refresh's own frequency. If a similar
+# rate-limit/staleness incident recurs: try 90s first, then 120s only if it
+# still recurs at 90s -- the original incident was the per-strategy fan-out
+# (fixed by the coalescing lock), not this threshold, so a further cut is
+# the wrong first response to a repeat.
 OPTION_CHAIN_THRESHOLDS = FreshnessThresholds(
-    degraded_after_seconds=120.0, stale_after_seconds=600.0
+    degraded_after_seconds=60.0, stale_after_seconds=600.0
 )
 
 # Beyond this, data has no useful age left to reason about at all.
@@ -340,6 +354,31 @@ def classify_option_chain(
     return state
 
 
+# One lock per (instrument, expiry) -- coalesces concurrent
+# `ensure_fresh_option_chain` refreshes for the same chain (e.g. several
+# StrategyRuns scanning the same instrument+expiry, a real live case: 11
+# concurrent runs all tracking one NIFTY expiry on 2026-08-31) down to a
+# single real broker call instead of each caller independently re-fetching
+# ~41 GetQuotes calls -- the redundant fan-out that was overwhelming the
+# shared broker rate limiter (`core.rate_limiter`) in the first place. The
+# actively-traded instrument x expiry set is small and bounded, so this
+# dict is never cleaned up, same minimalism as every other small in-process
+# registry in this codebase (e.g. `market_data.registry`'s ingestion-service
+# singleton).
+_refresh_locks: dict[tuple[uuid.UUID, date], threading.Lock] = {}
+_refresh_locks_guard = threading.Lock()
+
+
+def _refresh_lock_for(instrument_id: uuid.UUID, expiry_date: date) -> threading.Lock:
+    key = (instrument_id, expiry_date)
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[key] = lock
+        return lock
+
+
 def ensure_fresh_option_chain(
     db: Session,
     broker: BrokerPort,
@@ -353,9 +392,27 @@ def ensure_fresh_option_chain(
     LIVE, refreshes it once via the existing `record_option_chain_snapshot`
     (the same call `start_strategy` already makes) rather than only
     reporting staleness — this is what actually fixes the "only ever
-    snapshotted once per run" gap. A broker failure during refresh is
-    reported as DEAD, never raised — callers (`StrategyRunner`) already
-    catch-and-log-per-cycle same as every other background poller here.
+    snapshotted once per run" gap. A broker failure during refresh (also
+    the broker call limiter timing out under contention — `RateLimitExceeded`
+    is a plain `Exception`, not a `BrokerError`, so it needs its own catch
+    here; the 2026-08-31 live incident this whole coalescing lock exists
+    for was exactly this exception escaping uncaught and crashing the
+    caller's entire cycle) is reported as DEAD, never raised — callers
+    (`StrategyRunner`) already catch-and-log-per-cycle same as every other
+    background poller here, but relying on that outer catch-all means the
+    *rest* of that cycle (status update, watchdog, EOD check) gets skipped
+    too — exactly what catching the exception here, instead of letting it
+    propagate, avoids.
+
+    A non-blocking, in-process lock keyed by `(instrument_id, expiry_date)`
+    (`_refresh_lock_for`) coalesces concurrent refreshes for the same chain:
+    if another thread is already mid-refresh for this exact key, this call
+    skips the broker round-trip entirely and just re-reads the current
+    classification (cheap, DB-only) instead of adding to the same
+    contention. Whichever caller wins the race writes the row; every other
+    caller reads that same row on its own next call — the data isn't
+    run-specific, so there's no starvation, just less redundant broker
+    traffic for a resource multiple callers share.
 
     `session_factory`, when given, is threaded through to
     `record_option_chain_snapshot` instead of its own default — lets a
@@ -372,6 +429,10 @@ def ensure_fresh_option_chain(
     instrument = db.get(Instrument, instrument_id)
     if instrument is None:
         return FreshnessState.DEAD
+
+    lock = _refresh_lock_for(instrument_id, expiry_date)
+    if not lock.acquire(blocking=False):
+        return classify_option_chain(db, instrument_id, expiry_date, thresholds=thresholds)
     try:
         record_option_chain_snapshot(
             instrument_id,
@@ -380,11 +441,13 @@ def ensure_fresh_option_chain(
             expiry_date,
             session_factory=session_factory or session_scope,
         )
-    except BrokerError:
+    except (BrokerError, RateLimitExceeded):
         logger.warning(
             "option-chain refresh failed for instrument %s expiry %s", instrument_id, expiry_date
         )
         return FreshnessState.DEAD
+    finally:
+        lock.release()
 
     return classify_option_chain(db, instrument_id, expiry_date, thresholds=thresholds)
 

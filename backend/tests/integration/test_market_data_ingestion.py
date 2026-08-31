@@ -1184,6 +1184,100 @@ def test_ensure_fresh_option_chain_reports_dead_on_broker_failure(
     assert db.query(OptionChainSnapshot).count() == 0
 
 
+def test_ensure_fresh_option_chain_reports_dead_on_rate_limit_timeout(
+    seeded_universe, test_session_factory, db: Session
+):
+    """2026-08-31 live incident: 11 concurrently-scanning StrategyRuns all
+    tracking the same NIFTY expiry overwhelmed the shared broker call
+    limiter (`core.rate_limiter`), which raises `RateLimitExceeded` -- a
+    plain `Exception`, not a `BrokerError`. That used to propagate uncaught
+    straight out of this function, crashing the caller's entire cycle
+    (`StrategyRunner.run_cycle`) instead of being reported as DEAD the same
+    way a `BrokerError` already is. Same shape as
+    `test_ensure_fresh_option_chain_reports_dead_on_broker_failure` above,
+    just the other exception type this function must also contain.
+    """
+    from app.core.rate_limiter import RateLimitExceeded
+
+    class _RateLimitedBroker:
+        def get_option_chain(self, *args, **kwargs):
+            raise RateLimitExceeded("broker call limiter timed out waiting to call GetQuotes")
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    state = ensure_fresh_option_chain(
+        db, _RateLimitedBroker(), nifty.id, EXPIRY, session_factory=test_session_factory  # type: ignore[arg-type]
+    )
+
+    assert state == FreshnessState.DEAD
+    assert db.query(OptionChainSnapshot).count() == 0
+
+
+def test_ensure_fresh_option_chain_coalesces_concurrent_refresh_for_same_key(
+    seeded_universe, test_session_factory, db: Session
+):
+    """The real 2026-08-31 shape: several callers (StrategyRuns) racing to
+    refresh the identical (instrument, expiry) should only issue one real
+    broker call -- the second caller's own refresh would be pure redundant
+    load on the shared rate limiter for data it's about to read anyway once
+    the first caller's refresh lands.
+    """
+    import threading
+
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    call_count = 0
+    call_count_lock = threading.Lock()
+    entered_event = threading.Event()
+    release_event = threading.Event()
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=7)
+
+    class _SlowBroker:
+        def get_option_chain(self, *args, **kwargs):
+            nonlocal call_count
+            with call_count_lock:
+                call_count += 1
+            entered_event.set()
+            release_event.wait(timeout=5)
+            return real_broker.get_option_chain(*args, **kwargs)
+
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    broker = _SlowBroker()
+    first_state: list[FreshnessState] = []
+
+    def _call_first():
+        with test_session_factory() as db1:
+            first_state.append(
+                ensure_fresh_option_chain(
+                    db1, broker, nifty.id, EXPIRY, session_factory=test_session_factory  # type: ignore[arg-type]
+                )
+            )
+
+    t1 = threading.Thread(target=_call_first)
+    t1.start()
+    assert entered_event.wait(timeout=5)  # t1 is inside the broker call, lock held
+
+    # A second, concurrent caller for the identical key must see the lock
+    # already held and skip straight to re-classifying, not also call the
+    # broker.
+    with test_session_factory() as db2:
+        second_state = ensure_fresh_option_chain(
+            db2, broker, nifty.id, EXPIRY, session_factory=test_session_factory  # type: ignore[arg-type]
+        )
+
+    release_event.set()
+    t1.join(timeout=5)
+
+    assert call_count == 1
+    assert second_state == FreshnessState.DEAD  # nothing written yet when it checked
+    assert first_state == [FreshnessState.LIVE]
+    assert db.query(OptionChainSnapshot).count() == 1
+
+
 # -- _poll_once: silent-empty-poll observability (2026-08-10 static-audit fix) --
 # Calls `_poll_once` directly rather than `start()`+`sleep()` like the REST-
 # fallback tests above — this feature is about exact wall-clock stall
