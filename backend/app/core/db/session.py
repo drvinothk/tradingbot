@@ -25,6 +25,7 @@ SessionFactory = Callable[[], AbstractContextManager[Session]]
 engine = create_engine(
     _settings.db.sqlalchemy_url,
     pool_size=_settings.db.pool_size,
+    max_overflow=_settings.db.max_overflow,
     pool_pre_ping=True,
     future=True,
 )

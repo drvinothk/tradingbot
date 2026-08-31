@@ -28,7 +28,27 @@ class DBSettings(BaseSettings):
     name: str = "trading_bot"
     user: str = "trading_bot"
     password: SecretStr = SecretStr("")
-    pool_size: int = 5
+    # 2026-08-31: raised 5 -> 20 (+ new max_overflow, was an unset implicit
+    # 10) after a live incident traced a whole-app hang during a volatile
+    # market spike to this pool, not to CPU/RAM (both were idle). Root
+    # cause: dispatch_trade_intent/close_position hold LOCK_EXECUTION_
+    # SINGLETON (core/locking.py) -- a transaction-scoped Postgres advisory
+    # lock, by design, to prevent duplicate live orders -- for the full
+    # duration of the blocking broker place_order() HTTP call. Every other
+    # thread waiting on that same lock (up to LOCK_ACQUIRE_TIMEOUT=10s) is
+    # *already holding a pooled connection* while it waits. A burst of
+    # several strategies firing/exiting near-simultaneously (5 concurrent
+    # conviction-gated strategies today) could tie up most/all of the old
+    # 15-connection ceiling (5 + implicit max_overflow=10), starving the
+    # FastAPI dashboard's own get_db()-backed requests on the same pool --
+    # that's what made the *whole app* look hung, not just order dispatch.
+    # Postgres itself allows max_connections=100 (checked live on the OCI
+    # box), so 20+20=40 has ample headroom. This does not change the
+    # serialization itself -- orders still dispatch strictly one-at-a-time,
+    # exactly as LOCK_EXECUTION_SINGLETON requires -- it only stops that
+    # expected queuing from starving unrelated read-only requests.
+    pool_size: int = 20
+    max_overflow: int = 20
 
     @property
     def sqlalchemy_url(self) -> str:
