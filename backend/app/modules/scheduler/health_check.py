@@ -32,9 +32,18 @@ import uuid
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import QueuePool
 
+from app.config.settings import get_settings
 from app.core.clock import check_disk_space, check_ntp_drift, is_windows
-from app.core.db.session import SessionFactory, session_scope
+from app.core.db.session import SessionFactory, engine, session_scope
+from app.core.locking import (
+    LOCK_ACQUIRE_TIMEOUT,
+    LOCK_AUDIT_CHAIN,
+    LOCK_EXECUTION_SINGLETON,
+    LOCK_RISK_EVALUATION_QUEUE,
+    pop_lock_wait_stats,
+)
 from app.core.modes.state_machine import ModeTransitionError, transition_mode
 from app.domain.market.models import Instrument
 from app.domain.ops.models import AlertSeverity
@@ -75,8 +84,34 @@ _DEGRADABLE_MODES = (SafeMode.LIVE_ENABLED,)
 # option-chain snapshots rather than underlying ticks). "degraded" isn't
 # meaningfully used here (only STALE/DEAD trigger an alert), so its value
 # just needs to sit below stale_after_seconds.
+# 2026-08-31: tightened 10min -> 5min per explicit user request -- this is
+# the "no tick from any feed, primary or backup" signal (see the check's own
+# docstring: it reads quote_ticks/price_bars by instrument_id only, with no
+# notion of which provider is currently active), so 5 minutes is the real
+# "reconnect and look at this" threshold; the 5-minute HealthCheckScheduler
+# cadence means worst-case detection latency is ~5-10 minutes.
 _MARKET_DATA_STALE_THRESHOLDS = FreshnessThresholds(
-    degraded_after_seconds=300.0, stale_after_seconds=600.0
+    degraded_after_seconds=150.0, stale_after_seconds=300.0
+)
+
+# 2026-08-31: leading indicators for the whole-app-hang incident (see
+# settings.py's DBSettings.pool_size comment for the full root cause) --
+# alert-only, deliberately never escalating to degraded_mode the way the
+# ntp/disk checks above do: a pool/lock spike during a real multi-strategy
+# entry burst is expected, self-recovering load, not a broker/infra failure,
+# and forcing a live session out of live_enabled over a transient burst would
+# be the exact "twitchy" trap this codebase's own failover-threshold
+# reasoning already avoids elsewhere.
+_POOL_SATURATION_ALERT_RATIO = 0.8
+# 70% of core.locking.LOCK_ACQUIRE_TIMEOUT (10s) -- worth a human's attention
+# before a dispatch actually starts failing with a lock-timeout error.
+_LOCK_WAIT_ALERT_THRESHOLD_SECONDS = 7.0
+# Only the real, named locks this system relies on (core/locking.py's own
+# "add new ones here rather than inventing ad-hoc strings" list) -- filters
+# out any other lock name (a test's own throwaway lock, or any future ad-hoc
+# caller) so it can never show up as a metric or alert here.
+_MONITORED_LOCK_NAMES = frozenset(
+    {LOCK_EXECUTION_SINGLETON, LOCK_RISK_EVALUATION_QUEUE, LOCK_AUDIT_CHAIN}
 )
 
 
@@ -110,6 +145,8 @@ class HealthCheckScheduler(IntervalScheduler):
         # Independent of the ntp/disk checks below (which early-return the
         # whole cycle when both are ok) -- always runs.
         self._check_market_data_staleness(db, workspace_ids)
+        self._check_db_pool_saturation(db, workspace_ids, recorded_at)
+        self._check_lock_contention(db, workspace_ids, recorded_at)
 
         for workspace_id in workspace_ids:
             record_metric(
@@ -181,7 +218,8 @@ class HealthCheckScheduler(IntervalScheduler):
         dead feed but no strategy currently in a position produced zero
         signal anywhere. Checks the fixed `TRADABLE_UNDERLYINGS` universe
         (same convention `MarketDataScheduler`'s own pre-market subscribe
-        already uses) against a dedicated 10-minute threshold — deliberately
+        already uses) against a dedicated 5-minute threshold (tightened from
+        10 minutes 2026-08-31, per explicit user request) — deliberately
         its own `FreshnessThresholds`, not a reuse of `TICK_THRESHOLDS`
         (60s) or `OPTION_CHAIN_THRESHOLDS`, since "worth alerting a human"
         is a coarser granularity than either of those existing tiers.
@@ -221,7 +259,7 @@ class HealthCheckScheduler(IntervalScheduler):
             if state not in (FreshnessState.STALE, FreshnessState.DEAD):
                 continue
 
-            message = f"No fresh {symbol} tick for over 10 minutes (state={state.value})."
+            message = f"No fresh {symbol} tick for over 5 minutes (state={state.value})."
             logger.warning("Health check: %s", message)
             for workspace_id in workspace_ids:
                 # dedup_key includes workspace_id -- a shared key here would
@@ -237,6 +275,108 @@ class HealthCheckScheduler(IntervalScheduler):
                     dedup_key=f"market_data_stale:{symbol}:{workspace_id}",
                 )
 
+    def _check_db_pool_saturation(
+        self, db: Session, workspace_ids: set[uuid.UUID], recorded_at: datetime
+    ) -> None:
+        """2026-08-31: leading indicator for the exact incident fixed in
+        `DBSettings.pool_size` (see that field's own comment) -- reads
+        `engine.pool.checkedout()`, a free in-memory counter (no query), so
+        this adds no load of its own. Recorded every cycle regardless of
+        workspace_ids/market hours, same as ntp_drift_seconds/disk_free_gb,
+        for continuous visibility even overnight.
+
+        `checkedout()` is a `QueuePool`-specific method, not on the abstract
+        `Pool` base `engine.pool` is typed as -- `create_engine` always
+        returns a `QueuePool` for this app's Postgres URL (no `NullPool`/
+        `StaticPool` override anywhere), but the isinstance guard keeps this
+        degrading to "0, skip" rather than an AttributeError if that ever
+        changes, instead of taking the whole health-check cycle down with it.
+        """
+        settings = get_settings()
+        capacity = settings.db.pool_size + settings.db.max_overflow
+        pool = engine.pool
+        checked_out = pool.checkedout() if isinstance(pool, QueuePool) else 0
+        ratio = checked_out / capacity if capacity else 0.0
+
+        for workspace_id in workspace_ids:
+            record_metric(
+                db,
+                workspace_id=workspace_id,
+                metric_name="db_pool_checked_out",
+                value=float(checked_out),
+                recorded_at=recorded_at,
+                tags={"capacity": capacity},
+            )
+
+        if ratio < _POOL_SATURATION_ALERT_RATIO:
+            return
+
+        message = (
+            f"DB connection pool at {checked_out}/{capacity} checked out "
+            f"({ratio:.0%}) -- order dispatch and API requests may start "
+            f"queuing for a connection."
+        )
+        logger.warning("Health check: %s", message)
+        for workspace_id in workspace_ids:
+            send_alert(
+                db,
+                workspace_id=workspace_id,
+                severity=AlertSeverity.CRITICAL,
+                category="db_pool_saturated",
+                message=message,
+                dedup_key=f"db_pool_saturated:{workspace_id}",
+            )
+
+    def _check_lock_contention(
+        self, db: Session, workspace_ids: set[uuid.UUID], recorded_at: datetime
+    ) -> None:
+        """2026-08-31: leading indicator for the *other* half of the same
+        incident -- `db_pool_saturation` above catches the symptom
+        (connections held while queued), this catches the cause (how long
+        callers actually wait to acquire `LOCK_EXECUTION_SINGLETON` et al).
+        Drains `core.locking.pop_lock_wait_stats()`, which only ever
+        populates an entry once a real acquisition took >= 1s (see that
+        module's own `_SLOW_ACQUIRE_THRESHOLD_SECONDS`) -- most cycles this
+        is empty and nothing is recorded, by design.
+
+        Filtered to `_MONITORED_LOCK_NAMES` -- the stats dict is a single
+        process-wide store shared with anything that ever calls
+        `advisory_lock` (including test code using a throwaway lock name),
+        so this filter is what keeps an unrelated caller's lock name from
+        ever surfacing here as a metric or alert.
+        """
+        for lock_name, (max_wait, slow_count) in pop_lock_wait_stats().items():
+            if lock_name not in _MONITORED_LOCK_NAMES:
+                continue
+
+            for workspace_id in workspace_ids:
+                record_metric(
+                    db,
+                    workspace_id=workspace_id,
+                    metric_name="lock_wait_max_seconds",
+                    value=max_wait,
+                    recorded_at=recorded_at,
+                    tags={"lock_name": lock_name, "slow_count": slow_count},
+                )
+
+            if max_wait < _LOCK_WAIT_ALERT_THRESHOLD_SECONDS:
+                continue
+
+            message = (
+                f"Advisory lock '{lock_name}' took up to {max_wait:.1f}s to acquire "
+                f"({slow_count} slow acquisition(s) since last check) -- approaching "
+                f"the {LOCK_ACQUIRE_TIMEOUT} timeout."
+            )
+            logger.warning("Health check: %s", message)
+            for workspace_id in workspace_ids:
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="lock_contention_high",
+                    message=message,
+                    dedup_key=f"lock_contention_high:{lock_name}:{workspace_id}",
+                )
 
 
 _scheduler: HealthCheckScheduler | None = None

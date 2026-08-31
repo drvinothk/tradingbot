@@ -184,6 +184,82 @@ def test_trips_to_backup_after_threshold_of_silence_and_lazily_subscribes(make_p
     assert backup.subscribe_calls == [["NIFTY"]]
 
 
+class _FakeAlertDB:
+    """Minimal stand-in for the `Session` `_alert` reads/writes through --
+    only `query(TradingSession).filter(...).all()`, `commit()` are ever
+    called, so nothing beyond that chain needs faking."""
+
+    def __init__(self, workspace_ids: list) -> None:
+        self._workspace_ids = workspace_ids
+        self.committed = False
+
+    def query(self, *_args, **_kwargs):
+        return self
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def all(self):
+        return [_FakeTradingSessionRow(ws_id) for ws_id in self._workspace_ids]
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+class _FakeTradingSessionRow:
+    def __init__(self, workspace_id) -> None:
+        self.workspace_id = workspace_id
+
+
+def test_switch_to_backup_alerts_at_warning_not_critical(make_provider, monkeypatch):
+    """2026-08-31: a successful automatic failover is the system self-
+    healing as designed, not something that should page a human -- only a
+    genuine "both legs down" outage (see the "backup_not_ready"/"both_down"
+    dedup_suffix cases) should stay CRITICAL. Regression test for the
+    literal alert message the user reported: a healthy switch to backup
+    must never again fire CRITICAL.
+    """
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.providers.failover.send_alert",
+        lambda db, **kwargs: calls.append(kwargs),
+    )
+
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    workspace_id = "ws-1"
+    provider = FailoverMarketDataProvider(
+        primary=primary,
+        backup=backup,
+        primary_name="shoonya",
+        backup_name="angel_one",
+        failover_threshold_seconds=_THRESHOLD,
+        recovery_stabilization_seconds=_RECOVERY,
+        backup_retry_seconds=_BACKUP_RETRY,
+        poll_interval_seconds=_POLL_INTERVAL,
+        clock=clock,
+        alert_session_factory=lambda: _FakeAlertDB([workspace_id]),
+    )
+    try:
+        provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+        primary.fire_tick(_tick())
+        clock.advance(_THRESHOLD + 1.0)
+        provider.run_once()
+    finally:
+        provider.disconnect()
+
+    switched_calls = [c for c in calls if c["category"] == "market_data_failover_switch"]
+    assert len(switched_calls) == 1
+    from app.domain.ops.models import AlertSeverity
+
+    assert switched_calls[0]["severity"] == AlertSeverity.WARNING
+
+
 def test_only_active_leg_ticks_are_forwarded(make_provider):
     forwarded: list[Tick] = []
     primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()

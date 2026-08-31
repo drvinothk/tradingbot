@@ -24,6 +24,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
+from app.domain.execution.models import Position, StopPlan
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
@@ -1208,6 +1209,67 @@ def _build_last_signal_out(
     )
 
 
+def _build_position_signal_out(db: Session, position: Position) -> LastSignalOut | None:
+    """2026-08-31: the Market Terminal signal panel's Candidate column went
+    blank the moment a run became IN_POSITION -- `_build_last_signal_out`
+    above is deliberately gated to SCANNING only (a stale rejection reason
+    has no business next to an open position, see its own docstring), but
+    that left nothing at all showing for the position that's actually open,
+    even though its strike/expiry/entry/stop/target are already sitting in
+    `Position`/`TradeIntent`/`OptionContract` right now. This builds the
+    same `LastSignalOut` shape from that already-persisted data instead of
+    the transient in-memory `runner.last_signal_status` (which has no
+    concept of "why the open position was entered" at all -- see
+    `SignalStatus`'s own docstring: it's a rejection reason, wiped to empty
+    the instant a signal actually fires).
+
+    `reason_code="position_open"` is a sentinel with no entry in
+    `signalReasonLabel`'s map (`frontend/src/shared/format/friendlyLabel.ts`),
+    so it falls through to that function's own title-case fallback and
+    renders as "Position Open" — deliberately distinct from the adjacent
+    Status-column badge, which already reads "In Position".
+    """
+    contract = db.get(OptionContract, position.option_contract_id)
+    if contract is None:
+        return None
+    trade_intent = db.get(TradeIntent, position.trade_intent_id)
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    ltp = fresh_reference_premium(
+        db,
+        option_contract_id=position.option_contract_id,
+        instrument_id=contract.instrument_id,
+        expiry_date=contract.expiry_date,
+        contract_symbol=contract.symbol,
+    )
+    return LastSignalOut(
+        reason_code="position_open",
+        evaluated_at=position.opened_at,
+        option_contract_id=position.option_contract_id,
+        # side is the option type (CE/PE), same as _build_last_signal_out
+        # above -- not Position.side (BUY/SELL, a different axis entirely).
+        side=str(contract.option_type),
+        strike=float(contract.strike),
+        expiry_date=contract.expiry_date,
+        symbol=contract.symbol,
+        # The real fill price, not a "planned" one -- strictly better ground
+        # truth than the entry-time candidate this field represents while
+        # SCANNING.
+        planned_entry=float(position.entry_price),
+        ltp=ltp,
+        # The live, possibly-trailed stop from StopPlan, not the entry-time
+        # TradeIntent.stop_price -- matches what PositionManager itself is
+        # actually checking against right now. Falls back to the entry-time
+        # value in the (should-never-happen) case a position has no
+        # StopPlan row.
+        stop_price=(
+            float(stop_plan.stop_price)
+            if stop_plan is not None
+            else (float(trade_intent.stop_price) if trade_intent is not None else None)
+        ),
+        target_price=float(trade_intent.target_price) if trade_intent is not None else None,
+    )
+
+
 @router.get("/strategies/running", response_model=list[RunningStrategyOut])
 def list_running_strategies(
     db: Session = Depends(get_db),
@@ -1311,7 +1373,11 @@ def list_running_strategies(
                 ],
                 data_freshness=data_freshness,
                 is_live=is_live,
-                last_signal=_build_last_signal_out(db, run, runner),
+                last_signal=(
+                    _build_position_signal_out(db, position)
+                    if run.status == StrategyRunStatus.IN_POSITION and position is not None
+                    else _build_last_signal_out(db, run, runner)
+                ),
             )
         )
 

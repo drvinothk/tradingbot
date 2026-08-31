@@ -88,6 +88,14 @@ def test_run_once_records_metrics_for_active_sessions_workspace(
     monkeypatch.setattr(
         "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
     )
+    # Deterministic regardless of what any other test (e.g. test_locking.py's
+    # slow-second-session test) may have left in the real, process-wide
+    # lock-wait-stats dict -- pop_lock_wait_stats() is a real module-level
+    # store shared by anything that calls advisory_lock, so this test must
+    # not assume it starts empty.
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.pop_lock_wait_stats", lambda: {}
+    )
 
     _scheduler_for(db).run_once()
 
@@ -97,7 +105,7 @@ def test_run_once_records_metrics_for_active_sessions_workspace(
         .all()
     )
     names = {m.metric_name for m in metrics}
-    assert names == {"ntp_drift_seconds", "disk_free_gb"}
+    assert names == {"ntp_drift_seconds", "disk_free_gb", "db_pool_checked_out"}
 
 
 def test_run_once_moves_guarded_live_session_to_degraded_mode_on_failed_check(
@@ -304,6 +312,143 @@ def test_market_data_staleness_alerts_when_tick_and_bar_are_both_stale(
         )
         .count()
         == 1
+    )
+
+
+def test_db_pool_saturation_alerts_when_checked_out_ratio_is_high(
+    db: Session, trading_session, monkeypatch
+):
+    """2026-08-31: leading indicator for the whole-app-hang incident fixed by
+    raising DBSettings.pool_size/max_overflow -- alerts before the pool is
+    fully exhausted, not after."""
+    import app.modules.scheduler.health_check as hc
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {})
+    monkeypatch.setattr(hc.engine.pool, "checkedout", lambda: 35)  # 35/40 = 87.5%
+
+    _scheduler_for(db).run_once()
+
+    alerts = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "db_pool_saturated",
+        )
+        .all()
+    )
+    assert len(alerts) == 1
+    assert "35" in alerts[0].message
+
+
+def test_db_pool_saturation_no_alert_when_ratio_is_low(
+    db: Session, trading_session, monkeypatch
+):
+    import app.modules.scheduler.health_check as hc
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {})
+    monkeypatch.setattr(hc.engine.pool, "checkedout", lambda: 2)
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "db_pool_saturated",
+        )
+        .count()
+        == 0
+    )
+    # Metric still recorded every cycle regardless -- visibility even when healthy.
+    assert (
+        db.query(MetricSeries)
+        .filter(
+            MetricSeries.workspace_id == trading_session.workspace_id,
+            MetricSeries.metric_name == "db_pool_checked_out",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_lock_contention_alerts_when_max_wait_exceeds_threshold(
+    db: Session, trading_session, monkeypatch
+):
+    import app.modules.scheduler.health_check as hc
+    from app.core.locking import LOCK_EXECUTION_SINGLETON
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(
+        hc, "pop_lock_wait_stats", lambda: {LOCK_EXECUTION_SINGLETON: (8.2, 3)}
+    )
+
+    _scheduler_for(db).run_once()
+
+    alerts = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "lock_contention_high",
+        )
+        .all()
+    )
+    assert len(alerts) == 1
+    assert LOCK_EXECUTION_SINGLETON in alerts[0].message
+
+
+def test_lock_contention_records_metric_but_no_alert_below_threshold(
+    db: Session, trading_session, monkeypatch
+):
+    import app.modules.scheduler.health_check as hc
+    from app.core.locking import LOCK_EXECUTION_SINGLETON
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(
+        hc, "pop_lock_wait_stats", lambda: {LOCK_EXECUTION_SINGLETON: (1.5, 2)}
+    )
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "lock_contention_high")
+        .count()
+        == 0
+    )
+    assert (
+        db.query(MetricSeries)
+        .filter(
+            MetricSeries.workspace_id == trading_session.workspace_id,
+            MetricSeries.metric_name == "lock_wait_max_seconds",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_lock_contention_ignores_unmonitored_lock_names(
+    db: Session, trading_session, monkeypatch
+):
+    """Proves the exact filter that keeps a throwaway/unrelated lock name
+    (e.g. test_locking.py's own TEST_LOCK_NAME, sharing the same
+    process-wide stats dict) from ever surfacing here as a metric or alert.
+    """
+    import app.modules.scheduler.health_check as hc
+
+    _ntp_disk_ok(monkeypatch)
+    monkeypatch.setattr(hc, "pop_lock_wait_stats", lambda: {"some_other_lock": (9.0, 5)})
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert).filter(SystemAlert.category == "lock_contention_high").count()
+        == 0
+    )
+    assert (
+        db.query(MetricSeries).filter(MetricSeries.metric_name == "lock_wait_max_seconds").count()
+        == 0
     )
 
 

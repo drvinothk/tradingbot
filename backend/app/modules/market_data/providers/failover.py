@@ -571,9 +571,19 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             f"— switched active market-data provider to {self._backup_name!r}."
         )
         logger.warning("FAILOVER: %s", message)
+        # 2026-08-31: WARNING, not CRITICAL -- a successful automatic failover
+        # is the system self-healing exactly as designed, not something that
+        # needs a human to act on. Still written to system_alerts (audit
+        # trail intact) and still logged; it just no longer pages via
+        # Telegram/Attention Required (both gate on CRITICAL). A real "no
+        # feed at all" outage is still covered -- see "backup_not_ready"/
+        # "both_down" below (stay CRITICAL) and
+        # HealthCheckScheduler._check_market_data_staleness, which alerts
+        # CRITICAL if neither leg has produced a usable tick/bar for 5+
+        # minutes, regardless of which provider is "active".
         self._alert(
             category="market_data_failover_switch",
-            severity=AlertSeverity.CRITICAL,
+            severity=AlertSeverity.WARNING,
             message=message,
             dedup_suffix="switched",
         )

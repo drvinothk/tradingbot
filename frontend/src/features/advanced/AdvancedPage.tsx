@@ -8,6 +8,7 @@ import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
 import { useReconciliationRuns, useSystemAlerts } from '../../shared/hooks/useRecovery'
 import { useDailyLimits, useSetDailyLimits } from '../../shared/hooks/useDailyLimits'
+import { type AlertIncident, groupAlertsIntoIncidents } from '../../shared/alerts/groupAlerts'
 import { strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
   DailyLimitsOut,
@@ -23,7 +24,6 @@ import type {
   StrategyConfigOut,
   StrategyRunOut,
   StrategyType,
-  SystemAlertOut,
   UnderlyingSymbol,
 } from '../../shared/api/types'
 
@@ -668,69 +668,6 @@ function CreateStrategyDefinitionRow({ onCreated }: { onCreated: () => void }) {
 }
 
 // ---------- System errors ----------
-
-// Groups repeated occurrences of the same underlying issue (e.g. a
-// recurring "market data stale for NIFTY" warning firing every few
-// minutes) into one incident row instead of one row per raw alert --
-// `/system-alerts` already caps at 100 rows (see its own `limit` default),
-// and a single noisy category can easily fill that cap on its own,
-// crowding out genuinely distinct issues. Grouping key is
-// category + message with numbers stripped, so "...(42s)" and "...(61s)"
-// collapse together but two different messages/categories don't. Purely
-// client-side -- no backend change, the underlying SystemAlert rows are
-// untouched.
-function normalizeMessageForGrouping(message: string): string {
-  return message
-    .replace(/\d+(\.\d+)?/g, '#')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function severityRank(severity: string): number {
-  return severity === 'critical' ? 2 : severity === 'warning' ? 1 : 0
-}
-
-interface AlertIncident {
-  key: string
-  severity: string
-  category: string
-  message: string
-  count: number
-  lastSeen: string
-  occurrences: SystemAlertOut[]
-}
-
-function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertIncident[] {
-  const byKey = new Map<string, AlertIncident>()
-  for (const alert of alerts) {
-    const key = `${alert.category}::${normalizeMessageForGrouping(alert.message)}`
-    const existing = byKey.get(key)
-    if (!existing) {
-      byKey.set(key, {
-        key,
-        severity: alert.severity,
-        category: alert.category,
-        message: alert.message,
-        count: 1,
-        lastSeen: alert.created_at,
-        occurrences: [alert],
-      })
-      continue
-    }
-    existing.count += 1
-    existing.occurrences.push(alert)
-    if (new Date(alert.created_at) > new Date(existing.lastSeen)) {
-      existing.lastSeen = alert.created_at
-      existing.message = alert.message
-    }
-    if (severityRank(alert.severity) > severityRank(existing.severity)) {
-      existing.severity = alert.severity
-    }
-  }
-  return Array.from(byKey.values()).sort(
-    (a, b) => new Date(b.lastSeen).getTime() - new Date(a.lastSeen).getTime(),
-  )
-}
 
 function SystemErrorsCard() {
   const alertsQuery = useSystemAlerts()

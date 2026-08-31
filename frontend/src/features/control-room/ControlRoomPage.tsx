@@ -6,6 +6,7 @@ import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
 import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPositions'
 import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useSystemAlerts } from '../../shared/hooks/useRecovery'
+import { groupAlertsIntoIncidents } from '../../shared/alerts/groupAlerts'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
 import { exitReasonLabel, stagedExitSummary, strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
@@ -430,6 +431,9 @@ function TodaysActivityCard({
               ? realTradeRows.length
               : (dailyReportQuery.data?.trade_count ?? realTradeRows.length)}
           </div>
+          <div className="metric-subvalue muted">
+            {totalLots} lot{totalLots === 1 ? '' : 's'}
+          </div>
         </div>
 
         <div className="metric-box">
@@ -585,12 +589,29 @@ interface AttentionItem {
   sortValue: number
 }
 
+// A category re-firing every scheduler cycle (market_data_stale,
+// health_check_failed, strategy_run_stalled, reconciliation_mismatch, ...)
+// never sets is_resolved -- nothing in the backend ever does (see
+// groupAlerts.ts's own docstring) -- so a still-genuine issue keeps
+// re-alerting well inside this window and stays visible; one that's gone
+// quiet for 30 minutes is treated as resolved and drops off.
+const ATTENTION_STALE_AFTER_MS = 30 * 60 * 1000
+
 function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
   const alertsQuery = useSystemAlerts()
   const [expanded, setExpanded] = useState(false)
 
-  const relevantAlerts = (alertsQuery.data ?? []).filter(
-    (a) => a.severity === 'critical' && ATTENTION_ALERT_CATEGORIES.has(a.category),
+  // Same category+message grouping AdvancedPage.tsx's System Errors card
+  // uses (see shared/alerts/groupAlerts.ts) -- keeps a repeating alert to
+  // one row instead of one per raw occurrence, and (unlike a plain
+  // category-only grouping) still keeps two genuinely different messages
+  // in the same category as separate rows.
+  const incidents = groupAlertsIntoIncidents(alertsQuery.data ?? [])
+  const relevantAlerts = incidents.filter(
+    (inc) =>
+      inc.severity === 'critical' &&
+      ATTENTION_ALERT_CATEGORIES.has(inc.category) &&
+      Date.now() - new Date(inc.lastSeen).getTime() <= ATTENTION_STALE_AFTER_MS,
   )
 
   const approvalItems: AttentionItem[] = runs.flatMap((run) =>
@@ -603,13 +624,13 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
       sortValue: new Date(approval.expires_at).getTime(),
     })),
   )
-  const alertItems: AttentionItem[] = relevantAlerts.map((alert) => ({
-    key: `alert:${alert.id}`,
+  const alertItems: AttentionItem[] = relevantAlerts.map((incident) => ({
+    key: `alert:${incident.key}`,
     kind: 'alert' as const,
-    badgeLabel: alert.category,
-    message: alert.message,
-    whenLabel: new Date(alert.created_at).toLocaleTimeString(),
-    sortValue: new Date(alert.created_at).getTime(),
+    badgeLabel: incident.category,
+    message: incident.count > 1 ? `${incident.message} (×${incident.count})` : incident.message,
+    whenLabel: new Date(incident.lastSeen).toLocaleTimeString(),
+    sortValue: new Date(incident.lastSeen).getTime(),
   }))
 
   // Pending approvals first (soonest-expiring first -- most urgent to
