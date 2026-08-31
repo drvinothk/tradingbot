@@ -89,6 +89,8 @@ class OIVolumeConfirmedConvictionStrategy(ConvictionGateMixin, OIVolumeConfirmed
         skip_weekdays: list[str] | None = None,
         require_oi_price_alignment: bool = False,
         oi_alignment_lookback_bars: int = 5,
+        require_rsi_alignment: bool = False,
+        rsi_neutral_band: float = 10.0,
         **oi_kwargs: object,
     ) -> None:
         OIVolumeConfirmedStrategy.__init__(self, instrument_id, expiry_date, **oi_kwargs)  # type: ignore[arg-type]
@@ -109,6 +111,8 @@ class OIVolumeConfirmedConvictionStrategy(ConvictionGateMixin, OIVolumeConfirmed
             pcr_oi_min=pcr_oi_min,
             pcr_oi_max=pcr_oi_max,
             skip_weekdays=skip_weekdays,
+            require_rsi_alignment=require_rsi_alignment,
+            rsi_neutral_band=rsi_neutral_band,
         )
         self.require_oi_price_alignment = require_oi_price_alignment
         self.oi_alignment_lookback_bars = oi_alignment_lookback_bars

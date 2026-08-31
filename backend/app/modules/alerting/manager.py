@@ -116,6 +116,8 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "market_data_failover_switch",
         "trade_approval_pending",
         "exit_legs_collapsed",
+        "db_pool_saturated",
+        "lock_contention_high",
     }
 )
 
@@ -195,6 +197,14 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "exit_legs_collapsed": (
         "A live position's staged-exit config was ignored -- it is running on a single "
         "full-qty stop/target instead. Review params.exit_legs for this strategy."
+    ),
+    "db_pool_saturated": (
+        "Check for a burst of near-simultaneous order dispatch/exits -- should self-clear "
+        "once broker calls finish; escalate only if it stays saturated."
+    ),
+    "lock_contention_high": (
+        "Order dispatch is queuing on the execution lock -- check broker response times; "
+        "a dispatch may fail with a lock-timeout error if this continues."
     ),
 }
 

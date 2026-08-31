@@ -29,6 +29,8 @@ the full root-cause writeup.
 
 from __future__ import annotations
 
+import threading
+import time
 import zlib
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -75,6 +77,43 @@ def _lock_key(name: str) -> int:
     return zlib.crc32(name.encode("utf-8")) - (1 << 31)
 
 
+# 2026-08-31: in-memory-only slow-acquire tracking, added after the live
+# whole-app-hang incident traced to LOCK_EXECUTION_SINGLETON queuing under a
+# multi-strategy spike (see settings.py's DBSettings.pool_size comment for
+# the full incident). This module stays free of any DB write or alerting
+# import — HealthCheckScheduler drains `pop_lock_wait_stats()` on its own
+# periodic cycle and does all recording/alerting there, keeping this
+# safety-critical primitive's own blast radius unchanged. Below the
+# threshold, this costs one `time.monotonic()` read and a comparison per
+# acquisition — negligible next to the Postgres round-trip on the very next
+# line, and nowhere near the scale of the actual incident (connections
+# blocked on broker I/O, not CPU bookkeeping).
+_SLOW_ACQUIRE_THRESHOLD_SECONDS = 1.0
+_lock_stats_guard = threading.Lock()
+_lock_wait_stats: dict[str, tuple[float, int]] = {}  # name -> (max_wait_seconds, slow_count)
+
+
+def _record_acquire_wait(name: str, wait_seconds: float) -> None:
+    if wait_seconds < _SLOW_ACQUIRE_THRESHOLD_SECONDS:
+        return
+    with _lock_stats_guard:
+        max_wait, slow_count = _lock_wait_stats.get(name, (0.0, 0))
+        _lock_wait_stats[name] = (max(max_wait, wait_seconds), slow_count + 1)
+
+
+def pop_lock_wait_stats() -> dict[str, tuple[float, int]]:
+    """Returns and clears every lock name's accumulated (max_wait_seconds,
+    slow_count) since the last call — a periodic reader
+    (`HealthCheckScheduler`) drains this each cycle. Draining on read means a
+    caller that never reads (e.g. a test exercising `advisory_lock` directly)
+    simply lets entries accumulate harmlessly until something does.
+    """
+    with _lock_stats_guard:
+        stats = dict(_lock_wait_stats)
+        _lock_wait_stats.clear()
+    return stats
+
+
 @contextmanager
 def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
     """Transaction-scoped advisory lock — released automatically at whatever
@@ -93,7 +132,15 @@ def advisory_lock(db: Session, name: str) -> Generator[None, None, None]:
     # a fixed internal constant, never user input. Transaction-scoped, same
     # as the lock itself, so it reverts automatically at commit/rollback.
     db.execute(text(f"SET LOCAL lock_timeout = '{LOCK_ACQUIRE_TIMEOUT}'"))
-    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+    started = time.monotonic()
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": key})
+    finally:
+        # Runs even when the SELECT itself raised (a genuine lock timeout) —
+        # that's the case most worth capturing, not just the success path.
+        # Never raises itself: a pure in-memory dict/lock update must not be
+        # able to mask the real exception this finally block re-propagates.
+        _record_acquire_wait(name, time.monotonic() - started)
     yield
 
 

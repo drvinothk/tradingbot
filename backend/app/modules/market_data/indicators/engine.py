@@ -1,7 +1,7 @@
-"""Per-instrument indicator state: VWAP updates every tick, EMA9/EMA20/ATR14
-update only when a bar completes. Pure logic — no DB/broker dependency, so
-it's fully testable against synthetic ticks; the ingestion service is what
-wires this to persistence.
+"""Per-instrument indicator state: VWAP updates every tick, EMA9/EMA20/
+ATR14/RSI14 update only when a bar completes. Pure logic — no DB/broker
+dependency, so it's fully testable against synthetic ticks; the ingestion
+service is what wires this to persistence.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.market_data.indicators.atr import ATRCalculator
 from app.modules.market_data.indicators.bar_aggregator import Bar, BarAggregator
 from app.modules.market_data.indicators.ema import EMACalculator
+from app.modules.market_data.indicators.rsi import RSICalculator
 from app.modules.market_data.indicators.vwap import VWAPCalculator
 
 EMA_SHORT_PERIOD = 9
 EMA_LONG_PERIOD = 20
 ATR_PERIOD = 14
+RSI_PERIOD = 14
 
 
 class IndicatorEngine:
@@ -27,6 +29,7 @@ class IndicatorEngine:
         self._ema20: dict[uuid.UUID, EMACalculator] = {}
         self._vwap: dict[uuid.UUID, VWAPCalculator] = {}
         self._atr: dict[uuid.UUID, ATRCalculator] = {}
+        self._rsi: dict[uuid.UUID, RSICalculator] = {}
 
     def on_tick(self, instrument_id: uuid.UUID, tick: Tick) -> tuple[dict[str, float], Bar | None]:
         """Feeds one tick for `instrument_id`. Returns the indicator values
@@ -65,6 +68,11 @@ class IndicatorEngine:
             if atr_value is not None:
                 results["ATR14"] = atr_value
 
+            rsi_calc = self._rsi.setdefault(instrument_id, RSICalculator(RSI_PERIOD))
+            rsi_value = rsi_calc.update(completed_bar.close)
+            if rsi_value is not None:
+                results["RSI14"] = rsi_value
+
         return results, completed_bar
 
     def on_completed_bar(self, instrument_id: uuid.UUID, candle: PriceCandle) -> dict[str, float]:
@@ -92,6 +100,9 @@ class IndicatorEngine:
         atr_calc = self._atr.setdefault(instrument_id, ATRCalculator(ATR_PERIOD))
         atr_value = atr_calc.update(candle.high, candle.low, candle.close)
 
+        rsi_calc = self._rsi.setdefault(instrument_id, RSICalculator(RSI_PERIOD))
+        rsi_value = rsi_calc.update(candle.close)
+
         results: dict[str, float] = {}
         if ema9_value is not None:
             results["EMA9"] = ema9_value
@@ -99,6 +110,8 @@ class IndicatorEngine:
             results["EMA20"] = ema20_value
         if atr_value is not None:
             results["ATR14"] = atr_value
+        if rsi_value is not None:
+            results["RSI14"] = rsi_value
         return results
 
     def warm_start(self, instrument_id: uuid.UUID, bars: list[Bar]) -> None:
@@ -151,10 +164,12 @@ class IndicatorEngine:
         ema9_calc = self._ema9.setdefault(instrument_id, EMACalculator(EMA_SHORT_PERIOD))
         ema20_calc = self._ema20.setdefault(instrument_id, EMACalculator(EMA_LONG_PERIOD))
         atr_calc = self._atr.setdefault(instrument_id, ATRCalculator(ATR_PERIOD))
+        rsi_calc = self._rsi.setdefault(instrument_id, RSICalculator(RSI_PERIOD))
         for bar in bars:
             ema9_calc.update(bar.close)
             ema20_calc.update(bar.close)
             atr_calc.update(bar.high, bar.low, bar.close)
+            rsi_calc.update(bar.close)
 
     def reset_session(self, instrument_id: uuid.UUID | None = None) -> None:
         """VWAP resets at the start of each trading day; EMA deliberately

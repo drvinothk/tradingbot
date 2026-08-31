@@ -35,7 +35,12 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
-from app.core.locking import advisory_lock, try_advisory_lock
+from app.core.locking import (
+    _record_acquire_wait,  # noqa: SLF001 - white-box test of the tracker itself
+    advisory_lock,
+    pop_lock_wait_stats,
+    try_advisory_lock,
+)
 from app.core.security.passwords import hash_password
 from app.domain.identity.models import (
     BrokerAccount,
@@ -323,3 +328,71 @@ def test_concurrent_strategy_run_creation_exactly_one_wins(real_commit_factory):
             synchronize_session=False
         )
         verify_db.commit()
+
+
+def test_record_acquire_wait_ignores_fast_acquisitions():
+    """2026-08-31: added as a leading indicator for the whole-app-hang
+    incident (see settings.py's DBSettings.pool_size comment). Below
+    _SLOW_ACQUIRE_THRESHOLD_SECONDS (1.0s), nothing is tracked at all --
+    this is what keeps the tracker's overhead at zero for the overwhelming
+    majority of (fast, uncontended) acquisitions.
+    """
+    pop_lock_wait_stats()  # drain whatever any earlier test left behind
+    _record_acquire_wait("unit_test_fast_lock", 0.05)
+    assert "unit_test_fast_lock" not in pop_lock_wait_stats()
+
+
+def test_pop_lock_wait_stats_drains_and_tracks_max_and_count():
+    pop_lock_wait_stats()  # drain whatever any earlier test left behind
+    _record_acquire_wait("unit_test_slow_lock", 1.5)
+    _record_acquire_wait("unit_test_slow_lock", 3.2)
+    _record_acquire_wait("unit_test_slow_lock", 2.0)
+
+    stats = pop_lock_wait_stats()
+    assert stats["unit_test_slow_lock"] == (3.2, 3)
+
+    # Draining clears it -- a second read sees nothing left over.
+    assert "unit_test_slow_lock" not in pop_lock_wait_stats()
+
+
+def test_advisory_lock_records_a_slow_wait_on_real_contention(real_commit_factory):
+    """The actual `advisory_lock()` context manager, not just the tracker
+    functions directly -- a second session genuinely blocked >= 1s waiting
+    for the first to release must show up in pop_lock_wait_stats().
+    """
+    pop_lock_wait_stats()  # drain whatever any earlier test left behind
+    first_holds_lock = threading.Event()
+    release_first = threading.Event()
+
+    def _hold_then_release():
+        with real_commit_factory() as db:
+            with advisory_lock(db, TEST_LOCK_NAME):
+                first_holds_lock.set()
+                release_first.wait(timeout=10)
+                db.commit()
+
+    t1 = threading.Thread(target=_hold_then_release)
+    t1.start()
+    first_holds_lock.wait(timeout=10)
+
+    def _wait_then_acquire():
+        with real_commit_factory() as db:
+            with advisory_lock(db, TEST_LOCK_NAME):
+                pass
+
+    t2 = threading.Thread(target=_wait_then_acquire)
+    t2.start()
+    # Hold the lock for >= 1s (the tracker's own slow-acquire threshold)
+    # before releasing, so t2's wait is guaranteed to register as slow.
+    import time
+
+    time.sleep(1.2)
+    release_first.set()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    stats = pop_lock_wait_stats()
+    assert TEST_LOCK_NAME in stats
+    max_wait, slow_count = stats[TEST_LOCK_NAME]
+    assert max_wait >= 1.0
+    assert slow_count >= 1

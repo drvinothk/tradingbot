@@ -76,6 +76,8 @@ CONVICTION_GATE_PARAM_KEYS = {
     "pcr_oi_min",
     "pcr_oi_max",
     "skip_weekdays",
+    "require_rsi_alignment",
+    "rsi_neutral_band",
 }
 
 # IST weekday names accepted by `skip_weekdays` -- identical set
@@ -125,6 +127,8 @@ class ConvictionGateMixin:
         pcr_oi_min: float | None = None,
         pcr_oi_max: float | None = None,
         skip_weekdays: list[str] | None = None,
+        require_rsi_alignment: bool = False,
+        rsi_neutral_band: float = 10.0,
     ) -> None:
         self.require_prior_day_trend = require_prior_day_trend
         self.prior_day_trend_buffer_pts = prior_day_trend_buffer_pts
@@ -141,6 +145,8 @@ class ConvictionGateMixin:
         self.pcr_oi_min = pcr_oi_min
         self.pcr_oi_max = pcr_oi_max
         self.skip_weekdays = {d for d in (skip_weekdays or []) if d in _WEEKDAYS}
+        self.require_rsi_alignment = require_rsi_alignment
+        self.rsi_neutral_band = rsi_neutral_band
 
     def _conviction_reject_reason(
         self,
@@ -175,6 +181,11 @@ class ConvictionGateMixin:
 
         if self.require_htf_ema_trend:
             reason = self._htf_ema_reject(db, option_type)
+            if reason is not None:
+                return reason
+
+        if self.require_rsi_alignment:
+            reason = self._rsi_alignment_reject(db, option_type)
             if reason is not None:
                 return reason
 
@@ -243,6 +254,37 @@ class ConvictionGateMixin:
         else:
             if not (ema9[-1] < ema20 and slope < 0):
                 return "htf_ema_trend_disagrees"
+        return None
+
+    def _rsi_alignment_reject(self, db: Session, option_type: OptionType) -> str | None:
+        """2026-08-31, real-data-motivated (see project memory
+        `project_sweep4_conviction_exit_tuning_2026_08_30`'s Phase 6 RSI
+        diagnostic on real, glitch-excluded VWAP paper trades): winning CE
+        entries carried a materially higher RSI14 than losing CE entries
+        (median ~62-70 vs ~53-58 across periods 5-14); winning PE entries
+        carried a materially lower RSI14 than losing ones (~28-36 vs
+        ~46-51) -- consistent on both option types, unlike the HTF-EMA
+        gate's own real-data check, which found nothing on clean data.
+
+        **Neutral dead-zone, not a plain 50 split** -- the first cut used a
+        flat CE>50/PE<50 threshold, but the losers cluster *near* 50 on both
+        sides (CE-loss median 53.0, PE-loss median 46.4), not on the wrong
+        side of it -- a plain 50 line barely screens anything. `rsi_neutral_
+        band` (default 10.0, i.e. reject entries with RSI in [40, 60]) is
+        picked to clear both real median losers while still admitting both
+        real median winners (CE-win 62.2, PE-win 36.4) -- a wider band, e.g.
+        symmetric 15 (65/35), would exclude the median *winner* on both
+        sides too, per this same data. `None` (not-ready) is never a
+        rejection -- same "missing data isn't an adverse regime" reasoning
+        `_pcr_reject` already documents.
+        """
+        rsi = get_latest_indicator_value(db, self.instrument_id, "RSI14", self.timeframe)
+        if rsi is None:
+            return None
+        if option_type is OptionType.CE and rsi <= 50 + self.rsi_neutral_band:
+            return "rsi_alignment_disagrees"
+        if option_type is OptionType.PE and rsi >= 50 - self.rsi_neutral_band:
+            return "rsi_alignment_disagrees"
         return None
 
     def _atr_expansion_reject(self, db: Session) -> str | None:

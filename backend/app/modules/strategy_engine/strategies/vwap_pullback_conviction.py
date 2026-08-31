@@ -71,6 +71,8 @@ class VWAPPullbackConvictionStrategy(ConvictionGateMixin, VWAPPullbackStrategy):
         pcr_oi_max: float | None = None,
         skip_weekdays: list[str] | None = None,
         min_bars_since_open: int = 0,
+        require_rsi_alignment: bool = False,
+        rsi_neutral_band: float = 10.0,
         **vwap_kwargs: object,
     ) -> None:
         VWAPPullbackStrategy.__init__(self, instrument_id, expiry_date, **vwap_kwargs)  # type: ignore[arg-type]
@@ -91,6 +93,8 @@ class VWAPPullbackConvictionStrategy(ConvictionGateMixin, VWAPPullbackStrategy):
             pcr_oi_min=pcr_oi_min,
             pcr_oi_max=pcr_oi_max,
             skip_weekdays=skip_weekdays,
+            require_rsi_alignment=require_rsi_alignment,
+            rsi_neutral_band=rsi_neutral_band,
         )
         self.min_bars_since_open = min_bars_since_open
 
