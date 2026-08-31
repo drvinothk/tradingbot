@@ -1,0 +1,21 @@
+# Group E: liquidity entry-gate loosening (5) -- motivated by REAL live
+# evidence, not assumption: 2026-08-31 paper-trading forensics found
+# Liquidity_Sweep_Conviction fired ZERO trades all day, blocked by
+# min_sweep_distance_nifty_points (default 5.0) and
+# sweep_min_range_width_nifty_points (default 30.0) -- real observed values
+# sat JUST under both floors repeatedly (sweep distance 4.75/0.65/2.95;
+# window width 23.5-28.75). One day of near-misses isn't proof the floor is
+# wrong (could be correctly filtering a no-setup day) -- this sweep tests it
+# against the FULL historical sample instead of assuming.
+#
+# Held at trail_lock_fraction=0.85 (Group C's near-best point, avoiding
+# overfit to the single-best 0.90 over n=22) and arm=0.5 (unchanged --
+# don't tune two axes at once; entry is being isolated here the same way
+# Group A isolated entry-vs-exit tightening for VWAP). Same
+# EXTRA_BT_ARGS='--structure-stop-mode pivot_s1r1' as Group C/D.
+# Base structure/env unchanged (alice_index, pcr_oi 0.7-1.3, stop_pct 0.16).
+g8e_dist40|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85, "min_sweep_distance_nifty_points": 4.0}
+g8e_dist35|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85, "min_sweep_distance_nifty_points": 3.5}
+g8e_width25|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85, "sweep_min_range_width_nifty_points": 25.0}
+g8e_width20|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85, "sweep_min_range_width_nifty_points": 20.0}
+g8e_both|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85, "min_sweep_distance_nifty_points": 4.0, "sweep_min_range_width_nifty_points": 25.0}

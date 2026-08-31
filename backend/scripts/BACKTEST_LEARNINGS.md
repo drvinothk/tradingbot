@@ -8,6 +8,1018 @@ costs are applied only in analysis.
 
 ---
 
+## 2026-09-01 (~01:30–02:45 IST) — FULL-ARCHIVE RE-ANALYSIS (626 configs, fresh from the CSVs) + paper configs updated on OCI
+
+Not a new sweep. A from-scratch re-read of **every post-DTE-fix run** — 626
+configs / 38 run directories — scored on one bar, then acted on. Artifact:
+[Expiry-Week Config Triage](https://claude.ai/code/artifact/1f1a7c2a-0b39-476a-bb0d-2f2e443a0747).
+Tooling: `scripts/qc_paper_configs.py` (pre-apply) and
+`scripts/qc_paper_configs_live.py` (post-apply, validates what is actually in
+the DB). Full plan + reasons + applied record:
+`docs/ops/paper_config_update_2026_09_01.md`.
+
+**Scope.** Only `--near-expiry-days 6` runs count: `sweep3*` (from
+`20260828T152220Z`), all of Sweep #4 (`s4p1`–`s4p5`, `s4p15`, `s4p16`), all of
+Phase 6/7/8 (`s6_g1/g2/g3/g7ab/g7c/g7d/g8e`). Excluded: every pre-fix run
+(`conviction_sweep/`, `refined_sweep_20260828T072024Z`, `orb_NIFTY_targeted2x`,
+`2026-08-26_current_validation`, `gamma_blast`), three `*_PARTIAL` dirs, and six
+non-timestamped twins each verified byte-identical before dropping.
+
+**Pipeline is trustworthy.** Rebuilt from raw trade CSVs, not from this ledger,
+and it reproduces three independent prior entries exactly — W7b arm .12/lock .9,
+Phase 5 `o3_atr_pcrl` arm .30/lock .85, and Phase 5 Group B `e3_pdt_atr_pcrl`
+arm .7/lock .8 (n=7, 71.4% win, IS +397.9 / OOS +380.8). Only delta is the
+flat-cost constant (₹10 as in `analyze_walkforward.py`; this ledger's prose says
+₹40 — worth ~₹30/trade, **the two are not interchangeable, state which one a
+number came from**).
+
+### The bar: 7 standing gates + 1 new one
+
+n≥8 · E>0 · IS>0 **and** OOS>0 · both 6-mo halves>0 · P(mean≤0)≤0.15 ·
+5th-pctile≥0 · survives 1.0%/side slip · **E>0 after deleting the 2 best trades**.
+The last is new and is the cheapest tail-dependence check available at n≤26 — it
+is what separates ORB/OI/EMA from VWAP/Liquidity, which both go negative.
+
+### Result
+
+| strategy | pass 8/8 | configs | distinct **entry sets** | verdict |
+|---|---|---|---|---|
+| ORB_Conviction | 80 | 123 | 27 | deploy to paper |
+| OI_Volume_Confirmed | 33 | 190 | 24 | deploy to paper |
+| EMA_Micro_Pullback | 3 | 91 | 23 | paper, minimum size |
+| VWAP_Pullback | **0** | 113 | 26 | PARK |
+| Liquidity_Sweep | **0** | 92 | 21 | PARK |
+| Loren | 0 | 17 | 13 | PARK |
+
+**Read pass-counts as "how many exit variants survive", never as independent
+evidence.** 626 configs collapse to **145 distinct entry sets** — most of the
+search space was exit tuning on a handful of gates. ORB's 80 passers are
+**79 exit overlays of ONE 26-trade entry set** (`d_pdt_w65`). That cuts the right
+way, though: *all 79 are net positive* (+₹133 to +₹717), the strongest available
+evidence that ORB's edge lives in the entry, not the exit. Hash the
+(symbol, entry_ts) tuple set to detect this — it is invisible otherwise.
+
+### Per-strategy leads (₹/lot, net, 0.5%/side)
+
+- **ORB `d_pdt_w65`** (`orb_conviction` + `require_prior_day_trend` +
+  `max_or_range_nifty_points:65`), n=26: bare exits +304; best exits
+  `w7_s18_a12_l06` +520 (76.9% win, PF 16.70, maxDD ₹395, drop-2 +391, P=0.000),
+  `w7_s18_tgt40` +717 (61.5% win, maxDD ₹1,222), `x_stop15_arm06` +274
+  (84.6% win, maxDD ₹334, L-streak 1).
+  Marginal contribution is clean: bare ORB −13 (P=0.54); PDT alone +132
+  (IS +11 / OOS +372); width≤65 alone +124 (IS +162 / OOS +46); **together +304
+  with IS +297 / OOS +318** — the two filters' opposite regime weaknesses cancel.
+  9–10 of 10 traded months positive; top-3 trades only 42–56% of total.
+- **OI `o_pcrl` / `o3_atr_pcrl`**: `x4_o_pcrl_a30_l80` n=23, 65.2%, +221,
+  drop-2 +160, PF 3.03, 8/8 — the largest passing sample outside ORB;
+  `x5_o3_atr_pcrl_a30_l85` n=14, 71.4%, +274, 8/8. IS +322 / OOS +89 on the n=23
+  one — **edge is decaying, not growing; watch OOS in paper.**
+- **EMA `e_pdt_atr`**: `x4_e_pdt_atr_a70_l80` n=12, 58.3%, +304, drop-2 +155,
+  8/8. Top-3 trades are **78%** of total — real but fragile.
+- **VWAP best** `g1_s06_t50` +250 but **drop-2 = −91**; **Liquidity best**
+  `g7c_l_pcrt_lock90` +98 but **drop-2 = −21**, IS −58. Both are 3 trades deep.
+
+### Findings worth keeping
+
+1. **EMA_Micro_Conviction_PCR is a strict subset of EMA_Micro_Conviction.**
+   Trade-by-trade: shared 7, only-in-plain 5, **only-in-PCR 0**. The PCR gate
+   removed 5 trades netting **+₹934** (cut 3 `structure_break` losers, but also
+   both biggest winners: +603 and +1,308). Total 3,651 → 2,717. E/trade *rises*
+   304 → 388 only because it deleted more than it should have. **Two configs on
+   the same gate, one a subset of the other, is double size on one signal — not
+   diversification.** Always diff the entry sets before treating two variants as
+   independent strategies.
+2. **The 10:xx ORB cutoff claim was measured on the wrong entry set.** The
+   "10:xx = −437" note came from `w_25_65`; on the deployed `d_pdt_w65` gate the
+   same bucket is **+1,839**. Sign flips across gates AND across exit stacks
+   (`d_pdt_w65` with bare exits: −443). All 26 entries fall **09:32–10:16**, 88%
+   before 10:00. Moved 10:00 → **10:15** (also `ORBStrategy`'s own constructor
+   default) — justified distributionally, **not** by the +₹38/lot, which is one
+   trade.
+3. **`trail_activation_fraction` is ~3× the lever `trail_lock_fraction` is, and
+   OI and EMA run OPPOSITE directions on it.** OI peaks at 0.30 (8/8; 0.40 → 7/8,
+   0.60 → 3/8); EMA peaks at 0.70 (8/8; 0.60 → 7/8, 0.30 → 5/8). Both were
+   deployed at 0.5 — the wrong side of both peaks, ~₹85 (OI) and ~₹100 (EMA) per
+   lot per trade.
+4. **The lock ladder is monotonic with no turning point, and win% + maxDD are
+   byte-identical at every lock level** on all three strategies — only winner
+   size moves. That flatness is an artifact of 1-min bars: the sim cannot see the
+   sub-minute adverse wick a low lock exists to survive. **Lock cannot be settled
+   by this harness at all** — it needs live fills. Hence the paper A/B below.
+
+### Configs updated on OCI the same night (paper only; DB-only, no deploy)
+
+Applied in two transactions with `running_runs = 0`, `open_positions = 0`,
+`pending_orders = 0` verified immediately before each. Rollback snapshot:
+`docs/ops/paper_config_rollback_2026_09_01.txt`.
+
+- **ORB_Conviction** — cutoff 10:00 → 10:15; gained a **4-leg** staged exit
+  `[3,3,2,2]` at 10 lots: `core` lock .6 (anchor) / `runner` lock .8 /
+  `tightlock` lock .4 / `target` target .40 lock .6.
+- **OI_Volume_Conviction** — arm .5 → **.30**, leg locks .6/.8/.8, plus top-level
+  exit params (see below).
+- **EMA_Micro_Conviction** — arm .5 → **.70**, leg locks .6/.8/.8, plus top-level
+  exit params.
+- **EMA_Micro_Conviction_PCR** and **VWAP_Conviction** disabled.
+  Liquidity_Sweep_Conviction was already disabled.
+
+**Leg-design rule adopted:** every leg differs from a designated anchor leg in
+**exactly one** field, or the comparison is unattributable. This is why a lock
+value repeats across legs — ORB's `target` leg shares lock .6 with `core` so the
+target test is single-variable. The first draft got OI wrong (wide leg at lock
+.85 against legs at .6/.8, so *neither* comparison was clean); fixed to .80.
+
+### Two latent bugs found while doing this — both pre-existing, both now closed
+
+1. **`qty_lots: 10` would have blocked every live trade.** In
+   `resolve_qty_lots`, an explicit `params["qty_lots"]` wins in **both** modes —
+   it is not mode-aware; only the *absent* case is (paper 10 / live 1). Risk then
+   computes `effective_lot_cap = min(per_trade_lot_cap, resolved)` = `min(1, 10)`
+   = 1 and **rejects** an intent of 10 (`per_trade_lot_cap_exceeded`) — it does
+   not clamp. Confirmed by
+   `test_per_trade_lot_cap_allows_a_strategys_own_configured_qty_lots`, which has
+   to raise the workspace cap to 5 before a 5-lot config passes. The 2026-08-28
+   fix keyed the *default* off `is_strategy_routed_live`; it did not change
+   explicit behaviour. **Removed `qty_lots` from OI and EMA; never added it to
+   ORB.** Paper unchanged at 10; live now works at 1.
+2. **OI and EMA had no top-level exit params, so their LIVE exit used class
+   defaults.** `build_position_exit_legs` returns `None` — collapsing to the
+   single-exit path — for **any LIVE position** and for a position too small to
+   give every leg ≥1 lot; that path reads the **top-level** values. OI/EMA set
+   none, so a live trade would have exited on arm .5 / lock **.5** (and EMA stop
+   .08 instead of .12). Added top-level `stop_pct`/`target_pct`/arm/lock to both,
+   pinned to each strategy's best backtested single-leg config. Targets pinned to
+   the class-default values the backtests themselves ran under (OI .18, EMA .12)
+   so a future default change cannot silently alter a validated config.
+   **Consequence worth remembering: multi-leg exits are already paper-only in
+   code, so `exit_legs` can never affect live — the top-level params ARE the live
+   config.**
+
+### Needs attention next time
+
+- 🔴 **ORB's `max_or_range_nifty_points: 65` has still never been re-swept with
+  `require_prior_day_trend` on.** `d_pdt_w55` / `w75` / `w85` do not exist
+  anywhere in the archive. 65 came from the 21-band width-ridge sweep where it
+  was explicitly judged "a lone spike surrounded by negatives = noise". The whole
+  ORB result rests on 65 still being right once PDT is on. **~20 min, 4 configs,
+  the highest value per minute of anything outstanding.** Gates any decision to
+  size up; does not block paper.
+- **Lock 0.4 is unbacktested for OI and EMA** (their grids were .6/.7/.8 only).
+  It *is* backtested for ORB (8/8 gates, −₹18 vs .6), which is why only ORB got
+  the 4th leg. If the live lock A/B shows tighter is better, run the 0.4 cell for
+  OI/EMA before configuring it.
+- **The multi-leg exit engine itself has zero backtest coverage.** Every per-leg
+  number is from a separately-backtested *single-leg* run; a real staged position
+  shares one entry and its structure-break exit fires on all legs at once, so the
+  blended arithmetic will not reproduce. Measuring that is the point of the run.
+- **OI's edge is decaying** (IS +322 / OOS +89 on the n=23 config). If paper
+  confirms the OOS half, re-derive rather than re-tune.
+- **Liquidity's untouched pathology**: `structure_break` is 8/22 trades, 12.5%
+  win, 1-min median hold, ~−900 total, and is inert to every entry and exit lever
+  swept across Groups C/D/E. Any revival attacks that exit first; nothing else.
+- Four stub configs (`Bank nifty`, `Test `, `Test 1`, `Test 4`) remain
+  `is_enabled` and will auto-spawn alongside the conviction set, competing for
+  `max_concurrent_positions = 2`. **`Test 1` has `runtime_mode = NULL`** — it
+  follows the session rather than being pinned to paper, so it would route real
+  money if the master switch is ever flipped live. Left as-is on explicit
+  instruction; clear before any live session.
+- `ruff check .` currently reports 16 errors, all in pre-existing untracked
+  analysis scripts (`analyze_phase*.py`, `fetch_today_replay_data.py`,
+  `alice_blue_ws_quality_diagnostic.py`). CI runs `mypy app tests` only, so
+  `scripts/` is out of mypy scope — consistent with every existing script there.
+
+---
+
+## 2026-09-01 (~01:05 IST) — e4 backtest VM recovered into a single portable `backtest_engine/` folder, ready to move to A1
+
+The paid e4 VM (`129.159.226.106`) hits its trial-credit cutoff ~05:30 IST today.
+Everything on it was recovered and consolidated locally **before** that, into one
+self-contained, movable folder: **`backtest_engine/`** at the repo root
+(gitignored, 437 MB). See its own `README.md` and `VERSION.txt`.
+
+**What was actually at risk (only on the VM, not local):** 51 report directories —
+i.e. *every sweep result from Phase 3 through Phase 8*, including all of `s6_g1`/
+`g2`/`g3`/`g7ab`/`g7c`/`g7d`/`g8e` and the `s4p1`-`s4p5`/`sweep3w*` families. Local
+had 39 report dirs the VM lacked, so neither side was a superset — the union was
+taken. **Verified: 0 files present on the VM and missing locally** (18,367 report
+files now, 749 dirs).
+
+**Engine parity checked, not assumed** (content-diffed ignoring CRLF):
+`run_backtest.py`, `merge_backtest_shards.py`, `backtest_pivots.py` were
+**byte-identical** VM vs local, as were all strategy modules — the engine was never
+at risk. Two analysis scripts differed, and **the VM's copy was the newer one for
+one of them**: `analyze_conviction_sweep.py` had `FLAT_COST_PER_LOT = 10.0`
+(corrected 2026-08-31) while local still had a stale **40.0**. Local has been
+corrected. *Note: this ledger's own header still says "flat ₹40/lot" — that line is
+stale; the real cost model is ₹10/lot flat (Rs5/order × 2 legs).* Also recovered:
+12 VM-only scripts/config lists (incl. `run_phase6_generic.sh`, which carries the
+DB reaper) and 33 sweep runners.
+
+**Disk hygiene — the thing that saved the e4, now generalised.** Root cause of the
+VM filling up: `run_backtest.py` creates **one Postgres DB per shard** and never
+drops it; a 28-shard × 5-config sweep leaves 140 behind. The e4 was found holding
+**202 orphan databases / 4.0 GB**. The sweep runners reaped between configs, but
+anything dying mid-run (SSH drop, OOM, Ctrl-C) leaked permanently. Now three
+layers in `backtest_engine/setup/`: reap-between-configs + `trap` on exit
+(`run_sweep.sh`), `disk_guard.sh` (refuses to start below a free-GB floor, reaps,
+aborts if still short), and an hourly `backtest-reaper.timer` systemd safety net.
+
+**A1-specific safety, because A1 is the LIVE trading box** (unlike the e4, which
+ran nothing else): the bundle uses its own **`DB_NAME=btengine`**, so no backtest
+database can ever share a namespace with production `trading_bot`. The reaper
+matches with POSIX regex `^<DB_NAME>_backtest_` — **not SQL `LIKE`**, where `_` is
+a single-char wildcard — and hard-refuses `postgres`/`template0`/`template1`/
+`<DB_NAME>`/`<DB_NAME>_test`. `provision_a1.sh` reuses the already-installed
+Postgres *server* but creates only its own role/DB, builds its own venv, and never
+touches anything named `trading-bot*`.
+
+**A1 is a much smaller box**: 2 OCPU / 12 GB vs the e4's 16 OCPU / 128 GB, and its
+100 GB disk also carries the live service. `run_sweep.sh` therefore defaults to
+**`SHARD_COUNT=4`, not 28** — a 5-config group should be budgeted at roughly
+**2-3 h**, not the e4's ~18 min. The 33 historical runners in `runners/` are kept
+**unmodified as provenance** and must not be run on A1 (their paths and
+`SHARD_COUNT=28` assume the old VM).
+
+**Verified end-to-end from inside the bundle**, not just assembled:
+`run_backtest.py --help` exits 0 with all 11 strategy types, `DEFAULT_DATA_DIR`
+resolves inside the bundle, and `analyze_walkforward.py` reproduced the Phase 8
+`g7d_l_pcrt_arm70` and `g8e_width25` numbers exactly.
+
+**Two cleanups**: real broker credentials (`shoonya.env`, `alice_blue.env`,
+`telegram.env`, `angel_one.env`, `truedata.env`, plus a live Alice Blue session
+cache) were pulled in by the `app/` copy and have been **removed from the bundle**
+— the backtest replays a CSV archive and needs none (repo/live copies untouched).
+And `_paidvm_data_snapshot_2026-08-27/` (369 MB) was deleted after verifying it was
+a **strict subset** — all 1,957 of its files already present in the archive.
+`backend/data` is now a Windows junction into the bundle, so there is exactly **one
+physical copy** of the 424 MB archive and both paths still work.
+
+---
+
+## 2026-09-01 (~00:50 IST) — Phase 8 COMPLETE (Groups E + D): entry-gate loosening REFUTED; `arm` found to be the strongest exit lever yet — but nothing clears the bar. Liquidity_Sweep_Conviction stays PARKED.
+
+Chain finished unattended on the VM exactly as queued (`[master8] Phase 8 chain
+ALL COMPLETE`, 13:36:34Z / 19:06 IST 2026-08-31). All 10 configs `OK`, **zero
+shard failures**, full 20-25 trade samples each (the db-name-truncation bug that
+invalidated the original Group C stays fixed). CSVs pulled to
+`data/historical/backtest_reports/s6_g8e_liq_entry/` and `s6_g7d_liquidity_arm/`;
+analyzed with `analyze_walkforward.py` (default cost model, OOS ≥ 2026-04-01).
+
+### Cross-run reproducibility check — PASSED
+Group D's `arm50` cell (`arm=0.5, lock=0.80`) is the *same configuration* as
+Group C's `lock80`, run in a separate process on a separate DB: n=22, win 54.5%,
+E=92.7, PF 1.52, P(mean≤0)=0.250 — **identical to 3 significant figures**. The
+harness is deterministic across runs; Group C/D/E results are directly comparable.
+
+### Group E — entry-gate loosening: REFUTED, and it doesn't even add trades
+
+Motivated by 2026-08-31's live gate-block logs (real observed sweep distances of
+4.75/0.65/2.95 vs the 5.0 floor, widths 23.5-28.75 vs the [30,120] band). Held at
+`lock=0.85`, `arm=0.5`. Baseline for comparison = Group C `lock85` (n=22, E=95.5,
+PF 1.54, P=0.245).
+
+| config | loosened | n | win% | E/trade | PF | IS E | OOS E | P(mean≤0) |
+|---|---|---|---|---|---|---|---|---|
+| *(g7c lock85 baseline)* | — | 22 | 54.5% | **95.5** | 1.54 | -58.7 | 318.2 | **0.245** |
+| g8e_width25 | width 30→25 | 25 | 52.0% | 65.1 | 1.39 | -65.6 | 261.1 | 0.303 |
+| g8e_width20 | width 30→20 | 24 | 45.8% | 6.9 | 1.04 | -92.0 | 171.7 | 0.468 |
+| g8e_dist40 | dist 5.0→4.0 | 20 | 45.0% | -79.8 | 0.73 | -304.2 | 194.4 | 0.688 |
+| g8e_both | dist 4.0 + width 25 | 22 | 45.5% | -77.3 | 0.73 | -264.8 | 250.7 | 0.693 |
+| g8e_dist35 | dist 5.0→3.5 | 20 | 35.0% | -210.7 | 0.50 | -461.9 | 96.3 | 0.881 |
+
+**Every single Group E config is worse than the untouched baseline on E/trade, PF,
+and P(mean≤0).** Two findings worth keeping:
+
+1. **The distance floor is the wrong thing to blame.** Loosening it is monotonically
+   destructive (5.0 → 4.0 → 3.5 = E 95.5 → -79.8 → -210.7). A shallower sweep really
+   is a worse setup — the live near-misses were the gate working, not the gate
+   being miscalibrated.
+2. **Loosening `min_sweep_distance` *reduced* trade count (22 → 20).** Counter-
+   intuitive and worth remembering: a looser floor lets an earlier, weaker sweep
+   qualify first and consume the setup, displacing a later, better one that would
+   otherwise have fired. Same next-bar-re-qualification displacement already seen
+   in sweep #2's `g_skip_tue`. **Trade count is not a monotonic function of gate
+   looseness — never assume "looser gate = more trades" in this harness.**
+3. The width band is the milder of the two (25 costs ~30 E/trade, 20 costs ~89) but
+   still net-harmful. Widening the *sample* by 3 trades bought nothing.
+
+**Verdict: do not loosen either entry floor. One day of live near-misses was
+correctly read as "no real setup formed", not "the floor is too tight."**
+
+### Group D — the arm sweep (deprioritized, and it turned out to be the strongest lever tested)
+
+Held at `lock=0.80`, `stop_pct=0.16`, `pivot_s1r1`. Swept `trail_activation_fraction`
+0.3 → 0.7:
+
+| arm | n | win% | E/trade | PF | IS E | OOS E | P(mean≤0) | 5th-pctile |
+|---|---|---|---|---|---|---|---|---|
+| 0.30 | 22 | 54.5% | -3.0 | 0.98 | -119.4 | 165.1 | 0.504 | -204.8 |
+| 0.40 | 22 | 54.5% | 46.0 | 1.26 | -77.2 | 224.0 | 0.354 | -171.7 |
+| 0.50 | 22 | 54.5% | 92.7 | 1.52 | -59.8 | 313.0 | 0.250 | -142.5 |
+| 0.60 | 22 | 54.5% | 132.0 | 1.75 | -19.4 | 350.7 | 0.189 | -116.8 |
+| 0.70 | 22 | 50.0% | **164.1** | **1.89** | **-9.8** | 415.4 | **0.158** | -105.7 |
+
+**`arm` is roughly 3× the lever `lock` is.** Group C's full lock sweep (0.60→0.90)
+moved E/trade only 81.6 → 98.3 (+17); this arm sweep moves it -3.0 → 164.1 (+167)
+over a comparable range. **Group C's conclusion that "exit-side tuning is
+exhausted" was premature — it swept the weaker of the two exit axes.** The
+deprioritized run turned out to be the more informative one.
+
+**Mechanism is clean and fully isolated** (exit-reason breakdown): between arm 0.3
+and 0.5 the `stop`, `structure_break`, and `target` buckets are *byte-identical*
+(same n, same totals). **Only the `trail` bucket changes** — median hold 5.5 →
+12.5 → 20 min, E/trail-trade 444 → 708 → 1060. Arming the trail later does exactly
+one thing: it stops the trail from strangling winners in their first few minutes.
+This is the same "trades that work, work fast, but a trail armed too early cuts
+them before they get there" shape sweep #1 finding #4 first hinted at.
+
+**The trend is already turning, though.** At arm=0.70 one trade converts from
+`trail` to `stop` (trail 8→7, stop 3→4, stop total -2943.8 → -3134.1). Net E still
+improved because the surviving winners gained more, but this is the first evidence
+of the cost side of "arm later". **Do not extrapolate past 0.7 without testing it.**
+
+### Verdict against the standing bar — still NO
+
+- **No config clears `P(mean≤0) ≤ 0.15`.** `arm70` at **0.158** is the closest any
+  Liquidity_Sweep_Conviction config has ever come, but it misses.
+- **Every config in both groups is still IS-negative.** `arm70`'s IS E=-9.8 is
+  essentially breakeven — the best IS number this strategy has produced — but the
+  "IS-negative / OOS-flattered" shape this ledger distrusts elsewhere (VWAP
+  wide-target, OI at high arm) is fully intact: all the profit lives in OOS.
+- Expiry-week sign test is non-significant for every config (p = 0.83-1.00).
+- n=22 throughout. Two IS/OOS halves of 13 and 9 trades.
+
+**Liquidity_Sweep_Conviction stays PARKED / not deployed** — same disposition as
+VWAP. It is now the *best-understood* parked strategy, not a shippable one.
+
+### The pathology nothing has touched yet
+Across every Group C/D/E config, `structure_break` is **8/22 trades (36%), 12.5%
+win rate, median hold 1 minute**, contributing ~-840 to -1000 total. It is
+completely inert to `arm`, `lock`, and every entry gate tested. This is the same
+misfire documented in sweep #1 finding #8 (1-min bars collapse
+`structure_break_persistence_seconds` to "confirm on the 2nd breaching bar"), and
+it is the single largest untouched drag on this strategy. **Every lever swept so
+far tunes the 8 trail trades; none of them touches the 8 structure_break trades.**
+
+### What would actually be next (NOT run — VM terminates ~05:30 IST 2026-09-01)
+Two cheap, mechanism-motivated cells remain, ~18 min for a 5-config group:
+1. `arm` 0.75 / 0.80 / 0.90 at `lock=0.85` — find the turning point of a trend that
+   is monotonic and has not plateaued. Cannot be extrapolated; must be measured.
+2. `--structure-stop-mode pivot_s2r2` (a *wider* structure level, already
+   implemented, never tested on this strategy — Groups C/D/E all used `pivot_s1r1`)
+   — the only no-code-change lever that attacks the 36%/12.5%-win/1-min pathology.
+   Fully disabling the structure-break exit would need a code change (`--structure-
+   stop-mode` has no `off` choice), so it is not a same-night test.
+
+If the VM is gone, both are re-runnable anywhere the archive is — neither needs
+16 OCPU (each config is ~215s on 28 shards).
+
+---
+
+## 2026-08-31 (~18:34 IST) — Group E→D queued unattended on the VM itself, survives laptop/session shutdown
+
+Per explicit instruction to make the remaining backlog run without needing
+this session (or the local machine) to stay alive: wrote `~/run_phase8_
+master.sh` directly on the VM (129.159.226.106) — waits for the
+already-running Group E process to exit, then launches Group D
+(`phase8_groupd_liquidity_arm.txt`, the deprioritized arm sweep, held for
+exactly this "queue everything planned" case). Launched via `setsid nohup
+... < /dev/null > ~/s8_master_stdout.log 2>&1 &` — confirmed detached
+(`PPID=1`, own session id, no controlling tty), so it is immune to SSH
+disconnect, this Claude session ending, or the laptop sleeping/shutting
+down. **If this session doesn't survive to see it finish**: resume by SSHing
+in and checking `~/s8_master.log` for `[master8] Phase 8 chain ALL
+COMPLETE`, then pull + analyze both groups' CSVs the same way as every
+other phase in this file (`s6_g8e_liq_entry/` and `s6_g7d_liquidity_arm/`
+under `data/historical/backtest_reports/`). No further backlog beyond
+these two exists as of this note — once both finish, the Liquidity_Sweep_
+Conviction question is either answered (an entry-gate variant helps) or
+closed (re-park, matching VWAP).
+
+## 2026-08-31 (~18:31 IST) — Group C RERUN (fixed, valid): no lock clears the bar, still IS-negative/OOS-flattered; today's live paper-trade forensics motivates a real entry-gate test (Group E, launched)
+
+### Group C rerun — fix confirmed, results now trustworthy but still don't clear the bar
+
+All 5 configs completed with a full **22-trade sample each** (vs. 0-3 before
+the db-name fix), zero shard failures. `analyze_walkforward.py`:
+
+| lock | n | win% | E/trade | PF | IS E | OOS E | P(mean≤0) |
+|---|---|---|---|---|---|---|---|
+| 0.60 | 22 | 54.5% | 81.6 | 1.46 | -64.3 | 292.3 | 0.273 |
+| 0.70 | 22 | 54.5% | 87.1 | 1.49 | -62.1 | 302.7 | 0.261 |
+| 0.80 | 22 | 54.5% | 92.7 | 1.52 | -59.8 | 313.0 | 0.250 |
+| 0.85 | 22 | 54.5% | 95.5 | 1.54 | -58.7 | 318.2 | 0.245 |
+| 0.90 | 22 | 54.5% | 98.3 | 1.56 | -57.6 | 323.4 | 0.241 |
+
+**Sanity check passed**: lock=0.80's P(mean≤0)=0.250 matches Phase 6's
+original (buggy-VM-era but apparently still-valid-by-luck) finding almost
+exactly — the fix didn't overturn prior conclusions, it just made Group C's
+*new* 0.6/0.7/0.85/0.9 cells trustworthy for the first time. **Monotonic but
+flattening improvement with lock** (0.6→0.7: +5.5 E; 0.85→0.90: +2.8 E) —
+diminishing returns, a plateau, not a lever with more headroom. **None of
+the 5 clears the P(mean≤0)≤0.15 bar**, and every one shows the same
+"IS-negative / OOS-flattered" shape this ledger already distrusts elsewhere
+(VWAP wide-target, OI at high arm) — IS is negative at *every* lock tested,
+all the profit lives in OOS. **Verdict: exit-side tuning (stop-mode + lock)
+for Liquidity_Sweep_Conviction is exhausted, not under-tuned** — matches the
+"no exit tweak fixes a weak entry" pattern already proven 3× for VWAP. Do
+not chase this further on the exit side (the drafted Group D arm-sweep,
+`phase8_groupd_liquidity_arm.txt`, is deprioritized for this reason — held,
+not deleted, in case the entry-side test below changes the picture).
+
+### Today's live paper-trade forensics (2026-08-31, excl. confirmed glitch windows) — real evidence, not assumption
+
+Two parallel background agents ran against the live OCI box
+(144.24.137.112), read-only. Full detail in
+[[project_sweep4_conviction_exit_tuning_2026_08_30]] memory; key points:
+
+**Glitch window excluded**: 08:26-09:46 IST (option-chain "Feed: Dead"
+incident, confirmed via a real 3965s `option_chain_snapshots` refresh gap —
+4 trade_intents excluded). The 10:08-14:52 IST Shoonya→Alice Blue failover
+window was **checked and found clean** (zero `price_bars` gaps, option
+chain kept refreshing throughout) — not excluded, unlike the feed-dead
+window.
+
+**Per-strategy, n=37 clean trades, NIFTY down-drifting low-VIX chop day
+(24175.65→24066.50, VIX~11.2)**: `ema_micro_pullback` best (+16,718, 5/6
+win), `oi_volume_confirmed` flat (+2,399), `vwap_pullback` base −4,173
+(chasing pattern confirmed again — 2 same-strike re-entry-at-higher-premium
+clusters, both losers), `VWAP_Conviction` −13,510 (0/3, but its conviction
+gate correctly did NOT show the chase pattern that hit its non-conviction
+sibling), `OI_Volume_Conviction` −9,864 (0/2, but only traded post-restart —
+see cap bug below).
+
+**Real, already-known bug concretely reproduced today**:
+`ema_max_trades_per_session`-style per-session caps are **not mode-scoped**
+and **not reset except by a process restart** — `EMA_Micro_Conviction`,
+`EMA_Micro_Conviction_PCR`, and `OI_Volume_Conviction` each hit their cap
+within minutes of every process start today with **zero real trades fired
+yet**, then only traded in the ~2min windows after later restarts reset the
+counter. **Their "0-2 trade" results today say nothing about their edge** —
+treat as unmeasured, not weak, until this is fixed.
+
+**Liquidity_Sweep_Conviction: zero trades all day**, but NOT silent —
+real gate-block log lines fired repeatedly: `sweep distance 4.75/0.65/2.95
+below min 5.00` and `window width 23.5-28.75 outside [30,120]` (defaults:
+`min_sweep_distance_nifty_points=5.0`,
+`sweep_min_range_width_nifty_points∈[30,120]` —
+`liquidity_sweep_reversal.py`). Real observed values sat **just under**
+both floors, repeatedly, on a real low-volatility day. **One day of
+near-misses isn't proof the floor is wrong** — could just as easily mean
+"correctly no real setup formed today" — but it's a concrete,
+live-evidence-backed hypothesis worth testing against the full historical
+sample rather than assuming either way.
+
+### Group E — LAUNCHED 13:00 UTC / 18:30 IST: entry-gate loosening, motivated by the finding above
+
+5 configs (`phase8_groupe_liquidity_entry.txt`), held at
+`trail_lock_fraction=0.85` (Group C's near-best point, deliberately not the
+single-best 0.90 — avoids overfitting the exit choice to n=22 while testing
+a different axis) and `arm=0.5` unchanged (isolating one lever, same
+discipline as Group A's separate entry/exit tightening for VWAP):
+`min_sweep_distance_nifty_points` 4.0/3.5 (2 configs), `sweep_min_range_
+width_nifty_points` 25.0/20.0 (2 configs), and one combined loosening.
+Running on the VM (129.159.226.106) now, ETA ~18:48 IST (same ~18min shape
+as Group C's 5 configs). **This is the actual next-most-informative test**,
+not the arm-sweep — an untested entry lever with real live motivation beats
+further-diminishing exit-lever tuning.
+
+### Config audit — confirms nothing has been applied to production yet
+
+A separate audit agent confirmed: all 5 conviction strategies are still
+running at the pre-this-session `arm=0.5/lock=0.8` on every leg — none of
+the OI (`arm:0.3,lock:0.85`) or EMA (`arm:0.7`) retunes from earlier today
+have been deployed. `Liquidity_Sweep_Conviction` was already disabled
+(`is_enabled=false`) at 15:46 IST today — consistent with holding it for
+this sweep work, not an accident. Confirmed via code read: a `params` DB
+edit only takes effect at the next `start_strategy` call (construction
+time), never on an already-running instance — any future production update
+needs a stop/restart of the affected strategy, not just a DB edit.
+
+**Nothing applied to production this session** — per explicit instruction,
+backtesting continues before any production decision is made.
+
+---
+
+## 2026-08-31 (~16:50 IST) — Phase 7 ANALYZED: RSI gate hurts (not helps) on VWAP Pullback; Group C results INVALID (new bug: Postgres DB-name truncation collision)
+
+Sweep finished on its own at 10:44 UTC / 16:14 IST (`[master7] Phase 7 ALL
+COMPLETE`), 0 shard failures reported for Groups A/B, all 5 Group C configs
+flagged `HAD SHARD FAILURES`. Results pulled to
+`data/historical/backtest_reports/s6_g7ab_vwap/` and
+`s6_g7c_liquidity_pivot/`, analyzed via `analyze_walkforward.py` (numpy/pandas
+installed into the local `.venv` to run it locally instead of the VM's
+`an_venv` — no other change).
+
+### Group A/B verdict: the RSI 60/40 gate is net-harmful for VWAP Pullback, not net-positive as hypothesized
+
+Full table (n=12-15/config, IS=Nov-Mar, OOS=Apr-Aug 2026, costed):
+
+| config | RSI | entry/exit tightening | n | win% | E/trade | PF | P(mean≤0) |
+|---|---|---|---|---|---|---|---|
+| g7a_base_rsioff | off | none | 15 | 53.3% | **84.0** | 1.50 | **0.248** |
+| g7a_base_rsi60 | 60/40 | none | 14 | 35.7% | -111.7 | 0.63 | 0.773 |
+| g7a_base_rsi65 | 65/35 | none | 14 | 50.0% | -4.0 | 0.98 | 0.534 |
+| g7a_entrytight_rsioff | off | entry | 15 | 46.7% | 69.0 | 1.42 | 0.287 |
+| g7a_entrytight_rsi60 | 60/40 | entry | 13 | 46.2% | -148.0 | 0.48 | 0.840 |
+| g7a_entrytight_rsi65 | 65/35 | entry | 12 | 58.3% | -39.4 | 0.78 | 0.624 |
+| g7a_exittight_rsioff | off | exit | 15 | 53.3% | 23.0 | 1.10 | 0.436 |
+| g7a_exittight_rsi60 | 60/40 | exit | 14 | 28.6% | -165.0 | 0.53 | 0.848 |
+| g7a_exittight_rsi65 | 65/35 | exit | 14 | 42.9% | -95.9 | 0.66 | 0.748 |
+| g7a_bothtight_rsioff | off | both | 15 | 53.3% | 40.6 | 1.21 | 0.377 |
+| g7a_bothtight_rsi60 | 60/40 | both | 13 | 23.1% | -176.3 | 0.46 | 0.869 |
+| g7a_bothtight_rsi65 | 65/35 | both | 12 | 41.7% | -69.5 | 0.67 | 0.710 |
+
+Pattern is consistent across all 4 entry/exit variants: **adding the RSI
+gate always makes E/trade and P(mean≤0) worse**, and 60/40 is worse than
+65/35 in every case. Entry/exit tightening alone (RSI off) also underperforms
+the untouched baseline. **The single best Group A/B config remains
+`v_atr_pcrl` with everything off** — E=84.0, PF=1.50, P(mean≤0)=0.248,
+unchanged from before this session's RSI work. This directly contradicts the
+Phase 6 diagnostic's own prediction (CE/PE RSI-vs-win-rate split) — plausible
+explanation: that diagnostic was run on the raw win/loss population without
+conditioning on VWAP Pullback's own entry gates, and the two don't compose
+the way assumed. **Conclusion: do not ship the RSI gate on VWAP Pullback.**
+
+### Group B verdict: RSI gate does NOT fix the wide-target robustness problem — it's now catastrophic, not just weak
+
+| config | target | RSI | n | win% | E/trade | P(mean≤0) |
+|---|---|---|---|---|---|---|
+| g7b_t50_rsi60 | 0.50 | 60/40 | 14 | 7.1% | -232.7 | 0.916 |
+| g7b_t50_rsi65 | 0.50 | 65/35 | 14 | 7.1% | -333.3 | 1.000 |
+| g7b_tnone_rsi60 | 1.0 (trail-only) | 60/40 | 14 | 0.0% | -391.5 | 1.000 |
+| g7b_tnone_rsi65 | 1.0 (trail-only) | 65/35 | 14 | 7.1% | -333.3 | 1.000 |
+
+Phase 6's original wide-target configs (no RSI) were mediocre — P(mean≤0)
+0.18-0.43. Adding RSI made every one of these **worse**, not better — 3 of 4
+show `P(mean≤0)=1.000` (mean net loss in all 10k bootstrap resamples). Note
+`g7b_t50_rsi65` and `g7b_tnone_rsi65` produced byte-identical trade-level
+stats — the wide/no target never actually mattered because trail
+(activation 0.5/lock 0.8) always closed the trade first; effectively both
+rows tested the same "RSI-gated trail-only exit," not two different target
+widths. **Conclusion: the wide-target idea is dead — do not revisit without
+a fundamentally different exit design, RSI does not rescue it.**
+
+### Group C: results are INVALID — new bug found, not a strategy finding
+
+All 5 configs logged `HAD SHARD FAILURES` with far too few trades to mean
+anything (lock60: **0** trades, lock70: 2, lock80: 3, lock85: 3, lock90: 2 —
+vs. the expected ~15-30 for a full 28-shard run). Root cause confirmed via
+`/tmp/s6_logs/g7c_liquidity_pivot/*_s*.log` on the VM:
+`sqlalchemy.exc.IntegrityError: ... duplicate key ... "trading_bot_backtest_
+s6_g7c_liquidity_pivot_g7c_l_pcrt_lock60_s" already exists` — the
+per-shard Postgres test-database name (`trading_bot_backtest_<db-suffix>`)
+is **64-65 characters**, over Postgres's 63-byte `NAMEDATALEN` identifier
+limit, so **every shard's name (`..._s0` through `..._s27`) silently
+truncates to the identical string**, and all 28 shards race to
+create/use the same one database — collisions, not real failures, and the
+1-3 trades that did land per config came from whichever single shard won
+the race, not a representative sample. Group A/B were unaffected only
+because their shorter names (`s6_g7ab_vwap` + shorter config names) stay
+under 63 chars. **This is a latent bug in the sweep driver's `--db-suffix`
+construction (long group-dir + long config names), not new to Phase 7 —
+any future group with a long dir name + long config name will hit it
+silently again** (log says "HAD SHARD FAILURES" but still reports a
+misleadingly small nonzero trade count instead of erroring loudly).
+
+**Not fixed yet, not rerun.** Fix should shorten/hash the db-suffix (e.g.
+truncate the *group+config* combination or hash it to a fixed short id)
+rather than trying to fit full names under 63 chars by convention. Group C's
+underlying question (which `trail_lock_fraction` is best at the liquidity
+pivot-S1/R1 stop) is **still open** — Phase 6 already found lock=0.8 good
+(P(mean≤0) 0.457→0.250, E ₹14.6→₹92.7); Phase 7 was meant to check
+0.6/0.7/0.85/0.9 around it and cannot answer that yet. Rerun after the fix,
+before the backtest VM (129.159.226.106, paid, terminates night of
+2026-08-31 per `project_backtest_vm_e4_16ocpu_128gb_2026_08_26` memory) goes
+away, or move the rerun to the durable A1 box if this VM is gone first.
+
+### Net effect on the 4 still-open production decisions (unchanged from the entry below)
+
+None of Phase 7's results change any of the 4 open production decisions —
+Group A/B's answer is "don't adopt RSI," a negative result, and Group C is
+inconclusive due to the bug above. See the entry below for the decisions
+themselves.
+
+---
+
+## 2026-08-31 (~15:56 IST) — SESSION HANDOFF: RSI conviction gate built, 2 real bugs fixed, Phase 7 sweep RUNNING (resume here)
+
+**Session paused here at the user's request** — everything below is the
+state to resume from in a fresh session. The VM (129.159.226.106) is left
+running deliberately; only this session's own automatic check-in was
+stopped.
+
+### What's new since the Phase 6 entry (below): a real RSI indicator, built into production
+
+Motivated by real-data diagnostics (see the Phase 6 entry below for the
+methodology) showing CE winners carry materially higher RSI14 than CE
+losers, and PE winners materially lower RSI14 than PE losers — consistent
+on both option types, unlike every other tested discriminator. Built as
+real production code, not backtest-only:
+
+- **`app/modules/market_data/indicators/rsi.py`** — new `RSICalculator`,
+  Wilder-smoothed, identical shape to `ATRCalculator`.
+- **`app/modules/market_data/indicators/engine.py`** — wired into
+  `IndicatorEngine.on_tick`/`on_completed_bar`/`warm_start`, persists as
+  `RSI14` via the exact same generic `updated.items()` → `IndicatorSnapshot`
+  loop every other indicator already uses (zero `ingestion.py` changes
+  needed).
+- **`app/modules/strategy_engine/conviction_gates.py`** — new
+  `require_rsi_alignment` + `rsi_neutral_band` (default 10.0) gate.
+  **Not a flat RSI>50/<50 split** — the real diagnostic data showed losers
+  cluster *near* 50 on both sides (CE-loss median 53.0, PE-loss median
+  46.4), not on the wrong side of a plain line, so a symmetric dead-zone
+  around 50 was built instead: CE requires RSI > 50+band, PE requires RSI <
+  50-band. Default band 10 (→60/40) was chosen, not 15 (→65/35), because
+  65/35 would exclude the real median *winner* on both sides too — the
+  wider band overcorrects. `rsi_neutral_band` is a real, sweepable float
+  param, not hardcoded, specifically to let both be tested rather than
+  guessed at.
+- All 5 `*_conviction` subclasses (`orb`, `vwap_pullback`,
+  `ema_micro_pullback`, `oi_volume_confirmed`, `liquidity_sweep_reversal`)
+  updated to accept and forward both new params — see the bug below for why
+  this step is easy to silently miss in this codebase's pattern.
+- Lint/mypy/pytest all clean (75 passed, 0 failed, no regressions) before
+  any of this was synced anywhere.
+
+### Two real bugs found and fixed while building this (not pre-existing, both self-inflicted, both caught by the smoke test before any real sweep ran)
+
+1. **Every `*_conviction` subclass explicitly re-lists each gate param in
+   its own `__init__`** (not auto-forwarded from `ConvictionGateMixin`,
+   despite what that module's docstring implies about `PARAM_KEYS`
+   unioning — that union only covers API validation, not construction).
+   Adding `require_rsi_alignment` to the shared mixin alone, without
+   updating all 5 concrete subclasses, produced a `TypeError` at strategy
+   construction — which manifested as **every single candidate silently
+   producing 0 trades across 28 shards**, easy to misread as "the gate
+   rejects everything" rather than "the gate crashes everything." Caught
+   by re-adding a temporary debug print and finding the traceback, not by
+   trusting the 0-trades number at face value.
+2. **The backtest VM's `app/` tree hadn't been synced since 2026-08-27** —
+   4 days of real production changes never made it there (only
+   `scripts/run_backtest.py` gets updated per-sweep; `app/` itself is
+   apparently never routinely re-synced). This included the entire
+   "Market Terminal signal panel" feature (`SignalStatus`/
+   `last_signal_status`, added 2026-08-30) that every `*_conviction`
+   subclass's own rejection-handling code already assumes exists — every
+   conviction-gate rejection for ANY strategy (not just the new RSI gate)
+   would have crashed on this same stale VM, it simply happened to never
+   get exercised hard enough to surface before now. **Fixed via a full,
+   clean `tar`-based re-sync of `backend/app/`** (not file-by-file
+   patching) — 20 files differed. Old tree kept briefly as
+   `app.bak-20260831-presync` on the VM, since removed after verifying the
+   fix. **Anyone syncing new strategy/gate code to this VM in the future
+   should re-sync the whole `app/` tree, not just `scripts/run_backtest.py`
+   — this gap will silently recur otherwise.**
+
+Both bugs fully verified fixed via a smoke test (14/15 trades pass the
+60/40 gate on real data, 0 crashes across 28 shards) before Phase 7 below
+was launched.
+
+### Phase 7 — RUNNING, launched 2026-08-31 ~15:47 IST, NOT YET ANALYZED
+
+21 configs, 3 groups, on the VM right now. Master log: `~/s7_master.log`,
+per-config status: `~/s6_status.log` (yes, `s6_status.log` — the generic
+driver's log filename, reused across phases 6 and 7, doesn't reset per
+phase — don't be confused by the name). As of the last check (10:26 UTC /
+15:56 IST): **6 of 21 done, 0 failures**, ~75-215s/config depending on
+group, estimated completion ~16:30-16:45 IST.
+
+- **Group A** (12 configs, dir `s6_g7ab_vwap/g7a_*`): entry-tightened
+  (`min_trend_side_fraction` 0.70→0.85, `max_vwap_crosses_in_lookback`
+  3→1) / exit-tightened (`structure_break_atr_multiplier` 0.15→0.35,
+  `structure_break_persistence_seconds` 6→120) / both-tightened, each ×
+  RSI {off, 60/40 band, 65/35 band}. Base = `v_atr_pcrl` (ATR expansion +
+  PCR-loose, stop=0.10, arm=0.5/lock=0.8) — deliberately no
+  `require_htf_ema_trend` stacked on any of these, per explicit
+  instruction.
+- **Group B** (4 configs, dir `s6_g7ab_vwap/g7b_*`): the wide-target idea
+  from Phase 6 Group 1 (`stop:0.06, target:0.50` and
+  `stop:0.06, target:1.0` i.e. trail-only) combined with RSI {60/40,
+  65/35} — tests whether the RSI filter fixes Group 1's robustness failure
+  (all 8 original wide-target configs had P(mean≤0) 0.18-0.43) by cutting
+  bad-direction losers while the wide target still lets correct-direction
+  winners run.
+- **Group C** (5 configs, dir `s6_g7c_liquidity_pivot/g7c_*`): lock ∈
+  {0.6, 0.7, 0.8, 0.85, 0.9} at liquidity's already-confirmed-good
+  pivot-S1/R1 structure stop (Phase 6 found P(mean≤0) 0.457→0.250,
+  E ₹14.6→₹92.7 at lock=0.8 — this checks whether a different lock
+  improves on that further, same pattern that worked for OI).
+
+### Exact steps to resume in a new session
+
+1. **Check the VM is still alive and see if Phase 7 finished**:
+   ```
+   ssh -i "D:\Documents\Trading Bot_Oracle\ssh-key-2026-08-03_Pvt Key.key" ubuntu@129.159.226.106 "tail -20 ~/s6_status.log; cat ~/s7_master.log"
+   ```
+   Look for `[master7] Phase 7 ALL COMPLETE` in `s7_master.log`. If the VM
+   has been terminated (the user owns termination, no automated
+   backstop — see `project_backtest_vm_e4_16ocpu_128gb_2026_08_26` memory),
+   the sweep is lost and would need relaunching from the config files
+   below, which are safe locally regardless.
+2. **If complete**, pull results:
+   ```
+   scp -i "...key.key" 'ubuntu@129.159.226.106:~/trading-bot/backend/data/historical/backtest_reports/s6_g7ab_vwap/*_current.csv' "C:\Users\drvin\Trading Bot\data\historical\backtest_reports\s6_g7ab_vwap\"
+   scp -i "...key.key" 'ubuntu@129.159.226.106:~/trading-bot/backend/data/historical/backtest_reports/s6_g7c_liquidity_pivot/*_current.csv' "C:\Users\drvin\Trading Bot\data\historical\backtest_reports\s6_g7c_liquidity_pivot\"
+   ```
+3. **Run the walk-forward analysis** (same as every prior phase):
+   `backend/scripts/analyze_walkforward.py` (`FLAT_COST_PER_LOT` already
+   fixed to 10.0 locally) against each group's config names (strip
+   `_current.csv`, comma-join, pass via `--configs`).
+4. **What to look for**, per group — see the full Group A/B/C description
+   above for the exact question each answers. Also compute maxDD/worst-
+   losing-streak for Group A the same way it was done for Phase 6 Group 1
+   (`analyze_walkforward._load` + running-cumsum drawdown), since this is
+   exactly the kind of config (tightened entries, fewer trades) where a
+   good E/PF can still hide a bad tail.
+5. **Local config source files** (durable, VM-independent — copied out of
+   the session scratchpad into the repo itself for exactly this handoff):
+   `backend/scripts/sweep_configs/phase7_configs.txt` and
+   `phase7_groupc_liquidity.txt`. Also present on the VM itself as
+   `~/phase7_configs.txt`/`~/phase7_groupc_liquidity.txt` if needed there
+   directly (e.g. to relaunch).
+
+### Still-open production decisions (unchanged from before this session — nothing has been applied to production yet)
+
+1. OI_Volume_Conviction → `trail_activation_fraction:0.3,
+   trail_lock_fraction:0.85` (all 3 legs) — fully confirmed twice.
+2. EMA_Micro_Conviction / EMA_Micro_Conviction_PCR →
+   `trail_activation_fraction:0.7` — confirmed (PCR variant directly,
+   base variant by strong corroboration).
+3. VWAP_Conviction — still under active research (this session's whole
+   Phase 7). Do not re-park yet; Group A/B may change the picture.
+4. Liquidity_Sweep_Conviction — candidate structure-stop improvement
+   found (pivot_s1r1) but not yet clearing the robustness bar; Group C may
+   settle whether a different lock closes the gap.
+
+Full prior detail: this file's own 2026-08-31 ~10:50 IST (QC + overnight
+read), ~12:10 IST (Phase 5), and ~14:00 IST (Phase 6) entries below, plus
+memory `project_sweep4_conviction_exit_tuning_2026_08_30`.
+
+---
+
+## 2026-08-31 (~12:10 IST) — Sweep #4 Phase 5: follow-up sweep confirms OI arm=0.3/lock=0.85 and settles EMA-PCR
+
+24 new configs, 28-way sharded on the still-alive backtest VM, 86 min,
+**0 shard failures**, launched to answer the two open questions the
+Phase 4 grid + walk-forward re-read (above) raised, plus fill the
+`e3_pdt_atr_pcrl` coverage gap. Config list + driver:
+`~/phase5_configs.txt` / `~/trading-bot/backend/scripts/run_phase5_followup.sh`
+on the VM (copied from `run_phase4_armlock.sh`, `s4p4`→`s4p5`). **Launch
+bug caught immediately**: the driver derives its working directory from
+its own script path (`cd "$(dirname "$0")/.."`), so a copy placed in
+`~/` instead of `~/trading-bot/backend/scripts/` silently `cd`s to the
+wrong directory and every shard fails instantly with "0 trades" — caught
+within seconds (all 24 configs showed `HAD SHARD FAILURES (0s, 0 trades)`),
+fixed by moving the script to the sibling directory `run_phase4_armlock.sh`
+already lived in, relaunched clean.
+
+**Group A — does OI's arm advantage continue below 0.3, and does lock
+beat 0.8?** Tested arm ∈ {0.10, 0.15, 0.20, 0.25} at lock 0.8, and lock ∈
+{0.85, 0.90} at arm 0.3, on the 3 strongest OI variants
+(`o3_atr_pcrl`, `o3_atr_pcrt`, `o3_pdt_atr_pcrt`).
+
+- **Arm 0.30 is a genuine peak, not a grid-edge artifact.** All 3 variants
+  show a clean monotonic rise from arm 0.10 (worst, P(mean≤0) 0.024-0.121)
+  up through 0.30 — combined with the original grid's fall-off above 0.30,
+  this settles the shape as a real peak, not one lucky endpoint.
+  `o3_atr_pcrl`: a10 P=0.121 (marginal) → a15 P=0.025 → a20 P=0.014 →
+  a25 P=0.007 → a30 P=0.047(l80)/0.004(l85).
+- **Lock 0.85 clears real extra headroom over 0.80; 0.90 adds almost
+  nothing past 0.85.** `o3_atr_pcrl` at arm 0.30: P(mean≤0) 0.047 (l80) →
+  **0.004** (l85) → 0.004 (l90, flat). Same "no turning point, but the
+  real gain is at one specific step" shape, not identical to ORB's own
+  ladder (which kept improving smoothly all the way to 0.9) — here the
+  step from 0.80→0.85 is what matters.
+- `o3_atr_pcrt`/`o3_pdt_atr_pcrt` were already excellent at arm 0.30/lock
+  0.80 (P=0.001/0.004) and stay flat-to-marginally-better through 0.85/0.90
+  — confirms these don't regress, doesn't add new information.
+
+**Group B — e3_pdt_atr_pcrl (deployed EMA_Micro_Conviction_PCR gate),
+never arm-tuned before this.** Tested arm ∈ {0.3, 0.6, 0.7} × lock ∈
+{0.6, 0.8}. **Graduates from "thin but marginal" to a clean pass**:
+deployed arm=0.5 sat at P(mean≤0)=0.052 with a *negative* 5th-percentile
+(-1.4, from the earlier walk-forward re-read) — passing one criterion,
+failing the other. At **arm 0.7 / lock 0.8**: n=7, win 71.4%,
+IS E=+397.9 / OOS E=+380.8 (both strongly positive and balanced),
+P(mean≤0)=**0.021**, 5th-pctile=**+59.9** — clears the full bar cleanly.
+Confirms the exact same directional preference (later activation, not
+earlier) already found for its sibling `e_pdt_atr` in the Phase 4 grid
+(P=0.039 at arm 0.7 vs 0.100 at deployed arm 0.5) — the two EMA-family
+configs now corroborate each other, not just themselves. Arm 0.3
+(matching OI's direction) was actually *worse* here (P=0.107-0.115) than
+the deployed arm 0.5 — confirms EMA and OI genuinely run opposite
+directions on this lever, not just "0.3 always wins."
+
+**Revised "what to change" list** (still not actioned — reported for a
+production decision per standing rule to judge against real paper data
+first):
+1. OI_Volume_Conviction → `trail_activation_fraction:0.3,
+   trail_lock_fraction:0.85` (all 3 legs) — now confirmed, not inferred.
+2. EMA_Micro_Conviction_PCR → `trail_activation_fraction:0.7` (lock 0.8
+   unchanged) — now confirmed directly on the deployed gate itself.
+3. EMA_Micro_Conviction → `trail_activation_fraction:0.7` — Phase 4's
+   original finding, now corroborated by its sibling's identical result.
+4. VWAP_Conviction — re-park (deliberately not re-tested in Phase 5; no
+   exit tweak fixes a weak entry, confirmed 3× already).
+5. Liquidity_Sweep_Conviction — re-park (P(mean≤0)=0.457 at every cell
+   tested anywhere).
+
+Full write-up + tables:
+[Sweep 4 Ledger artifact](https://claude.ai/code/artifact/d7d38361-75aa-4412-8fbe-7cedb60706bc)
+(updated same session). Raw data: `wf_p5_results.txt` +
+`s4p5_refinement_20260831T051015Z/*_current.csv`, both pulled to local
+disk (VM data no longer at risk from termination for any of Phase 2-5).
+
+---
+
+## 2026-08-31 (~14:00 IST) — Sweep #4 Phase 6: real-data-motivated follow-ups (VWAP asymmetric exit, OI noise-floor confirmed, structure-stop for vwap/liquidity)
+
+34 configs, 3 independent groups, all launched via a new generic driver
+(`run_phase6_generic.sh`, appends a per-run `EXTRA_BT_ARGS` env var to every
+shard invocation — reused for all 3 groups instead of one-off scripts), 0
+shard failures, ~90min total wall time.
+
+**Real-data correction first (glitch exclusion).** Per explicit instruction,
+excluded two documented incidents before evaluating real paper trades: the
+frozen-VWAP bug (Aug 25-27, VWAP pinned at a stale 24182.8 since TrueData's
+archival broke volume-weighted VWAP — see `project_vwap_frozen_index_no_volume
+_2026_08_27`) and today's option-chain-feed-dead incident (before ~10:10 IST —
+`project_option_chain_feed_dead_fix_2026_08_31`). This **overturned an earlier
+same-day finding**: 15 of the 17 "real" VWAP stop-losses reported earlier were
+inside the glitch window. Clean data: base VWAP net **+₹21,006** over 26 real
+trades (65% win rate), not the murkier picture reported before exclusion. It
+also killed a same-session hypothesis (EMA9-vs-EMA20 trend misalignment
+discriminating CE losers) — on clean data CE losses and CE wins have nearly
+identical trend context (+3.37 vs +3.23 avg spread); the earlier "-7.68"
+signal was entirely a glitch artifact. Dropped that config idea rather than
+launch a test built on contaminated evidence.
+
+**New harness code**: `--min-minutes-before-trail-arm` (default 0.0, smoke-
+tested byte-identical to prior results) — even once the trail's price
+condition is met, require at least N minutes since entry before it can arm.
+A crude noise-filter proxy for the fact this 1-min-bar backtest has no
+intrabar ticks, motivated by the user's own realism concern about arm=0.3.
+
+### Group 1 — VWAP tight-stop/wide-target (8 configs)
+Real-evidence motivated: both of today's real spike trades (11:54/11:56 IST,
+the sharp NIFTY move the user's own chart showed) closed at exactly
+15.00%/15.01% — capped precisely at `target_pct=0.15`, which was **never once
+varied across all of Sweep 4's ~180 VWAP configs** (only `stop_pct` was ever
+swept). Tested `stop_pct` ∈ {0.06, 0.08} × `target_pct` ∈ {0.25, 0.35, 0.50,
+1.0 (trail-only)}, arm/lock held at the confirmed-best 0.5/0.8.
+
+Win rate drops as hypothesized (26.7-40% vs ~50-53% baseline), point
+estimates look attractive (PF 1.20-2.12, all positive E/lot) — **but all 8
+configs fail the walk-forward robustness bar** (P(mean≤0) 0.183-0.426, every
+one above 0.15), with a stark H1-negative/H2-positive regime split (H1 down to
+-432 E/lot, H2 up to +812) — the same "profit concentrated in the back half"
+trap this ledger has flagged since sweep #2. MaxDD is proportionally large at
+n=15 (e.g. `s08_t35`: DD ₹2,920 vs total net only ₹808 — drawdown exceeds
+total profit). Best point estimate: `stop 0.06/target 0.50`, E=250.3, PF=2.12,
+still P=0.183. **Verdict: directionally plausible (win-rate mechanism behaves
+exactly as predicted), not yet proven — n=15 too thin, needs more real data or
+a larger backtest sample before any production change.**
+
+### Group 2 — OI arm-noise-floor (12 configs: 3 strongest OI variants × 1/2/3/5 min)
+Directly answers the realism concern from the arm=0.3 recommendation. Results
+are **essentially unchanged across all 4 thresholds** — P(mean≤0) stays
+0.001-0.005 throughout for every config, E/PF move by <1%. The noise-floor
+gate never binds: real winning trades behind the arm=0.3 edge take longer
+than 5 minutes to reach 30%-of-target, so same-bar/near-instant activation
+isn't actually driving this edge. **Confirms the OI retune isn't exposed to
+the intrabar-whipsaw risk that motivated this test.**
+
+### Group 3 — Structure/S-R stop on vwap_pullback_conviction + liquidity_sweep_reversal_conviction (14 configs: swing {5,10,15,20,30} + pivot_s1r1 + pivot_s2r2, both strategies)
+- **liquidity_sweep_reversal_conviction: floor pivot S1/R1 is a real
+  improvement** over its own default structure level — P(mean≤0)
+  0.457→**0.250**, E ₹14.6→**₹92.7**, PF 1.07→**1.52**. Still short of the
+  0.15 bar but the best result this strategy has produced anywhere in the
+  project. Pivot S2/R2 also helps (P→0.331) but less than S1/R1. Swing
+  lookback 5/10/15 ≈ no change from baseline; 20/30 make it worse.
+- **vwap_pullback_conviction: no structure-stop mode helps at all** — every
+  variant sits within noise of its own or_boundary-equivalent default
+  (P=0.277-0.444 vs baseline 0.270). Confirms "no exit tweak fixes a weak
+  entry" once more, this time for VWAP specifically.
+
+### Files
+`run_phase6_generic.sh` (VM, backend/scripts/), config lists
+`phase6_g{1,2,3}_*.txt`, results pulled locally to
+`data/historical/backtest_reports/s6_g{1,2,3}_*/`, walk-forward output at
+`s4_walkforward_results/wf_s6_*.txt`. `analyze_walkforward.py`'s
+`FLAT_COST_PER_LOT` fix (40→10) from earlier today still in effect.
+
+---
+
+## 2026-08-31 (~10:50 IST) — Sweep #4 QC + overnight results READ (walk-forward pass + Phase 4 arm×lock grid pulled off the VM before termination)
+
+**Data recovery.** VM (129.159.226.106) was still reachable this morning
+(04:54 UTC / ~10:24 IST). Pulled both `wf_p2_results.txt`/`wf_p3_results.txt`
+and all 144 Phase-4 merged `*_current.csv` files to local disk
+(`data/historical/backtest_reports/s4_walkforward_results/`,
+`.../s4p4_refinement_20260830T201059Z/`) before anything could be lost to the
+VM's termination. `analyze_walkforward.py`'s `FLAT_COST_PER_LOT` fixed
+locally 40→10 (was already corrected on the VM for wf_p2/wf_p3, confirmed
+from their own header line) before re-running it locally against the Phase 4
+CSVs to produce `wf_p4_results.txt` (144 configs, same IS/OOS/bootstrap/
+slippage methodology).
+
+**QC verdict on the 2026-08-30/31 shortlist and deploy decision.** The
+sweep's *methodology* through Phase 3 was sound and genuinely self-
+correcting — the robustness reality-check that overturned 3 of 4 raw
+"winners" once real costs were applied, and the stop-pinning transcription
+catch before Phase 3 launched, are real QC, not rubber-stamping. But **the
+2026-08-31 ~01:24 IST deploy decision was made one filter short of the
+sweep's own stated robustness bar**: `analyze_walkforward.py` (IS/OOS,
+both halves, bootstrap P(mean≤0)≤0.15, non-negative 5th-percentile) had
+been *launched* against all 138 Phase 2+3 configs but its results sat
+unread on the VM at deploy time. Re-checking the 5 deployed entry gates
+against that bar, now that it's been read:
+
+| deployed config | n | P(mean≤0) | 5th-pctile | IS / OOS | verdict |
+|---|---|---|---|---|---|
+| `o3_atr_pcrl` (OI, lock 0.8) | 14 | **0.047** | **+5.4** | +142.6 / +395.6 | **clears the bar** |
+| `e_pdt_atr` (EMA, lock 0.8) | 12 | 0.100 | -52.7 | +47.9 / +310.7 | borderline (IS thin, win 50%) |
+| `e3_pdt_atr_pcrl` (EMA-PCR) | 7 | 0.052 | -1.4 | +242.2 / +314.3 | thin but clean, not a mirage |
+| `v_atr_pcrl` (VWAP, all 3 legs) | 15 each | **0.21–0.39** | -102 to -189 | H1-neg/H2-pos on every leg | **fails** |
+| `l_pcrt` (Liquidity, lock 0.8) | 22 | **0.457** | -203.9 | +10.5 / +20.5 | **fails — coin-flip** |
+
+VWAP_Conviction and Liquidity_Sweep_Conviction — 2 of the 5 deployed
+strategies — do not clear the bar this project holds every other strategy
+to (same bar `d_pdt_w65` had to clear before being called more than
+"paper-test worthy"). Blast radius was correctly bounded (`force_paper`,
+paper-only), but the walk-forward pass exists specifically to catch a
+VWAP/Liquidity-shaped false positive before it reaches even paper trading,
+and reading it a day late meant it didn't.
+
+**Real, actionable finding from the Phase 4 arm×lock grid (144 configs,
+locally re-scored).** `trail_lock_fraction 0.8 > 0.7 > 0.6` replicates
+cleanly at every `trail_activation_fraction` tested, across all 10 covered
+configs — the wick-cushion worry that motivated this grid isn't a real
+cost in this data. But **arm timing matters far more than lock, and OI's
+deployed arm is not the best one**: all 5 tested `oi_volume_confirmed_
+conviction` variants (`o3_atr_pcrl`, `o3_atr_pcrt`, `o3_pdt_atr_pcrt`,
+`o_pcrl`, `o_pcrt`) show the identical shape — activating the trail at
+`trail_activation_fraction:0.3` (30% of target) is dramatically more
+robust than the deployed 0.5:
+
+| arm | win% | E/lot | IS E | OOS E | P(mean≤0) |
+|---|---|---|---|---|---|
+| **0.30** (untested at deploy) | 71.4% | +270.9 | +204.4 | +337.3 | **0.004** |
+| 0.40 | 64.3% | +203.8 | +78.1 | +329.6 | 0.076 |
+| 0.50 (deployed) | 64.3% | +269.1 | +142.6 | +395.6 | 0.047 |
+| 0.60 | 57.1% | +165.0 | -127.2 | +457.2 | 0.203 |
+| 0.70 | 57.1% | +218.9 | -80.7 | +518.5 | 0.157 |
+
+(all at lock 0.8). Mechanism: past arm≈0.5, IS expectancy flips sharply
+negative while OOS keeps climbing — the same "OOS-flattered" shape this
+ledger's sweep #2 write-up already distrusts. Arm 0.3 is the one point
+where both halves are solidly positive — and it repeats independently
+across all 5 oi_volume_confirmed variants in the grid, not one lucky
+config. **`ema_pdt_atr` runs the opposite direction** — only arm
+0.7/lock 0.8 clears the bar cleanly (P(mean≤0)=0.039); arm 0.3/0.4 stay
+marginal, consistent with `e_pdt_atr`'s own borderline verdict above.
+**`vwap_pullback` (`v_atr`/`v_pdt`) and `liquidity_sweep_reversal`
+(`l_pcrt`) fail at every one of their combined 36 grid cells** — no
+arm/lock combination rescues either; the exit-tuning lever is exhausted
+for both, not just under-tuned.
+
+**Coverage gap found while cross-checking.** `e3_pdt_atr_pcrl` and
+`v_atr_pcrl` — the actual deployed gates for EMA_Micro_Conviction_PCR and
+VWAP_Conviction — were never among the 12 configs carried into the Phase 4
+arm×lock grid (that used `e3_atr_pcrl` and `v_atr`/`v_pdt` instead, related
+but not identical configs). Both do have Phase-3 walk-forward coverage
+(the table above), but neither has ever been tested at any
+`trail_activation_fraction` besides the deployed default — the arm-tuning
+finding above cannot be applied to them without a dedicated run.
+
+**What to change, in order** (not yet actioned — reported here for a
+production decision, per the standing rule that changes are judged against
+real paper data first, not backtest alone):
+1. Re-tune OI_Volume_Conviction's `trail_activation_fraction` 0.5→0.3
+   (all 3 legs, keep lock 0.8) — the strongest, most-repeated finding in
+   the dataset, upside on an already-good strategy, not a rescue.
+2. Consider re-tuning EMA_Micro_Conviction's arm 0.5→0.7 — same direction
+   its own borderline verdict already hinted at; run a dedicated
+   confirmation first (inferred from a related config family, not a
+   config-identical grid cell).
+3. Re-park VWAP_Conviction formally — every variant tested anywhere in
+   Phase 2/3/4 fails; the conviction-gate layer did not change this
+   strategy's outcome the way it did for the other three.
+4. Re-park Liquidity_Sweep_Conviction formally, not just flag as weakest —
+   P(mean≤0)=0.457 at every grid cell is statistically indistinguishable
+   from no edge.
+5. Run the missing Phase-4-equivalent grid for `e3_pdt_atr_pcrl` and
+   `v_atr_pcrl` if either strategy is kept running.
+
+Full write-up, per-strategy verdict cards, and the complete arm×lock table:
+[Sweep 4 Ledger artifact](https://claude.ai/code/artifact/d7d38361-75aa-4412-8fbe-7cedb60706bc)
+(updated same session). Raw data now safe locally regardless of the VM's
+fate: `wf_p2_results.txt`, `wf_p3_results.txt`, `wf_p4_results.txt` (new),
+144 Phase-4 trade CSVs.
+
+---
+
 ## CANONICAL RELIABLE-BACKTEST SETUP (read this first — don't rediscover it)
 
 **The one invocation that gives trustworthy numbers** (per-strategy sharded,
@@ -76,6 +1088,250 @@ IS *and* OOS *and* both 6-month halves; bootstrap P(mean≤0) ≤ ~0.15 with a
 non-negative 5th-percentile; survives 1.0%/side slippage; expiry-week sign
 test as supporting (not decisive — n is small). At n≈20–40, every pass is
 "paper-trade to collect live data", never "deploy".
+
+---
+
+## 2026-08-30 (11:26 IST → ongoing, ~23:22 IST as of this entry) — Sweep #4: conviction-gates + exit-tuning for the 4 non-ORB strategies (vwap_pullback, ema_micro_pullback, oi_volume_confirmed, liquidity_sweep_reversal)
+
+**Context.** Sweep #3 (2026-08-28/29) already re-tested all 4 non-ORB
+strategies on the canonical setup and found them still net losers after
+tightening each strategy's own *native* params — verdict was "permanent
+park, all four." Never tried on these 4: the cross-cutting conviction-gate
+layer (`ConvictionGateMixin`, day-trend/VIX/ATR-expansion/volume-surge/
+HTF-EMA/PCR-band/day-of-week) that already rescued ORB. This sweep ports
+that layer, adds 4 new strategy-specific "native" params, then runs
+entry-conviction → exit-tuning → lock-fraction refinement, same
+entries-first-then-exits shape ORB's own sweep #3 used. **VM
+(129.159.226.106) terminates the night of 2026-08-31 — this sweep is
+scoped to that deadline.**
+
+### Code built (all merged, tested, `ruff`/`mypy` clean before syncing)
+- `strategy_engine/conviction_gates.py` — `ConvictionGateMixin` extracted
+  from `orb_conviction.py`, generalized to take an explicit `option_type`
+  (the other 4 strategies already know direction before finalizing a
+  proposal, unlike ORB). `orb_conviction.py` itself refactored onto the
+  mixin (byte-identical, its own test suite re-run unchanged).
+- 4 new subclasses, same shape as `orb_conviction.py`:
+  `vwap_pullback_conviction.py`, `ema_micro_pullback_conviction.py`,
+  `oi_volume_confirmed_conviction.py`, `liquidity_sweep_reversal_conviction.py`.
+  `oi_volume_confirmed` needs the same `_fired_directions.discard()` undo
+  ORB needs (it latches direction before the gate sees the proposal); the
+  other 3 don't latch, so a gate rejection is just `return None`.
+- **Real bug fixed while wiring the direction lookup**: `OptionContract
+  .option_type` is `Mapped[OptionType]` but backed by plain `String(2)`
+  (no SQLAlchemy Enum type) — a freshly-queried row returns a raw `str`,
+  silently breaking every `is OptionType.CE/PE` identity check. Fixed via
+  `OptionType(contract.option_type)` normalization in all 4 subclasses
+  (idempotent either way).
+- 4 new strategy-specific "native" params, one per strategy, each `0`/
+  `False` by default = byte-identical to the base strategy:
+  `min_bars_since_open` (vwap — VWAP-band session-open warm-up),
+  `min_ema_spread_atr_ratio` (ema — ADX-substitute trend-strength filter,
+  `|EMA9-EMA20|/ATR14`), `require_oi_price_alignment` +
+  `oi_alignment_lookback_bars` (oi — PCR-slope proxy for real temporal OI
+  buildup, since per-contract OI history isn't tracked anywhere today),
+  `min_displacement_atr` (liquidity — ICT-style confirmation-bar body/ATR
+  displacement filter).
+- Registered in `api/v1/strategies.py` (4 new `*_PARAM_KEYS` + 4
+  `_build_strategy` branches + `KNOWN_STRATEGY_TYPES`) and
+  `run_backtest.py`'s `STRATEGY_TYPES` CLI choices.
+
+### Phase 1 — single-gate entry sweep (~10 configs/strategy, base exit config)
+Confirms **ATR expansion is the standout single lever**: `o_atr` PF 1.66,
+`o_pdt_atr` PF 2.41, `e_pdt_atr` PF 2.06 (n=12) — vs `o_pdt`/`e_pdt`/`l_pdt`
+alone all net losers (PF 0.74–0.77). Non-obvious interaction found here and
+confirmed in every later round: **`prior_day_trend` is a loser alone for
+oi/ema but a real winner stacked with ATR expansion.** `l_atr` alone is a
+clear loser for liquidity specifically (PF 0.63, n=38) — the one strategy
+where ATR does NOT help, unlike the other 3. `v_atr`/`v_pdt` were the only
+two live signals for vwap (PF ~1.03–1.18); `v_pdt_atr` combined was worse
+(PF 0.93) — stacking hurts vwap, unlike oi/ema.
+
+### Phase 1.5 (mix-and-match) + Round 3 (untested double/triple combos)
+16 configs stacking each strategy's best Phase-1 gate with its new native
+param; 8 configs testing untested PDT/ATR/PCR-tight/PCR-loose combos for
+oi + ema specifically. **The 4 new native params were mostly a bust in
+isolation** — `min_bars_since_open`, `min_ema_spread_atr_ratio`,
+`min_displacement_atr` all net negative, worse than the shared gates
+alone. `require_oi_price_alignment` (oi) showed a positive signal only
+combined with other gates (`o15_align5`), not decisively on its own.
+
+### Robustness reality-check (real costs) — overturned 3 of 4 raw "winners"
+Running the raw-PnL Phase 1/1.5 "champions" through the real cost model
+(flat ₹40/lot + 0.04% turnover + 0.1% STT, **no slippage yet**) flipped
+**3 of 4 to net losers** — only `oi_volume_confirmed`'s best config
+survived as a borderline (not clean-pass) candidate. This is why exit
+tuning ran on a much broader win_rate≥50% pool (below), not just the
+raw-PnL leaderboard — raw PnL alone was actively misleading at this n.
+
+### Phase 2 — exit-tuning (102 configs: 34 qualifying entry configs ×
+3-point stop grid, `trail_lock_fraction` fixed 0.6, `trail_activation_fraction`
+fixed 0.5). Entry pool = every config from Phase 1/1.5/Round 3 with
+win_rate≥50% (content-hash deduped — 2 exact duplicates removed). Result
+dir: `s4p2_exittuning_20260830T104615Z`, 310min, 0 shard failures.
+
+**Cost-adjusted results by strategy** (net of flat ₹40/lot + 0.04% + 0.1%
+STT, no slippage — see the ₹5/order Shoonya-brokerage correction below,
+which means real costs are actually *lower* than what these numbers
+assume, i.e. every figure here understates real net PnL):
+
+| strategy | best cohorts (n, PF range, all 3 stops) | verdict |
+|---|---|---|
+| oi_volume_confirmed | `o3_atr_pcrl` (n=14, PF 1.9–3.9), `o3_atr_pcrt` (n=8, PF 2.5–4.0), `o3_pdt_atr_pcrt` (n=7, PF 2.2–3.4), `o_pdt_atr` (n=16, PF 1.3–2.4), `o_pcrl` (n=23, PF 1.3–1.9), `o_pcrt` (n=11, PF 1.8–2.4) | **strongest — 6 cohorts, PF>1.8 consistently across ALL 3 stops (real robustness signal)** |
+| ema_micro_pullback | `e_pdt_atr` (n=12, PF 2.1–3.1), `e3_atr_pcrl` (n=10, PF 2.4–2.9, stop-insensitive) | real, smaller sample |
+| vwap_pullback | `v_pdt` (n=16, PF 1.20 @ 0.10), `v_atr` (n=16, PF 1.17 @ 0.08) | marginal at best |
+| liquidity_sweep_reversal | `l_pcrt` (n=22, PF 1.20 @ max stop only) | **no robust winner — re-confirms sweep #3's "permanent park"** |
+
+`e3_atr_pcrt`/`e3_pdt_atr_pcrt` showed PF 6.6/8.1 but n=4–5 — flagged as
+statistical mirages, not chased.
+
+**Cross-strategy insight**: ATR expansion appears in every genuine winner
+across all 4 strategies — the single most consistently valuable lever,
+matching ORB's own `d_pdt_w65` precedent (volatility-regime gating > any
+strategy's own setup logic).
+
+### Cost-model correction (2026-08-30, ~23:00 IST)
+**Shoonya's real brokerage is ₹5/order flat = ₹10/round-trip (entry+exit),
+not the ₹40/lot `FLAT_COST_PER_LOT` constant `analyze_walkforward.py` /
+`analyze_conviction_sweep.py` currently assume.** Every net-PnL figure
+computed so far (Phase 2 table above, all of sweep #3) is understating
+real profitability — apply the corrected ₹10 flat cost (keep the
+proportional-turnover + STT components, which model real exchange
+charges, unchanged) in the final walk-forward robustness pass on whatever
+shortlist survives Phase 3, and correct the shared constant itself before
+any future sweep reuses it.
+
+### Phase 3 — refinement (36 configs, IN PROGRESS as of this entry, ~69%
+done, 0 failures, disk stable ~91G free). Two parts, launched
+`s4p3_refinement_20260830T164757Z`:
+1. **Trail-lock bracket** (0.4, 0.8 — reusing existing 0.6 data) on the 12
+   strongest candidates across all 4 strategies (6 oi + 2 ema + 2 vwap + 2
+   liquidity — the last 2 included per explicit instruction to keep testing
+   the weaker strategies too, despite liquidity having no real winner yet).
+2. **4 new untested triple/pair combos**, full 3-stop bracket at lock=0.6:
+   `e3_pdt_atr_pcrl`, `o3_pdt_atr_pcrl` (pdt+atr+PCR-loose — motivated by
+   the Phase-1 finding that pdt only helps ema/oi when stacked with ATR),
+   `v_atr_pcrl`, `v_atr_pcrt` (vwap's only working single gate, atr, never
+   stacked with either PCR band before).
+
+**QC catch before/during launch (real, worth recording as a process
+lesson)**: a cross-check script comparing the Phase 3 config file against
+the actual authoritative Phase 2 CSV data (not my own condensed recap
+tables) found **4 real stop-pinning errors** — `o3_atr_pcrt`,
+`o3_pdt_atr_pcrt`, `o_pcrt` were pinned to the wrong (worse) stop, `l_pcrt`
+likewise. Root cause: I'd condensed 3-row per-cohort tables into a single
+range string in chat and silently assumed stop-ascending order matched
+PnL-ascending order, which was false for these 4. **Always cross-check a
+condensed summary table against the raw per-variant data before turning it
+into a new sweep's input** — a launched-then-caught version of this wasted
+~14 min of VM time (2 wrong configs already run); caught before the
+remaining 6 wrong configs launched. Killed, reaped orphaned DBs, fixed,
+re-verified via the same script (0 mismatches), relaunched clean.
+
+### Phase 3 results (completed 2026-08-30 18:31:37Z / 00:01 IST, 36 configs,
+103min, 0 failures) — a real QC catch first: a cross-check against the
+authoritative Phase 2 CSV data (not my own condensed recap tables) found 4
+stop-pinning transcription errors (`o3_atr_pcrt`, `o3_pdt_atr_pcrt`,
+`o_pcrt`, `l_pcrt` pinned to the wrong stop) baked into the first launch —
+caught after only 2 wrong configs had run (~14min wasted), killed, fixed,
+re-verified, relaunched clean. **Lesson: always cross-check a condensed
+chat summary against raw per-variant data before turning it into a new
+sweep's input.**
+
+**Universal finding: `trail_lock_fraction 0.8 > 0.6 > 0.4`, zero exceptions
+across all 12 directly-tested lock-refinement configs**, drawdown flat or
+slightly better at 0.8. Same wick-cushion caution as ORB's own `d_pdt_w65`
+precedent (backtest's synthetic spread can't see real fill slippage on a
+tighter trail) — deployed at 0.8 per the backtest signal, but paper-tested
+for a few days before fully trusting it; see the "Deployed to production"
+section below.
+
+Top picks (best PnL / best-optimized / highest win-rate / lowest-drawdown,
+full table in that day's chat, not reproduced here): `o3_atr_pcrl` (oi,
+n=14, PF 3.95 @ lock 0.8) is the single best candidate; `o3_pdt_atr_pcrl`
+(new triple-combo, n=13, PF 3.54) and `v_atr_pcrl`/`v_atr_pcrt` (new vwap
+combos, n=15, roughly tripled vwap's prior best PnL) were genuine new
+discoveries this round; `l_pcrt` (liquidity) improved to PF 1.25 but
+remains the weakest of the 4 strategies by a wide margin.
+
+### Deployed to production for paper testing (2026-08-31 ~01:24 IST)
+**5 new `strategy_configs` rows live on OCI** (`144.24.137.112`), all
+`runtime_mode=force_paper`, `NIFTY`, `qty_lots=10`, auto-spawned via the
+09:00 IST `DailyBootstrapScheduler` and confirmed `scanning` as of
+2026-08-31 08:26 IST:
+
+| Name | strategy_type | Entry gate | Exit structure |
+|---|---|---|---|
+| `OI_Volume_Conviction` | oi_volume_confirmed_conviction | `o3_atr_pcrl` (ATR expansion + PCR-loose 0.4–2.5) | 3-leg multi-leg exit (0.4/0.3/0.3 lots): stop 0.11/0.17/0.09, all lock 0.8 |
+| `EMA_Micro_Conviction` | ema_micro_pullback_conviction | `e_pdt_atr` (prior-day-trend + ATR expansion) | 3-leg: stop 0.12/0.06/0.08, lock 0.8 |
+| `EMA_Micro_Conviction_PCR` | ema_micro_pullback_conviction | `e3_pdt_atr_pcrl` (pdt+atr+PCR-loose, PF 4.75 but n=7) | 3-leg: stop 0.06/0.08/0.12, lock 0.8 |
+| `VWAP_Conviction` | vwap_pullback_conviction | `v_atr_pcrl` (ATR expansion + PCR-loose) | 3-leg: stop 0.08/0.10/0.15, lock 0.8 |
+| `Liquidity_Sweep_Conviction` | liquidity_sweep_reversal_conviction | `l_pcrt` (PCR-tight 0.7–1.3) | single-leg, stop 0.16, lock 0.8 (only 1 of 3 tested stops was profitable — no forced multi-leg split) |
+
+Every multi-leg leg carries `use_structure:true` (preserves the
+structure-break exit path — a real, frequent exit reason in every backtest
+— which the multi-leg engine otherwise silently drops per-leg) and
+`trail_activation_fraction:0.5`. Where a specific stop×lock pairing wasn't
+directly Phase-3-tested, lock 0.8 was extrapolated from the universal
+finding above (flagged per-leg in the original chat table, not reproduced
+here). Frontend: 4 new strategy types exposed (`StrategyType`,
+`friendlyLabel`, `PRIMARY_STRATEGY_TYPES` positions 7–10, Create-form
+dropdown); `synthetic` archived from all 3 lists (its one DB row was
+already disabled — zero live impact). Deploy record:
+`docs/ops/oci_deploy_authorization.md`'s 2026-08-31 ~01:24 IST entry
+(commits `51f8d77` code + `d4cf6c4` docs). QC before deploy: all 5 rows
+dry-run constructed via the real `_build_strategy` + `validate_exit_leg_templates`
+— 0 errors.
+
+### Cost-model constant corrected (2026-08-31, before the overnight run)
+`FLAT_COST_PER_LOT` changed **40.0 → 10.0** in both `analyze_walkforward.py`
+and `analyze_conviction_sweep.py` on the VM (matches Shoonya's real ₹5/order
+flat × 2 legs) — every net-PnL figure computed before this point across
+sweep #3 and sweep #4 understated real profitability; anything computed
+after this point uses the correct figure.
+
+### Walk-forward robustness pass (2026-08-31, existing-data analysis, no
+VM compute) — run against **all 138 configs** across both Phase 2
+(`s4p2_exittuning_20260830T104615Z`, 102 configs) and Phase 3
+(`s4p3_refinement_20260830T164757Z`, 36 configs) result directories, with
+the corrected ₹10 cost. Output saved, **not yet analyzed**:
+`backend/scripts/BACKTEST_LEARNINGS.md`-adjacent
+`data/historical/backtest_reports/s4_walkforward_results/{wf_p2_results.txt,wf_p3_results.txt}`
+on the VM (129.159.226.106) — pull these back before the VM terminates
+tonight (2026-08-31, ~05:30 IST Sep 1).
+
+### Phase 4 — trail_activation_fraction × trail_lock_fraction grid
+(completed 2026-08-31 03:50:45Z / 09:20 IST, 144 configs, 459min ≈ 7.65hr,
+**0 failures**), the deferred arm-sweep now finally run since this is the
+VM's last night. On the same 12 strongest candidates from Phase 3 (pinned
+at each one's established best stop): `trail_activation_fraction ∈
+{0.3, 0.4, 0.6, 0.7}` × `trail_lock_fraction ∈ {0.6, 0.7, 0.8}` = 12 new
+combos/config (arm=0.5 already covered by Phase 1-3; lock=0.4 dropped from
+this grid since Phase 3 already showed it's consistently worst). Directly
+answers the "is 0.6 or 0.8 the right lock, given the wick-cushion risk"
+question the deployed strategies are running at 0.8 without full
+confirmation on. Results at
+`data/historical/backtest_reports/s4p4_refinement_20260830T201059Z/` on
+the VM — **not yet analyzed**.
+
+### Not yet done / planned next
+1. **Pull and analyze both the walk-forward robustness results and the
+   Phase 4 arm×lock grid** — the actual remaining gate before anything
+   here can be called more than "paper-test worthy." Do this before the
+   VM terminates tonight (2026-08-31 ~05:30 IST Sep 1) since the raw CSVs
+   disappear with it — the two `.txt` result files and the Phase 4 CSVs
+   are the priority to retrieve first.
+2. Based on the arm×lock grid: decide whether the 5 live production
+   configs' `trail_lock_fraction=0.8` should move to 0.6/0.7, or whether
+   0.8 holds up — cross-reference against a few days of real paper
+   performance (chart-level eyeball), not backtest alone, per explicit
+   user instruction 2026-08-31.
+3. `liquidity_sweep_reversal` stays the weakest of the 4 — reconsider
+   formally re-parking it if the paper run does't improve on Phase 3's
+   marginal PF 1.25.
+4. VM (129.159.226.106) terminates tonight — this is the last chance to
+   pull any raw CSV/result data off it. After that, only the already-saved
+   summary tables/analysis in this file and the project memory survive.
 
 ---
 

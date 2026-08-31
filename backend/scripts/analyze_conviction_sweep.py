@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-FLAT_COST_PER_LOT = 40.0  # brokerage (2 legs) + GST, approx, INR
+FLAT_COST_PER_LOT = 10.0  # Shoonya real brokerage: Rs5/order flat x2 legs (round-trip), corrected 2026-08-31
 PROPORTIONAL_RATE = 0.0004  # exchange txn + stamp + SEBI, fraction of (entry+exit) premium
 STT_RATE = 0.001  # sell-side STT, fraction of exit premium
 

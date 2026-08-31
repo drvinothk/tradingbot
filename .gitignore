@@ -62,3 +62,6 @@ backend/data/
 
 # Claude
 .claude/settings.local.json
+
+# Backtest engine bundle (424M archive + pinned app snapshot; movable to A1)
+backtest_engine/

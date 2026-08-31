@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-FLAT_COST_PER_LOT = 40.0
+FLAT_COST_PER_LOT = 10.0  # Shoonya real brokerage: Rs5/order flat x2 legs (round-trip)
 PROPORTIONAL_RATE = 0.0004
 STT_RATE = 0.001
 _SYM_RE = re.compile(r"^[A-Z]+?(\d{2})(\d{2})(\d{2})(\d+)(CE|PE)$")

@@ -227,6 +227,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import sys
 import uuid
@@ -370,9 +371,13 @@ STRATEGY_TYPES = (
     "orb_conviction",
     "atr_breakout",
     "vwap_pullback",
+    "vwap_pullback_conviction",
     "ema_micro_pullback",
+    "ema_micro_pullback_conviction",
     "oi_volume_confirmed",
+    "oi_volume_confirmed_conviction",
     "liquidity_sweep_reversal",
+    "liquidity_sweep_reversal_conviction",
 )
 
 # Synthetic spread/depth proxy (2026-08-23, see module docstring's "Known,
@@ -813,6 +818,9 @@ class HistoricalBrokerAdapter(BrokerPort):
 # ---------------------------------------------------------------------------
 
 
+_PG_IDENTIFIER_LIMIT = 63  # Postgres NAMEDATALEN=64, i.e. 63 usable chars
+
+
 def _backtest_db_name(suffix: str) -> str:
     """`suffix` (default: `--strategy`, see `main()`) keeps concurrent runs
     of this script fully isolated -- 2026-08-23, found live: `main()` does
@@ -823,8 +831,25 @@ def _backtest_db_name(suffix: str) -> str:
     in-progress tables out from under it. A suffixed, per-run database name
     makes that structurally impossible rather than relying on "don't run
     two at once" discipline.
+
+    A long `suffix` (e.g. a sweep driver's `<group>_<config>_s<shard>`) can
+    push the full name past Postgres's 63-char identifier limit -- found
+    live 2026-08-31 (Phase 7 Group C): every shard of 5 configs produced
+    the same >63-char name, which Postgres silently truncated to one
+    identical string, so all 28 shards per config collided onto a single
+    database and corrupted every one of those configs' results (0-3 trades
+    survived instead of ~15-30, whichever shard won the CREATE DATABASE
+    race). Suffixes that would overflow are shortened to a short
+    human-readable head plus a content hash of the *full* suffix, so
+    distinct suffixes (distinct shard indices included) can never collide.
     """
-    return f"{get_settings().db.name}_backtest_{suffix}"
+    prefix = f"{get_settings().db.name}_backtest_"
+    budget = _PG_IDENTIFIER_LIMIT - len(prefix)
+    if len(suffix) <= budget:
+        return f"{prefix}{suffix}"
+    digest = hashlib.sha1(suffix.encode()).hexdigest()[:8]
+    head = suffix[: budget - len(digest) - 1]
+    return f"{prefix}{head}_{digest}"
 
 
 def _backtest_database_url(suffix: str) -> str:
@@ -1515,6 +1540,7 @@ def _reconstruct_exit_current(
     max_loss_per_lot: float | None = None,
     time_stop_minutes: float | None = None,
     structure_level_override: float | None = None,
+    min_minutes_before_trail_arm: float = 0.0,
 ) -> ReconstructedTrade:
     """`--exit-mode current` (2026-08-27) — the faithful default, replacing
     `legacy` as `main()`'s own CLI default while `legacy` itself stays
@@ -1740,11 +1766,20 @@ def _reconstruct_exit_current(
         # docstring for the exact limitation.
         favorable_extreme = high if favorable else low
         unfavorable_extreme = low if favorable else high
-        activated = (
+        price_condition_met = (
             favorable_extreme >= activation_price
             if favorable
             else favorable_extreme <= activation_price
         )
+        # 2026-08-31 follow-up: optionally require a minimum hold time
+        # before the trail can arm at all, even if the price condition is
+        # already met — a crude noise-filter proxy for the fact that this
+        # 1-min-bar backtest has no intrabar ticks, so it can't otherwise
+        # tell a genuine early move from a same-bar spike-then-reversal
+        # that a live tighter arm would be exposed to. 0.0 (default) =
+        # byte-identical to before this change.
+        elapsed_minutes = (bar.ts - entry_time).total_seconds() / 60
+        activated = price_condition_met and elapsed_minutes >= min_minutes_before_trail_arm
         if activated:
             gain_beyond = (
                 (favorable_extreme - activation_price)
@@ -2293,6 +2328,7 @@ def _run_single_backtest(
     strategy_params: dict[str, object] | None = None,
     structure_stop_mode: str = "or_boundary",
     swing_lookback: int = 10,
+    min_minutes_before_trail_arm: float = 0.0,
 ) -> tuple[dict[str, list[ReconstructedTrade]], int, Counter[str], int]:
     """One expiry's full seed -> replay -> risk-outcome -> exit-reconstruction
     pass — the exact single-run body `main()` used to run inline, now
@@ -2631,6 +2667,7 @@ def _run_single_backtest(
                             max_loss_per_lot=getattr(strategy_obj, "max_loss_per_lot", None),
                             time_stop_minutes=getattr(strategy_obj, "time_stop_minutes", None),
                             structure_level_override=structure_level_override,
+                            min_minutes_before_trail_arm=min_minutes_before_trail_arm,
                         )
                     )
                     continue
@@ -2849,6 +2886,16 @@ def main() -> None:
         "--swing-lookback", type=int, default=10,
         help="Only for --structure-stop-mode swing: how many prior underlying 1-min bars the "
         "swing low/high is taken over. Default 10.",
+    )
+    parser.add_argument(
+        "--min-minutes-before-trail-arm", type=float, default=0.0,
+        help="`--exit-mode current` only (2026-08-31). Even once the trail's own "
+        "trail_activation_fraction price condition is met, require at least this many minutes "
+        "since entry before the trail can actually arm. A crude noise-filter proxy for the fact "
+        "that this backtest has no intrabar ticks (1-min bars only), so a very low "
+        "trail_activation_fraction can't otherwise be distinguished from arming on a same-bar "
+        "spike that a live position's real intrabar volatility would be exposed to. Default 0.0 "
+        "= byte-identical to before this flag existed.",
     )
     parser.add_argument(
         "--pairs", default=None,
@@ -3108,6 +3155,7 @@ def main() -> None:
                     target_multiplier=args.target_multiplier,
                     structure_stop_mode=args.structure_stop_mode,
                     swing_lookback=args.swing_lookback,
+                    min_minutes_before_trail_arm=args.min_minutes_before_trail_arm,
                 )
                 total_risk_rejected += rejected
                 total_risk_rejected_reasons.update(reasons)
@@ -3182,6 +3230,7 @@ def main() -> None:
                 target_multiplier=args.target_multiplier,
                 structure_stop_mode=args.structure_stop_mode,
                 swing_lookback=args.swing_lookback,
+                min_minutes_before_trail_arm=args.min_minutes_before_trail_arm,
             )
             total_risk_rejected += rejected
             total_risk_rejected_reasons.update(reasons)
@@ -3231,6 +3280,7 @@ def main() -> None:
                 target_multiplier=args.target_multiplier,
                 structure_stop_mode=args.structure_stop_mode,
                 swing_lookback=args.swing_lookback,
+                min_minutes_before_trail_arm=args.min_minutes_before_trail_arm,
             )
         )
 

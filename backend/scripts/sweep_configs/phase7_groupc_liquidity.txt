@@ -1,0 +1,8 @@
+# Group C: liquidity pivot-S1/R1 lock refinement (5) -- run 5x, one per
+# lock value, using run_phase6_generic.sh's EXTRA_BT_ARGS pattern for the
+# structure-stop-mode flag (fixed across all 5), varying lock in the params.
+g7c_l_pcrt_lock60|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.6}
+g7c_l_pcrt_lock70|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.7}
+g7c_l_pcrt_lock80|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.8}
+g7c_l_pcrt_lock85|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.85}
+g7c_l_pcrt_lock90|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.9}

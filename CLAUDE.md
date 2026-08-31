@@ -614,6 +614,71 @@ check, then exercise it live).
 
 ## Known open items
 
+- **2026-09-01: full backtest-archive re-analysis (626 configs) + the three
+  surviving conviction configs updated on OCI for a multi-leg paper run —
+  APPLIED to the live DB, NOT yet committed/deployed (docs+scripts only in the
+  working tree).** A from-scratch re-read of every post-`--near-expiry-days 6`
+  run, scored on the standing 7-gate robustness bar plus a new 8th gate
+  ("still net-positive after deleting the 2 best trades" — the cheapest
+  tail-dependence check at n≤26). Verdicts: **ORB_Conviction** (80/123 pass)
+  and **OI_Volume_Confirmed** (33/190) go to paper; **EMA_Micro_Pullback**
+  (3/91) at minimum size; **VWAP_Pullback (0/113)** and
+  **Liquidity_Sweep (0/92, incl. Groups C/D/E)** stay PARKED — both go
+  *negative* once their 2 best trades are removed. Full write-up + tables:
+  `backend/scripts/BACKTEST_LEARNINGS.md` (2026-09-01 ~01:30 entry) and
+  `docs/ops/paper_config_update_2026_09_01.md` (plan, per-change reasons,
+  applied record, rollback pointer).
+
+  **The methodological point worth carrying forward**: 626 configs collapse to
+  **145 distinct entry sets**. ORB's 80 "passers" are 79 exit overlays of ONE
+  26-trade entry set — pass-counts measure how many exit variants survive, never
+  independent evidence. Detect it by hashing each config's (symbol, entry_ts)
+  tuple set; it is invisible otherwise. (Same check found that
+  `EMA_Micro_Conviction_PCR`'s trades are a **strict subset** of
+  `EMA_Micro_Conviction`'s — 7 of 12, with the PCR filter removing 5 trades
+  worth +₹934 net — so it was disabled rather than run as a second strategy.)
+
+  **Two real latent bugs found while doing this, both pre-existing, both closed
+  in config (no code change):**
+  1. **An explicit `params["qty_lots"]` is NOT mode-aware** — it wins in both
+     modes; only the *absent* case resolves paper 10 / live 1. Risk then does
+     `effective_lot_cap = min(per_trade_lot_cap, resolved)` = `min(1, 10)` = 1
+     and **rejects** (`per_trade_lot_cap_exceeded`), it does not clamp. So the
+     `qty_lots: 10` sitting on OI/EMA would have blocked every live trade. The
+     2026-08-28 fix keyed the *default* off `is_strategy_routed_live`; it never
+     changed explicit behaviour. Key removed from both; never added to ORB.
+  2. **`build_position_exit_legs` returns `None` for any LIVE position** (and
+     for one too small to give every leg ≥1 lot), collapsing to the single-exit
+     path — which reads the **top-level** `stop_pct`/`target_pct`/arm/lock.
+     OI and EMA set none of those, so a live trade would have exited on class
+     defaults (arm .5 / lock **.5**). Top-level params added to both, pinned to
+     each strategy's best backtested single-leg config. **Corollary: multi-leg
+     exits are already paper-only in code, so `exit_legs` can never affect live
+     — the top-level params ARE the live config.**
+
+  **Config state now** (all `force_paper`, NIFTY, verified by reading the rows
+  back out of the DB through `backend/scripts/qc_paper_configs_live.py`):
+  `ORB_Conviction` cutoff 10:15 + 4-leg staged exit `[3,3,2,2]`;
+  `OI_Volume_Conviction` arm .30 + 3 legs `[4,3,3]`; `EMA_Micro_Conviction`
+  arm .70 + 3 legs `[4,3,3]`; `EMA_Micro_Conviction_PCR`, `VWAP_Conviction`,
+  `Liquidity_Sweep_Conviction` disabled. Leg-design rule: **every leg differs
+  from a designated anchor leg in exactly one field**, or the comparison is
+  unattributable — which is why a lock value deliberately repeats across legs.
+  No restart was needed (`auto_spawner` queries `is_enabled` from the DB each
+  run; `_build_strategy` reads `params` at spawn; there is no config cache).
+
+  **🔴 Open, and it gates any decision to size ORB up**: `max_or_range_nifty
+  _points: 65` has never been re-swept with `require_prior_day_trend` on —
+  `d_pdt_w55`/`w75`/`w85` do not exist anywhere in the archive, and 65 came
+  from the width-ridge sweep that judged it "a lone spike surrounded by
+  negatives = noise". ~20 min, 4 configs. Does not block paper. Also open:
+  lock 0.4 is unbacktested for OI/EMA (ORB only); the multi-leg engine itself
+  has zero backtest coverage; OI's edge is IS +322 / OOS +89 (decaying, watch
+  the OOS half in paper); and four stub configs (`Bank nifty`, `Test `,
+  `Test 1`, `Test 4`) remain enabled and will auto-spawn, with **`Test 1`
+  carrying `runtime_mode = NULL`** so it follows the session rather than being
+  pinned to paper — clear those before any live session.
+
 - **2026-08-29: weekend rest mode — implemented, tested, DEPLOYED to OCI.**
   Root cause of weekend Telegram spam: every time-of-day gate in the
   codebase (`market_data.market_hours` 08:30–16:00, `alerting.manager`'s

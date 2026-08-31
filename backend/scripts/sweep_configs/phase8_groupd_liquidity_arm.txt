@@ -1,0 +1,16 @@
+# Group D: liquidity pivot-S1/R1 trail_activation_fraction (arm) sweep (5) --
+# trail_activation_fraction has NEVER been swept for Liquidity_Sweep_Conviction
+# (unlike OI/EMA, which got both arm AND lock tuned) -- deployed value (0.5) is
+# an untested default, not a confirmed one. Held at lock=0.8 (Phase 6's
+# already-decent point, P(mean<=0) 0.457->0.250) pending Group C's actual best
+# lock -- rerun this file with lock swapped to Group C's winner once known.
+# Same EXTRA_BT_ARGS='--structure-stop-mode pivot_s1r1' as Group C.
+# DO NOT LAUNCH until Group C (backend/scripts/sweep_configs/phase7_groupc_liquidity.txt)
+# has completed and been analyzed -- only worth running if some lock value
+# there shows real promise; if every lock still fails the robustness bar,
+# re-park Liquidity_Sweep_Conviction instead of arm-tuning a dead entry.
+g7d_l_pcrt_arm30|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.3, "trail_lock_fraction": 0.8}
+g7d_l_pcrt_arm40|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.4, "trail_lock_fraction": 0.8}
+g7d_l_pcrt_arm50|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.5, "trail_lock_fraction": 0.8}
+g7d_l_pcrt_arm60|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.6, "trail_lock_fraction": 0.8}
+g7d_l_pcrt_arm70|liquidity_sweep_reversal_conviction|alice_index|{"pcr_oi_min": 0.7, "pcr_oi_max": 1.3, "stop_pct": 0.16, "trail_activation_fraction": 0.7, "trail_lock_fraction": 0.8}
