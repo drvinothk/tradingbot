@@ -132,6 +132,28 @@ def option_contract(db: Session, instrument: Instrument) -> OptionContract:
 
 
 @pytest.fixture
+def option_contract_pe(db: Session, instrument: Instrument) -> OptionContract:
+    """PE sibling of `option_contract` -- every existing structure_break
+    test in this file uses the CE-only fixture above, which is exactly why
+    the 2026-09-01 direction bug (`favorable = side == SignalSide.BUY`,
+    always True since every position here is BUY, reused for the
+    underlying-based structure check where favorable direction depends on
+    CE vs PE) shipped and stayed live undetected -- zero test coverage ever
+    exercised a PE structure-break at all."""
+    contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=EXPIRY,
+        strike=22000,
+        option_type=OptionType.PE,
+        symbol="NIFTY26JUL22000PE-EXEC",
+    )
+    db.add(contract)
+    db.flush()
+    return contract
+
+
+@pytest.fixture
 def strategy_config(db: Session, workspace) -> StrategyConfig:
     config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="exec-test-strategy")
     db.add(config)
@@ -1818,6 +1840,60 @@ def test_evaluate_open_position_exits_on_structure_break(
     # only the underlying has broken structure.
     outcome = evaluate_open_position(
         db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21990.0
+    )
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+
+def test_evaluate_open_position_pe_no_structure_break_when_underlying_falls_further(
+    db: Session, broker, trading_session, strategy_run, option_contract_pe
+):
+    """The exact live-confirmed 2026-09-01 bug: a bought PE profits when the
+    underlying FALLS, so a falling underlying is this position's own
+    favorable direction and must never be treated as a structure breach.
+    Before the fix (`favorable = side == SignalSide.BUY`, always True,
+    wrongly reused for this underlying-based check), this exact scenario
+    exited immediately and incorrectly -- confirmed against 19/19 real
+    PE structure_break exits that day, all mathematically false triggers.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract_pe,
+        side=SignalSide.BUY,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # Underlying falls well below structure_level (22000) -- the PE's own
+    # favorable direction, must NOT trigger a structure-break exit.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=21000.0
+    )
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
+def test_evaluate_open_position_pe_exits_on_structure_break_when_underlying_rises(
+    db: Session, broker, trading_session, strategy_run, option_contract_pe
+):
+    """Mirror of the CE case above: a PE's structure is broken when the
+    underlying RISES back above the level it broke down through (the
+    unfavorable direction for a PE), invalidating the bearish setup."""
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract_pe,
+        side=SignalSide.BUY,
+        entry_price=80.0, stop_price=72.0, target_price=92.0, structure_level=22000.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=82.0, broker=broker, underlying_price=22010.0
     )
 
     assert outcome is not None

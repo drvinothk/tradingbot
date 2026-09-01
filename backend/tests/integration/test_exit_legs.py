@@ -114,6 +114,25 @@ def option_contract(db: Session, instrument: Instrument) -> OptionContract:
 
 
 @pytest.fixture
+def option_contract_pe(db: Session, instrument: Instrument) -> OptionContract:
+    """PE sibling of `option_contract` -- see the identical fixture's own
+    docstring in `test_execution_paper_service.py` for why this file's own
+    pre-fix structure_break test suite (CE-only) never caught the
+    2026-09-01 direction bug either."""
+    contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=EXPIRY,
+        strike=22000,
+        option_type=OptionType.PE,
+        symbol="NIFTY26JUL22000PE-LEGS",
+    )
+    db.add(contract)
+    db.flush()
+    return contract
+
+
+@pytest.fixture
 def strategy_config(db: Session, workspace) -> StrategyConfig:
     config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="legs-test-strategy")
     db.add(config)
@@ -491,6 +510,77 @@ def test_leg_structure_break_closes_that_leg(
     )
     rows = _legs(db, position.id)
     assert rows[0].status == PositionExitLegStatus.OPEN  # no structure_level
+    assert rows[1].status == PositionExitLegStatus.CLOSED
+    assert rows[1].exit_reason == ExitReason.STRUCTURE_BREAK
+
+
+def test_leg_structure_break_pe_does_not_close_when_underlying_falls_further(
+    db, broker, trading_session, strategy_run, option_contract_pe
+):
+    """Multi-leg counterpart of the live-confirmed 2026-09-01 direction bug:
+    a bought PE leg profits when the underlying falls, so a falling
+    underlying must never close it as a structure break."""
+    legs = [
+        ExitLegSpec(qty_fraction=0.5, kind="a", stop_price=72.0, target_price=92.0),
+        ExitLegSpec(
+            qty_fraction=0.5, kind="b", stop_price=72.0, target_price=92.0,
+            structure_level=24000.0,
+        ),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract_pe, qty_lots=10, exit_legs=legs
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+
+    # Underlying well below structure_level (24000) -- the PE's own
+    # favorable direction, must not close leg b.
+    evaluate_open_position(
+        db, trading_session, position, tick_price=80.0, broker=broker,
+        underlying_price=23000.0,
+    )
+    rows = _legs(db, position.id)
+    assert rows[1].status == PositionExitLegStatus.OPEN
+
+
+def test_leg_structure_break_pe_closes_when_underlying_rises(
+    db, broker, trading_session, strategy_run, option_contract_pe, instrument
+):
+    """Mirror of the CE case above: a PE leg's structure is broken when the
+    underlying rises back above the level it broke down through."""
+    from app.domain.market.models import PriceBar
+    from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME
+
+    db.add(
+        PriceBar(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            timeframe=BAR_TIMEFRAME,
+            bucket_start=datetime.now(UTC),
+            open=24005, high=24015, low=24000, close=24010,
+            volume=1000,
+        )
+    )
+    db.flush()
+
+    legs = [
+        ExitLegSpec(qty_fraction=0.5, kind="a", stop_price=72.0, target_price=92.0),
+        ExitLegSpec(
+            qty_fraction=0.5, kind="b", stop_price=72.0, target_price=92.0,
+            structure_level=24000.0,
+        ),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract_pe, qty_lots=10, exit_legs=legs
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+
+    evaluate_open_position(
+        db, trading_session, position, tick_price=80.0, broker=broker,
+        underlying_price=24010.0,
+    )
+    rows = _legs(db, position.id)
     assert rows[1].status == PositionExitLegStatus.CLOSED
     assert rows[1].exit_reason == ExitReason.STRUCTURE_BREAK
 

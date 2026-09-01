@@ -74,7 +74,7 @@ from app.domain.execution.models import (
     TrailPlan,
     TrailPlanStatus,
 )
-from app.domain.market.models import Instrument, OptionContract
+from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent, TradeIntentStatus
@@ -1400,14 +1400,44 @@ def evaluate_open_position(
     # stop yet. Skipped when either side of the comparison is unavailable
     # (no structure_level set, or no underlying_price supplied). See this
     # function's own docstring for the candidate/confirm/reclaim design.
-    if stop_plan.structure_level is not None and underlying_price is not None:
+    #
+    # `favorable` (side == BUY, always True in this codebase) is deliberately
+    # NOT reused here, unlike the stop/target checks above -- those compare
+    # against the option's own premium, where "rising is good" holds for any
+    # bought option regardless of CE/PE. This check compares against the
+    # *underlying's* spot price, where favorable direction is the opposite
+    # for a PE vs a CE. Reusing `favorable` here made every PE position treat
+    # a falling underlying (its own favorable direction) as a structure
+    # breach, since the buggy buffered_level sat below spot from the moment
+    # of entry -- live-confirmed 2026-09-01: 19/19 structure_break exits that
+    # day were PE, all mathematically false triggers (spot never actually
+    # reclaimed the level), while CE exits over the same session correctly
+    # never fired this way. `structure_favorable` is derived from the
+    # contract's real option_type instead.
+    structure_option_contract = (
+        db.get(OptionContract, position.option_contract_id)
+        if stop_plan.structure_level is not None and underlying_price is not None
+        else None
+    )
+    # `structure_option_contract is None` covers both the pre-existing
+    # "comparison unavailable, skip this check" case (no structure_level or
+    # no underlying_price) and the unreachable-in-practice (FK-protected)
+    # missing-contract case, identically -- neither should touch the
+    # candidate/persistence state below or fall through to a stale one.
+    if structure_option_contract is not None:
+        option_contract = structure_option_contract
+        structure_favorable = option_contract.option_type == OptionType.CE
         structure_level = _dec(stop_plan.structure_level)
         underlying = _dec(underlying_price)
         buffer = _dec(stop_plan.structure_break_buffer or 0)
         persistence_seconds = float(stop_plan.structure_break_persistence_seconds or 0)
 
-        buffered_level = structure_level - buffer if favorable else structure_level + buffer
-        breached = underlying < buffered_level if favorable else underlying > buffered_level
+        buffered_level = (
+            structure_level - buffer if structure_favorable else structure_level + buffer
+        )
+        breached = (
+            underlying < buffered_level if structure_favorable else underlying > buffered_level
+        )
 
         if breached:
             if stop_plan.structure_break_candidate_since is None:
@@ -1416,7 +1446,9 @@ def evaluate_open_position(
             else:
                 prior_extreme = _dec(stop_plan.structure_break_candidate_extreme)
                 worse = (
-                    underlying < prior_extreme if favorable else underlying > prior_extreme
+                    underlying < prior_extreme
+                    if structure_favorable
+                    else underlying > prior_extreme
                 )
                 if worse:
                     stop_plan.structure_break_candidate_extreme = underlying_price
@@ -1426,11 +1458,8 @@ def evaluate_open_position(
             elapsed = (_utcnow() - stop_plan.structure_break_candidate_since).total_seconds()
             if elapsed >= persistence_seconds:
                 if persistence_seconds > 0:
-                    option_contract = db.get(OptionContract, position.option_contract_id)
-                    confirmed = option_contract is not None and (
-                        _structure_break_confirmed_by_bar_close(
-                            db, option_contract.instrument_id, buffered_level, favorable
-                        )
+                    confirmed = _structure_break_confirmed_by_bar_close(
+                        db, option_contract.instrument_id, buffered_level, structure_favorable
                     )
                 else:
                     # Not opted in (persistence unset) -- preserve the exact
