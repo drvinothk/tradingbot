@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.domain.execution.models import Order, OrderMode, Position, TradeOutcome
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import Signal, StrategyRun, TradeIntent, TradeIntentStatus
-from app.modules.reporting.costs import estimate_trade_cost
+from app.modules.reporting.costs import estimate_entry_order_cost, estimate_exit_leg_cost
 
 
 @dataclass(frozen=True)
@@ -84,27 +84,66 @@ class _TradeRow:
     cost: float
 
 
+@dataclass(frozen=True)
+class _PositionAccumulator:
+    """Intermediate per-position accumulator for `_collapse_to_trades` —
+    tracks enough to compute the position's single entry-order cost once
+    at the end (full original qty, not any one leg's own slice), separate
+    from `exit_cost`, which is a running sum of each leg's own exit-order
+    cost (one real broker order per leg, per `reporting.costs`'s own
+    docstring)."""
+
+    closed_at: datetime
+    realized_pnl: float
+    slippage: float
+    entry_price: float
+    total_qty: int
+    exit_cost: float
+
+
 def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
-    by_position: dict[uuid.UUID, _TradeRow] = {}
+    by_position: dict[uuid.UUID, _PositionAccumulator] = {}
     for o in outcomes:
-        leg_cost = estimate_trade_cost(float(o.entry_price), float(o.exit_price), o.qty)
+        leg_exit_cost = estimate_exit_leg_cost(float(o.exit_price), o.qty)
         existing = by_position.get(o.position_id)
         if existing is None:
-            by_position[o.position_id] = _TradeRow(
+            by_position[o.position_id] = _PositionAccumulator(
                 closed_at=o.closed_at,
                 realized_pnl=float(o.realized_pnl),
                 slippage=float(o.slippage),
-                cost=leg_cost,
+                # Identical across every leg of the same position (the
+                # same original entry fill, repeated per TradeOutcome row
+                # by the multi-leg exit engine) -- see exit_legs.py's own
+                # TradeOutcome construction.
+                entry_price=float(o.entry_price),
+                total_qty=o.qty,
+                exit_cost=leg_exit_cost,
             )
         else:
-            by_position[o.position_id] = _TradeRow(
+            by_position[o.position_id] = _PositionAccumulator(
                 # A staged trade's "close time" is its last leg's.
                 closed_at=max(existing.closed_at, o.closed_at),
                 realized_pnl=existing.realized_pnl + float(o.realized_pnl),
                 slippage=existing.slippage + float(o.slippage),
-                cost=existing.cost + leg_cost,
+                entry_price=existing.entry_price,
+                # Every leg's own qty is a slice of the position's one real
+                # entry order's full quantity -- summing them back recovers
+                # it, regardless of how many exit legs there are.
+                total_qty=existing.total_qty + o.qty,
+                exit_cost=existing.exit_cost + leg_exit_cost,
             )
-    return list(by_position.values())
+    return [
+        _TradeRow(
+            closed_at=acc.closed_at,
+            realized_pnl=acc.realized_pnl,
+            slippage=acc.slippage,
+            # The position's one real entry order, priced on its full
+            # original quantity, charged exactly once here -- plus every
+            # exit leg's own order cost, already summed above.
+            cost=acc.exit_cost + estimate_entry_order_cost(acc.entry_price, acc.total_qty),
+        )
+        for acc in by_position.values()
+    ]
 
 
 def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:

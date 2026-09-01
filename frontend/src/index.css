@@ -516,31 +516,34 @@ tbody tr:hover {
   margin-top: 0.2rem;
 }
 
+/* Flexbox, not grid -- a grid track is an all-or-nothing allocation
+   (2026-09-02's first cut used grid-column: span 2 for the 3-item boxes,
+   which doubled their track width even though 3 short stat columns don't
+   need a full extra 240px track, and on a narrower container -- the paper
+   sub-ribbon, or two Today's Activity cards shown side by side -- a
+   2-track span often couldn't fit at all, so every box fell onto its own
+   row). Flex-basis sizes each box to what its own stat count actually
+   needs and reflows box-by-box as space runs out, instead of reserving
+   whole grid tracks. */
 .metrics-strip {
-  display: grid;
-  /* 240px (up from 180px) -- each box in Today's Activity now carries a
-     main stat plus a divided secondary stat (see .metric-box-split below),
-     so it needs more room than the single-stat boxes this width was
-     originally tuned for. Scoped to .metrics-strip only -- confirmed unused
-     elsewhere in the frontend. */
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  /* dense: lets a 2-item box (Total Trades, Open Risk) backfill a gap left
-     by an adjacent .metric-box-wide box's 2-column span, instead of the
-     default row-flow leaving a ragged empty cell -- see .metric-box-wide's
-     own comment. */
-  grid-auto-flow: row dense;
+  display: flex;
+  flex-wrap: wrap;
   gap: 0.9rem;
   margin-bottom: 1.25rem;
 }
 
+.metric-box {
+  flex: 1 1 210px;
+  min-width: 210px;
+}
+
 /* P&L (+Total Cost+Win Rate) and Total Drawdown (+Largest Loss+Largest
-   Profit) each carry a 3-way split now instead of 2 -- one more stat needs
-   one more column's worth of room, so these two boxes span 2 grid tracks
-   instead of 1. Paired with .metrics-strip's grid-auto-flow: dense above so
-   the narrower 2-item boxes (Total Trades, Open Risk) backfill the leftover
-   single-track gaps rather than leaving them empty. */
+   Profit) each carry a 3-way split now instead of 2 -- sized wider than a
+   plain .metric-box, but only as much as a third short stat column
+   actually needs, not a full doubled track. */
 .metric-box-wide {
-  grid-column: span 2;
+  flex: 1 1 300px;
+  min-width: 300px;
 }
 
 /* Today's Activity split boxes (P&L+WinRate, TotalTrades+OpenTrades,
@@ -589,13 +592,19 @@ tbody tr:hover {
 }
 
 .metrics-substrip {
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 0.6rem;
   margin-bottom: 0.5rem;
 }
 
 .metrics-substrip .metric-box {
+  flex-basis: 170px;
+  min-width: 170px;
   padding: 0.6rem 0.75rem;
+}
+
+.metrics-substrip .metric-box-wide {
+  flex-basis: 250px;
+  min-width: 250px;
 }
 
 .metrics-substrip .metric-box .metric-value {
