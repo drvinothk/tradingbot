@@ -1724,6 +1724,10 @@ def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(
     assert live_broker.modify_calls[0]["broker_order_id"] == "STOP-1"
     assert live_broker.modify_calls[0]["contract_symbol"] == option_contract.symbol
     assert live_broker.modify_calls[0]["trigger_price"] == pytest.approx(120.0)
+    # 2026-09-01: live-confirmed Shoonya rejects ModifyOrder outright
+    # ("ORA: no qty field in modify") without qty, regardless of which
+    # fields are actually changing -- must be sent on every call.
+    assert live_broker.modify_calls[0]["qty"] == position.qty
     assert _price(stop_plan.resting_order_price) == pytest.approx(120.0)
 
     # Further tightening (126 -> locks in 123) syncs again.

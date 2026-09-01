@@ -381,6 +381,14 @@ def sync_resting_protective_stop(
             contract_symbol=option_contract.symbol,
             trigger_price=float(trigger_price),
             limit_price=float(limit_price),
+            # 2026-09-01: Shoonya's real ModifyOrder rejects with "ORA: no
+            # qty field in modify" if qty is omitted -- live-confirmed the
+            # same day (order 26090100261986, NIFTY01SEP26P24100) cascading
+            # into a cancel/re-exit that also fumbled its own synchronous
+            # fill detection (exit_order_unfilled). qty is unchanged by a
+            # TSL price sync, but Shoonya requires it on every ModifyOrder
+            # call regardless of which fields are actually changing.
+            qty=position.qty,
         )
     except Exception:  # noqa: BLE001 - see place_protective_stop's identical reasoning
         # Broader than `BrokerError` deliberately -- `evaluate_open_
