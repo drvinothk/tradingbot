@@ -93,6 +93,7 @@ _RUNNERS: dict[uuid.UUID, StrategyRunner] = {}
 ORB_PARAM_KEYS = {
     "qty_lots",
     "or_minutes",
+    "or_search_minutes",
     "stop_pct",
     "target_pct",
     "trail_activation_fraction",

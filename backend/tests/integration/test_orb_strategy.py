@@ -253,7 +253,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
 
@@ -270,7 +270,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         # Width 40 -- inside ORBStrategy's default NIFTY range filter (20-80).
@@ -295,7 +295,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
@@ -320,7 +320,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         # Width 40 -- inside ORBStrategy's default NIFTY range filter (20-80).
@@ -342,7 +342,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         # Width 40 -- inside ORBStrategy's default NIFTY range filter (20-80).
@@ -360,7 +360,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         # Width 40 -- inside ORBStrategy's default NIFTY range filter (20-80).
@@ -378,15 +378,15 @@ class TestORBStrategy:
         assert first is not None
         assert second is None
 
-    def test_opening_range_is_anchored_to_9_15_ist_not_run_start(
+    def test_opening_range_is_anchored_to_9_16_ist_not_run_start(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
         """The strategy run starts well after the real opening range (10:30
-        IST) -- the range must still be computed from the fixed 9:15-9:30
+        IST) -- the range must still be computed from the fixed 9:16-9:31
         IST window, not from `strategy_run.started_at`, proving the anchor
         is restart-independent."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         late_started_at = datetime(2026, 7, 24, 10, 30, tzinfo=IST)
         strategy_run = _make_strategy_run(
             db, strategy_config, trading_session, user, late_started_at
@@ -410,11 +410,13 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        """Only a handful of the 9:15-9:30 bars are present (e.g. the WS
-        feed didn't warm up in time) -- the range isn't well-defined, so no
-        breakout should fire even though the sparse bars alone would look
-        like one."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        """Only a handful of the 9:16-9:31 bars are present, and the feed
+        never delivers any more of them at all (e.g. a sustained outage,
+        not a short gap) -- even the widened 9:16-9:46 search window still
+        can't find 15 valid same-day bars, so the range isn't well-defined
+        and no breakout should fire even though the sparse bars alone would
+        look like one."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
 
@@ -433,13 +435,99 @@ class TestORBStrategy:
         strategy = ORBStrategy(instrument.id, EXPIRY, or_minutes=OR_MINUTES)
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
 
+    def test_breakout_still_fires_after_a_short_mid_window_gap(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """The 9:16-9:46 tolerant search: one bar missing in the middle of
+        the window (e.g. a single dropped minute, not a sustained outage)
+        must not permanently disqualify the day the way the old, strict
+        9:16-9:31-only window did -- the 15th valid same-day bar, wherever
+        it lands chronologically within the widened window, still completes
+        the range and a real breakout after it still fires."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+
+        # 15 valid bars, but minute 5 (9:21) is missing entirely -- the 15th
+        # valid bar lands at minute 15 (9:31) instead of minute 14 (9:30).
+        for i in list(range(5)) + list(range(6, 16)):
+            mid = (22030.0 + 21990.0) / 2
+            _seed_bar(
+                db, instrument, or_start + timedelta(minutes=i),
+                open=mid, high=22030.0 if i == 0 else mid + 5, low=21990.0 if i == 1 else mid - 5,
+                close=mid,
+            )
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=16),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(instrument.id, EXPIRY, or_minutes=OR_MINUTES)
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_bad_bar_excluded_from_range_and_next_valid_bar_used_instead(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """A single bar whose own (high - low) exceeds the aggregate range
+        ceiling (default NIFTY max 80 points) is a data artifact (e.g. an
+        initial WS-reconnect handshake bar), not real price action -- it
+        must be excluded from the range calc entirely, with the next valid
+        bar used to complete the required 15, rather than poisoning
+        `or_high`/`or_low` or failing the width filter outright."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+
+        # 14 clean bars (minutes 0-13, flat at [21990, 22030]).
+        for i in range(14):
+            mid = (22030.0 + 21990.0) / 2
+            _seed_bar(
+                db, instrument, or_start + timedelta(minutes=i),
+                open=mid, high=22030.0 if i == 0 else mid + 5, low=21990.0 if i == 1 else mid - 5,
+                close=mid,
+            )
+        # Minute 14: a corrupted bar with a 200-point range (far beyond the
+        # 80-point NIFTY ceiling) -- must be excluded, not counted toward
+        # the 15, and must not widen or_high/or_low.
+        _seed_bar(
+            db, instrument, or_start + timedelta(minutes=14),
+            open=22200, high=22300, low=22100, close=22200,
+        )
+        # Minute 15: a clean bar that completes the required count of 15
+        # valid (non-excluded) bars.
+        mid = (22030.0 + 21990.0) / 2
+        _seed_bar(
+            db, instrument, or_start + timedelta(minutes=15),
+            open=mid, high=mid + 5, low=mid - 5, close=mid,
+        )
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=16),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(instrument.id, EXPIRY, or_minutes=OR_MINUTES)
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+        # or_high/or_low come from the 15 clean bars only -- the corrupted
+        # bar's 22100-22300 range must not appear here at all.
+        assert proposal.structure_level == pytest.approx(21990.0)
+
     def test_breakout_blocked_after_entry_cutoff_time(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
         """Default cutoff is 10:15 IST -- a breakout bar arriving after that
         (even a genuinely valid one) must not fire."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
@@ -456,7 +544,7 @@ class TestORBStrategy:
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
@@ -475,7 +563,7 @@ class TestORBStrategy:
     ):
         """A configured (non-default) cutoff is what actually gets enforced,
         not just the "10:15" default."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
@@ -497,7 +585,7 @@ class TestORBStrategy:
         """Range width 10 is below the NIFTY default min (20 points) -- the
         whole day should be skipped, even though the bar itself would
         otherwise look like a valid breakout."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22005.0, or_low=21995.0)
@@ -516,7 +604,7 @@ class TestORBStrategy:
     ):
         """Range width 200 is above the NIFTY default max (80 points) -- an
         already-trending/gap day this strategy shouldn't chase."""
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
         _seed_opening_range(db, instrument, or_start, or_high=22100.0, or_low=21900.0)
@@ -552,7 +640,7 @@ class TestORBStrategy:
         db.flush()
         _seed_chain(db, bn_instrument, ce, pe, spot=48000.0)
 
-        or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
         strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
         _seed_opening_range(db, bn_instrument, or_start, or_high=48100.0, or_low=47900.0)
 

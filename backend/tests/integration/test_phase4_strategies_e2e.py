@@ -159,11 +159,12 @@ def _seed_indicator(db, instrument: Instrument, name: str, value: float) -> None
 
 def _seed_orb_breakout(db, instrument: Instrument) -> None:
     """OR window flat at [21990, 22030] (width 40 -- inside ORBStrategy's
-    default NIFTY range filter of 20-80 points), anchored to the fixed 9:15
-    IST session open (not `strategy_run.started_at`, which is real
+    default NIFTY range filter of 20-80 points), anchored to the fixed 9:16
+    IST range start (one minute after the real 9:15 session open, skipping
+    the open candle -- not `strategy_run.started_at`, which is real
     wall-clock `now()` in this test -- deliberately different, proving the
     anchor is restart-independent), then a bar closing above it."""
-    or_start = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+    or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
     mid = 22010.0
     db.add(PriceBar(
         id=uuid.uuid4(), instrument_id=instrument.id, timeframe=BAR_TIMEFRAME,

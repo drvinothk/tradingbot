@@ -40,13 +40,14 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from app.core.clock import IST, to_ist
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
+from app.modules.market_data.market_hours import NORMAL_MARKET_OPEN
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
@@ -67,9 +68,19 @@ from app.modules.strategy_engine.strike_ranking.engine import (
     rank_from_latest_snapshot,
 )
 
-# NSE cash/index session open. Fixed regardless of when the StrategyRunner
-# process starts or restarts -- see module docstring.
-ORB_SESSION_OPEN_IST = time(9, 15)
+# The opening-range window deliberately starts one minute after the real
+# NSE cash/index open (`NORMAL_MARKET_OPEN`, single source of truth shared
+# with `market_hours.py` -- was previously its own separately-hardcoded
+# `time(9, 15)` here, a real duplication), not at open itself: the very
+# first minute's candle is disproportionately likely to carry opening-
+# auction noise or an initial-WS-reconnect artifact, and including it in a
+# 15-candle range skews the range for the rest of the day. Fixed regardless
+# of when the StrategyRunner process starts or restarts -- see module
+# docstring.
+_OPEN_CANDLE_SKIP_MINUTES = 1
+ORB_RANGE_START_IST = (
+    datetime.combine(date.min, NORMAL_MARKET_OPEN) + timedelta(minutes=_OPEN_CANDLE_SKIP_MINUTES)
+).time()
 
 logger = logging.getLogger("app.strategy_engine.orb")
 
@@ -82,6 +93,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         ranking_config: StrikeRankingConfig = StrikeRankingConfig(),
         qty_lots: int = 1,
         or_minutes: int = 15,
+        or_search_minutes: int = 30,
         stop_pct: float = 0.12,
         target_pct: float = 0.20,
         trail_activation_fraction: float = 0.6,
@@ -100,6 +112,7 @@ class ORBStrategy(ConfirmationFilterStrategy):
         self.ranking_config = ranking_config
         self.qty_lots = qty_lots
         self.or_minutes = or_minutes
+        self.or_search_minutes = or_search_minutes
         self.stop_pct = stop_pct
         self.target_pct = target_pct
         self.trail_activation_fraction = trail_activation_fraction
@@ -124,17 +137,62 @@ class ORBStrategy(ConfirmationFilterStrategy):
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
     ) -> TradeProposal | None:
         bar_ist = to_ist(latest_bar.bucket_start)
-        or_start = datetime.combine(bar_ist.date(), ORB_SESSION_OPEN_IST, tzinfo=IST)
-        or_end = or_start + timedelta(minutes=self.or_minutes)
-        if latest_bar.bucket_start < or_end:
-            return None  # still inside (or before) the opening range window
+        or_start = datetime.combine(bar_ist.date(), ORB_RANGE_START_IST, tzinfo=IST)
+        or_min_end = or_start + timedelta(minutes=self.or_minutes)
+        if latest_bar.bucket_start < or_min_end:
+            return None  # still inside the minimum opening-range window
 
-        or_bars = get_recent_completed_bars(
-            db, self.instrument_id, self.timeframe, since=or_start, until=or_end
+        # Search window widened to `or_search_minutes` (default 30, i.e.
+        # 9:16-9:46) but the *count* required stays `or_minutes` (15) --
+        # this tolerates a short gap in same-day bars (a dropped minute
+        # anywhere in the window, not just at the very start -- a real
+        # `price_bars` row missing from any single minute already meant
+        # "not enough bars, sit out for the day" under the old 9:15-9:30-
+        # only window) without changing normal-day behavior at all: on any
+        # day where 15 bars already exist by `or_min_end` (9:31), this
+        # fires at exactly the same bar it always has, byte-identical
+        # range. Only a day with a real gap reaches past `or_min_end`
+        # still short, and keeps checking bar-by-bar until either 15
+        # valid same-day bars accumulate (wherever they land
+        # chronologically -- a missing bar is skipped, never gap-filled)
+        # or `or_search_minutes` passes with still too few, in which case
+        # this sits out for the day exactly as before, just with a longer
+        # grace period. Live-confirmed 2026-09-01: a Shoonya reconnect at
+        # 10:03 left zero bars for 9:15-9:30, so ORB_Conviction fired zero
+        # signals all day -- this fix tolerates a short (few-minute) gap;
+        # an outage that long is still a sit-out day by design, not
+        # something this window relaxation is meant to cover.
+        or_max_end = or_start + timedelta(minutes=self.or_search_minutes)
+        or_bars_candidates = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, since=or_start, until=or_max_end
         )
-        if len(or_bars) < self.or_minutes:
-            return None  # gap in the 9:15-9:30 data -- range isn't well-defined yet
 
+        # Bad-bar exclusion: a single 1-minute bar whose own (high - low)
+        # already exceeds the *aggregate* 15-bar range ceiling
+        # (`max_or_range_{nifty,banknifty}_points`) is treated as a data
+        # artifact (a wide/garbage bar from an initial WS-reconnect
+        # handshake), not real price action -- real NIFTY/BANKNIFTY index
+        # moves don't cover an entire opening-range's worth of width in one
+        # minute. Reuses the existing, already-calibrated ceiling rather
+        # than a new uncalibrated threshold -- no behavior change on a
+        # normal day (no bar ever approaches this width), and strictly
+        # better than the pre-existing fallback on a corrupted-bar day
+        # (previously that one bar would poison the aggregate range calc
+        # and likely fail the width filter below, killing the whole day;
+        # now it's simply excluded and the search continues for the next
+        # valid bar, same "skip it, use the next one" tolerance as a
+        # missing bar). Instrument resolved here (moved up from below) so
+        # both this filter and the width filter share one lookup.
+        instrument = db.get(Instrument, self.instrument_id)
+        symbol = instrument.symbol if instrument is not None else ""
+        min_range, max_range = self._range_thresholds(symbol)
+        or_bars_all = [
+            bar for bar in or_bars_candidates if (float(bar.high) - float(bar.low)) <= max_range
+        ]
+        if len(or_bars_all) < self.or_minutes:
+            return None  # not enough valid same-day bars yet, or a real gap -- either way, wait
+
+        or_bars = or_bars_all[: self.or_minutes]  # first 15 valid bars chronologically
         or_high, or_low = compute_range_high_low(or_bars)
         range_width = or_high - or_low
 
@@ -144,9 +202,6 @@ class ORBStrategy(ConfirmationFilterStrategy):
             strategy_run.id, or_low, or_high, range_width,
         )
 
-        instrument = db.get(Instrument, self.instrument_id)
-        symbol = instrument.symbol if instrument is not None else ""
-        min_range, max_range = self._range_thresholds(symbol)
         if range_width < min_range or range_width > max_range:
             self._log_once(
                 logger, "range_filter",
