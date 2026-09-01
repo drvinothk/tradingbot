@@ -8,6 +8,191 @@ costs are applied only in analysis.
 
 ---
 
+## 2026-09-02 (~03:34 IST, session ongoing) — Phase 9: new `require_momentum_alignment` gate built, tested, one live paper deploy; Batches 1–2 done/running, Batch 3 queued+auto-chained
+
+New gate, new sweep series, not a continuation of Sweep #4's own gate set.
+Cost model throughout: `analyze_walkforward.py`'s `FLAT_COST_PER_LOT=10.0`
+(the corrected value — see this ledger's own top-of-file caveat about the
+₹40 vs ₹10 split). All NIFTY, `--all-expiries --near-expiry-days 6
+--exit-mode current`.
+
+### What was built (commit `83ee6ad`, already on `main`/deployed live)
+
+1. **RSI14 test coverage** — `RSICalculator`/`IndicatorEngine`/`warm_start`
+   wiring and the `require_rsi_alignment` gate (both built 2026-08-31, zero
+   tests until now) got real coverage: hand-computed Wilder-smoothing tests,
+   engine warmup tests, and gate-behavior tests via ORB's own harness.
+2. **`require_momentum_alignment`/`momentum_lookback_bars`** — new,
+   independent `ConvictionGateMixin` gate. For lookback `N`, requires the
+   last `N` closes **strictly monotonic** (all consecutive increasing for
+   CE, all decreasing for PE) — not a single current-vs-N-bars-ago
+   comparison. Default `False`/`1`, zero behavior change until opted in.
+   Wired through all 5 `*_conviction` subclasses.
+
+### Real bugs found and fixed before/during the sweep, now in `backtest_engine/README.md`'s own rules
+
+- **Hourly `backtest-reaper.timer` force-drops a currently-running sweep's
+  own shard databases** — no liveness check, matches on name pattern alone.
+  Killed 3 of 4 shards of `m1_base_ema` mid-run at an exact hour boundary
+  (`AdminShutdown` in the shard logs, confirmed via the systemd journal:
+  the reaper's own `DROP DATABASE ... WITH (FORCE)` at the top of the
+  hour). Fixed by stopping the timer for the duration of any multi-hour
+  sweep, re-enabling only once it fully completes — `run_sweep.sh`'s own
+  per-config reaping is unaffected and is what actually keeps disk in
+  check during a run.
+- **Re-syncing `app/` via plain `tar`/`scp` copies live broker credentials**
+  — `app/config/credentials/*.env` and `.alice_blue_session_cache.json` are
+  gitignored (skipped by git-based tooling) but not excluded by a
+  filesystem-level copy. Caught within minutes on the first re-pin, deleted
+  from both the box and the local scratchpad copy before any further use —
+  never left this box (already trusted, already running live trading with
+  the same credentials).
+- **A stale sweep-config file silently sat on the box** after a local
+  revision — checksums didn't match, would have silently run an older,
+  smaller config set. Caught by verifying `md5sum` before every launch,
+  now standing practice.
+- **Silent-param-drop risk from an out-of-date `app/` pin** — `run_backtest.py`
+  imports the real production `_build_strategy`; unrecognized
+  `strategy_configs.params` keys are silently ignored, not rejected. A
+  sweep testing a param that didn't exist at the pinned commit would
+  produce a normal-looking, wrongly-gate-off result instead of an error.
+  Fixed by a deliberate re-pin to `83ee6ad` + a QC script
+  (`_build_strategy` against every config line, verifying the intended
+  params actually land) run against both the local venv and the box's own
+  venv before any compute was spent — caught the stale-file bug above via
+  this exact check.
+
+### `VWAP_RSI_modified` — new, real, live paper config
+
+`d510ca3f-a043-4778-98ae-bf756b1f7e55`, `vwap_pullback_conviction`,
+`params={"require_momentum_alignment": true, "momentum_lookback_bars": 1}`
+only (no ATR expansion, no PCR band — `ConvictionGateMixin`'s own
+guarantee makes this byte-identical to base VWAP Pullback entry logic plus
+the momentum filter alone). `is_enabled=true`, `runtime_mode=force_paper`
+(deliberately — user wants control over if/when this ever goes live,
+independent of the master switch; `NULL`/follow-session was considered and
+rejected, see the session transcript for the exact reasoning). No
+`max_trades_per_day`, no `qty_lots` override. Verified via the live app's
+own `_build_strategy`, not just the DB row. Will auto-spawn at the next
+daily bootstrap.
+
+### Batch 1 (`s6_mom1b` + `s6_mom1liq`) — COMPLETE, 16 configs
+
+Baselines are each strategy's exact already-confirmed-best params (ORB:
+`d_pdt_w65`/`w7_s18_a12_l06` — the real live top-level params from
+`docs/ops/paper_config_update_2026_09_01.md`; OI: `o3_atr_pcrl` arm
+.30/lock .85; EMA: `e_pdt_atr` arm .70/lock .80; EMA-PCR: `e3_pdt_atr_pcrl`;
+VWAP: `v_atr_pcrl` arm .5/lock .8; Liquidity: Group C's lock=.85 +
+`--structure-stop-mode pivot_s1r1`, run as a separate invocation since
+that flag would otherwise silently apply to every other strategy in the
+same run).
+
+| config | n | win% | E/lot | PF | P(mean≤0) | bar (≤0.15)? |
+|---|---|---|---|---|---|---|
+| VWAP base (no gates) | 16 | 25.0% | −352 | 0.26 | 0.986 | fail |
+| VWAP_Conviction N=1 | 15 | 53.3% | +84 | 1.50 | 0.248 | fail |
+| VWAP_Conviction N=5 | 10 | 20.0% | −85 | 0.16 | 0.994 | fail |
+| EMA base (⚠️ reaper-corrupted, discard) | 43 | — | — | — | — | — |
+| EMA_Micro_Conviction N=1 | 12 | 58.3% | **+304** | 3.05 | **0.039** | **pass** |
+| EMA_Micro_Conviction N=5 | 1 | — | +662 | — | n/a | n=1, meaningless |
+| EMA_Micro_Conviction_PCR N=1 | 7 | 71.4% | **+388** | 4.38 | **0.021** | **pass** |
+| EMA_Micro_Conviction_PCR N=5 | 1 | — | +662 | — | n/a | n=1, meaningless |
+| ORB base (no gates) | 44 | 40.9% | −177 | 0.60 | 0.869 | fail |
+| OI base (no gates) | 45 | 40.0% | −147 | 0.55 | 0.941 | fail |
+| ORB_Conviction N=1 | 40 | 50.0% | +122 | 1.49 | 0.186 | fail (marginal) |
+| ORB_Conviction N=5 | 35 | 57.1% | +226 | 2.08 | **0.062** | **pass** |
+| OI_Volume_Conviction N=1 | 14 | 71.4% | **+274** | 5.07 | **0.004** | **pass, strong** |
+| OI_Volume_Conviction N=5 | 4 | 75.0% | +267 | 19.32 | 0.004 | pass, but n=4 — likely a statistical mirage (same trap this ledger already flags elsewhere) |
+| Liquidity_Sweep_Conviction N=1 | 22 | 54.5% | +96 | 1.54 | 0.245 | fail |
+| Liquidity_Sweep_Conviction N=5 | 0 | — | — | — | n/a | too strict, zero trades |
+
+**The one real correction mid-session**: momentum was first read as hurting
+ORB, based on N=1 alone (E=122, fails the bar). With N=5 in, **ORB is the
+opposite of every other strategy tested** — momentum strictness *helps*
+ORB (E climbs to 226, P(mean≤0) drops to 0.062, clears the bar) while it
+hurts or is a wash everywhere else. This is *why* Batch 3 below runs a
+wide N grid on ORB specifically, not just N=1/N=5.
+
+**Clean summary**: `EMA_Micro_Conviction`, `EMA_Micro_Conviction_PCR`,
+`ORB_Conviction` (N=5 specifically, not N=1), and `OI_Volume_Conviction`
+(N=1; N=5's pass is thin, n=4) clear the bar. VWAP and Liquidity don't
+clear it at any N tested so far.
+
+### Batch 2 (`s6_mom2`) — IN PROGRESS, 15 configs, off/N1/N2 matrix
+
+VWAP and EMA, each at 3 entry-gate variants (full ATR+PCR / PCR-removed /
+base-no-gates) × momentum off/N1/N2 — isolating whether the PCR gate
+specifically interacts with momentum, and extending the off/N1/N2
+calibration to base entry logic too (not just each strategy's tuned
+conviction baseline), per explicit user request. All 9 VWAP-family configs
+done, zero shard failures, tight consistent timing (392–405s each,
+matching Batch 1's VWAP-family rate). Currently on the 6 EMA-family
+configs (`m2_ema_full_off` done: 12 trades, matches `EMA_Micro_Conviction`'s
+own Batch-1 N=1 baseline sample size closely; `m2_ema_full_n1` running).
+Not yet analyzed — do that before touching these configs further.
+
+### Batch 3 (`s6_mom3`) — QUEUED, auto-chained, not yet started
+
+**Scope note**: user asked for "ORB conviction" / "OI_volume conviction",
+meaning the full-gate conviction baselines — what actually got built is
+**base entry only** (`orb_conviction`/`oi_volume_confirmed_conviction`
+with *only* `require_momentum_alignment` set, no other gate) at a wide N
+grid, per a mid-conversation mix-up caught and left as-is by explicit user
+call ("no issues we will do it now, and conviction ones tomorrow" — see
+"Not yet done" below).
+
+11 configs: `orb_conviction` base entry, N∈{1,2,4,5,6,8,10,15} (coarse
+grid, not exhaustive — motivated directly by the ORB N=1-vs-N=5 reversal
+above); `oi_volume_confirmed_conviction` base entry, N∈{1,2,3}. The
+momentum-off ("N=0") reference for each already exists from Batch 1
+(`m1_base_orb` E=−177/44 trades, `m1_base_oi` E=−147/45 trades) — not
+rerun. QC'd twice (local + box venv) including an explicit check that no
+*other* gate landed on for any of the 11 lines.
+
+**Launch mechanism**: a detached wait-loop unit
+(`backtest-20260901-215329.service`) polls Batch 2's unit every 5 min and
+only invokes `run_sweep.sh` once it reports inactive — chosen over a
+Claude-side scheduler specifically because it survives the session/laptop
+ending entirely, running solely on the A1 box. Confirmed genuinely
+waiting (near-zero CPU) before the session ended.
+
+### Not yet done (resume here)
+
+1. **Analyze Batch 2** (VWAP off/N1/N2 × full/nopcr/base already
+   complete; EMA still finishing) once it's done.
+2. **Analyze Batch 3** (ORB/OI base-entry wide-N sweep) once the
+   auto-chain fires and completes.
+3. **The actual conviction-gate versions of Batch 3** — `ORB_Conviction`
+   (full: `require_prior_day_trend` + `max_or_range_nifty_points=65`) and
+   `OI_Volume_Conviction` (full: `require_atr_expansion` +
+   `pcr_oi_min`/`max`) at the same N grids, momentum layered *on top of*
+   each strategy's already-tuned entry gates rather than replacing them —
+   this is what "conviction ones tomorrow" refers to.
+4. **Real RSI14-oscillator gate** (`require_rsi_alignment`, band-vs-50 —
+   distinct from the momentum/"micro-trend" gate above) still fully
+   deferred, not started this session: base VWAP + RSI, full VWAP
+   conviction + RSI (already known net-harmful from Sweep #4 Phase 7,
+   would be a regression check not new information), base EMA + RSI, full
+   EMA conviction + RSI (both EMA combos genuinely untested).
+5. **`m1_base_ema` clean rerun** — superseded by Batch 2's
+   `m2_ema_base_off`, which serves the same purpose; confirm once Batch 2
+   is analyzed that this is covered and the corrupted Batch-1 number can
+   be fully discarded.
+6. Re-enable `backtest-reaper.timer` once Batch 3 (the last queued item)
+   fully completes — currently off, correctly, must not be forgotten.
+
+Also this session: 3 stale local+remote git branches deleted
+(`feat/multi-leg-exit-engine`, `fix/shoonya-option-chain-expiry-anchor`,
+`fix/structure-break-and-orb-window-fixes` — all confirmed strict subsets
+of `main` before deletion, zero commits lost); `backtest_engine/README.md`
+gained 3 new restrictive rules (reaper-vs-active-sweep, credential
+exclusion on re-pin, config-construction QC before launch, checksum
+verification after sync) and a real-data Efficiency rule 4 (was an
+untested placeholder, now: VWAP-family ~6.3–6.7 min/config,
+EMA/ORB/OI/Liquidity-family ~22–25 min/config, at `SHARD_COUNT=4` on A1).
+
+---
+
 ## 2026-09-01 (~01:30–02:45 IST) — FULL-ARCHIVE RE-ANALYSIS (626 configs, fresh from the CSVs) + paper configs updated on OCI
 
 Not a new sweep. A from-scratch re-read of **every post-DTE-fix run** — 626
