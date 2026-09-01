@@ -85,6 +85,8 @@ class LiquiditySweepReversalConvictionStrategy(
         min_displacement_atr: float = 0.0,
         require_rsi_alignment: bool = False,
         rsi_neutral_band: float = 10.0,
+        require_momentum_alignment: bool = False,
+        momentum_lookback_bars: int = 1,
         **sweep_kwargs: object,
     ) -> None:
         LiquiditySweepReversalStrategy.__init__(self, instrument_id, expiry_date, **sweep_kwargs)  # type: ignore[arg-type]
@@ -107,6 +109,8 @@ class LiquiditySweepReversalConvictionStrategy(
             skip_weekdays=skip_weekdays,
             require_rsi_alignment=require_rsi_alignment,
             rsi_neutral_band=rsi_neutral_band,
+            require_momentum_alignment=require_momentum_alignment,
+            momentum_lookback_bars=momentum_lookback_bars,
         )
         self.min_displacement_atr = min_displacement_atr
 

@@ -78,6 +78,8 @@ CONVICTION_GATE_PARAM_KEYS = {
     "skip_weekdays",
     "require_rsi_alignment",
     "rsi_neutral_band",
+    "require_momentum_alignment",
+    "momentum_lookback_bars",
 }
 
 # IST weekday names accepted by `skip_weekdays` -- identical set
@@ -129,6 +131,8 @@ class ConvictionGateMixin:
         skip_weekdays: list[str] | None = None,
         require_rsi_alignment: bool = False,
         rsi_neutral_band: float = 10.0,
+        require_momentum_alignment: bool = False,
+        momentum_lookback_bars: int = 1,
     ) -> None:
         self.require_prior_day_trend = require_prior_day_trend
         self.prior_day_trend_buffer_pts = prior_day_trend_buffer_pts
@@ -147,6 +151,8 @@ class ConvictionGateMixin:
         self.skip_weekdays = {d for d in (skip_weekdays or []) if d in _WEEKDAYS}
         self.require_rsi_alignment = require_rsi_alignment
         self.rsi_neutral_band = rsi_neutral_band
+        self.require_momentum_alignment = require_momentum_alignment
+        self.momentum_lookback_bars = momentum_lookback_bars
 
     def _conviction_reject_reason(
         self,
@@ -186,6 +192,11 @@ class ConvictionGateMixin:
 
         if self.require_rsi_alignment:
             reason = self._rsi_alignment_reject(db, option_type)
+            if reason is not None:
+                return reason
+
+        if self.require_momentum_alignment:
+            reason = self._momentum_alignment_reject(db, latest_bar, option_type)
             if reason is not None:
                 return reason
 
@@ -287,6 +298,49 @@ class ConvictionGateMixin:
             return "rsi_alignment_disagrees"
         return None
 
+    def _momentum_alignment_reject(
+        self, db: Session, latest_bar: PriceBar, option_type: OptionType
+    ) -> str | None:
+        """New, not backtest-proven yet (2026-09-01) -- a plain price-action
+        alternative to `_rsi_alignment_reject`, requested alongside it: does
+        the underlying's own raw closes show `momentum_lookback_bars`
+        consecutive bars of strictly one-directional movement, not just a
+        smoothed oscillator crossing a level. Independent opt-in gate, not a
+        replacement -- both can be enabled together or separately, same as
+        every other gate in this mixin.
+
+        Deliberately monotonic across the whole window (every bar in
+        sequence must move the same way), not a single current-vs-N-bars-ago
+        comparison -- a stricter, more conviction-heavy filter picked
+        explicitly over the looser pairwise form, per user instruction.
+        `get_recent_completed_bars` returns oldest-first, so `closes[-1]` is
+        always the latest (== `latest_bar`) and `closes[0]` the oldest of the
+        window -- same ordering `_prior_day_trend_reject` already relies on.
+
+        `since=day_start`: without a day anchor, `limit=N` alone would pull
+        yesterday's bars for the first N minutes of every session, the same
+        live-confirmed 2026-09-01 cross-session contamination
+        `oi_volume_confirmed.py` fixed for its own rolling window.
+        """
+        day_start = datetime.combine(to_ist(latest_bar.bucket_start).date(), dtime.min, tzinfo=IST)
+        bars = get_recent_completed_bars(
+            db,
+            self.instrument_id,
+            self.timeframe,
+            since=day_start,
+            limit=self.momentum_lookback_bars + 1,
+        )
+        if len(bars) < self.momentum_lookback_bars + 1:
+            return None  # not enough history yet -- missing data isn't an adverse regime
+        closes = [float(b.close) for b in bars]
+        if option_type is OptionType.CE:
+            if not all(closes[i] < closes[i + 1] for i in range(len(closes) - 1)):
+                return "momentum_alignment_disagrees"
+        else:
+            if not all(closes[i] > closes[i + 1] for i in range(len(closes) - 1)):
+                return "momentum_alignment_disagrees"
+        return None
+
     def _atr_expansion_reject(self, db: Session) -> str | None:
         need = self.atr_expansion_lookback + 1
         atrs = get_recent_indicator_values(
@@ -301,7 +355,12 @@ class ConvictionGateMixin:
 
     def _volume_surge_reject(self, db: Session, latest_bar: PriceBar) -> str | None:
         need = self.volume_surge_lookback + 1
-        bars = get_recent_completed_bars(db, self.instrument_id, self.timeframe, limit=need)
+        # `since=day_start` -- see `oi_volume_confirmed.py`'s identical fix
+        # for the live-confirmed 2026-09-01 cross-session contamination.
+        day_start = datetime.combine(to_ist(latest_bar.bucket_start).date(), dtime.min, tzinfo=IST)
+        bars = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, since=day_start, limit=need
+        )
         if len(bars) < need:
             return "volume_not_ready"
         current = float(bars[-1].volume or 0)

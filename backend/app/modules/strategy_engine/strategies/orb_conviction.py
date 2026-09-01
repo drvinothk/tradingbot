@@ -122,6 +122,8 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
         time_stop_minutes: float | None = None,
         require_rsi_alignment: bool = False,
         rsi_neutral_band: float = 10.0,
+        require_momentum_alignment: bool = False,
+        momentum_lookback_bars: int = 1,
         **orb_kwargs: object,
     ) -> None:
         ORBStrategy.__init__(self, instrument_id, expiry_date, **orb_kwargs)  # type: ignore[arg-type]
@@ -144,6 +146,8 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
             skip_weekdays=skip_weekdays,
             require_rsi_alignment=require_rsi_alignment,
             rsi_neutral_band=rsi_neutral_band,
+            require_momentum_alignment=require_momentum_alignment,
+            momentum_lookback_bars=momentum_lookback_bars,
         )
         self.max_trades_per_day = max_trades_per_day
         self.target_r_multiple = target_r_multiple

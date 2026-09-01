@@ -200,7 +200,7 @@ def _seed_vix(db: Session, value: float, ts: datetime) -> None:
     db.flush()
 
 
-OR_START = datetime(2026, 7, 24, 9, 15, tzinfo=IST)
+OR_START = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
 BREAKOUT_TS = OR_START + timedelta(minutes=OR_MINUTES)
 
 
@@ -398,6 +398,194 @@ class TestVixBandGate:
 
         strategy = ORBConvictionStrategy(
             instrument.id, EXPIRY, or_minutes=OR_MINUTES, vix_min=10.0, vix_max=20.0,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
+
+
+class TestRsiAlignmentGate:
+    """`require_rsi_alignment`/`rsi_neutral_band` -- gate logic lives in
+    `ConvictionGateMixin._rsi_alignment_reject` (shared by all 5
+    `*_conviction` strategies), tested once here through ORB's own harness
+    rather than duplicated per strategy, same as every other gate in this
+    file. Default `rsi_neutral_band=10.0` -> reject CE when RSI14<=60,
+    reject PE when RSI14>=40.
+    """
+
+    def test_blocked_when_ce_rsi_in_neutral_band(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "RSI14", [55.0], OR_START)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is None
+
+    def test_blocked_when_pe_rsi_in_neutral_band(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "RSI14", [45.0], OR_START)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(
+            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS)
+        ) is None
+
+    def test_allowed_when_ce_rsi_clearly_bullish(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "RSI14", [65.0], OR_START)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
+
+    def test_allowed_when_pe_rsi_clearly_bearish(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "RSI14", [35.0], OR_START)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(
+            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS)
+        ) is not None
+
+    def test_band_boundary_exactly_at_neutral_edge_still_blocks(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+        _seed_indicator_series(db, instrument, "RSI14", [60.0], OR_START)  # exactly 50+band
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is None
+
+    def test_allowed_when_rsi_not_available_yet(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Missing data isn't an adverse regime -- same convention
+        `_pcr_reject`/`_rsi_alignment_reject`'s own docstring documents."""
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, require_rsi_alignment=True,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
+
+
+class TestMomentumAlignmentGate:
+    """`require_momentum_alignment`/`momentum_lookback_bars` -- gate logic
+    lives in `ConvictionGateMixin._momentum_alignment_reject`, tested once
+    here through ORB's own harness same as the RSI gate above.
+    `_seed_opening_range`'s bars are all flat at `close=mid` (22010.0 here),
+    so with the breakout bar's own close appended: N=1's window (last flat
+    bar -> breakout) is a genuine single-step move and passes; N=2's window
+    (two flat bars -> breakout) has an equal pair in it and fails strict
+    monotonicity -- no extra custom bar-seeding needed to get both a passing
+    and a blocking case from the same fixture.
+    """
+
+    def test_allowed_ce_when_single_bar_step_is_a_clean_rise(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_momentum_alignment=True, momentum_lookback_bars=1,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
+
+    def test_blocked_ce_when_two_bar_window_has_a_flat_step(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_momentum_alignment=True, momentum_lookback_bars=2,
+        )
+        assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is None
+
+    def test_allowed_pe_when_single_bar_step_is_a_clean_fall(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_momentum_alignment=True, momentum_lookback_bars=1,
+        )
+        assert strategy.check_setup(
+            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS)
+        ) is not None
+
+    def test_blocked_pe_when_two_bar_window_has_a_flat_step(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_momentum_alignment=True, momentum_lookback_bars=2,
+        )
+        assert strategy.check_setup(
+            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS)
+        ) is None
+
+    def test_allowed_when_not_enough_bar_history_for_the_lookback(
+        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Missing data isn't an adverse regime -- same convention every
+        other gate in this mixin already follows."""
+        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+
+        strategy = ORBConvictionStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES,
+            require_momentum_alignment=True, momentum_lookback_bars=50,
         )
         assert strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument)) is not None
 

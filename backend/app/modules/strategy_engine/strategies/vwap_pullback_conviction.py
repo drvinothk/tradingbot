@@ -73,6 +73,8 @@ class VWAPPullbackConvictionStrategy(ConvictionGateMixin, VWAPPullbackStrategy):
         min_bars_since_open: int = 0,
         require_rsi_alignment: bool = False,
         rsi_neutral_band: float = 10.0,
+        require_momentum_alignment: bool = False,
+        momentum_lookback_bars: int = 1,
         **vwap_kwargs: object,
     ) -> None:
         VWAPPullbackStrategy.__init__(self, instrument_id, expiry_date, **vwap_kwargs)  # type: ignore[arg-type]
@@ -95,6 +97,8 @@ class VWAPPullbackConvictionStrategy(ConvictionGateMixin, VWAPPullbackStrategy):
             skip_weekdays=skip_weekdays,
             require_rsi_alignment=require_rsi_alignment,
             rsi_neutral_band=rsi_neutral_band,
+            require_momentum_alignment=require_momentum_alignment,
+            momentum_lookback_bars=momentum_lookback_bars,
         )
         self.min_bars_since_open = min_bars_since_open
 

@@ -12,6 +12,7 @@ from app.modules.market_data.indicators import (
     BarAggregator,
     EMACalculator,
     IndicatorEngine,
+    RSICalculator,
     VWAPCalculator,
 )
 
@@ -90,6 +91,61 @@ class TestATRCalculator:
     def test_rejects_invalid_period(self):
         with pytest.raises(ValueError):
             ATRCalculator(period=0)
+
+
+class TestRSICalculator:
+    def test_returns_none_until_warmed_up(self):
+        rsi = RSICalculator(period=3)
+        assert rsi.update(10) is None  # no prior close yet -- contributes nothing
+        assert rsi.update(12) is None  # 1st gain/loss sample
+        assert rsi.update(11) is None  # 2nd gain/loss sample
+        seed = rsi.update(14)  # 3rd sample -> seeds avg_gain/avg_loss
+        assert seed == pytest.approx(100 - 100 / 6)
+        assert rsi.is_warmed_up
+
+    def test_matches_hand_computed_wilder_smoothed_sequence(self):
+        rsi = RSICalculator(period=3)
+        rsi.update(10)
+        rsi.update(12)  # gain=2
+        rsi.update(11)  # loss=1
+        seed = rsi.update(14)  # gain=3 -> avg_gain=(2+0+3)/3=5/3, avg_loss=(0+1+0)/3=1/3
+        assert seed == pytest.approx(100 - 100 / 6)
+
+        value = rsi.update(13)  # loss=1
+        expected_avg_gain = (5 / 3 * (3 - 1) + 0) / 3
+        expected_avg_loss = (1 / 3 * (3 - 1) + 1) / 3
+        expected_rs = expected_avg_gain / expected_avg_loss
+        expected = 100 - 100 / (1 + expected_rs)
+        assert value == pytest.approx(expected)
+        assert value == pytest.approx(66.6667, abs=1e-3)
+
+    def test_all_gains_saturate_at_100(self):
+        rsi = RSICalculator(period=3)
+        value = None
+        for price in [10, 11, 12, 13, 14, 15, 16]:
+            value = rsi.update(price)
+        assert value == pytest.approx(100.0)
+
+    def test_all_losses_approach_zero(self):
+        rsi = RSICalculator(period=3)
+        value = None
+        for price in [16, 15, 14, 13, 12, 11, 10]:
+            value = rsi.update(price)
+        assert value == pytest.approx(0.0)
+
+    def test_value_and_is_warmed_up_properties_match_update(self):
+        rsi = RSICalculator(period=3)
+        assert rsi.value is None
+        assert not rsi.is_warmed_up
+        last = None
+        for price in [10, 12, 11, 14]:
+            last = rsi.update(price)
+        assert rsi.value == pytest.approx(last)
+        assert rsi.is_warmed_up
+
+    def test_rejects_invalid_period(self):
+        with pytest.raises(ValueError):
+            RSICalculator(period=0)
 
 
 class TestVWAPCalculator:
@@ -217,6 +273,7 @@ class TestIndicatorEngine:
         assert results["EMA9"] == pytest.approx(100.0)
         assert "EMA20" not in results  # not warmed up yet at 9 candles
         assert "ATR14" not in results  # not warmed up yet at 9 candles either
+        assert "RSI14" not in results  # needs 15 closes (period+1), not warmed yet either
 
     def test_on_completed_bar_warms_up_atr14_from_candle_high_low_close(self):
         engine = IndicatorEngine(timeframe_seconds=60)
@@ -236,6 +293,33 @@ class TestIndicatorEngine:
 
         assert results["ATR14"] == pytest.approx(2.0)
 
+    def test_on_completed_bar_warms_up_rsi14_from_candle_closes(self):
+        """RSI14 needs `period + 1` closes (the first close only seeds
+        `_prev_close`, contributing no gain/loss sample) -- 15 candles for
+        the production period=14, not 14 like ATR14's own warmup.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        results: dict[str, float] = {}
+        for i in range(1, 15):  # 14 candles -- one short of RSI14's warmup
+            candle = PriceCandle(
+                bucket_start=_ts(i * 60),
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.0 + i,  # steadily rising -> all gains
+                volume=0,
+            )
+            results = engine.on_completed_bar(instrument_id, candle)
+        assert "RSI14" not in results
+
+        candle = PriceCandle(
+            bucket_start=_ts(15 * 60), open=100.0, high=101.0, low=99.0, close=115.0, volume=0
+        )
+        results = engine.on_completed_bar(instrument_id, candle)
+        assert results["RSI14"] == pytest.approx(100.0)  # all-gains -> avg_loss=0
+
     def test_on_tick_warms_up_atr14_alongside_ema_on_bar_completion(self):
         engine = IndicatorEngine(timeframe_seconds=60)
         instrument_id = uuid.uuid4()
@@ -249,6 +333,25 @@ class TestIndicatorEngine:
                 ),
             )
         assert "ATR14" in values
+
+    def test_on_tick_warms_up_rsi14_on_bar_completion(self):
+        """15 completed bars (one more than ATR14's own 14) needed here too
+        -- see `test_on_completed_bar_warms_up_rsi14_from_candle_closes`'s
+        docstring for why. 16 ticks, one per bucket boundary, produce 15
+        completions.
+        """
+        engine = IndicatorEngine(timeframe_seconds=60)
+        instrument_id = uuid.uuid4()
+
+        values: dict[str, float] = {}
+        for i in range(16):
+            values, _ = engine.on_tick(
+                instrument_id,
+                Tick(
+                    "NIFTY", ltp=100.0 + i, bid=0, ask=0, volume=10, oi=None, ts=_ts(i * 60)
+                ),
+            )
+        assert "RSI14" in values
 
     def test_on_completed_bar_never_produces_or_touches_vwap(self):
         """A completed candle has no per-trade volume to weight — VWAP is a
@@ -354,6 +457,7 @@ class TestWarmStart:
         assert engine._ema9[instrument_id].is_warmed_up
         assert engine._ema20[instrument_id].is_warmed_up
         assert engine._atr[instrument_id].is_warmed_up
+        assert engine._rsi[instrument_id].is_warmed_up
 
     def test_matches_replaying_the_same_bars_through_on_completed_bar(self):
         """`warm_start` must be mathematically identical to normal live
@@ -394,6 +498,7 @@ class TestWarmStart:
         assert warm_started._ema9[warm_id].value == pytest.approx(results["EMA9"])
         assert warm_started._ema20[warm_id].value == pytest.approx(results["EMA20"])
         assert warm_started._atr[warm_id].value == pytest.approx(results["ATR14"])
+        assert warm_started._rsi[warm_id].value == pytest.approx(results["RSI14"])
 
     def test_is_a_noop_once_a_live_tick_already_arrived(self):
         """The critical safety property: replaying stale historical bars
@@ -416,6 +521,7 @@ class TestWarmStart:
             Tick("NIFTY", ltp=100.0, bid=0, ask=0, volume=10, oi=None, ts=_ts(61)),
         )
         assert not engine._ema9[instrument_id].is_warmed_up  # only 1 bar in so far
+        assert not engine._rsi[instrument_id].is_warmed_up
 
         bars = [
             Bar(bucket_start=_ts(i * 60), open=50.0, high=51.0, low=49.0, close=50.0, volume=0)
@@ -426,6 +532,7 @@ class TestWarmStart:
         # Still not warmed -- warm_start must not have touched this
         # instrument's calculators once a live tick already created them.
         assert not engine._ema9[instrument_id].is_warmed_up
+        assert not engine._rsi[instrument_id].is_warmed_up
 
     def test_is_idempotent_second_call_is_ignored(self):
         engine = IndicatorEngine(timeframe_seconds=60)
@@ -458,6 +565,7 @@ class TestWarmStart:
         assert instrument_id not in engine._ema9
         assert instrument_id not in engine._ema20
         assert instrument_id not in engine._atr
+        assert instrument_id not in engine._rsi
 
     def test_replaying_fewer_than_the_warmup_period_leaves_indicators_unwarmed(self):
         """Same 'not enough history yet' semantics as live warmup -- a
@@ -475,6 +583,7 @@ class TestWarmStart:
 
         assert engine._ema9[instrument_id].is_warmed_up
         assert not engine._ema20[instrument_id].is_warmed_up
+        assert not engine._rsi[instrument_id].is_warmed_up  # needs 15, only 12 replayed
 
     def test_other_instruments_are_unaffected(self):
         engine = IndicatorEngine(timeframe_seconds=60)
