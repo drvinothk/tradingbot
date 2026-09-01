@@ -62,8 +62,8 @@ class _FakeConnectContext:
     def __enter__(self) -> _RunLoopFakeConnection:
         return self._conn
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
 
 
 def _patch_fast_backoff_and_connect(monkeypatch) -> tuple[list[str], list[int]]:
