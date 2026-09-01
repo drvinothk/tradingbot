@@ -244,6 +244,17 @@ frontend test tooling yet (see the build plan's frontend section); verify
 frontend changes by driving the real dev server (`npm run build` for a type
 check, then exercise it live).
 
+## Running a backtest
+
+**Before running, changing, or reasoning about any backtest work, read
+[`backtest_engine/README.md`](backtest_engine/README.md) first** — its
+"Restrictive rules" and "Efficiency rules" tables are the current source of
+truth for how the engine runs on the live A1 box (`backtest_engine/` itself is
+gitignored, not tracked here). Short version: it's co-located on the same OCI
+box as live trading, hard-isolated (own DB namespace, own venv, `backtest.slice`
+cgroup cap), and must never be run or edited from a session doing trading-app
+work, or vice versa.
+
 ## Conventions that matter (don't relitigate without reading the "why")
 
 - **Broker-agnostic boundary**: every module talks to `app/modules/broker_adapter/base/broker_port.py`,

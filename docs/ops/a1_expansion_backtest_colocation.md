@@ -1,3 +1,8 @@
+> **Superseded 2026-09-01.** This is the original plan doc. The actual deployed
+> design is simpler: same Postgres cluster with `DB_NAME=btengine` (no `btuser`,
+> no `:5433` cluster), `MemoryMax=4G`. For current state, run practices, and the
+> disk-hygiene rules, see `backtest_engine/README.md`'s "Best practices" section.
+
 # A1 box expansion + co-located isolated backtesting
 
 Runbook for expanding the live OCI trading-bot box to 2 OCPU / 12 GB / 100 GB
