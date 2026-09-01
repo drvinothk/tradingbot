@@ -9,9 +9,12 @@ caveat) would break.
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import pytest
 
+import app.modules.broker_adapter.shoonya.ws_client as ws_client_module
 from app.modules.broker_adapter.shoonya.ws_client import ShoonyaWSClient, _SubscriptionEntry
 
 
@@ -412,4 +415,137 @@ def test_unsubscribe_target_also_drops_its_volume_proxy_source():
 
     assert client._entries_by_key == {}
     assert client._volume_proxy == {}
+
+
+# -- `_run`'s session_is_live gate (2026-09-01) -------------------------------
+#
+# `_run`/`_receive_loop` still need a live server to test meaningfully in
+# general (this file's own module docstring) — but the gate itself is pure
+# control flow around whether `connect()` gets called at all, testable with
+# `connect` monkeypatched to a fake and the backoff tuples shrunk to make the
+# test fast, same spirit as every other test here staying deterministic and
+# socket-free.
+
+
+class _RunLoopFakeConnection:
+    """Gives `_authenticate` a real ack on the first `recv`, then makes every
+    later `recv` (the ones `_receive_loop` issues) behave like Shoonya's own
+    real 1s poll timeout — never any further messages, so `_receive_loop`
+    just idles until `_stop` is set, exactly like a genuinely idle connection.
+    """
+
+    def __init__(self, ack: dict):
+        self._ack = json.dumps(ack)
+        self._first = True
+        self.sent: list[str] = []
+
+    def send(self, message: str) -> None:
+        self.sent.append(message)
+
+    def recv(self, timeout: float | None = None) -> str:
+        if self._first:
+            self._first = False
+            return self._ack
+        raise TimeoutError
+
+
+class _FakeConnectContext:
+    def __init__(self, conn: _RunLoopFakeConnection):
+        self._conn = conn
+
+    def __enter__(self) -> _RunLoopFakeConnection:
+        return self._conn
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+def _patch_fast_backoff_and_connect(monkeypatch) -> list[str]:
+    """Shrinks both backoff tuples to ~10ms so these tests don't spend real
+    wall-clock seconds waiting out `_RECONNECT_BACKOFF_SECONDS`/
+    `_SESSION_NOT_READY_BACKOFF_SECONDS`, and replaces `connect` with a fake
+    that records each attempted URL. Returns that list.
+    """
+    connect_calls: list[str] = []
+
+    def _fake_connect(url: str, open_timeout: float = 10) -> _FakeConnectContext:
+        connect_calls.append(url)
+        return _FakeConnectContext(_RunLoopFakeConnection({"t": "ak", "s": "OK"}))
+
+    monkeypatch.setattr(ws_client_module, "connect", _fake_connect)
+    monkeypatch.setattr(ws_client_module, "_RECONNECT_BACKOFF_SECONDS", (0.01,))
+    monkeypatch.setattr(ws_client_module, "_SESSION_NOT_READY_BACKOFF_SECONDS", (0.01, 0.01))
+    return connect_calls
+
+
+def _run_in_background(client: ShoonyaWSClient) -> threading.Thread:
+    thread = threading.Thread(target=client._run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_run_skips_connect_while_session_is_not_live(monkeypatch):
+    connect_calls = _patch_fast_backoff_and_connect(monkeypatch)
+    client, _, _ = _client(session_is_live=lambda: False)
+
+    thread = _run_in_background(client)
+    time.sleep(0.2)
+    client.stop()
+    thread.join(timeout=2)
+
+    assert connect_calls == []
+    assert client._connected.is_set() is False
+
+
+def test_run_attempts_connect_once_session_becomes_live(monkeypatch):
+    connect_calls = _patch_fast_backoff_and_connect(monkeypatch)
+    live = {"value": False}
+    client, _, _ = _client(session_is_live=lambda: live["value"])
+
+    thread = _run_in_background(client)
+    time.sleep(0.1)
+    assert connect_calls == [], "must not attempt while session_is_live() is False"
+
+    live["value"] = True
+    connected = client._connected.wait(timeout=2.0)
+
+    client.stop()
+    thread.join(timeout=2)
+
+    assert connected is True, "auth should complete once session_is_live() flips True"
+    assert len(connect_calls) >= 1
+
+
+def test_run_attempts_connect_immediately_when_session_is_live_is_unset(monkeypatch):
+    """`session_is_live=None` (the default, and every existing caller that
+    predates this parameter) must behave exactly as before — no gating.
+    """
+    connect_calls = _patch_fast_backoff_and_connect(monkeypatch)
+    client, _, _ = _client()  # no session_is_live passed
+
+    thread = _run_in_background(client)
+    for _ in range(50):
+        if connect_calls:
+            break
+        time.sleep(0.02)
+    client.stop()
+    thread.join(timeout=2)
+
+    assert len(connect_calls) >= 1
+
+
+def test_run_treats_a_raising_session_is_live_as_not_live(monkeypatch):
+    connect_calls = _patch_fast_backoff_and_connect(monkeypatch)
+
+    def _raising() -> bool:
+        raise RuntimeError("probe blew up")
+
+    client, _, _ = _client(session_is_live=_raising)
+
+    thread = _run_in_background(client)
+    time.sleep(0.2)
+    client.stop()
+    thread.join(timeout=2)
+
+    assert connect_calls == []
     assert client._proxy_last_cum_v == {}

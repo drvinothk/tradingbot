@@ -94,6 +94,18 @@ _RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 15, 30)
 # Alice Blue's own doc: "Send heartbeat once in every 50 seconds."
 _HEARTBEAT_INTERVAL_SECONDS = 50.0
 
+# 2026-09-01: separate, longer-capped backoff for "we already know there's no
+# live session" (`session_is_live` returns False) — see `ws_client.py`'s
+# identical constant for the full incident writeup (a stale/expired Alice
+# Blue session, the normal state until a human logs in, meant this loop
+# retried a doomed handshake — *and* the `_ensure_ws_session` REST call ahead
+# of it — every 30s indefinitely). This client is additionally the live
+# failover backup for Shoonya (`MARKET_DATA_FAILOVER_ENABLED=true` on the
+# deployed box) — confirmed via live logs, this exact loop is what produced
+# ~190 failed attempts over one ~90 minute morning while Alice Blue's cached
+# session was stale.
+_SESSION_NOT_READY_BACKOFF_SECONDS = (5, 15, 30, 60, 120, 300)
+
 
 @dataclass(frozen=True)
 class _SubscriptionEntry:
@@ -125,6 +137,7 @@ class AliceBlueWSClient:
         on_tick: TickCallback,
         source: str = "API",
         ensure_ws_session: Callable[[], None] | None = None,
+        session_is_live: Callable[[], bool] | None = None,
     ) -> None:
         """`uid`/`actid` are taken exactly as given — see `alice_blue.py`'s
         own docstring for why the `f"{client_id}_API"` formatting lives at
@@ -136,6 +149,11 @@ class AliceBlueWSClient:
         `alice_blue_auth.create_ws_session`'s own docstring for why this
         call is required at all: live-confirmed 2026-08-21, every connect
         attempt without it first was rejected with `NOT_OK`.
+
+        `session_is_live`, when given, is checked at the top of every `_run`
+        loop iteration *before* `ensure_ws_session`/the connect attempt —
+        `None` (the default) preserves prior behavior exactly. See
+        `_SESSION_NOT_READY_BACKOFF_SECONDS`'s own comment.
         """
         self._ws_host = ws_host
         self._uid = uid
@@ -144,6 +162,7 @@ class AliceBlueWSClient:
         self._on_tick = on_tick
         self._source = source
         self._ensure_ws_session = ensure_ws_session
+        self._session_is_live = session_is_live
 
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
         self._last_known_by_key: dict[str, dict] = {}
@@ -207,7 +226,27 @@ class AliceBlueWSClient:
 
     def _run(self) -> None:
         backoff_index = 0
+        not_ready_index = 0
+        waiting_for_session = False
         while not self._stop.is_set():
+            if self._session_is_live is not None and not self._session_looks_live():
+                if not waiting_for_session:
+                    logger.warning(
+                        "Alice Blue WebSocket: no valid session yet — deferring connect "
+                        "attempts until a fresh login completes"
+                    )
+                    waiting_for_session = True
+                delay = _SESSION_NOT_READY_BACKOFF_SECONDS[
+                    min(not_ready_index, len(_SESSION_NOT_READY_BACKOFF_SECONDS) - 1)
+                ]
+                not_ready_index += 1
+                self._stop.wait(delay)
+                continue
+            if waiting_for_session:
+                logger.warning("Alice Blue WebSocket: session now available — resuming connect")
+                waiting_for_session = False
+            not_ready_index = 0
+
             try:
                 if self._ensure_ws_session is not None:
                     self._ensure_ws_session()
@@ -235,6 +274,16 @@ class AliceBlueWSClient:
             ]
             backoff_index += 1
             self._stop.wait(delay)
+
+    def _session_looks_live(self) -> bool:
+        assert self._session_is_live is not None
+        try:
+            return self._session_is_live()
+        except Exception:
+            logger.exception(
+                "Alice Blue WebSocket: session_is_live check raised — treating as not live"
+            )
+            return False
 
     def _authenticate(self, ws: Connection) -> None:
         logger.warning(

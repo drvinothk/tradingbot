@@ -70,6 +70,9 @@ class _FakeRunner:
         self.stopped = False
         _FakeRunner.instances.append(self)
 
+    def is_alive(self) -> bool:
+        return self.started and not self.stopped
+
     def start(self) -> None:
         self.started = True
 

@@ -436,6 +436,15 @@ class StrategyRunner:
         """
         return getattr(self._strategy, "last_signal_status", None)
 
+    def is_alive(self) -> bool:
+        """Mirrors `PositionManager.is_alive()` exactly -- lets a caller that
+        might already hold a live runner for this `strategy_run_id` (see
+        `strategy_engine.recovery.resume_strategy_runners`) tell "already
+        running" apart from "never started" / "thread died" before deciding
+        whether to spin up a second one.
+        """
+        return self._thread is not None and self._thread.is_alive()
+
     def start(self) -> None:
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True)

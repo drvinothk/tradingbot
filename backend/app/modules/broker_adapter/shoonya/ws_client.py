@@ -100,6 +100,21 @@ logger = logging.getLogger("app.broker_adapter.shoonya.ws")
 # lasting hours shouldn't turn into a multi-hour sleep before the next retry.
 _RECONNECT_BACKOFF_SECONDS = (1, 2, 5, 10, 15, 30)
 
+# 2026-09-01: a *separate*, longer-capped backoff for the "we already know
+# there's no valid session" case (`session_is_live` returns False) — distinct
+# from `_RECONNECT_BACKOFF_SECONDS` above, which is for a genuine connect/auth
+# attempt that failed (worth retrying fairly soon, a transient blip is
+# plausible). Live-confirmed incident: before this existed, a stale/expired
+# access token (the normal state every morning until a human completes a
+# fresh OAuth login) meant `_run` kept attempting a doomed handshake every
+# 30s indefinitely — ~190 failed attempts logged over a ~90 minute morning
+# window. Capping at 5 minutes instead of 30 seconds cuts that by ~90% with
+# zero effect on how quickly a fresh login is picked up, since that already
+# happens via an external teardown+rebuild (`market_data.registry
+# .reset_for_reconnect`, run from `api.v1.shoonya.oauth_callback`), not by
+# this loop noticing on its own — see `session_is_live`'s own docstring.
+_SESSION_NOT_READY_BACKOFF_SECONDS = (5, 15, 30, 60, 120, 300)
+
 # App-level keepalive Noren's own protocol convention expects on top of the
 # WebSocket ping/pong frames `websockets.sync.client.connect` already sends
 # automatically — cheap to include even if the server turns out not to need
@@ -136,6 +151,7 @@ class ShoonyaWSClient:
         on_depth: DepthCallback | None = None,
         on_order_update: OrderUpdateCallback | None = None,
         source: str = "API",
+        session_is_live: Callable[[], bool] | None = None,
     ) -> None:
         self._ws_host = ws_host
         self._uid = uid
@@ -145,6 +161,17 @@ class ShoonyaWSClient:
         self._on_depth = on_depth
         self._on_order_update = on_order_update
         self._source = source
+        # Optional readiness gate, checked at the top of every `_run` loop
+        # iteration before attempting a connect+auth handshake. `None`
+        # (the default) preserves the exact prior behavior — always attempt
+        # — so any existing/test caller that doesn't pass this is unaffected.
+        # See `_SESSION_NOT_READY_BACKOFF_SECONDS`'s own comment for why this
+        # exists: this client's own captured `access_token` never refreshes
+        # itself, so once it goes stale the only real fix is a fresh login
+        # elsewhere tearing this whole client down and building a new one —
+        # this gate's only job is to stop hammering the broker while that
+        # hasn't happened yet, not to somehow revive this instance on its own.
+        self._session_is_live = session_is_live
 
         self._entries_by_key: dict[str, _SubscriptionEntry] = {}
         # Noren's own touchline-feed protocol: "tk"/"dk" (sent once, right
@@ -308,7 +335,27 @@ class ShoonyaWSClient:
 
     def _run(self) -> None:
         backoff_index = 0
+        not_ready_index = 0
+        waiting_for_session = False
         while not self._stop.is_set():
+            if self._session_is_live is not None and not self._session_looks_live():
+                if not waiting_for_session:
+                    logger.warning(
+                        "Shoonya WebSocket: no valid session yet — deferring connect "
+                        "attempts until a fresh login completes"
+                    )
+                    waiting_for_session = True
+                delay = _SESSION_NOT_READY_BACKOFF_SECONDS[
+                    min(not_ready_index, len(_SESSION_NOT_READY_BACKOFF_SECONDS) - 1)
+                ]
+                not_ready_index += 1
+                self._stop.wait(delay)
+                continue
+            if waiting_for_session:
+                logger.warning("Shoonya WebSocket: session now available — resuming connect")
+                waiting_for_session = False
+            not_ready_index = 0
+
             try:
                 with connect(self._ws_host, open_timeout=10) as ws:
                     self._authenticate(ws)
@@ -331,6 +378,16 @@ class ShoonyaWSClient:
             ]
             backoff_index += 1
             self._stop.wait(delay)
+
+    def _session_looks_live(self) -> bool:
+        assert self._session_is_live is not None
+        try:
+            return self._session_is_live()
+        except Exception:
+            logger.exception(
+                "Shoonya WebSocket: session_is_live check raised — treating as not live"
+            )
+            return False
 
     def _authenticate(self, ws: Connection) -> None:
         # 2026-08-11: payload shape per Shoonya support's own reply (see

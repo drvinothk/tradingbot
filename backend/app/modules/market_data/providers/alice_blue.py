@@ -33,7 +33,10 @@ from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.broker_adapter.base.errors import BrokerAuthError
 from app.modules.market_data.providers.alice_blue_auth import create_ws_session
 from app.modules.market_data.providers.alice_blue_scrip_master import AliceBlueScripMasterService
-from app.modules.market_data.providers.alice_blue_session import get_alice_blue_session
+from app.modules.market_data.providers.alice_blue_session import (
+    alice_blue_connection_live,
+    get_alice_blue_session,
+)
 from app.modules.market_data.providers.alice_blue_ws_client import AliceBlueWSClient
 from app.modules.market_data.providers.base import (
     BaseMarketDataProvider,
@@ -98,12 +101,25 @@ class AliceBlueMarketDataProvider(BaseMarketDataProvider):
         `True` default in this codebase, since Alice Blue is the one provider
         whose auth can't self-recover (see this module's own docstring: only
         a human browser login via `api.v1.alice_blue.oauth_callback` can ever
-        produce a session). Same underlying check `connect()`/
-        `subscribe_ticks()` already make, and the identical one
-        `diagnostic_session._validate_can_run` uses for the "Test Failback"
-        button's own precondition.
+        produce a session).
+
+        2026-09-01: upgraded from a bare `get_alice_blue_session() is not
+        None` presence check to the real, TTL-cached `alice_blue_connection_
+        live()` probe -- a *cached* session (yesterday's, still on disk/in
+        memory) is not the same as a *live* one, and the presence-only check
+        let this gate wave a stale session through, letting
+        `_ensure_backup_subscribed` construct a real `AliceBlueWSClient`
+        against a dead token every morning until a human reconnected —
+        confirmed live: ~190 failed WS auth attempts in one ~90 minute
+        window. `alice_blue_connection_live` is a strict superset (it already
+        returns `False` when there's no session at all), so this is a pure
+        tightening, not a behavior change for the "genuinely connected" case.
+        `diagnostic_session._validate_can_run`'s own "Test Failback"
+        precondition uses the same weaker presence check independently —
+        not changed here, flagged as a lower-priority follow-up since that
+        path requires an explicit human action to even trigger.
         """
-        return get_alice_blue_session() is not None
+        return alice_blue_connection_live()
 
     def close(self) -> None:
         self.disconnect()
@@ -146,6 +162,7 @@ class AliceBlueMarketDataProvider(BaseMarketDataProvider):
                 user_session=session.user_session,
                 on_tick=self._handle_raw_tick,
                 ensure_ws_session=lambda: create_ws_session(settings, session),
+                session_is_live=alice_blue_connection_live,
             )
             self._ws.start()
 

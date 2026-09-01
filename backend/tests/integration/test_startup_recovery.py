@@ -65,13 +65,18 @@ class _FakeStrategyRunner:
         self.strategy_run_id = strategy_run_id
         self.interval_seconds = interval_seconds
         self.started = False
+        self._alive = False
         _FakeStrategyRunner.instances.append(self)
+
+    def is_alive(self) -> bool:
+        return self._alive
 
     def start(self) -> None:
         self.started = True
+        self._alive = True
 
     def stop(self) -> None:
-        pass
+        self._alive = False
 
 
 @pytest.fixture
@@ -417,6 +422,63 @@ def test_resume_strategy_runners_resumes_scanning_run_with_instrument_and_expiry
     assert resumed.started is True
     assert resumed.strategy.instrument_id == instrument.id
     assert resumed.strategy.expiry_date == EXPIRY
+
+
+def test_resume_strategy_runners_is_idempotent_across_repeated_calls(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    """2026-09-01 regression: `resume_strategy_runners` is called more than
+    once in the same process in real operation (09:00 daily scheduler, every
+    `POST /sessions/bootstrap-now`, every Shoonya `oauth_callback`) — a
+    second call used to unconditionally start a *second* `StrategyRunner`
+    thread for a run already resumed by the first call, orphaning the first
+    thread rather than skipping. Confirmed live: two logins in one day left
+    14 threads running for 7 strategy_runs. A run whose runner is still
+    alive must be left alone on a repeat call.
+    """
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, _instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
+
+    resume_strategy_runners()
+    resume_strategy_runners()
+
+    from app.api.v1.strategies import _RUNNERS
+
+    assert len(_FakeStrategyRunner.instances) == 1
+    assert _RUNNERS[strategy_run.id] is _FakeStrategyRunner.instances[0]
+
+
+def test_resume_strategy_runners_replaces_a_dead_runner(
+    db: Session, workspace, broker_account, user, monkeypatch
+):
+    """The idempotency guard must only skip a run whose thread is genuinely
+    still alive — a run whose runner already died (crashed, or simply never
+    started) should still be resumed fresh, same as before this guard
+    existed.
+    """
+    trading_session = _active_session(db, workspace, broker_account, user)
+    strategy_run, _instrument = _scanning_run(
+        db, workspace, user, trading_session, expiry_date=EXPIRY
+    )
+    _patch_strategy_resume_collaborators(monkeypatch, db)
+
+    from app.api.v1.strategies import _RUNNERS
+    from app.modules.strategy_engine.recovery import resume_strategy_runners
+
+    resume_strategy_runners()
+    assert len(_FakeStrategyRunner.instances) == 1
+    _RUNNERS[strategy_run.id].stop()  # simulate the first runner's thread dying
+
+    resume_strategy_runners()
+
+    assert len(_FakeStrategyRunner.instances) == 2
+    assert _RUNNERS[strategy_run.id] is _FakeStrategyRunner.instances[1]
+    assert _RUNNERS[strategy_run.id].is_alive() is True
 
 
 def test_resume_strategy_runners_defers_ingestion_when_shoonya_not_connected(

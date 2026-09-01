@@ -817,6 +817,19 @@ class ShoonyaBrokerAdapter(BrokerPort):
         resume both went down until the next process restart.
         """
         if self._ws is None:
+            # Local import, not module-level -- `broker_adapter.composition`
+            # is the composition root (nothing below it should import it at
+            # module scope; see that module's own docstring). `is_shoonya_
+            # configured` is the cheapest existing "is there a real,
+            # authenticated Shoonya adapter installed right now" signal
+            # (flips False the moment any BrokerPort call raises
+            # BrokerAuthError, including this same day's first auto-spawn
+            # option-chain fetch against a stale overnight token) -- passed
+            # through so `_run`'s own reconnect loop stops hammering a dead
+            # session instead of retrying every 30s forever. See ws_client
+            # .py's `_SESSION_NOT_READY_BACKOFF_SECONDS` for the full reasoning.
+            from app.modules.broker_adapter.composition import is_shoonya_configured
+
             self._ws = ShoonyaWSClient(
                 self._settings.ws_host,
                 uid=self._uid,
@@ -826,6 +839,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 on_depth=on_depth,
                 on_order_update=self._handle_order_update,
                 source=self._settings.ws_auth_source,
+                session_is_live=is_shoonya_configured,
             )
             self._ws.start()
             self._ws_bound_on_tick = on_tick

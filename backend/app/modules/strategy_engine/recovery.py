@@ -58,6 +58,7 @@ def resume_strategy_runners() -> None:
     """
     from app.api.v1.strategies import _RUNNERS, _build_strategy
     from app.core.db.session import session_scope
+    from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
     from app.core.sleep_inhibitor import get_sleep_inhibitor
     from app.domain.market.models import Instrument
     from app.domain.session.models import TradingSession, TradingSessionStatus
@@ -67,7 +68,18 @@ def resume_strategy_runners() -> None:
     from app.modules.market_data.registry import ensure_ingestion_running
     from app.modules.strategy_engine.runner import StrategyRunner
 
-    with session_scope() as db:
+    with session_scope() as db, advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        # advisory_lock closes a check-then-act race: this function can run
+        # more than once in the same still-alive process (09:00 daily
+        # scheduler, POST /sessions/bootstrap-now, and every Shoonya
+        # oauth_callback all call it -- see this function's own history of
+        # being called a second time within the same process, which used to
+        # silently double every runner thread before the _RUNNERS.get(...)
+        # check below existed). Two near-simultaneous triggers could
+        # otherwise both read "no live runner yet" before either registers
+        # one -- same reasoning `start_strategy` (api.v1.strategies.py)
+        # already reuses LOCK_EXECUTION_SINGLETON for its own "at most one
+        # active run per strategy" check.
         runs = (
             db.query(StrategyRun)
             .join(TradingSession, StrategyRun.trading_session_id == TradingSession.id)
@@ -89,10 +101,25 @@ def resume_strategy_runners() -> None:
             )
 
         resumed: list[uuid.UUID] = []
+        already_running: list[uuid.UUID] = []
         skipped_no_instrument: list[uuid.UUID] = []
         for run in runs:
             if run.instrument_id is None or run.expiry_date is None:
                 skipped_no_instrument.append(run.id)
+                continue
+
+            # Idempotency guard -- a run this function already resumed
+            # earlier in this same process still has a live thread
+            # registered in `_RUNNERS`; starting a second `StrategyRunner`
+            # for it would leave the first one orphaned (never stopped,
+            # just overwritten), doubling every evaluate() cycle, broker
+            # call, and audit write for that run. Every other "ensure
+            # singleton background thread" function in this codebase
+            # (`ensure_position_manager_running`, `ensure_ingestion_running`)
+            # already guards this way; this was the one place that didn't.
+            existing = _RUNNERS.get(run.id)
+            if existing is not None and existing.is_alive():
+                already_running.append(run.id)
                 continue
 
             try:
@@ -149,6 +176,12 @@ def resume_strategy_runners() -> None:
                 "Resumed %d strategy runner(s) found active at startup: %s",
                 len(resumed),
                 [str(r) for r in resumed],
+            )
+        if already_running:
+            logger.info(
+                "%d strategy_run(s) already have a live runner thread — skipped: %s",
+                len(already_running),
+                [str(r) for r in already_running],
             )
         if skipped_no_instrument:
             logger.warning(
