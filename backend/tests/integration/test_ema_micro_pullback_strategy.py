@@ -319,7 +319,6 @@ class TestEMAMicroPullbackStrategy:
         assert proposal is not None
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(float(setup_bar.low))
-        assert strategy.trades_fired_count == 1
         assert proposal.structure_break_buffer == pytest.approx(0.0)
 
     def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
@@ -351,7 +350,6 @@ class TestEMAMicroPullbackStrategy:
         assert proposal is not None
         assert proposal.option_contract_id == option_contract_pe.id
         assert proposal.structure_level == pytest.approx(float(setup_bar.high))
-        assert strategy.trades_fired_count == 1
 
     def test_no_signal_without_ema_warmup(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
@@ -517,41 +515,3 @@ class TestEMAMicroPullbackStrategy:
         strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY, ema_morning_window_end="11:00")
         assert strategy.check_setup(db, strategy_run, entry_bar) is None
 
-    def test_no_signal_once_max_trades_per_session_reached(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
-    ):
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _, entry_bar = _seed_bullish_baseline(db, instrument)
-
-        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY, ema_max_trades_per_session=1)
-        first = strategy.check_setup(db, strategy_run, entry_bar)
-        assert first is not None
-        assert strategy.trades_fired_count == 1
-
-        second = strategy.check_setup(db, strategy_run, entry_bar)
-        assert second is None
-
-    def test_trades_fired_count_resets_on_new_strategy_run(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_config,
-        trading_session, user,
-    ):
-        """Defensive coverage for the spec's own reset-on-run-change
-        requirement -- not reachable via the real start_strategy path
-        today (a fresh Strategy instance is always constructed per
-        StrategyRun), but proven correct here in case that ever changes.
-        """
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _, entry_bar = _seed_bullish_baseline(db, instrument)
-
-        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY, ema_max_trades_per_session=1)
-        run_a = _make_strategy_run(db, strategy_config, trading_session, user)
-        proposal_a = strategy.check_setup(db, run_a, entry_bar)
-        assert proposal_a is not None
-        assert strategy.trades_fired_count == 1
-
-        # Same strategy instance, a different StrategyRun -- the cap must
-        # not carry over.
-        run_b = _make_strategy_run(db, strategy_config, trading_session, user)
-        proposal_b = strategy.check_setup(db, run_b, entry_bar)
-        assert proposal_b is not None
-        assert strategy.trades_fired_count == 1

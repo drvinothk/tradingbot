@@ -524,8 +524,23 @@ tbody tr:hover {
      originally tuned for. Scoped to .metrics-strip only -- confirmed unused
      elsewhere in the frontend. */
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  /* dense: lets a 2-item box (Total Trades, Open Risk) backfill a gap left
+     by an adjacent .metric-box-wide box's 2-column span, instead of the
+     default row-flow leaving a ragged empty cell -- see .metric-box-wide's
+     own comment. */
+  grid-auto-flow: row dense;
   gap: 0.9rem;
   margin-bottom: 1.25rem;
+}
+
+/* P&L (+Total Cost+Win Rate) and Total Drawdown (+Largest Loss+Largest
+   Profit) each carry a 3-way split now instead of 2 -- one more stat needs
+   one more column's worth of room, so these two boxes span 2 grid tracks
+   instead of 1. Paired with .metrics-strip's grid-auto-flow: dense above so
+   the narrower 2-item boxes (Total Trades, Open Risk) backfill the leftover
+   single-track gaps rather than leaving them empty. */
+.metric-box-wide {
+  grid-column: span 2;
 }
 
 /* Today's Activity split boxes (P&L+WinRate, TotalTrades+OpenTrades,
@@ -640,8 +655,12 @@ tbody tr:hover {
 /* Strategy type headers (ORB, OI/Volume Confirmed, ...) read as more
    prominent than a generic muted .section-title -- these are the actual
    row-group identity inside a scrolling frame, not a minor subsection
-   label. */
-.section-title-bright {
+   label. Compound selector (not a bare .section-title-bright) so this wins
+   the cascade regardless of source order against .section-title's own
+   later `color: var(--text-muted)` rule below -- both are single-class
+   selectors of equal specificity, so without this the later declaration
+   silently won and left the label bold but still muted gray. */
+.section-title.section-title-bright {
   color: var(--text-main);
   font-weight: 700;
 }

@@ -20,16 +20,13 @@ all of which must pass on the same bar:
    single-level `touch_and_confirm` (against EMA9 alone) VWAP Pullback
    still uses — a two-level zone check needs its own logic, not a shared
    helper with a single `reference_level`.
-3. **Time windows & session trade cap** — entries only fire inside
-   `ema_morning_window`/`ema_afternoon_window` (a deliberate midday gap,
-   since this is the fastest-firing, most chop-sensitive of the three
-   Phase 4 strategies), and stop once `ema_max_trades_per_session` trades
-   have fired this run. `trades_fired_count` resets if `strategy_run.id`
-   ever changes on this instance — defensive: under the current
-   architecture a `Strategy` instance is always constructed fresh per
-   `StrategyRun` (see `api.v1.strategies._build_strategy`), so this reset
-   can't actually trigger today, but costs nothing to have in place if
-   that ever changes.
+3. **Time windows** — entries only fire inside `ema_morning_window`/
+   `ema_afternoon_window` (a deliberate midday gap, since this is the
+   fastest-firing, most chop-sensitive of the three Phase 4 strategies).
+   No per-strategy trade-count cap any more (removed 2026-09-02) — trade
+   count is managed centrally via the UI-editable Risk Service
+   `max_trades_per_day` / Advanced page Daily Plan, not a hardcoded
+   per-strategy knob.
 4. **Candle body ratio** — `common_rules.compute_body_ratio` (shared with
    OI/Volume Confirmed, which needs the identical computation over its own
    bar window) over the last 10 bars must be at least `min_body_ratio` — a
@@ -120,7 +117,6 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         ema_morning_window_end: str = "15:00",
         ema_afternoon_window_start: str = "13:00",
         ema_afternoon_window_end: str = "15:00",
-        ema_max_trades_per_session: int = 3,
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
@@ -138,11 +134,8 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         self.ema_morning_window_end = _parse_hhmm(ema_morning_window_end)
         self.ema_afternoon_window_start = _parse_hhmm(ema_afternoon_window_start)
         self.ema_afternoon_window_end = _parse_hhmm(ema_afternoon_window_end)
-        self.ema_max_trades_per_session = ema_max_trades_per_session
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
-        self.trades_fired_count = 0
-        self._current_run_id: uuid.UUID | None = None
 
     def _within_trade_windows(self, t: time) -> bool:
         return (
@@ -153,24 +146,12 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
     ) -> TradeProposal | None:
-        if self._current_run_id != strategy_run.id:
-            self._current_run_id = strategy_run.id
-            self.trades_fired_count = 0
-
         bar_time = to_ist(latest_bar.bucket_start).time()
         if not self._within_trade_windows(bar_time):
             self._log_once(
                 logger, "time_window",
                 "run %s: bar time %s outside EMA morning/afternoon windows",
                 strategy_run.id, bar_time.strftime("%H:%M"),
-            )
-            return None
-
-        if self.trades_fired_count >= self.ema_max_trades_per_session:
-            self._log_once(
-                logger, "max_trades",
-                "run %s: max trades per session reached (%d)",
-                strategy_run.id, self.ema_max_trades_per_session,
             )
             return None
 
@@ -258,7 +239,6 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
             entry_price, self.stop_pct, self.target_pct, tick_size
         )
 
-        self.trades_fired_count += 1
         logger.info(
             "run %s: EMA %s fired -- entry=%.2f stop=%.2f target=%.2f structure=%.2f",
             strategy_run.id, direction, entry_price, stop_price, target_price, structure_level,

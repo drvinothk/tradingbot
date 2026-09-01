@@ -268,26 +268,6 @@ class TestATRBreakout:
         assert first is not None
         assert second is None
 
-    def test_max_trades_per_session_cap(
-        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
-        strategy_config, user,
-    ):
-        run = _run(db, strategy_config, trading_session, user)
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _seed_flat_window(db, instrument, high=22020, low=21980)
-        _seed_atr(db, instrument, EXPANDING_ATR)
-
-        s = ATRBreakoutStrategy(
-            instrument.id, EXPIRY, breakout_lookback_bars=LOOKBACK, atr_expansion_lookback=LOOKBACK,
-            max_trades_per_session=1,
-        )
-        up = s.check_setup(db, run, _breakout_bar(db, instrument, ENTRY_TS))
-        down = s.check_setup(
-            db, run, _breakout_bar(db, instrument, ENTRY_TS + timedelta(minutes=1), up=False)
-        )
-        assert up is not None
-        assert down is None
-
     def test_blocked_before_entry_start_time(
         self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,

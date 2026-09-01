@@ -96,8 +96,6 @@ const SIGNAL_REASON_LABELS: Record<string, string> = {
   volume_not_surging: 'Volume not surging',
   volume_not_ready: 'Volume data not ready',
   skip_weekday: 'Skipped weekday',
-  max_trades_per_day: 'Max trades/day reached',
-  max_trades: 'Max trades/session reached',
   ce_only: 'CE-only filter',
   min_bars_since_open: 'Waiting for more bars since open',
   min_ema_spread_atr_ratio: 'EMA9/EMA20 spread too tight',

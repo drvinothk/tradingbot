@@ -441,7 +441,17 @@ class RiskDefaults(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RISK_", env_file=DOTENV_PATH, extra="ignore")
 
     max_concurrent_positions: int = 2
-    max_trades_per_day: int = 5
+    # 2026-09-02: raised 5 -> 15 -- the 5 hardcoded per-strategy in-memory
+    # trade-count caps (ema_max_trades_per_session, oi_max_trades_per_session,
+    # sweep_max_trades_per_session, ATR's max_trades_per_session, ORB
+    # Conviction's own max_trades_per_day) were removed the same day so trade
+    # count is managed from exactly one place (Advanced page's Daily Plan /
+    # this field, PATCH /system-settings/max-trades-per-day) rather than a
+    # hidden per-strategy default -- this is only the seed value for a
+    # workspace's first-ever RiskLimitConfig row; an already-saved workspace
+    # keeps whatever it last set (versioned, sticky by design -- see
+    # get_active_risk_limit_config).
+    max_trades_per_day: int = 15
     consecutive_loss_pause_threshold: int = 2
     daily_loss_cap: float = 5000.0
     daily_target_profit: float = 5000.0

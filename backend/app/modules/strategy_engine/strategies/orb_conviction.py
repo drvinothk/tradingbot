@@ -8,12 +8,16 @@ prior-day-close trend agreement, a hard trades-per-day cap, and an optional
 reward:risk target override).
 
 **Every gate is opt-in.** With all `require_*` flags left `False`, no
-`vix_min`/`vix_max`/`pcr_oi_min`/`pcr_oi_max` set, `target_r_multiple=None`,
-and `max_trades_per_day` at ORB's own natural ceiling of 2 (one entry per
-direction per run), this class produces byte-identical proposals to plain
-`orb` — so a backtest of `orb_conviction` with an empty `params` dict
-reproduces the `orb` baseline exactly, and each gate's contribution can be
-measured by turning it on alone.
+`vix_min`/`vix_max`/`pcr_oi_min`/`pcr_oi_max` set, and `target_r_multiple=
+None`, this class produces byte-identical proposals to plain `orb` — so a
+backtest of `orb_conviction` with an empty `params` dict reproduces the
+`orb` baseline exactly, and each gate's contribution can be measured by
+turning it on alone. No per-strategy trade-count cap any more (removed
+2026-09-02, along with `max_trades_per_day` here — trade count is managed
+centrally via the UI-editable Risk Service `max_trades_per_day` / Advanced
+page Daily Plan, not a hardcoded per-strategy knob); ORB's own
+`_fired_directions` latch (max one entry per direction per run, i.e. at
+most 2 per day) still applies unchanged.
 
 **2026-08-30 refactor**: the cross-cutting gates (prior-day trend, VIX band,
 ATR expansion, volume surge, HTF EMA trend, the new PCR band, skip_weekdays)
@@ -21,7 +25,7 @@ moved to `conviction_gates.ConvictionGateMixin` once four more strategies
 needed the identical gates — this class now mixes that in
 (`ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy)`) rather than
 owning its own copy, so there's one source of truth for these gates going
-forward. Only ORB-specific gates stay here: `max_trades_per_day`, `ce_only`,
+forward. Only ORB-specific gates stay here: `ce_only`,
 `min_breakout_strength_atr`, `require_drift_alignment` (kept — already
 shipped/tested even though sweep #3 found it rejects nothing on real data —
 not being ported to the new strategies, but not removed from ORB either),
@@ -81,7 +85,6 @@ logger = logging.getLogger("app.strategy_engine.orb_conviction")
 # sets in `api.v1.strategies` are explicit literals: an unexpected key must
 # fail loudly at construction, not leak through.
 ORB_ONLY_CONVICTION_PARAM_KEYS = {
-    "max_trades_per_day",
     "target_r_multiple",
     "ce_only",
     "min_breakout_strength_atr",
@@ -113,7 +116,6 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
         require_prior_day_trend: bool = False,
         prior_day_trend_buffer_pts: float = 0.0,
         skip_weekdays: list[str] | None = None,
-        max_trades_per_day: int = 2,
         target_r_multiple: float | None = None,
         ce_only: bool = False,
         min_breakout_strength_atr: float | None = None,
@@ -149,17 +151,12 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
             require_momentum_alignment=require_momentum_alignment,
             momentum_lookback_bars=momentum_lookback_bars,
         )
-        self.max_trades_per_day = max_trades_per_day
         self.target_r_multiple = target_r_multiple
         self.ce_only = ce_only
         self.min_breakout_strength_atr = min_breakout_strength_atr
         self.require_drift_alignment = require_drift_alignment
         self.max_loss_per_lot = max_loss_per_lot
         self.time_stop_minutes = time_stop_minutes
-        # Per-IST-day entry counter. Same in-memory durability class as
-        # ORBStrategy._fired_directions — a process restart resets it, the
-        # same way it resets the runner thread itself.
-        self._entries_by_day: dict[date, int] = {}
 
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
@@ -169,10 +166,9 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
             return None
 
         bar_ist = to_ist(latest_bar.bucket_start)
-        day = bar_ist.date()
         option_type = self._infer_direction(latest_bar, proposal)
 
-        reject = self._orb_only_reject_reason(db, latest_bar, proposal, option_type, day)
+        reject = self._orb_only_reject_reason(db, latest_bar, proposal, option_type)
         if reject is None:
             reject = self._conviction_reject_reason(db, latest_bar, option_type, bar_ist)
         if reject is not None:
@@ -189,7 +185,6 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
             self.last_signal_status.candidate = proposal
             return None
 
-        self._entries_by_day[day] = self._entries_by_day.get(day, 0) + 1
         return self._finalize(db, proposal)
 
     # --- ORB-only gates ---------------------------------------------------
@@ -200,11 +195,7 @@ class ORBConvictionStrategy(ConvictionGateMixin, ORBStrategy):
         latest_bar: PriceBar,
         proposal: TradeProposal,
         option_type: OptionType,
-        day: date,
     ) -> str | None:
-        if self._entries_by_day.get(day, 0) >= self.max_trades_per_day:
-            return "max_trades_per_day"
-
         if self.ce_only and option_type is not OptionType.CE:
             return "ce_only"
 

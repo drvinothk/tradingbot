@@ -314,8 +314,10 @@ export interface PerformanceStatsOut {
   profit_factor: number | null
   max_drawdown: number
   largest_single_loss: number
+  largest_single_win: number
   total_realized_pnl: number
   total_slippage: number
+  total_cost: number
   signal_count: number
   dispatched_count: number
   filled_count: number

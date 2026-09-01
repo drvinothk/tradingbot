@@ -37,10 +37,13 @@ sits ahead of all of them:**
    established.
 3. **Candle body ratio** — `common_rules.compute_body_ratio` over the last
    10 bars, same chop filter EMA Micro-pullback uses.
-4. **Time windows & session trade cap** — identical dual-window shape to
-   EMA Micro-pullback (`oi_morning_window`/`oi_afternoon_window`,
-   `oi_max_trades_per_session`), same reasoning: breakouts fail during
-   midday low-volume chop regardless of which strategy is looking for one.
+4. **Time windows** — identical dual-window shape to EMA Micro-pullback
+   (`oi_morning_window`/`oi_afternoon_window`), same reasoning: breakouts
+   fail during midday low-volume chop regardless of which strategy is
+   looking for one. No per-strategy trade-count cap any more (removed
+   2026-09-02) — trade count is managed centrally via the UI-editable
+   Risk Service `max_trades_per_day` / Advanced page Daily Plan, not a
+   hardcoded per-strategy knob.
 5. **Participation stubs** (`oi_use_futures_volume_confirmation`,
    `oi_futures_volume_multiplier`, `oi_use_atm_oi_buildup`) — not enforced
    yet (no real futures-volume/ATM-OI-buildup pipeline exists), but real
@@ -48,8 +51,8 @@ sits ahead of all of them:**
    breakout's log line references their current values, ready for the
    pipeline that will eventually read them.
 
-All new per-run state (`trades_fired_count`, `bar_count`,
-`_pending_breakout`, `_false_breakout_blocked`, and `_fired_directions`)
+All new per-run state (`bar_count`, `_pending_breakout`,
+`_false_breakout_blocked`, and `_fired_directions`)
 resets together if `strategy_run.id` ever changes on this instance —
 defensive, same as EMA Micro-pullback's identical reset (a fresh instance
 is always constructed per `StrategyRun` today, so this can't actually
@@ -136,7 +139,6 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         oi_morning_window_end: str = "15:00",
         oi_afternoon_window_start: str = "13:00",
         oi_afternoon_window_end: str = "15:00",
-        oi_max_trades_per_session: int = 3,
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
@@ -161,10 +163,8 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         self.oi_morning_window_end = _parse_hhmm(oi_morning_window_end)
         self.oi_afternoon_window_start = _parse_hhmm(oi_afternoon_window_start)
         self.oi_afternoon_window_end = _parse_hhmm(oi_afternoon_window_end)
-        self.oi_max_trades_per_session = oi_max_trades_per_session
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
-        self.trades_fired_count = 0
         self.bar_count = 0
         self._fired_directions: set[OptionType] = set()
         self._pending_breakout: dict[OptionType, tuple[float, float, int]] = {}
@@ -189,7 +189,6 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
     ) -> TradeProposal | None:
         if self._current_run_id != strategy_run.id:
             self._current_run_id = strategy_run.id
-            self.trades_fired_count = 0
             self.bar_count = 0
             self._fired_directions = set()
             self._pending_breakout = {}
@@ -257,14 +256,6 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
             )
             return None
 
-        if self.trades_fired_count >= self.oi_max_trades_per_session:
-            self._log_once(
-                logger, "max_trades",
-                "run %s: max trades per session reached (%d)",
-                strategy_run.id, self.oi_max_trades_per_session,
-            )
-            return None
-
         instrument = db.get(Instrument, self.instrument_id)
         symbol = instrument.symbol if instrument is not None else ""
         min_range, max_range = self._range_thresholds(symbol)
@@ -295,7 +286,6 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
 
         self._fired_directions.add(candidate)
         self._pending_breakout.pop(candidate, None)
-        self.trades_fired_count += 1
 
         entry_price = top.ltp
         tick_size = float(instrument.tick_size) if instrument is not None else 0.0

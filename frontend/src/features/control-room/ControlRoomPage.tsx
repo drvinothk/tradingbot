@@ -499,10 +499,14 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
     sessionId === null ? '—' : report ? report.max_drawdown.toFixed(2) : '…'
   const largestLossDisplay =
     sessionId === null ? '—' : report ? report.largest_single_loss.toFixed(2) : '…'
+  const largestWinDisplay =
+    sessionId === null ? '—' : report ? report.largest_single_win.toFixed(2) : '…'
+  const totalCostDisplay =
+    sessionId === null ? '—' : report ? report.total_cost.toFixed(2) : '…'
 
   return (
     <>
-      <div className="metric-box metric-box-split">
+      <div className="metric-box metric-box-split metric-box-wide">
         <div className="metric-box-main">
           <div className="metric-label">P&amp;L</div>
           <div className="metric-value">
@@ -516,6 +520,10 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
               ? `${metrics.perLotPnl >= 0 ? '+' : ''}${metrics.perLotPnl.toFixed(2)} / lot`
               : '— / lot'}
           </div>
+        </div>
+        <div className="metric-box-secondary">
+          <div className="metric-label">Total Cost</div>
+          <div className="metric-value">{totalCostDisplay}</div>
         </div>
         <div className="metric-box-secondary">
           <div className="metric-label">Win Rate</div>
@@ -537,14 +545,18 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
         </div>
       </div>
 
-      <div className="metric-box metric-box-split">
+      <div className="metric-box metric-box-split metric-box-wide">
         <div className="metric-box-main">
-          <div className="metric-label">Max Drawdown (Cumulative)</div>
+          <div className="metric-label">Total Drawdown</div>
           <div className="metric-value">{maxDrawdownDisplay}</div>
         </div>
         <div className="metric-box-secondary">
           <div className="metric-label">Largest Single Loss</div>
           <div className="metric-value">{largestLossDisplay}</div>
+        </div>
+        <div className="metric-box-secondary">
+          <div className="metric-label">Largest Single Profit</div>
+          <div className="metric-value">{largestWinDisplay}</div>
         </div>
       </div>
 

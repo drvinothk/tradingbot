@@ -76,6 +76,20 @@ the 2026-08-10 section above) only ever streams in the *evening*
 09:15 floor is always already satisfied by the time a replay session's own
 `ACTIVE_MARKET` phase begins; there is no scenario where replay data
 legitimately needs to be treated as "expected" before 09:15 wall-clock IST.
+
+**2026-09-02: an upper bound too, `DATA_FLOW_EXPECTED_END` (15:15 IST),
+mirroring the 09:15 floor.** NSE's cash/index session genuinely winds down
+~15:30, well before this system's own connection-lifecycle cutoff
+(`MARKET_CLOSE = 16:00`); a real feed going quiet in that last stretch is
+expected, not evidence of an outage, so `_check_market_data_staleness` and
+`FailoverMarketDataProvider`'s health checks (the same two consumers the
+09:15 floor above already protects) would otherwise spuriously alert/trip
+failover for the last ~45 minutes of every trading day. Scoped to
+*non-replay* mode only, same asymmetry as the floor's own replay carve-out
+above but in the opposite direction: TrueData's replay feed streams from
+~16:00 through `REPLAY_MODE_MARKET_CLOSE` (23:30), squarely inside this new
+15:15-16:00 window, so applying the cutoff there would falsely mark every
+replay tick as unexpected for the entire session.
 """
 
 from __future__ import annotations
@@ -96,6 +110,9 @@ REPLAY_MODE_MARKET_CLOSE = time(23, 30)
 # ORB's opening-range anchor) should import it from here rather than
 # keeping their own private copy.
 NORMAL_MARKET_OPEN = time(9, 15)
+# The is_data_flow_expected upper bound -- see module docstring's 2026-09-02
+# section. Live (non-replay) only.
+DATA_FLOW_EXPECTED_END = time(15, 15)
 
 # This system only ever trades these two underlyings -- kept here (not
 # imported from a specific broker adapter, e.g. `broker_adapter.shoonya
@@ -122,7 +139,7 @@ class MarketPhase(enum.Enum):
     CLOSED = "closed"
 
 
-def _resolve_market_close(replay_mode: bool | None) -> time:
+def _resolve_replay_mode(replay_mode: bool | None) -> bool:
     if replay_mode is None:
         # Local import: same load-time-cycle caution this codebase already
         # applies elsewhere (e.g. market_data_scheduler.ensure_market_data_
@@ -130,8 +147,13 @@ def _resolve_market_close(replay_mode: bool | None) -> time:
         # otherwise has zero app-level imports beyond app.core.clock.
         from app.config.settings import get_settings
 
-        replay_mode = get_settings().market_data.is_replay_mode
-    return REPLAY_MODE_MARKET_CLOSE if replay_mode else MARKET_CLOSE
+        return get_settings().market_data.is_replay_mode
+    return replay_mode
+
+
+def _resolve_market_close(replay_mode: bool | None) -> time:
+    resolved = _resolve_replay_mode(replay_mode)
+    return REPLAY_MODE_MARKET_CLOSE if resolved else MARKET_CLOSE
 
 
 def current_phase(now: time | None = None, replay_mode: bool | None = None) -> MarketPhase:
@@ -150,13 +172,21 @@ def is_within_market_hours(now: time | None = None, replay_mode: bool | None = N
 
 def is_data_flow_expected(now: time | None = None, replay_mode: bool | None = None) -> bool:
     """True only once a real tick is plausible -- `active_market` (09:00+)
-    AND at/past NSE's own 09:15 session open. A strict subset of
-    `is_within_market_hours`'s wider 08:30-16:00 span; see module docstring's
-    2026-09-01 section for why this exists as a second, narrower predicate
-    rather than moving `PRE_MARKET_END`/tightening `is_within_market_hours`
+    AND at/past NSE's own 09:15 session open, AND (live mode only) before
+    15:15. A strict subset of `is_within_market_hours`'s wider 08:30-16:00
+    span; see module docstring's 2026-09-01/2026-09-02 sections for why this
+    exists as a second, narrower predicate rather than moving
+    `PRE_MARKET_END`/`MARKET_CLOSE`/tightening `is_within_market_hours`
     itself -- connectivity readiness (warm up the WS handshake, sit idle)
     and "should absence of a tick be treated as meaningful" are genuinely
-    different questions with different answers in the 09:00-09:15 gap.
+    different questions with different answers in the 09:00-09:15 and
+    15:15-16:00 gaps. The 15:15 upper bound is skipped entirely in replay
+    mode -- TrueData's replay feed streams from ~16:00 onward, so it would
+    otherwise never be considered "expected".
     """
     t = now if now is not None else now_ist().time()
-    return current_phase(t, replay_mode) is MarketPhase.ACTIVE_MARKET and t >= NORMAL_MARKET_OPEN
+    if current_phase(t, replay_mode) is not MarketPhase.ACTIVE_MARKET or t < NORMAL_MARKET_OPEN:
+        return False
+    if _resolve_replay_mode(replay_mode):
+        return True
+    return t < DATA_FLOW_EXPECTED_END

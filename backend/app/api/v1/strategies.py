@@ -155,7 +155,6 @@ EMA_MICRO_PULLBACK_PARAM_KEYS = {
     "ema_morning_window_end",
     "ema_afternoon_window_start",
     "ema_afternoon_window_end",
-    "ema_max_trades_per_session",
     "structure_break_atr_multiplier",
     "structure_break_persistence_seconds",
 }
@@ -183,7 +182,6 @@ OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "oi_morning_window_end",
     "oi_afternoon_window_start",
     "oi_afternoon_window_end",
-    "oi_max_trades_per_session",
     "structure_break_atr_multiplier",
     "structure_break_persistence_seconds",
 }
@@ -215,7 +213,6 @@ LIQUIDITY_SWEEP_REVERSAL_PARAM_KEYS = {
     "sweep_morning_window_end",
     "sweep_afternoon_window_start",
     "sweep_afternoon_window_end",
-    "sweep_max_trades_per_session",
     "structure_break_atr_multiplier",
     "structure_break_persistence_seconds",
 }

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import time
 
 from app.modules.market_data.market_hours import (
+    DATA_FLOW_EXPECTED_END,
     MARKET_CLOSE,
     MARKET_OPEN,
     NORMAL_MARKET_OPEN,
@@ -126,11 +127,12 @@ def test_default_replay_mode_reads_from_settings_when_false(monkeypatch):
     assert current_phase(time(20, 0)) is MarketPhase.CLOSED
 
 
-# -- is_data_flow_expected (2026-09-01): NSE's real 09:15 session open, a
-# strict subset of is_within_market_hours's wider 08:30-16:00 connectivity
-# window. Boundary tests specifically -- an off-by-one here either lets a
-# false failover trip / spurious staleness alert through in the 09:00-09:15
-# gap, or wrongly suppresses a genuine one after 09:15.
+# -- is_data_flow_expected (2026-09-01, 15:15 upper bound added 2026-09-02):
+# NSE's real 09:15 session open through a 15:15 wind-down cutoff, a strict
+# subset of is_within_market_hours's wider 08:30-16:00 connectivity window.
+# Boundary tests specifically -- an off-by-one here either lets a false
+# failover trip / spurious staleness alert through in the 09:00-09:15 or
+# 15:15-16:00 gaps, or wrongly suppresses a genuine one inside 09:15-15:15.
 
 
 def test_data_flow_not_expected_during_pre_market():
@@ -146,9 +148,17 @@ def test_data_flow_expected_exactly_at_normal_market_open():
     assert is_data_flow_expected(NORMAL_MARKET_OPEN) is True
 
 
-def test_data_flow_expected_through_the_rest_of_active_market():
+def test_data_flow_expected_through_the_middle_of_active_market():
     assert is_data_flow_expected(time(12, 0)) is True
-    assert is_data_flow_expected(time(15, 59, 59)) is True
+
+
+def test_data_flow_expected_just_before_the_15_15_cutoff():
+    assert is_data_flow_expected(time(15, 14, 59)) is True
+
+
+def test_data_flow_not_expected_at_or_after_the_15_15_cutoff():
+    assert is_data_flow_expected(DATA_FLOW_EXPECTED_END) is False
+    assert is_data_flow_expected(time(15, 59, 59)) is False
 
 
 def test_data_flow_not_expected_once_closed():
@@ -165,6 +175,14 @@ def test_data_flow_expected_respects_replay_mode_close_extension():
     assert is_data_flow_expected(time(20, 0), replay_mode=True) is True
     assert is_data_flow_expected(time(20, 0), replay_mode=False) is False
     assert is_data_flow_expected(REPLAY_MODE_MARKET_CLOSE, replay_mode=True) is False
+
+
+def test_data_flow_expected_15_15_cutoff_does_not_apply_in_replay_mode():
+    # The 15:15 upper bound is live-mode only (see module docstring's
+    # 2026-09-02 section) -- replay data legitimately streams well past it,
+    # right up until REPLAY_MODE_MARKET_CLOSE (23:30).
+    assert is_data_flow_expected(time(15, 30), replay_mode=True) is True
+    assert is_data_flow_expected(DATA_FLOW_EXPECTED_END, replay_mode=True) is True
 
 
 class _FakeMarketDataSettingsForReplay:

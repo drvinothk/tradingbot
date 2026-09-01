@@ -232,27 +232,14 @@ class TestORBConvictionBaseline:
         assert proposal.payload["strategy"] == "orb_conviction"
 
 
-class TestMaxTradesPerDay:
-    def test_second_direction_blocked_when_cap_is_one(
-        self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
-        strategy_config, user,
-    ):
-        run = _make_strategy_run(db, strategy_config, trading_session, user, OR_START)
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _seed_opening_range(db, instrument, OR_START, or_high=22030.0, or_low=21990.0)
+class TestBothDirectionsCanFire:
+    """No per-strategy trade-count cap any more (removed 2026-09-02) --
+    trade count is managed centrally via the UI-editable Risk Service
+    max_trades_per_day / Advanced page Daily Plan. This only re-confirms
+    ORB Conviction still lets both directions fire in the same run (via
+    ORB's own _fired_directions latch, unaffected by that removal)."""
 
-        strategy = ORBConvictionStrategy(
-            instrument.id, EXPIRY, or_minutes=OR_MINUTES, max_trades_per_day=1,
-        )
-        first = strategy.check_setup(db, run, _bullish_breakout_bar(db, instrument))
-        second = strategy.check_setup(
-            db, run, _bearish_breakout_bar(db, instrument, BREAKOUT_TS + timedelta(minutes=1)),
-        )
-
-        assert first is not None
-        assert second is None
-
-    def test_default_cap_of_two_allows_both_directions(
+    def test_both_directions_can_fire_in_the_same_run(
         self, db, instrument, option_contract_ce, option_contract_pe, trading_session,
         strategy_config, user,
     ):

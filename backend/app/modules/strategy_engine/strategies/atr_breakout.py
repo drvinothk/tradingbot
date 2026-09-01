@@ -76,7 +76,6 @@ ATR_BREAKOUT_PARAM_KEYS = {
     "trail_lock_fraction",
     "entry_start_time",
     "entry_cutoff_time",
-    "max_trades_per_session",
     "min_breakout_range_nifty_points",
     "min_breakout_range_banknifty_points",
     "vix_min",
@@ -104,7 +103,6 @@ class ATRBreakoutStrategy(ConfirmationFilterStrategy):
         timeframe: str = BAR_TIMEFRAME,
         entry_start_time: str = "09:30",
         entry_cutoff_time: str = "14:00",
-        max_trades_per_session: int = 2,
         min_breakout_range_nifty_points: float = 15.0,
         min_breakout_range_banknifty_points: float = 45.0,
         vix_min: float | None = None,
@@ -126,7 +124,6 @@ class ATRBreakoutStrategy(ConfirmationFilterStrategy):
         self.trail_lock_fraction = trail_lock_fraction
         self.entry_start_time = _parse_hhmm(entry_start_time)
         self.entry_cutoff_time = _parse_hhmm(entry_cutoff_time)
-        self.max_trades_per_session = max_trades_per_session
         self.min_breakout_range_nifty_points = min_breakout_range_nifty_points
         self.min_breakout_range_banknifty_points = min_breakout_range_banknifty_points
         self.vix_min = vix_min
@@ -134,7 +131,6 @@ class ATRBreakoutStrategy(ConfirmationFilterStrategy):
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
         self._fired_directions: set[OptionType] = set()
-        self._entries_by_day: dict[date, int] = {}
         self._current_run_id: uuid.UUID | None = None
 
     def _min_range(self, symbol: str) -> float:
@@ -150,21 +146,12 @@ class ATRBreakoutStrategy(ConfirmationFilterStrategy):
         if self._current_run_id != strategy_run.id:
             self._current_run_id = strategy_run.id
             self._fired_directions = set()
-            self._entries_by_day = {}
 
         bar_ist = to_ist(latest_bar.bucket_start)
         if not (self.entry_start_time <= bar_ist.time() <= self.entry_cutoff_time):
             return None
 
         day = bar_ist.date()
-        if self._entries_by_day.get(day, 0) >= self.max_trades_per_session:
-            self._log_once(
-                logger, "max_trades",
-                "run %s: max trades per session reached (%d)",
-                strategy_run.id, self.max_trades_per_session,
-            )
-            return None
-
         need = self.breakout_lookback_bars + 1
         # `since=day_start` -- see `oi_volume_confirmed.py`'s identical fix
         # for the live-confirmed 2026-09-01 cross-session contamination.
@@ -223,7 +210,6 @@ class ATRBreakoutStrategy(ConfirmationFilterStrategy):
             return None
 
         self._fired_directions.add(option_type)
-        self._entries_by_day[day] = self._entries_by_day.get(day, 0) + 1
 
         entry_price = top.ltp
         tick_size = float(instrument.tick_size) if instrument is not None else 0.0

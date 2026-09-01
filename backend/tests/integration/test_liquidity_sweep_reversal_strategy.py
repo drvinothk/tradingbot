@@ -395,7 +395,6 @@ class TestLiquiditySweepReversalStrategy:
         assert proposal.option_contract_id == option_contract_ce.id
         assert proposal.structure_level == pytest.approx(WINDOW_LOW)
         assert proposal.stop_price < proposal.entry_price < proposal.target_price
-        assert strategy.trades_fired_count == 1
         assert proposal.structure_break_buffer == pytest.approx(0.0)
 
     def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
@@ -635,47 +634,3 @@ class TestLiquiditySweepReversalStrategy:
         )
         assert strategy.check_setup(db, strategy_run, confirmation_bar) is None
 
-    def test_no_signal_once_max_trades_per_session_reached(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
-    ):
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        sweep_bar = _seed_bullish_sweep(db, instrument)
-
-        strategy = LiquiditySweepReversalStrategy(
-            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, sweep_max_trades_per_session=0,
-        )
-        assert strategy.check_setup(db, strategy_run, sweep_bar) is None
-        confirmation_bar = _seed_bullish_confirmation(db, instrument, sweep_bar)
-        assert strategy.check_setup(db, strategy_run, confirmation_bar) is None
-
-    def test_trades_fired_count_resets_on_new_strategy_run(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_config,
-        trading_session, user,
-    ):
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        sweep_bar = _seed_bullish_sweep(db, instrument)
-
-        strategy = LiquiditySweepReversalStrategy(
-            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, sweep_max_trades_per_session=1,
-        )
-        run_a = _make_strategy_run(db, strategy_config, trading_session, user)
-        assert strategy.check_setup(db, run_a, sweep_bar) is None
-        confirmation_bar = _seed_bullish_confirmation(db, instrument, sweep_bar)
-        proposal_a = strategy.check_setup(db, run_a, confirmation_bar)
-        assert proposal_a is not None
-        assert strategy.trades_fired_count == 1
-
-        # A new StrategyRun on the same instance -- bar_count/pending state
-        # reset, so a fresh sweep+confirmation sequence must still fire
-        # despite the cap of 1. Shifted forward (still inside the morning
-        # window) so its bars don't collide with the first sequence's.
-        second_base = BASE + timedelta(minutes=20)
-        second_sweep = _seed_bullish_sweep(db, instrument, base=second_base)
-        run_b = _make_strategy_run(db, strategy_config, trading_session, user)
-        assert strategy.check_setup(db, run_b, second_sweep) is None
-        second_confirmation = _seed_bullish_confirmation(
-            db, instrument, second_sweep, base=second_base
-        )
-        proposal_b = strategy.check_setup(db, run_b, second_confirmation)
-        assert proposal_b is not None
-        assert strategy.trades_fired_count == 1

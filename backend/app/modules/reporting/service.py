@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.domain.execution.models import Order, OrderMode, Position, TradeOutcome
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import Signal, StrategyRun, TradeIntent, TradeIntentStatus
+from app.modules.reporting.costs import estimate_trade_cost
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,18 @@ class PerformanceStats:
     # all" 0.0 default -- both collapse to the same value there, which is
     # fine since neither has anything to report yet.
     largest_single_loss: float
+    # Magnitude of the single best closed trade's realized_pnl -- 0.0 when
+    # there are no winning trades, same "no trades at all" collapse as
+    # largest_single_loss/max_drawdown above.
+    largest_single_win: float
     total_realized_pnl: float
     total_slippage: float
+    # Approximate real brokerage/STT/exchange/SEBI/stamp/GST cost across
+    # every closed trade -- see reporting.costs.estimate_trade_cost's own
+    # docstring for the source and reasoning. Not part of realized_pnl
+    # (which is the strategy's raw price-only P&L); this is a separate,
+    # approximate figure surfaced alongside it.
+    total_cost: float
 
 
 @dataclass(frozen=True)
@@ -70,17 +81,20 @@ class _TradeRow:
     closed_at: datetime
     realized_pnl: float
     slippage: float
+    cost: float
 
 
 def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
     by_position: dict[uuid.UUID, _TradeRow] = {}
     for o in outcomes:
+        leg_cost = estimate_trade_cost(float(o.entry_price), float(o.exit_price), o.qty)
         existing = by_position.get(o.position_id)
         if existing is None:
             by_position[o.position_id] = _TradeRow(
                 closed_at=o.closed_at,
                 realized_pnl=float(o.realized_pnl),
                 slippage=float(o.slippage),
+                cost=leg_cost,
             )
         else:
             by_position[o.position_id] = _TradeRow(
@@ -88,6 +102,7 @@ def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
                 closed_at=max(existing.closed_at, o.closed_at),
                 realized_pnl=existing.realized_pnl + float(o.realized_pnl),
                 slippage=existing.slippage + float(o.slippage),
+                cost=existing.cost + leg_cost,
             )
     return list(by_position.values())
 
@@ -104,8 +119,10 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
             profit_factor=None,
             max_drawdown=0.0,
             largest_single_loss=0.0,
+            largest_single_win=0.0,
             total_realized_pnl=0.0,
             total_slippage=0.0,
+            total_cost=0.0,
         )
 
     ordered = sorted(_collapse_to_trades(outcomes), key=lambda o: o.closed_at)
@@ -137,8 +154,10 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
         profit_factor=(gross_profit / gross_loss) if gross_loss > 0 else None,
         max_drawdown=max_drawdown,
         largest_single_loss=abs(min(losses)) if losses else 0.0,
+        largest_single_win=max(wins) if wins else 0.0,
         total_realized_pnl=sum(pnls),
         total_slippage=sum(float(o.slippage) for o in ordered),
+        total_cost=sum(o.cost for o in ordered),
     )
 
 

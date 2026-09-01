@@ -49,9 +49,12 @@ the first one this run.
    5-bar one, so naturally wider on average).
 4. **Candle body ratio & time windows** — `common_rules.compute_body_ratio`
    over the last 10 bars and the identical dual-window shape EMA/OI-Volume
-   use (`sweep_morning_window`/`sweep_afternoon_window`,
-   `sweep_max_trades_per_session`) — checked at the *confirmation* bar
-   (where the trade would actually enter), not the sweep bar.
+   use (`sweep_morning_window`/`sweep_afternoon_window`) — checked at the
+   *confirmation* bar (where the trade would actually enter), not the
+   sweep bar. No per-strategy trade-count cap any more (removed
+   2026-09-02) — trade count is managed centrally via the UI-editable
+   Risk Service `max_trades_per_day` / Advanced page Daily Plan, not a
+   hardcoded per-strategy knob.
 
 `target_pct` default moves 0.16 -> 0.20 (a stated 1:2 R:R against the
 unchanged 0.10 stop). Expiry-day config hooks are deliberately NOT added to
@@ -120,7 +123,6 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
         sweep_morning_window_end: str = "15:00",
         sweep_afternoon_window_start: str = "13:00",
         sweep_afternoon_window_end: str = "15:00",
-        sweep_max_trades_per_session: int = 3,
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:
@@ -144,10 +146,8 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
         self.sweep_morning_window_end = _parse_hhmm(sweep_morning_window_end)
         self.sweep_afternoon_window_start = _parse_hhmm(sweep_afternoon_window_start)
         self.sweep_afternoon_window_end = _parse_hhmm(sweep_afternoon_window_end)
-        self.sweep_max_trades_per_session = sweep_max_trades_per_session
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
-        self.trades_fired_count = 0
         self.bar_count = 0
         self._pending_sweep: tuple[OptionType, float, float, float, float, int] | None = None
         self._current_run_id: uuid.UUID | None = None
@@ -183,7 +183,6 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
     ) -> TradeProposal | None:
         if self._current_run_id != strategy_run.id:
             self._current_run_id = strategy_run.id
-            self.trades_fired_count = 0
             self.bar_count = 0
             self._pending_sweep = None
 
@@ -279,14 +278,6 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
             )
             return None
 
-        if self.trades_fired_count >= self.sweep_max_trades_per_session:
-            self._log_once(
-                logger, "max_trades",
-                "run %s: max trades per session reached (%d)",
-                strategy_run.id, self.sweep_max_trades_per_session,
-            )
-            return None
-
         day_start = datetime.combine(to_ist(latest_bar.bucket_start).date(), time.min, tzinfo=IST)
         bars = get_recent_completed_bars(
             db,
@@ -312,8 +303,6 @@ class LiquiditySweepReversalStrategy(ConfirmationFilterStrategy):
         top = pick_top_by_type(ranked, direction)
         if top is None:
             return None
-
-        self.trades_fired_count += 1
 
         entry_price = top.ltp
         instrument = db.get(Instrument, self.instrument_id)

@@ -39,8 +39,10 @@ class PerformanceStatsOut(BaseModel):
     profit_factor: float | None
     max_drawdown: float
     largest_single_loss: float
+    largest_single_win: float
     total_realized_pnl: float
     total_slippage: float
+    total_cost: float
     signal_count: int
     dispatched_count: int
     filled_count: int

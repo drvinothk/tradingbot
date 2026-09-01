@@ -363,7 +363,6 @@ class TestOIVolumeConfirmedStrategy:
         assert proposal is not None
         assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
         assert proposal.structure_break_persistence_seconds == pytest.approx(2.0)
-        assert strategy.trades_fired_count == 1
 
     def test_bearish_breakout_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
@@ -634,46 +633,3 @@ class TestOIVolumeConfirmedStrategy:
         )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
 
-    def test_no_signal_once_max_trades_per_session_reached(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
-    ):
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
-        breakout_bar = _seed_bar(
-            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
-        )
-
-        strategy = OIVolumeConfirmedStrategy(
-            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_max_trades_per_session=1,
-        )
-        first = strategy.check_setup(db, strategy_run, breakout_bar)
-        assert first is not None
-        assert strategy.trades_fired_count == 1
-
-        # Same direction is already in _fired_directions regardless, but
-        # confirms the cap independently would also have blocked it.
-        strategy._fired_directions.clear()  # noqa: SLF001
-        second = strategy.check_setup(db, strategy_run, breakout_bar)
-        assert second is None
-
-    def test_trades_fired_count_resets_on_new_strategy_run(
-        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_config,
-        trading_session, user,
-    ):
-        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
-        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
-        breakout_bar = _seed_bar(
-            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
-        )
-
-        strategy = OIVolumeConfirmedStrategy(
-            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_max_trades_per_session=1,
-        )
-        run_a = _make_strategy_run(db, strategy_config, trading_session, user)
-        proposal_a = strategy.check_setup(db, run_a, breakout_bar)
-        assert proposal_a is not None
-
-        run_b = _make_strategy_run(db, strategy_config, trading_session, user)
-        proposal_b = strategy.check_setup(db, run_b, breakout_bar)
-        assert proposal_b is not None
-        assert strategy.trades_fired_count == 1
