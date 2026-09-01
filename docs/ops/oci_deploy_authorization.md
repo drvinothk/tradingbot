@@ -575,3 +575,55 @@ Approve? (yes / yes+add-allow-rules / no)
   /var/www/trading-bot/dist && sudo mv
   /var/www/trading-bot/dist.bak-20260902-032611 /var/www/trading-bot/dist
   && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
+
+- **2026-09-02 ~03:54 IST — follow-up fix deploy, `main` commit
+  `454a5d2`.** Same session, two real corrections found after the prior
+  deploy went live: (1) the "Total Cost" estimate's brokerage component
+  scaled with quantity, making it mathematically invariant to how many
+  orders a trade was split across -- user asked directly what a 10-lot
+  single-order trade vs. a 10-lot entry squared off in 3 legs would cost,
+  which exposed it. Confirmed (user-supplied, cross-checked against
+  published pricing) Shoonya charges a flat Rs 5 per executed order,
+  independent of lot count. Rewrote `reporting/costs.py` into
+  `estimate_entry_order_cost`/`estimate_exit_leg_cost`; `reporting/
+  service.py`'s `_collapse_to_trades` now charges the entry order's cost
+  exactly once per position (on the full original qty) and each exit
+  leg's own cost once per leg -- a multi-leg staged exit now correctly
+  costs more than a single-leg one, and a large single order no longer
+  scales the estimate up qty-linearly. (2) Today's Activity boxes:
+  replaced `grid-column: span 2` with flexbox + content-sized
+  `flex-basis` (`.metric-box` 210px, `.metric-box-wide` 300px, substrip
+  170px/250px) -- the grid-span approach reserved a full extra track
+  regardless of whether the 3rd stat needed it and often couldn't fit at
+  all in the narrower paper sub-ribbon, so both the primary strip and the
+  paper strip were wrapping across multiple rows with visible dead space;
+  now both fit their 4 boxes in one row.
+
+  Tested: 1472/1472 backend pytest pass (up from 1467 -- 5 new dedicated
+  tests in `tests/unit/test_reporting_costs.py`, directly proving
+  splitting an exit into more legs costs more, not the same, and that the
+  entry order is charged once not per-leg), ruff/mypy clean, frontend
+  `tsc -b && vite build` clean. Layout re-verified via the same static
+  harness technique as the prior deploy.
+
+  Safety gate (checked live on the box): `Wed Sep 2 03:53:43 IST 2026`
+  (outside 09:15-15:30 IST), session `paper_only`/active, zero open
+  positions, alembic `0030` (head, no migration). Backup
+  `app.bak-20260902-035408` (backend) / `dist.bak-20260902-035408`
+  (frontend). Noted in passing: `main` had picked up one unrelated
+  docs-only commit (`f82d521`, backtest sweep notes) from outside this
+  session between the prior deploy and this one -- doesn't touch
+  `backend/app`, no effect on this deploy.
+
+  Commands run: same tarball/backup/extract/restart pattern as the prior
+  entry. Verified live: `/` -> `200`, `/control-room` -> `200`, served
+  `index-Cw1GeHNj.js`/`index-C9rBjkWz.css` matching the local build hash
+  exactly; grepped the live CSS for the new `210px`/`300px` flex-basis
+  values -- both present.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260902-035408 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf
+  /var/www/trading-bot/dist && sudo mv
+  /var/www/trading-bot/dist.bak-20260902-035408 /var/www/trading-bot/dist
+  && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
