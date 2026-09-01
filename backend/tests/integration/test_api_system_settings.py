@@ -406,7 +406,7 @@ def test_get_max_trades_per_day_lazily_seeds_from_risk_defaults(
     response = api_client.get("/api/v1/system-settings/max-trades-per-day")
 
     assert response.status_code == 200
-    assert response.json() == {"max_trades_per_day": 5}  # RiskDefaults.max_trades_per_day
+    assert response.json() == {"max_trades_per_day": 15}  # RiskDefaults.max_trades_per_day
 
 
 def test_patch_max_trades_per_day_creates_a_new_risk_limit_config_version(
