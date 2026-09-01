@@ -20,6 +20,7 @@ from app.modules.market_data.freshness import (
     classify_latest_bar,
     underlying_feed_freshness,
     underlying_feed_state,
+    vix_feed_freshness,
 )
 
 
@@ -193,5 +194,50 @@ def test_underlying_feed_freshness_prefers_the_better_state_over_a_stale_tick(db
 
 def test_underlying_feed_freshness_dead_when_symbols_are_unknown(db: Session):
     age, state = underlying_feed_freshness(db, ("NO-SUCH-SYMBOL",))
+    assert age is None
+    assert state == FreshnessState.DEAD
+
+
+# --- vix_feed_freshness (Advanced page telemetry card) ---------------------
+#
+# India VIX ticks as infrequently as ~2/60s by design -- these thresholds are
+# deliberately wider than underlying_feed_freshness's own (30s/120s), so an
+# age that would read STALE for NIFTY/BANKNIFTY must still read LIVE here.
+
+
+def test_vix_feed_freshness_dead_with_no_data(db: Session):
+    inst = _instrument(db, "INDIA VIX-1")
+    age, state = vix_feed_freshness(db, inst.id)
+    assert age is None
+    assert state == FreshnessState.DEAD
+
+
+def test_vix_feed_freshness_live_at_an_age_that_would_be_stale_for_an_underlying(db: Session):
+    inst = _instrument(db, "INDIA VIX-2")
+    # 70s ago is well past underlying_feed_freshness's own 30s degraded / 120s
+    # stale tick thresholds, but under VIX_UI_THRESHOLDS's 90s degraded cutoff.
+    _tick(db, inst.id, seconds_ago=70)
+    age, state = vix_feed_freshness(db, inst.id)
+    assert age is not None
+    assert 60 <= age < 80
+    assert state == FreshnessState.LIVE
+
+
+def test_vix_feed_freshness_stale_past_its_own_wider_threshold(db: Session):
+    inst = _instrument(db, "INDIA VIX-3")
+    _tick(db, inst.id, seconds_ago=400)  # past VIX_UI_THRESHOLDS' 300s stale cutoff
+    age, state = vix_feed_freshness(db, inst.id)
+    assert age is not None
+    assert state == FreshnessState.STALE
+
+
+def test_vix_feed_freshness_ignores_price_bars(db: Session):
+    """VIX isn't a tradable underlying -- no OHLC bar aggregation exists for
+    it, so a stray PriceBar row (which shouldn't occur in practice) must not
+    be picked up the way underlying_feed_freshness's tick-or-bar logic would.
+    """
+    inst = _instrument(db, "INDIA VIX-4")
+    _bar(db, inst.id, bucket_seconds_ago=10)  # would be LIVE if bars were consulted
+    age, state = vix_feed_freshness(db, inst.id)
     assert age is None
     assert state == FreshnessState.DEAD

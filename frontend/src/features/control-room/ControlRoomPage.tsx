@@ -355,14 +355,87 @@ function ControlRoomHeader({
 }
 
 // "Today's Activity" -- consolidates the old Net P&L / Margin Utilized /
-// Live Trades Today / Max Drawdown boxes into one card with 5 fields
-// (total + per-lot P&L, total trades, win rate, max drawdown, open risk),
-// scoped to whichever of Live/Paper is actually where the action is: if any
-// running strategy is genuinely routed live right now (RunningStrategyOut
-// .is_live -- NOT just "session is live_enabled", see that field's own
-// comment in shared/api/types.ts), show Live data; otherwise show Paper.
-// Margin Utilized is dropped outright -- it was a non-functional WIP stub,
-// and open risk is the meaningful real-money replacement.
+// Live Trades Today / Max Drawdown boxes into one card with 4 split-metric
+// boxes (P&L+WinRate, TotalTrades+OpenTrades, MaxDrawdown+LargestLoss,
+// OpenRisk+PotentialProfit), scoped to whichever of Live/Paper is actually
+// where the action is: if any running strategy is genuinely routed live
+// right now (RunningStrategyOut.is_live -- NOT just "session is
+// live_enabled", see that field's own comment in shared/api/types.ts), the
+// main strip shows Live data. Margin Utilized is dropped outright -- it was
+// a non-functional WIP stub, and open risk is the meaningful real-money
+// replacement.
+//
+// 2026-09-01: Paper no longer disappears once Live starts. A live-routed
+// strategy going live never stops a force_paper strategy from trading
+// alongside it in the same session -- previously the whole card just
+// swapped to Live and every paper number vanished from view. Now both
+// scopes are always computed (useScopeMetrics below is called once per
+// scope, unconditionally -- required anyway since hooks can't be
+// conditional), and Paper renders as a smaller sub-ribbon under the main
+// Live strip whenever there's genuine paper-side activity to show.
+interface ScopeMetrics {
+  sessionId: string | null
+  report: DailyReportOut | undefined
+  totalPnl: number
+  perLotPnl: number | null
+  totalLots: number
+  realTradeCount: number
+  openTrades: number
+  openRisk: number | null
+  potentialProfit: number | null
+}
+
+function useScopeMetrics(
+  sessionId: string | null,
+  mode: 'live' | 'paper',
+  rows: TradeRow[],
+  runs: RunningStrategyOut[],
+): ScopeMetrics {
+  // mode keeps this scope's Total Trades/Win Rate/Max Drawdown/Largest Loss
+  // scoped to the same population as its already-per-trade-scoped P&L below
+  // -- without it, a live_enabled session holding both live-routed and
+  // force_paper strategies together (normal since 2026-08-28) blends the
+  // force_paper strategy's own paper trades into stats labeled "Live". See
+  // build_daily_report's own docstring.
+  const dailyReportQuery = useQuery({
+    queryKey: ['reports', 'daily', sessionId, mode],
+    queryFn: () => api.get<DailyReportOut>(`/reports/sessions/${sessionId}/daily?mode=${mode}`),
+    enabled: sessionId != null,
+    refetchInterval: 15_000,
+  })
+
+  const realTradeRows = rows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
+  const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
+  const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
+  const openTrades = rows.filter((r) => r.status === 'position_open').length
+
+  // Open risk/potential profit are scoped the same way -- only positions
+  // belonging to strategies in this scope, so Live never mixes a paper
+  // position's numbers in or vice versa.
+  const isLiveScope = mode === 'live'
+  const scopedRuns = runs.filter((r) => r.is_live === isLiveScope)
+  const openRisks = scopedRuns
+    .map((r) => r.open_position?.open_risk)
+    .filter((v): v is number => v != null)
+  const potentialProfits = scopedRuns
+    .map((r) => r.open_position?.potential_profit)
+    .filter((v): v is number => v != null)
+
+  return {
+    sessionId,
+    report: dailyReportQuery.data,
+    totalPnl,
+    perLotPnl,
+    totalLots,
+    realTradeCount: realTradeRows.length,
+    openTrades,
+    openRisk: openRisks.length > 0 ? openRisks.reduce((sum, v) => sum + v, 0) : null,
+    potentialProfit:
+      potentialProfits.length > 0 ? potentialProfits.reduce((sum, v) => sum + v, 0) : null,
+  }
+}
+
 function TodaysActivityCard({
   runs,
   liveRows,
@@ -377,103 +450,119 @@ function TodaysActivityCard({
   paperSessionId: string | null
 }) {
   const anyLive = runs.some((r) => r.is_live)
-  const scopeRows = anyLive ? liveRows : paperRows
-  const scopeSessionId = anyLive ? liveSessionId : paperSessionId
-  const scopeLabel = anyLive ? 'Live' : 'Paper'
 
-  // scopeMode ('live'/'paper') keeps this card's Total Trades/Win Rate/Max
-  // Drawdown scoped to the same population as its already-per-trade-scoped
-  // P&L above -- without it, a live_enabled session holding both live-routed
-  // and force_paper strategies together (normal since 2026-08-28) blends the
-  // force_paper strategy's own paper trades into stats labeled "Live". See
-  // build_daily_report's own docstring.
-  const scopeMode = anyLive ? 'live' : 'paper'
-  const dailyReportQuery = useQuery({
-    queryKey: ['reports', 'daily', scopeSessionId, scopeMode],
-    queryFn: () =>
-      api.get<DailyReportOut>(`/reports/sessions/${scopeSessionId}/daily?mode=${scopeMode}`),
-    enabled: scopeSessionId != null,
-    refetchInterval: 15_000,
-  })
+  const liveMetrics = useScopeMetrics(liveSessionId, 'live', liveRows, runs)
+  const paperMetrics = useScopeMetrics(paperSessionId, 'paper', paperRows, runs)
 
-  const realTradeRows = scopeRows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
-  const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
-  const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
-  const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
+  const primaryMetrics = anyLive ? liveMetrics : paperMetrics
+  const primaryLabel = anyLive ? 'Live' : 'Paper'
 
-  // Open risk is scoped the same way -- only positions belonging to
-  // strategies in the scope currently being shown, so it never mixes a
-  // live position's risk into a paper-scoped card or vice versa.
-  const scopeOpenRisks = runs
-    .filter((r) => r.is_live === anyLive)
-    .map((r) => r.open_position?.open_risk)
-    .filter((v): v is number => v != null)
-  const totalOpenRisk = scopeOpenRisks.reduce((sum, v) => sum + v, 0)
+  // The sub-ribbon only ever appears once Live is primary, and only when
+  // there's genuine paper-side activity to show underneath it -- a
+  // workspace with no paper strategies at all never gets an empty ribbon.
+  const showPaperSubRibbon = anyLive && (paperRows.length > 0 || runs.some((r) => !r.is_live))
 
   return (
     <div className="card">
       <div className="card-header">
         <h3>Today&apos;s Activity</h3>
-        <span className="muted">({scopeLabel})</span>
+        <span className="muted">({primaryLabel})</span>
       </div>
       <div className="metrics-strip">
-        <div className="metric-box">
+        <ActivityMetricsBoxes metrics={primaryMetrics} />
+      </div>
+      {showPaperSubRibbon && (
+        <>
+          <div className="muted metrics-substrip-label">Paper</div>
+          <div className="metrics-strip metrics-substrip">
+            <ActivityMetricsBoxes metrics={paperMetrics} />
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
+  const { sessionId, report } = metrics
+  const winRateDisplay =
+    sessionId === null
+      ? '—'
+      : !report
+        ? '…'
+        : report.trade_count > 1
+          ? `${Math.round(report.win_rate * 100)}%`
+          : '—'
+  const totalTradesDisplay =
+    sessionId === null ? metrics.realTradeCount : (report?.trade_count ?? metrics.realTradeCount)
+  const maxDrawdownDisplay =
+    sessionId === null ? '—' : report ? report.max_drawdown.toFixed(2) : '…'
+  const largestLossDisplay =
+    sessionId === null ? '—' : report ? report.largest_single_loss.toFixed(2) : '…'
+
+  return (
+    <>
+      <div className="metric-box metric-box-split">
+        <div className="metric-box-main">
           <div className="metric-label">P&amp;L</div>
           <div className="metric-value">
-            <span className={totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-              {totalPnl >= 0 ? '+' : ''}
-              {totalPnl.toFixed(2)}
+            <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {metrics.totalPnl >= 0 ? '+' : ''}
+              {metrics.totalPnl.toFixed(2)}
             </span>
           </div>
           <div className="metric-subvalue muted">
-            {perLotPnl !== null
-              ? `${perLotPnl >= 0 ? '+' : ''}${perLotPnl.toFixed(2)} / lot`
+            {metrics.perLotPnl !== null
+              ? `${metrics.perLotPnl >= 0 ? '+' : ''}${metrics.perLotPnl.toFixed(2)} / lot`
               : '— / lot'}
           </div>
         </div>
-
-        <div className="metric-box">
-          <div className="metric-label">Total Trades</div>
-          <div className="metric-value">
-            {scopeSessionId === null
-              ? realTradeRows.length
-              : (dailyReportQuery.data?.trade_count ?? realTradeRows.length)}
-          </div>
-          <div className="metric-subvalue muted">
-            {totalLots} lot{totalLots === 1 ? '' : 's'}
-          </div>
-        </div>
-
-        <div className="metric-box">
+        <div className="metric-box-secondary">
           <div className="metric-label">Win Rate</div>
-          <div className="metric-value">
-            {scopeSessionId === null
-              ? '—'
-              : dailyReportQuery.data
-                ? `${Math.round(dailyReportQuery.data.win_rate * 100)}%`
-                : '…'}
+          <div className="metric-value">{winRateDisplay}</div>
+        </div>
+      </div>
+
+      <div className="metric-box metric-box-split">
+        <div className="metric-box-main">
+          <div className="metric-label">Total Trades</div>
+          <div className="metric-value">{totalTradesDisplay}</div>
+          <div className="metric-subvalue muted">
+            {metrics.totalLots} lot{metrics.totalLots === 1 ? '' : 's'}
           </div>
         </div>
-
-        <div className="metric-box">
-          <div className="metric-label">Max Drawdown</div>
-          <div className="metric-value">
-            {scopeSessionId === null
-              ? '—'
-              : dailyReportQuery.data
-                ? dailyReportQuery.data.max_drawdown.toFixed(2)
-                : '…'}
-          </div>
+        <div className="metric-box-secondary">
+          <div className="metric-label">Open Trades</div>
+          <div className="metric-value">{metrics.openTrades}</div>
         </div>
+      </div>
 
-        <div className="metric-box">
+      <div className="metric-box metric-box-split">
+        <div className="metric-box-main">
+          <div className="metric-label">Max Drawdown (Cumulative)</div>
+          <div className="metric-value">{maxDrawdownDisplay}</div>
+        </div>
+        <div className="metric-box-secondary">
+          <div className="metric-label">Largest Single Loss</div>
+          <div className="metric-value">{largestLossDisplay}</div>
+        </div>
+      </div>
+
+      <div className="metric-box metric-box-split">
+        <div className="metric-box-main">
           <div className="metric-label">Open Risk</div>
           <div className="metric-value">
-            {scopeOpenRisks.length > 0 ? totalOpenRisk.toFixed(2) : '—'}
+            {metrics.openRisk !== null ? metrics.openRisk.toFixed(2) : '—'}
+          </div>
+        </div>
+        <div className="metric-box-secondary">
+          <div className="metric-label">Potential Profit</div>
+          <div className="metric-value">
+            {metrics.potentialProfit !== null ? metrics.potentialProfit.toFixed(2) : '—'}
           </div>
         </div>
       </div>
-    </div>
+    </>
   )
 }
 
@@ -829,6 +918,14 @@ function TradeBucketCard({
       (strategyFilter === 'all' || r.strategyType === strategyFilter),
   )
 
+  // Totals row -- recomputed from visibleRows, so it updates live as the
+  // status/strategy filters above change. Only Lots and P&L are summed;
+  // every other column has no meaningful total (entry/exit prices, exit
+  // reason, status, etc. don't aggregate).
+  const totalsLots = visibleRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
+  const totalsPnl = visibleRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  const totalsHasOpenPosition = visibleRows.some((r) => r.status === 'position_open')
+
   // Which single row is currently being acted on -- Approve/Reject/
   // Square-off all share these three mutation objects, but their own
   // `isPending` used to disable every row's buttons at once (acting on one
@@ -866,9 +963,7 @@ function TradeBucketCard({
   return (
     <div className="card">
       <div className="collapsible-header" onClick={toggle}>
-        <h3>
-          {title} {session && <span className="muted">({session.mode})</span>}
-        </h3>
+        <h3>{title}</h3>
         <span className={`chevron ${isExpanded ? 'open' : ''}`}>▶</span>
       </div>
       {isExpanded && unhiddenRows.length > 0 && (
@@ -964,6 +1059,26 @@ function TradeBucketCard({
                   />
                 ))}
               </tbody>
+              <tfoot>
+                <tr className="trade-table-totals">
+                  <td>Total</td>
+                  <td>{totalsLots > 0 ? totalsLots : '—'}</td>
+                  <td></td>
+                  <td></td>
+                  <td></td>
+                  <td>
+                    <span className={totalsPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                      {totalsPnl >= 0 ? '+' : ''}
+                      {totalsPnl.toFixed(2)}
+                      {totalsHasOpenPosition ? ' (incl. open)' : ''}
+                    </span>
+                  </td>
+                  <td></td>
+                  <td></td>
+                  <td></td>
+                  <td></td>
+                </tr>
+              </tfoot>
             </table>
           </div>
         ))}

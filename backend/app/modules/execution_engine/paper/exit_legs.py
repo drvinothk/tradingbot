@@ -134,6 +134,48 @@ def compute_position_open_risk(db: Session, position: Position) -> float | None:
     return float(risk)
 
 
+def compute_position_potential_profit(db: Session, position: Position) -> float | None:
+    """Rupees gained if every open leg's (or the position's single) target
+    hits right now: Σ max(0, target − entry_price) × qty. Mirrors
+    `compute_position_open_risk` above, but is NOT a literal mirror of its
+    single-leg data source: that function reads the single-leg stop from
+    `StopPlan.stop_price`, but the single-leg *target* was never put on
+    `StopPlan` -- it lives on `TradeIntent.target_price` instead (the same
+    field `api.v1.execution`'s `PositionOut` building code already reads for
+    a non-staged position's own target). `TradeIntent.target_price` is
+    non-nullable (unlike a staged leg's own `target_price`, which is
+    genuinely optional -- a "runner" leg with no profit target, see
+    `PositionExitLeg`'s own comment) so the single-leg case only returns
+    `None` if the intent row itself can't be found, which shouldn't happen
+    given `Position.trade_intent_id`'s NOT NULL FK -- kept as a defensive
+    check, not an expected path.
+    """
+    if position_has_exit_legs(db, position.id):
+        legs = (
+            db.query(PositionExitLeg)
+            .filter(
+                PositionExitLeg.position_id == position.id,
+                PositionExitLeg.status == PositionExitLegStatus.OPEN,
+            )
+            .all()
+        )
+        total = Decimal("0")
+        found_target = False
+        for leg in legs:
+            if leg.target_price is None:
+                continue
+            found_target = True
+            leg_profit = max(Decimal("0"), _dec(leg.target_price) - _dec(position.entry_price))
+            total += leg_profit * leg.qty
+        return float(total) if found_target else None
+
+    trade_intent = db.get(TradeIntent, position.trade_intent_id)
+    if trade_intent is None:
+        return None
+    per_unit = max(Decimal("0"), _dec(trade_intent.target_price) - _dec(position.entry_price))
+    return float(per_unit * position.qty)
+
+
 def build_position_exit_legs(
     db: Session,
     trading_session: TradingSession,

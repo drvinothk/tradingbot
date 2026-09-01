@@ -254,6 +254,23 @@ tbody tr:hover {
   z-index: 1;
 }
 
+/* Totals row (Lots/P&L summed over the currently-filtered rows) -- pinned
+   to the bottom of the scroll frame, mirroring thead's own sticky-top
+   treatment, so it stays visible while scrolling a busy day's trade list
+   rather than requiring a scroll-to-bottom to see it. */
+.trade-table-scroll tfoot td {
+  position: sticky;
+  bottom: 0;
+  background: var(--bg-panel);
+  z-index: 1;
+}
+
+.trade-table-totals td {
+  font-weight: 700;
+  border-top: 1px solid var(--border);
+  border-bottom: none;
+}
+
 /* The expandable per-leg breakdown for a staged (multi-leg) exit -- a
    colSpan'd mini table nested under its parent trade row, deliberately not
    reusing the parent <table>'s fixed <colgroup> widths since the two
@@ -501,9 +518,78 @@ tbody tr:hover {
 
 .metrics-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  /* 240px (up from 180px) -- each box in Today's Activity now carries a
+     main stat plus a divided secondary stat (see .metric-box-split below),
+     so it needs more room than the single-stat boxes this width was
+     originally tuned for. Scoped to .metrics-strip only -- confirmed unused
+     elsewhere in the frontend. */
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 0.9rem;
   margin-bottom: 1.25rem;
+}
+
+/* Today's Activity split boxes (P&L+WinRate, TotalTrades+OpenTrades,
+   MaxDrawdown+LargestLoss, OpenRisk+PotentialProfit) -- main stat on the
+   left keeps the box's existing look untouched, secondary stat on the
+   right is visually subordinate (muted color, no bold weight) but the same
+   font size as the main value per design, divided by the same left-border
+   pattern .global-settings-split already established. */
+.metric-box-split {
+  display: flex;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+.metric-box-main {
+  flex: 2 1 auto;
+  min-width: 0;
+}
+
+.metric-box-secondary {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-left: 1px solid var(--border);
+  padding-left: 1rem;
+}
+
+.metric-box-secondary .metric-label {
+  color: var(--text-muted);
+}
+
+.metric-box-secondary .metric-value {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* Paper sub-ribbon under the main (Live) metrics-strip, shown only once a
+   live-routed strategy exists alongside genuine paper activity -- see
+   TodaysActivityCard's own comment. Smaller and muted throughout so it
+   reads as secondary context, never mistaken for the primary Live numbers
+   above it. */
+.metrics-substrip-label {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 0.6rem 0 0.4rem;
+}
+
+.metrics-substrip {
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.metrics-substrip .metric-box {
+  padding: 0.6rem 0.75rem;
+}
+
+.metrics-substrip .metric-box .metric-value {
+  font-size: 1.1rem;
+}
+
+.metrics-substrip .metric-box .metric-label,
+.metrics-substrip .metric-box-secondary .metric-value {
+  color: var(--text-muted);
 }
 
 /* ---------- Advanced page: Global Controls ribbon ---------- */

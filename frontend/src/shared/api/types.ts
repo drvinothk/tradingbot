@@ -111,6 +111,10 @@ export interface RunningPositionOut {
   // hits right now -- null when there's no stop data to compute from at
   // all, distinct from a genuine 0.
   open_risk: number | null
+  // Rupees gained if the current target (or every open multi-leg target)
+  // hits right now -- null when there's no target data to compute from at
+  // all, distinct from a genuine 0.
+  potential_profit: number | null
 }
 
 export interface PendingApprovalOut {
@@ -282,6 +286,18 @@ export interface UnderlyingFeedTelemetryOut {
   symbol: string
   feed_age_seconds: number | null
   feed_state: string
+  // Latest persisted indicator_snapshots values -- null before the
+  // calculator has warmed up for this symbol.
+  rsi14: number | null
+  ema9: number | null
+  ema20: number | null
+  vwap: number | null
+  // Put/call ratio against the nearest tradable expiry's latest
+  // option-chain snapshot -- null for INDIA VIX (no option chain) and for
+  // a tradable underlying with no snapshot captured yet today.
+  pcr_oi: number | null
+  pcr_vol: number | null
+  pcr_age_seconds: number | null
 }
 
 export interface MarketDataTelemetryOut {
@@ -297,6 +313,7 @@ export interface PerformanceStatsOut {
   avg_loss: number
   profit_factor: number | null
   max_drawdown: number
+  largest_single_loss: number
   total_realized_pnl: number
   total_slippage: number
   signal_count: number

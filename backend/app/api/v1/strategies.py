@@ -46,7 +46,10 @@ from app.domain.strategy.models import (
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.errors import BrokerError
 from app.modules.broker_adapter.composition import get_broker, is_strategy_routed_live
-from app.modules.execution_engine.paper.exit_legs import compute_position_open_risk
+from app.modules.execution_engine.paper.exit_legs import (
+    compute_position_open_risk,
+    compute_position_potential_profit,
+)
 from app.modules.execution_engine.paper.registry import ensure_position_manager_running
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.market_data import record_option_chain_snapshot
@@ -1082,6 +1085,12 @@ class RunningPositionOut(BaseModel):
     # when there's no stop data to compute from at all, distinct from a
     # genuine ₹0.
     open_risk: float | None
+    # Rupees gained if the current target (or, per open multi-leg, every
+    # open leg's own target) hits right now -- see
+    # execution_engine.paper.exit_legs.compute_position_potential_profit.
+    # `None` when there's no target data to compute from at all, distinct
+    # from a genuine ₹0.
+    potential_profit: float | None
 
 
 class PendingApprovalOut(BaseModel):
@@ -1356,6 +1365,7 @@ def list_running_strategies(
                         qty=position.qty,
                         entry_price=float(position.entry_price),
                         open_risk=compute_position_open_risk(db, position),
+                        potential_profit=compute_position_potential_profit(db, position),
                     )
                     if position is not None
                     else None

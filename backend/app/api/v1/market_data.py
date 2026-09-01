@@ -13,17 +13,18 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.core.clock import now_ist
 from app.core.db.session import get_db
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
-from app.domain.market.models import PriceBar
+from app.domain.market.models import OptionChainSnapshot, PriceBar
 from app.domain.ops.models import MarketDataProviderPreference
 from app.modules.audit_service.service import record_event
 from app.modules.market_data import diagnostic_session
@@ -93,10 +94,48 @@ class UnderlyingFeedTelemetryOut(BaseModel):
     symbol: str
     feed_age_seconds: float | None
     feed_state: str
+    # Latest persisted `indicator_snapshots` values for this symbol --
+    # computed continuously by ingestion for every subscribed instrument
+    # (independent of whether any strategy is currently running), so these
+    # populate for INDIA VIX too, not just the two tradable underlyings.
+    # `None` before the first bar/tick has warmed the calculator up.
+    rsi14: float | None = None
+    ema9: float | None = None
+    ema20: float | None = None
+    vwap: float | None = None
+    # Put/call ratio against the nearest tradable expiry's latest
+    # option-chain snapshot -- `None` for INDIA VIX (no option chain) and for
+    # a tradable underlying with no snapshot captured yet today (nothing has
+    # scanned it -- see get_market_data_telemetry's own docstring). Unlike
+    # feed_age_seconds above (continuous tick freshness), pcr_age_seconds is
+    # "how old is this snapshot" -- option chains are refreshed on demand,
+    # not per-tick, so a present PCR value can honestly be a while old.
+    pcr_oi: float | None = None
+    pcr_vol: float | None = None
+    pcr_age_seconds: float | None = None
 
 
 class MarketDataTelemetryOut(BaseModel):
     underlyings: list[UnderlyingFeedTelemetryOut]
+
+
+def _latest_indicator_values(db: Session, instrument_id: uuid.UUID) -> dict[str, float]:
+    from app.domain.market.models import IndicatorSnapshot
+
+    values: dict[str, float] = {}
+    for name in ("RSI14", "EMA9", "EMA20", "VWAP"):
+        row = (
+            db.query(IndicatorSnapshot)
+            .filter(
+                IndicatorSnapshot.instrument_id == instrument_id,
+                IndicatorSnapshot.indicator_name == name,
+            )
+            .order_by(IndicatorSnapshot.ts.desc())
+            .first()
+        )
+        if row is not None:
+            values[name] = float(row.value)
+    return values
 
 
 @router.get("/telemetry", response_model=MarketDataTelemetryOut)
@@ -110,20 +149,91 @@ def get_market_data_telemetry(
     already calls -- just per-underlying instead of that endpoint's
     best-of-both-underlyings single value, so NIFTY and BANKNIFTY staleness
     are distinguishable here. No new tables, no new background service:
-    purely a read over `quote_ticks`/`price_bars`. Active-provider/
-    live-active-leg is deliberately NOT duplicated here -- the frontend
-    already fetches that from `GET /market-data/provider-preference`
-    (used by the Global settings card) and shares the cache.
-    """
-    from app.modules.market_data.freshness import underlying_feed_freshness
-    from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS
+    purely a read over `quote_ticks`/`price_bars`/`indicator_snapshots`/
+    `option_chain_snapshots`. Active-provider/live-active-leg is
+    deliberately NOT duplicated here -- the frontend already fetches that
+    from `GET /market-data/provider-preference` (used by the Global settings
+    card) and shares the cache.
 
+    2026-09-01: extended to also list INDIA VIX (genuinely streamed --
+    `market_hours.ENV_METRIC_SYMBOLS` -- but never shown here before) and
+    the computed RSI14/EMA9/EMA20/VWAP/PCR values every row already has
+    persisted somewhere, even though no strategy gates on most of them
+    today. VIX deliberately uses `vix_feed_freshness`, not
+    `underlying_feed_freshness` -- see that function's own docstring for why
+    reusing the tradable-underlying thresholds would show VIX as permanently
+    stale by design, not as a real problem.
+    """
+    from app.domain.market.models import Instrument
+    from app.modules.market_data.freshness import (
+        FreshnessState,
+        underlying_feed_freshness,
+        vix_feed_freshness,
+    )
+    from app.modules.market_data.market_hours import ENV_METRIC_SYMBOLS, TRADABLE_UNDERLYINGS
+    from app.modules.strategy_engine.auto_spawner import resolve_nearest_expiry
+    from app.modules.strategy_engine.env_metrics import compute_pcr
+
+    now = datetime.now(UTC)
+    today = now_ist().date()
     underlyings = []
+
     for symbol in TRADABLE_UNDERLYINGS:
         age, state = underlying_feed_freshness(db, (symbol,))
+        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+        indicators = _latest_indicator_values(db, instrument.id) if instrument is not None else {}
+
+        pcr_oi = pcr_vol = pcr_age_seconds = None
+        if instrument is not None:
+            expiry = resolve_nearest_expiry(db, instrument.id, today)
+            if expiry is not None:
+                snapshot = (
+                    db.query(OptionChainSnapshot)
+                    .filter(
+                        OptionChainSnapshot.instrument_id == instrument.id,
+                        OptionChainSnapshot.expiry_date == expiry,
+                    )
+                    .order_by(OptionChainSnapshot.ts.desc())
+                    .first()
+                )
+                if snapshot is not None:
+                    pcr_oi, pcr_vol = compute_pcr(snapshot.chain_data)  # type: ignore[arg-type]
+                    pcr_age_seconds = max((now - snapshot.ts).total_seconds(), 0.0)
+
         underlyings.append(
-            UnderlyingFeedTelemetryOut(symbol=symbol, feed_age_seconds=age, feed_state=state.value)
+            UnderlyingFeedTelemetryOut(
+                symbol=symbol,
+                feed_age_seconds=age,
+                feed_state=state.value,
+                rsi14=indicators.get("RSI14"),
+                ema9=indicators.get("EMA9"),
+                ema20=indicators.get("EMA20"),
+                vwap=indicators.get("VWAP"),
+                pcr_oi=pcr_oi,
+                pcr_vol=pcr_vol,
+                pcr_age_seconds=pcr_age_seconds,
+            )
         )
+
+    for symbol in ENV_METRIC_SYMBOLS:
+        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+        if instrument is None:
+            age, state = None, FreshnessState.DEAD
+        else:
+            age, state = vix_feed_freshness(db, instrument.id)
+        indicators = _latest_indicator_values(db, instrument.id) if instrument is not None else {}
+        underlyings.append(
+            UnderlyingFeedTelemetryOut(
+                symbol=symbol,
+                feed_age_seconds=age,
+                feed_state=state.value,
+                rsi14=indicators.get("RSI14"),
+                ema9=indicators.get("EMA9"),
+                ema20=indicators.get("EMA20"),
+                vwap=indicators.get("VWAP"),
+            )
+        )
+
     return MarketDataTelemetryOut(underlyings=underlyings)
 
 

@@ -33,6 +33,13 @@ class PerformanceStats:
     # or infinite, since either would misleadingly imply a real ratio.
     profit_factor: float | None
     max_drawdown: float
+    # Magnitude (>=0) of the single worst closed trade's realized_pnl -- same
+    # sign convention as max_drawdown (a positive size, not a signed loss),
+    # so the two read consistently side by side in the UI. 0.0 when there
+    # are no losing trades, distinct from max_drawdown's own "no trades at
+    # all" 0.0 default -- both collapse to the same value there, which is
+    # fine since neither has anything to report yet.
+    largest_single_loss: float
     total_realized_pnl: float
     total_slippage: float
 
@@ -96,6 +103,7 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
             avg_loss=0.0,
             profit_factor=None,
             max_drawdown=0.0,
+            largest_single_loss=0.0,
             total_realized_pnl=0.0,
             total_slippage=0.0,
         )
@@ -128,6 +136,7 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
         avg_loss=(sum(losses) / len(losses)) if losses else 0.0,
         profit_factor=(gross_profit / gross_loss) if gross_loss > 0 else None,
         max_drawdown=max_drawdown,
+        largest_single_loss=abs(min(losses)) if losses else 0.0,
         total_realized_pnl=sum(pnls),
         total_slippage=sum(float(o.slippage) for o in ordered),
     )

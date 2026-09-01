@@ -83,6 +83,18 @@ UI_BAR_FRESH_THRESHOLDS = FreshnessThresholds(
     degraded_after_seconds=90.0, stale_after_seconds=210.0
 )
 
+# India VIX ticks as infrequently as ~2/60s by design (a computed index, not
+# continuously traded -- see market_data.ingestion's own
+# _WS_HEALTH_GRACE_SECONDS_BY_SYMBOL, which already gives it a 60s grace
+# period for the *ingestion* health-watchdog). Applying UI_TICK_FRESH_
+# THRESHOLDS (30s/120s, tuned for NIFTY/BANKNIFTY's much higher tick rate) to
+# VIX would show it as permanently degraded/stale even when perfectly
+# healthy -- see env_metrics.py's own module docstring ("deliberately no
+# staleness filtering... informational context, not a trade-safety gate").
+# This pair is display-only (the telemetry card), loosely anchored to that
+# same 60s grace period with headroom on top of it.
+VIX_UI_THRESHOLDS = FreshnessThresholds(degraded_after_seconds=90.0, stale_after_seconds=300.0)
+
 # How much a contract's premium may have moved since a price was proposed
 # (a Signal/TradeIntent's entry_price) before it's treated as stale — shared
 # by the manual-approval re-check and evaluate_trade_intent's AUTO-mode
@@ -257,6 +269,23 @@ def underlying_feed_freshness(
     if best_ts is None:
         return None, FreshnessState.DEAD
     return max((now - best_ts).total_seconds(), 0.0), best_state
+
+
+def vix_feed_freshness(
+    db: Session, instrument_id: uuid.UUID
+) -> tuple[float | None, FreshnessState]:
+    """Same shape as `underlying_feed_freshness`, but VIX-specific: no
+    `price_bars` fallback (VIX isn't a tradable underlying, so it has no OHLC
+    bar aggregation), and `VIX_UI_THRESHOLDS` instead of the tick/bar pair
+    tuned for NIFTY/BANKNIFTY's much higher tick rate. Informational display
+    only (the Advanced page's telemetry card) -- not a trading gate, see
+    `VIX_UI_THRESHOLDS`'s own comment.
+    """
+    now = datetime.now(UTC)
+    ts = _latest_tick_ts(db, instrument_id)
+    if ts is None:
+        return None, FreshnessState.DEAD
+    return max((now - ts).total_seconds(), 0.0), classify_age(ts, now, VIX_UI_THRESHOLDS)
 
 
 def _latest_chain_snapshot(

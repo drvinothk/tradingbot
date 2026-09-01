@@ -233,6 +233,10 @@ def test_build_daily_report_matches_hand_computed_stats(
     assert report.avg_loss == pytest.approx(-200.0)
     assert report.profit_factor == pytest.approx(750.0 / 200.0)
     assert report.max_drawdown == pytest.approx(200.0)
+    # Only one losing trade (B, -200) -- largest_single_loss is its magnitude,
+    # same value as max_drawdown here since B is also the whole drawdown, but
+    # computed independently (min over losses, not the equity-curve walk).
+    assert report.largest_single_loss == pytest.approx(200.0)
     assert report.total_realized_pnl == pytest.approx(550.0)
     assert report.total_slippage == pytest.approx(0.0)
     assert report.signal_count == 3
@@ -251,6 +255,7 @@ def test_build_daily_report_with_no_trades_is_all_zero(
     assert report.win_rate == 0.0
     assert report.profit_factor is None
     assert report.max_drawdown == 0.0
+    assert report.largest_single_loss == 0.0
     assert report.total_realized_pnl == 0.0
 
 

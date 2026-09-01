@@ -16,6 +16,7 @@ import type {
   InstrumentFirewallOut,
   InstrumentOut,
   MarketDataTelemetryOut,
+  UnderlyingFeedTelemetryOut,
   MaxTradesPerDayOut,
   ProviderPreferenceOut,
   RuntimeMode,
@@ -1237,6 +1238,21 @@ function formatFeedAge(seconds: number | null): string {
   return `${Math.round(seconds / 60)}m ago`
 }
 
+function formatIndicatorValue(value: number | null): string {
+  return value !== null ? value.toFixed(2) : '—'
+}
+
+function formatPcr(u: UnderlyingFeedTelemetryOut): string {
+  // No option-chain snapshot yet for this (underlying, nearest expiry) --
+  // e.g. nothing has scanned it today -- or this symbol has no option chain
+  // at all (INDIA VIX). See get_market_data_telemetry's own docstring.
+  if (u.pcr_oi === null && u.pcr_vol === null) return '—'
+  const oi = u.pcr_oi !== null ? u.pcr_oi.toFixed(2) : '—'
+  const vol = u.pcr_vol !== null ? u.pcr_vol.toFixed(2) : '—'
+  const age = u.pcr_age_seconds !== null ? ` (${formatFeedAge(u.pcr_age_seconds)})` : ''
+  return `${oi} oi / ${vol} vol${age}`
+}
+
 function MarketDataTelemetryCard() {
   const telemetryQuery = useQuery({
     queryKey: ['market-data', 'telemetry'],
@@ -1257,7 +1273,9 @@ function MarketDataTelemetryCard() {
       <h3>Market Data Adapter telemetry</h3>
       <p className="muted">
         Live per-underlying feed freshness, reusing the same staleness classification the trading
-        gates themselves use — not a separate counter system.
+        gates themselves use — not a separate counter system. Also lists every genuinely streamed
+        symbol (including INDIA VIX) plus the computed indicator/PCR values already persisted for
+        each, even where no strategy gates on them yet.
       </p>
       <div className="form-row">
         <label>Active provider</label>
@@ -1276,9 +1294,14 @@ function MarketDataTelemetryCard() {
         <table>
           <thead>
             <tr>
-              <th>Underlying</th>
+              <th>Symbol</th>
               <th>Feed state</th>
               <th>Last tick/bar</th>
+              <th>RSI14</th>
+              <th>EMA9</th>
+              <th>EMA20</th>
+              <th>VWAP</th>
+              <th>PCR (OI / Vol)</th>
             </tr>
           </thead>
           <tbody>
@@ -1291,11 +1314,23 @@ function MarketDataTelemetryCard() {
                   </span>
                 </td>
                 <td>{formatFeedAge(u.feed_age_seconds)}</td>
+                <td>{formatIndicatorValue(u.rsi14)}</td>
+                <td>{formatIndicatorValue(u.ema9)}</td>
+                <td>{formatIndicatorValue(u.ema20)}</td>
+                <td>{formatIndicatorValue(u.vwap)}</td>
+                <td>{formatPcr(u)}</td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+      <p className="muted" style={{ fontSize: '0.75rem', margin: '0.5rem 0 0' }}>
+        INDIA VIX ticks far less often than NIFTY/BANKNIFTY by design, so it uses a wider
+        staleness threshold — its "Stale"/"Dead" badge is informational only, not a trading gate
+        (nothing here ever blocks a strategy on VIX freshness). PCR only applies to the two
+        tradable underlyings — it needs an option-chain snapshot, which only exists once
+        something has scanned that underlying's nearest expiry today.
+      </p>
     </div>
   )
 }
