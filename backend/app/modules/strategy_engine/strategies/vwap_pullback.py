@@ -89,7 +89,18 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
     def check_setup(
         self, db: Session, strategy_run: StrategyRun, latest_bar: PriceBar
     ) -> TradeProposal | None:
-        bars = get_recent_completed_bars(db, self.instrument_id, self.timeframe, limit=2)
+        # `since=day_start` -- `prev_bar` feeds `structure_level` directly
+        # below (CE: prev_bar.low, PE: prev_bar.high); without a day anchor,
+        # the very first bar of a session would pull yesterday's last bar as
+        # "previous," handing a fresh setup a structure_level with no
+        # relationship to today. Same fix as `_trend_direction` below and
+        # `oi_volume_confirmed.py`'s identical live-confirmed 2026-09-01 bug.
+        day_start = datetime.combine(
+            latest_bar.bucket_start.astimezone(IST).date(), time.min, tzinfo=IST
+        )
+        bars = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, since=day_start, limit=2
+        )
         if len(bars) < 2:
             return None
         prev_bar = bars[0]  # bars[1] is latest_bar itself

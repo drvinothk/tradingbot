@@ -278,6 +278,39 @@ class TestOIVolumeConfirmedStrategy:
 
         assert strategy.check_setup(db, strategy_run, bar) is None
 
+    def test_no_signal_when_only_prior_days_bars_would_fill_the_window(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Live-confirmed 2026-09-01 bug: `get_recent_completed_bars` has no
+        day boundary, so a rolling `limit=N` lookback with too few same-day
+        bars silently reached back into the *previous* day to pad the
+        count -- a real strategy that spawned right after a broker
+        reconnect at 10:03 built its opening window from a frozen bar at
+        08-31 15:38, mixing sessions. Only 4 same-day bars exist here
+        (09:31-09:34); 6 more exist from the day before (ending 15:59) that
+        would, uncorrected, pad the count to the needed 10 and fire a
+        breakout built from yesterday's close, not today's actual range."""
+        prior_day_end = datetime(2026, 7, 23, 16, 0, tzinfo=IST)
+        for i in range(6):
+            _seed_bar(
+                db, instrument, prior_day_end - timedelta(minutes=6 - i),
+                open=25000, high=25010, low=24990, close=25005,
+            )
+        today_start = datetime(2026, 7, 24, 9, 31, tzinfo=IST)
+        for i in range(4):
+            _seed_bar(
+                db, instrument, today_start + timedelta(minutes=i),
+                open=22000, high=22010, low=21990, close=22005,
+            )
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        strategy = OIVolumeConfirmedStrategy(instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS)
+        bar = _seed_bar(
+            db, instrument, today_start + timedelta(minutes=4),
+            open=22030, high=22055, low=22028, close=22050,
+        )
+
+        assert strategy.check_setup(db, strategy_run, bar) is None
+
     def test_no_breakout_when_price_stays_within_window(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
     ):

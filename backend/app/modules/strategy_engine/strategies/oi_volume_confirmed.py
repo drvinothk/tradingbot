@@ -60,11 +60,11 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, time
+from datetime import date, datetime, time
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import to_ist
+from app.core.clock import IST, to_ist
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
@@ -218,7 +218,18 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
                 )
 
         needed = max(self.lookback_bars + 1, BODY_RATIO_LOOKBACK_BARS)
-        bars = get_recent_completed_bars(db, self.instrument_id, self.timeframe, limit=needed)
+        # `since=day_start` (bar-anchored, not wall-clock now()) -- without
+        # it, `limit=needed` alone silently pads the window with the
+        # *previous* trading day's bars for the first `needed` minutes of
+        # every day, live-confirmed 2026-09-01 (a strategy that spawned at
+        # 10:03 pulled in 08-31's frozen 15:38 close as its window_high,
+        # producing a structure_level with no relationship to the day's
+        # actual price action). Same fix, same reasoning `vwap_pullback
+        # .py`'s `_trend_direction` already applies to its own lookback.
+        day_start = datetime.combine(to_ist(latest_bar.bucket_start).date(), time.min, tzinfo=IST)
+        bars = get_recent_completed_bars(
+            db, self.instrument_id, self.timeframe, since=day_start, limit=needed
+        )
         if len(bars) < needed:
             return None
         window_bars = bars[-(self.lookback_bars + 1):-1]  # bars[-1] is latest_bar itself

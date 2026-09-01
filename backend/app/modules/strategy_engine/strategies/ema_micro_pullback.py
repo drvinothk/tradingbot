@@ -52,12 +52,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, time
+from datetime import date, datetime, time
 from typing import Literal
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import to_ist
+from app.core.clock import IST, to_ist
 from app.domain.market.models import Instrument, OptionType, PriceBar
 from app.domain.strategy.models import SignalSide, StrategyRun
 from app.modules.strategy_engine.common_rules import (
@@ -174,8 +174,13 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
             )
             return None
 
+        # `since=day_start` -- see `oi_volume_confirmed.py`'s identical fix
+        # for the live-confirmed 2026-09-01 cross-session contamination this
+        # closes (a bare `limit=N` silently pads with the prior day's bars
+        # for the first N minutes of every session).
+        day_start = datetime.combine(to_ist(latest_bar.bucket_start).date(), time.min, tzinfo=IST)
         bars = get_recent_completed_bars(
-            db, self.instrument_id, self.timeframe, limit=BODY_RATIO_LOOKBACK_BARS
+            db, self.instrument_id, self.timeframe, since=day_start, limit=BODY_RATIO_LOOKBACK_BARS
         )
         if len(bars) < BODY_RATIO_LOOKBACK_BARS:
             return None  # not enough bars yet for the body-ratio window
