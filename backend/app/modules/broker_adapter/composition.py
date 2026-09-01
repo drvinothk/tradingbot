@@ -51,6 +51,8 @@ instance execution always uses today, entirely independent of whatever
 from __future__ import annotations
 
 import logging
+import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -91,6 +93,12 @@ logger = logging.getLogger("app.broker_adapter.composition")
 _broker: BrokerPort | None = None
 _execution_mock: MockBrokerAdapter | None = None
 _shoonya_connected: bool = False
+
+# See shoonya_connection_live()'s own docstring -- mirrors
+# alice_blue_session.py's identical _PROBE_TTL_SECONDS/_probe_cache shape.
+_SHOONYA_PROBE_TTL_SECONDS = 30.0
+_shoonya_probe_lock = threading.Lock()
+_shoonya_probe_cache: tuple[float, bool] | None = None  # (monotonic_deadline, live)
 
 
 class _AuthAwareBroker(BrokerPort):
@@ -522,11 +530,18 @@ def reset_for_tests() -> None:
     `set_broker(None)` alone already guaranteed before `get_execution_broker`
     existed. Test-only — production code never needs to forget the
     execution mock's state.
+
+    Also clears `shoonya_connection_live()`'s own TTL cache (2026-09-01) —
+    without this, a `True`/`False` result cached by one test could leak into
+    a later test within the same 30s wall-clock window, the same
+    cross-test-leak class this function already exists to prevent for
+    `_broker`/`_execution_mock`.
     """
-    global _broker, _execution_mock, _shoonya_connected
+    global _broker, _execution_mock, _shoonya_connected, _shoonya_probe_cache
     _broker = None
     _execution_mock = None
     _shoonya_connected = False
+    _shoonya_probe_cache = None
 
 
 def is_shoonya_configured() -> bool:
@@ -545,6 +560,57 @@ def is_shoonya_configured() -> bool:
     broker-agnostic form every broker-agnostic caller should use instead.
     """
     return _shoonya_connected
+
+
+def shoonya_connection_live() -> bool:
+    """Active counterpart to `is_shoonya_configured()` — that flag is
+    *push-only* (it flips `False` only once some other call happens to fail
+    with `BrokerAuthError`), so it can stay stale-`True` for a while after
+    the underlying token actually died overnight — confirmed live 2026-09-01:
+    both the WS reconnect-storm incident and, more seriously, a real risk of
+    `FailoverMarketDataProvider` tripping to backup within
+    `failover_threshold_seconds` of a login that happens before NSE's real
+    09:15 open (see `market_hours.is_data_flow_expected`'s own docstring).
+
+    This is a real, cheap, TTL-cached (30s) `get_margin()` call — the same
+    `Limits` endpoint `app.main._attempt_shoonya_reconnect_from_cache`
+    already uses to validate a cached token at startup — behind the same
+    mechanical shape as `alice_blue_session.alice_blue_connection_live()`
+    (`_probe_cache`, an `"unknown"`-transient case falling back to the last
+    definitive result or an optimistic `True`), so a periodic caller (the
+    8:30 connection checkup) costs at most one real REST call per 30s
+    regardless of how often it's checked. Returns `False` immediately, no
+    REST call, when `is_shoonya_configured()` is already `False` (no real
+    adapter installed at all — nothing to probe). `get_margin()` already
+    goes through `get_broker()`'s `_AuthAwareBroker` wrapping, so a genuine
+    `BrokerAuthError` here also correctly flips `is_shoonya_configured()`
+    for every other caller, not just this one.
+    """
+    global _shoonya_probe_cache
+
+    if not is_shoonya_configured():
+        return False
+
+    now = time.monotonic()
+    with _shoonya_probe_lock:
+        if _shoonya_probe_cache is not None and now < _shoonya_probe_cache[0]:
+            return _shoonya_probe_cache[1]
+        last_known = _shoonya_probe_cache[1] if _shoonya_probe_cache is not None else None
+
+    try:
+        get_broker().get_margin()
+        live = True
+    except BrokerAuthError:
+        live = False
+    except Exception:
+        # Transient/non-auth failure -- a network blip must not read as
+        # "not connected", same reasoning alice_blue_connection_live()'s
+        # "unknown" case already applies.
+        return last_known if last_known is not None else True
+
+    with _shoonya_probe_lock:
+        _shoonya_probe_cache = (time.monotonic() + _SHOONYA_PROBE_TTL_SECONDS, live)
+    return live
 
 
 def is_execution_broker_connected() -> bool:

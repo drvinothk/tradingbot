@@ -28,6 +28,7 @@ import logging
 import threading
 from collections.abc import Callable
 
+from app.core.db.session import SessionFactory
 from app.modules.market_data.market_hours import (
     ENV_METRIC_SYMBOLS,
     TRADABLE_UNDERLYINGS,
@@ -57,12 +58,27 @@ PRE_MARKET_HEALTH_CHECK_SECONDS = 300.0
 
 
 class MarketDataScheduler:
-    def __init__(self, tick_seconds: float = DEFAULT_TICK_SECONDS) -> None:
+    def __init__(
+        self,
+        tick_seconds: float = DEFAULT_TICK_SECONDS,
+        alert_session_factory: SessionFactory | None = None,
+    ) -> None:
         self._tick_seconds = tick_seconds
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_phase: MarketPhase | None = None
         self._seconds_since_health_check = 0.0
+        # 2026-09-01: opt-in only, defaulting to None -- this class is
+        # constructed directly (with zero alerting awareness) by every
+        # existing test in test_market_data_scheduler.py, and a hardcoded
+        # `session_scope` default here would repeat the exact "background
+        # write defaults to the production DB inside a test" trap this
+        # codebase has hit before (see `PositionManager`/`StrategyRunner`,
+        # and `providers/failover.py`'s own `FailoverMarketDataProvider
+        # .__init__`'s identical `alert_session_factory` param, copied here).
+        # `ensure_market_data_scheduler_running` below is the one real
+        # composition-root call site that passes the actual `session_scope`.
+        self._alert_session_factory = alert_session_factory
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -190,8 +206,61 @@ class MarketDataScheduler:
                 "known underlyings until reconnect (see market_data.registry"
                 ".reset_for_reconnect)."
             )
+            self._alert_if_no_session_anywhere()
             return
         self._subscribe_known_underlyings()
+
+    def _alert_if_no_session_anywhere(self) -> None:
+        """`is_market_data_ready()` above is Shoonya-specific and passive
+        (it only ever flips False as a *side effect* of some other call
+        failing) — it says nothing about whether the live failover backup
+        (Alice Blue, `MARKET_DATA_FAILOVER_ENABLED=true` in production) has
+        a session either. This is the real "is there any usable market-data
+        session at all" check: an active probe of both brokers
+        (`shoonya_connection_live`/`alice_blue_connection_live`, both
+        TTL-cached so calling this on every deferred subscription attempt is
+        cheap), and only raises `market_data_no_session` when *neither* is
+        live — the actual 8:30 "nothing's connected, notify me" gap this was
+        built to close. No throttling of our own is added here: `send_alert`'s
+        own 15-minute dedup (keyed per-workspace below) is what naturally
+        turns this into "once per morning" rather than a repeat-every-tick
+        ping, the same as every other alert call site in this codebase
+        already relies on.
+        """
+        if self._alert_session_factory is None:
+            return
+        from app.modules.broker_adapter.composition import shoonya_connection_live
+        from app.modules.market_data.providers.alice_blue_session import (
+            alice_blue_connection_live,
+        )
+
+        if shoonya_connection_live() or alice_blue_connection_live():
+            return
+
+        from app.domain.ops.models import AlertSeverity
+        from app.domain.session.models import TradingSession, TradingSessionStatus
+        from app.modules.alerting.manager import send_alert
+
+        with self._alert_session_factory() as db:
+            workspace_ids = {
+                row[0]
+                for row in db.query(TradingSession.workspace_id)
+                .filter(TradingSession.status == TradingSessionStatus.ACTIVE)
+                .distinct()
+                .all()
+            }
+            for workspace_id in workspace_ids:
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="market_data_no_session",
+                    message=(
+                        "Neither Shoonya nor the failback provider has a live session yet "
+                        "-- connect at least one before market open."
+                    ),
+                    dedup_key=f"market_data_no_session:{workspace_id}",
+                )
 
     def _subscribe_known_underlyings(self) -> None:
         # Local import matches this codebase's existing convention for this
@@ -287,13 +356,16 @@ def ensure_market_data_scheduler_running(
     `provider_composition.get_market_data_provider`'s own gate exclusion.
     """
     from app.config.settings import get_settings
+    from app.core.db.session import session_scope
 
     if get_settings().market_data.provider == "mock":
         return None
 
     global _scheduler
     if _scheduler is None or not _scheduler.is_alive():
-        _scheduler = MarketDataScheduler(tick_seconds=tick_seconds)
+        _scheduler = MarketDataScheduler(
+            tick_seconds=tick_seconds, alert_session_factory=session_scope
+        )
         _scheduler.start()
     return _scheduler
 

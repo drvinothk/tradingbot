@@ -819,16 +819,19 @@ class ShoonyaBrokerAdapter(BrokerPort):
         if self._ws is None:
             # Local import, not module-level -- `broker_adapter.composition`
             # is the composition root (nothing below it should import it at
-            # module scope; see that module's own docstring). `is_shoonya_
-            # configured` is the cheapest existing "is there a real,
-            # authenticated Shoonya adapter installed right now" signal
-            # (flips False the moment any BrokerPort call raises
-            # BrokerAuthError, including this same day's first auto-spawn
-            # option-chain fetch against a stale overnight token) -- passed
-            # through so `_run`'s own reconnect loop stops hammering a dead
-            # session instead of retrying every 30s forever. See ws_client
-            # .py's `_SESSION_NOT_READY_BACKOFF_SECONDS` for the full reasoning.
-            from app.modules.broker_adapter.composition import is_shoonya_configured
+            # module scope; see that module's own docstring).
+            # `shoonya_connection_live` (2026-09-01) is a real, TTL-cached
+            # (30s) active probe -- passed through so `_run`'s own reconnect
+            # loop stops hammering a dead session instead of retrying every
+            # 30s forever, and notices a genuinely dead-but-not-yet-failed
+            # token sooner than the passive `is_shoonya_configured` flag
+            # alone would (that flag only flips once some *other* call
+            # happens to fail). Parity with `alice_blue.py`'s own
+            # `subscribe_ticks`, which already passes the equivalent active
+            # `alice_blue_connection_live` probe for the identical reason.
+            # See ws_client.py's `_SESSION_NOT_READY_BACKOFF_SECONDS` for the
+            # full reasoning.
+            from app.modules.broker_adapter.composition import shoonya_connection_live
 
             self._ws = ShoonyaWSClient(
                 self._settings.ws_host,
@@ -839,7 +842,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 on_depth=on_depth,
                 on_order_update=self._handle_order_update,
                 source=self._settings.ws_auth_source,
-                session_is_live=is_shoonya_configured,
+                session_is_live=shoonya_connection_live,
             )
             self._ws.start()
             self._ws_bound_on_tick = on_tick

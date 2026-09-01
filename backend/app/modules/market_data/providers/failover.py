@@ -58,6 +58,28 @@ unready backup is never even attempted — primary simply stays the active
 leg (still unhealthy, still being retried every watchdog cycle for its own
 recovery) until a human connects the backup, rather than "tripping" to a
 leg that can't actually take over.
+
+**Time-of-day-gated health evaluation (2026-09-01).** `_check_primary_
+health`/`_check_recovery` both now skip entirely (no trip, no recovery
+evaluation) whenever `market_hours.is_data_flow_expected()` is `False` for
+the injected `now_ist_provider()` — a real, previously-live risk found by
+tracing this exact incident: NSE's cash/index session genuinely opens at
+09:15 IST, a full 15 minutes after this system's own `active_market` phase
+begins (09:00) and connections are already expected to be live. Before this
+gate existed, a human completing the daily Shoonya OAuth login any time
+before ~09:15 — something this project's own operator does on some
+mornings, per explicit confirmation — could trip failover to Alice Blue
+within just `failover_threshold_seconds` (10.0s default) of subscribing,
+purely because real ticks hadn't started yet, never because of an actual
+primary outage; `_last_primary_tick_at`'s existing `subscribed_at`-grace
+fallback only covers the first `failover_threshold_seconds`, not the whole
+09:00-09:15 gap. The trip/recovery *mechanism* itself — tick-staleness math,
+the backup-readiness gate above, the 90s anti-flap recovery dwell — is
+completely unchanged; this is purely an additional early-return guard, so
+every already-live-proven behavior from 09:15 onward is untouched. See
+`market_hours.is_data_flow_expected`'s own docstring for the full incident
+writeup (a second, related bug in `HealthCheckScheduler
+._check_market_data_staleness` is fixed the identical way).
 """
 
 from __future__ import annotations
@@ -67,12 +89,15 @@ import threading
 import time
 from collections.abc import Callable
 from datetime import datetime
+from datetime import time as dt_time
 
+from app.core.clock import now_ist
 from app.core.db.session import SessionFactory
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession, TradingSessionStatus
 from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
+from app.modules.market_data.market_hours import is_data_flow_expected
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 
 logger = logging.getLogger("app.market_data.failover")
@@ -96,6 +121,7 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         backup_retry_seconds: float,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        now_ist_provider: Callable[[], dt_time] = lambda: now_ist().time(),
         alert_session_factory: SessionFactory | None = None,
     ) -> None:
         self._primary = primary
@@ -107,6 +133,12 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._backup_retry_seconds = backup_retry_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._clock = clock
+        # 2026-09-01: injectable same reasoning as `clock` above -- real
+        # `now_ist().time()` in production, a controllable fake in tests, so
+        # `_check_primary_health`/`_check_recovery`'s new time-of-day gate
+        # (see module docstring) is deterministically testable without
+        # depending on real wall-clock IST time.
+        self._now_ist_provider = now_ist_provider
         # 2026-08-25: opt-in only, defaulting to None -- this class has zero
         # DB/session context otherwise, and it's directly instantiated by
         # several existing tests with no session_factory of any kind. A
@@ -544,6 +576,13 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             self._check_recovery(now)
 
     def _check_primary_health(self, now: float) -> None:
+        if not is_data_flow_expected(self._now_ist_provider()):
+            # Before NSE's real 09:15 session open, "no primary tick yet" is
+            # expected, not a signal of anything -- see module docstring's
+            # 2026-09-01 section. Skip entirely rather than evaluate
+            # `healthy`: no state here needs updating, and there is nothing
+            # to trip to.
+            return
         with self._lock:
             last = self._last_primary_tick_at
             subscribed_at = self._subscribed_at
@@ -664,6 +703,13 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         return True
 
     def _check_recovery(self, now: float) -> None:
+        if not is_data_flow_expected(self._now_ist_provider()):
+            # Symmetry with _check_primary_health -- see module docstring's
+            # 2026-09-01 section. Only reachable pre-09:15 via a manual
+            # override trip (automatic trips are already gated above), but
+            # recovering back to primary based on data that isn't expected
+            # yet would be premature either way.
+            return
         with self._lock:
             last = self._last_primary_tick_at
         primary_healthy = last is not None and (now - last) <= self._failover_threshold_seconds

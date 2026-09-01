@@ -11,10 +11,12 @@ from datetime import time
 from app.modules.market_data.market_hours import (
     MARKET_CLOSE,
     MARKET_OPEN,
+    NORMAL_MARKET_OPEN,
     PRE_MARKET_END,
     REPLAY_MODE_MARKET_CLOSE,
     MarketPhase,
     current_phase,
+    is_data_flow_expected,
     is_within_market_hours,
 )
 
@@ -122,6 +124,47 @@ def test_default_replay_mode_reads_from_settings_when_false(monkeypatch):
     )
 
     assert current_phase(time(20, 0)) is MarketPhase.CLOSED
+
+
+# -- is_data_flow_expected (2026-09-01): NSE's real 09:15 session open, a
+# strict subset of is_within_market_hours's wider 08:30-16:00 connectivity
+# window. Boundary tests specifically -- an off-by-one here either lets a
+# false failover trip / spurious staleness alert through in the 09:00-09:15
+# gap, or wrongly suppresses a genuine one after 09:15.
+
+
+def test_data_flow_not_expected_during_pre_market():
+    assert is_data_flow_expected(time(8, 45)) is False
+
+
+def test_data_flow_not_expected_just_after_pre_market_end():
+    assert is_data_flow_expected(time(9, 0)) is False
+    assert is_data_flow_expected(time(9, 14, 59)) is False
+
+
+def test_data_flow_expected_exactly_at_normal_market_open():
+    assert is_data_flow_expected(NORMAL_MARKET_OPEN) is True
+
+
+def test_data_flow_expected_through_the_rest_of_active_market():
+    assert is_data_flow_expected(time(12, 0)) is True
+    assert is_data_flow_expected(time(15, 59, 59)) is True
+
+
+def test_data_flow_not_expected_once_closed():
+    assert is_data_flow_expected(MARKET_CLOSE) is False
+    assert is_data_flow_expected(time(20, 0)) is False
+
+
+def test_data_flow_expected_respects_replay_mode_close_extension():
+    # Replay mode only ever streams in the evening (see module docstring's
+    # 2026-09-01 section) -- the 09:15 floor is irrelevant there in practice,
+    # but the boundary logic itself must still compose correctly: evening
+    # replay data is "expected" only while ACTIVE_MARKET (extended to 23:30)
+    # actually holds.
+    assert is_data_flow_expected(time(20, 0), replay_mode=True) is True
+    assert is_data_flow_expected(time(20, 0), replay_mode=False) is False
+    assert is_data_flow_expected(REPLAY_MODE_MARKET_CLOSE, replay_mode=True) is False
 
 
 class _FakeMarketDataSettingsForReplay:

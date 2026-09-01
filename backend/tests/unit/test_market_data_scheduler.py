@@ -35,6 +35,36 @@ class _FakeProvider:
         self.calls.append("disconnect")
 
 
+class _FakeAlertDB:
+    """Minimal stand-in for the `Session` `_alert_if_no_session_anywhere`
+    reads through -- `query(TradingSession.workspace_id).filter(...)
+    .distinct().all()`, returning `(workspace_id,)` tuples the same shape a
+    real single-column query would. Matches `test_failover_provider.py`'s
+    own `_FakeAlertDB` pattern (a callable `alert_session_factory` that
+    returns this instance, which is itself the context manager)."""
+
+    def __init__(self, workspace_ids: list) -> None:
+        self._workspace_ids = workspace_ids
+
+    def query(self, *_args, **_kwargs):
+        return self
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def distinct(self):
+        return self
+
+    def all(self):
+        return [(ws_id,) for ws_id in self._workspace_ids]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc) -> None:
+        return None
+
+
 def _scheduler_with_phase_sequence(
     monkeypatch,
     phases: list[MarketPhase],
@@ -459,3 +489,87 @@ def test_health_check_still_does_not_fire_during_closed(monkeypatch):
     for _ in range(19):
         sched.run_once()
     assert provider.calls == []
+
+
+def test_alerts_market_data_no_session_when_neither_broker_is_live(monkeypatch):
+    """2026-09-01: the real gap this closes -- `is_market_data_ready()` is
+    Shoonya-only and passive, so it alone can't tell you the failback
+    (Alice Blue) is also down. With both probes False and a real
+    `alert_session_factory` injected, a deferred subscription must raise
+    `market_data_no_session`.
+    """
+    import app.modules.alerting.manager as alerting_manager
+    import app.modules.broker_adapter.composition as broker_composition
+    import app.modules.market_data.providers.alice_blue_session as alice_blue_session_module
+
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr(scheduler_module, "is_market_data_ready", lambda: False)
+    monkeypatch.setattr(broker_composition, "shoonya_connection_live", lambda: False)
+    monkeypatch.setattr(alice_blue_session_module, "alice_blue_connection_live", lambda: False)
+
+    alert_calls: list[dict] = []
+    monkeypatch.setattr(
+        alerting_manager, "send_alert", lambda db, **kwargs: alert_calls.append(kwargs)
+    )
+    sched._alert_session_factory = lambda: _FakeAlertDB(["ws-1"])  # noqa: SLF001
+
+    sched.run_once()
+
+    assert len(alert_calls) == 1
+    assert alert_calls[0]["category"] == "market_data_no_session"
+    assert alert_calls[0]["workspace_id"] == "ws-1"
+
+
+def test_no_alert_session_factory_stays_silent_by_default(monkeypatch):
+    """The constructor default (`alert_session_factory=None`) must stay a
+    true no-op -- no exception, no alert call -- since this is exactly what
+    every pre-existing test in this file relies on implicitly by
+    constructing `MarketDataScheduler(tick_seconds=1.0)` with no awareness
+    of alerting at all.
+    """
+    import app.modules.alerting.manager as alerting_manager
+    import app.modules.broker_adapter.composition as broker_composition
+    import app.modules.market_data.providers.alice_blue_session as alice_blue_session_module
+
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr(scheduler_module, "is_market_data_ready", lambda: False)
+    monkeypatch.setattr(broker_composition, "shoonya_connection_live", lambda: False)
+    monkeypatch.setattr(alice_blue_session_module, "alice_blue_connection_live", lambda: False)
+
+    alert_calls: list[dict] = []
+    monkeypatch.setattr(
+        alerting_manager, "send_alert", lambda db, **kwargs: alert_calls.append(kwargs)
+    )
+    assert sched._alert_session_factory is None  # noqa: SLF001 - the constructor default itself
+
+    sched.run_once()  # must not raise
+
+    assert alert_calls == []
+
+
+def test_no_alert_when_at_least_one_broker_is_live(monkeypatch):
+    """The actual point of this feature: `is_market_data_ready()` being
+    False (Shoonya-only) is not itself the signal to notify on -- if the
+    failback (Alice Blue) is live, nothing needs to alert.
+    """
+    import app.modules.alerting.manager as alerting_manager
+    import app.modules.broker_adapter.composition as broker_composition
+    import app.modules.market_data.providers.alice_blue_session as alice_blue_session_module
+
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr(scheduler_module, "is_market_data_ready", lambda: False)
+    monkeypatch.setattr(broker_composition, "shoonya_connection_live", lambda: False)
+    monkeypatch.setattr(alice_blue_session_module, "alice_blue_connection_live", lambda: True)
+
+    alert_calls: list[dict] = []
+    monkeypatch.setattr(
+        alerting_manager, "send_alert", lambda db, **kwargs: alert_calls.append(kwargs)
+    )
+    sched._alert_session_factory = lambda: _FakeAlertDB(["ws-1"])  # noqa: SLF001
+
+    sched.run_once()
+
+    assert alert_calls == []

@@ -14,7 +14,7 @@ from datetime import time as dt_time
 import pytest
 from sqlalchemy.orm import Session
 
-from app.core.clock import ClockCheckResult, DiskCheckResult
+from app.core.clock import IST, ClockCheckResult, DiskCheckResult
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, PriceBar, QuoteTick
 from app.domain.ops.models import AlertSeverity, MetricSeries, SystemAlert
@@ -194,7 +194,7 @@ def _ntp_disk_ok(monkeypatch) -> None:
         "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
     )
     monkeypatch.setattr(
-        "app.modules.scheduler.health_check.is_within_market_hours", lambda: True
+        "app.modules.scheduler.health_check.is_data_flow_expected", lambda: True
     )
     # The staleness sub-check is skipped on any weekend (calendar) -- force
     # "weekday" so these tests are deterministic whichever day CI runs on.
@@ -289,6 +289,91 @@ def test_market_data_staleness_alerts_when_tick_and_bar_are_both_stale(
     db: Session, trading_session, monkeypatch
 ):
     _ntp_disk_ok(monkeypatch)
+    inst = _seed_nifty(db)
+    db.add(
+        QuoteTick(
+            id=uuid.uuid4(), instrument_id=inst.id, ltp=100.0, bid=99.5, ask=100.5,
+            volume=0, oi=None, ts=datetime.now(UTC) - timedelta(seconds=4000),
+        )
+    )
+    db.add(
+        PriceBar(
+            id=uuid.uuid4(), instrument_id=inst.id, timeframe="60s",
+            bucket_start=datetime.now(UTC) - timedelta(seconds=4000),
+            open=100.0, high=101.0, low=99.0, close=100.5, volume=1000,
+        )
+    )
+    db.flush()
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "market_data_stale",
+        )
+        .count()
+        == 1
+    )
+
+
+def test_market_data_staleness_no_alert_before_normal_market_open(
+    db: Session, trading_session, monkeypatch
+):
+    """2026-09-01: the actual bug this gate change closes. Previously gated
+    on `is_within_market_hours()` (opens 08:30), so a cycle running at 09:05
+    -- with zero QuoteTick/PriceBar rows yet written, the normal pre-open
+    state, not a dead feed -- read as maximally-stale (`classify_latest_tick`/
+    `classify_latest_bar` both return DEAD when no row exists at all) and
+    fired a spurious CRITICAL alert. Drives the real `is_data_flow_expected()`
+    gate via a monkeypatched wall clock rather than force-patching the gate
+    itself to True, so this exercises the actual composition, not just that
+    a mock returns a fixed value.
+    """
+    import app.modules.market_data.market_hours as market_hours
+    import app.modules.ops.weekend_rest as weekend_rest
+
+    monkeypatch.setattr("app.modules.scheduler.health_check.check_ntp_drift", lambda: _OK_NTP)
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
+    )
+    monkeypatch.setattr(weekend_rest, "is_weekend_ist", lambda *a, **k: False)
+    # 09:05 IST -- active_market (>= 09:00) but before NSE's real 09:15
+    # session open.
+    monkeypatch.setattr(market_hours, "now_ist", lambda: datetime(2026, 9, 7, 9, 5, tzinfo=IST))
+    _seed_nifty(db)  # zero QuoteTick/PriceBar rows -- the normal pre-open state
+
+    _scheduler_for(db).run_once()
+
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.category == "market_data_stale",
+        )
+        .count()
+        == 0
+    )
+
+
+def test_market_data_staleness_alerts_at_and_after_normal_market_open(
+    db: Session, trading_session, monkeypatch
+):
+    """Guards against over-suppressing the alert: once NSE's real 09:15
+    session open has passed, a genuinely dead feed must still alert -- same
+    real-wall-clock-driven `is_data_flow_expected()` gate as the pre-open
+    test above, just on the other side of the boundary.
+    """
+    import app.modules.market_data.market_hours as market_hours
+    import app.modules.ops.weekend_rest as weekend_rest
+
+    monkeypatch.setattr("app.modules.scheduler.health_check.check_ntp_drift", lambda: _OK_NTP)
+    monkeypatch.setattr(
+        "app.modules.scheduler.health_check.check_disk_space", lambda path: _OK_DISK
+    )
+    monkeypatch.setattr(weekend_rest, "is_weekend_ist", lambda *a, **k: False)
+    monkeypatch.setattr(market_hours, "now_ist", lambda: datetime(2026, 9, 7, 10, 0, tzinfo=IST))
     inst = _seed_nifty(db)
     db.add(
         QuoteTick(

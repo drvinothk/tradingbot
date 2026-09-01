@@ -114,6 +114,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "broker_disconnected",
         "market_data_stale",
         "market_data_failover_switch",
+        "market_data_no_session",
         "trade_approval_pending",
         "exit_legs_collapsed",
         "db_pool_saturated",
@@ -190,6 +191,10 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "market_data_failover_switch": (
         "The backup market-data provider is now active -- confirm the primary "
         "provider's health before switching back."
+    ),
+    "market_data_no_session": (
+        "Neither Shoonya nor the failback provider has a live session yet -- "
+        "connect at least one from the Sessions page before market open."
     ),
     "trade_approval_pending": (
         "Open Control Room and Approve/Reject before the approval window expires."

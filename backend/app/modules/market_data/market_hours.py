@@ -45,6 +45,37 @@ Both `MarketDataScheduler` (the 16:00/23:30 hard-disconnect trigger) and
 override at all, so they automatically pick up whichever cutoff is
 currently configured — one shared source of truth, unchanged from before
 today, now with one more input.
+
+**2026-09-01: `is_data_flow_expected` — a narrower predicate for "is a real
+tick plausible right now", distinct from `is_within_market_hours`'s
+connectivity-warm-up window.** NSE's own cash/index session genuinely opens
+at 09:15 IST, a full 15 minutes after this module's own `PRE_MARKET_END`
+(09:00) — deliberately, per this module's own docstring above, since
+`active_market` models connectivity readiness, not the exchange's real
+hours. Before this existed, every *consumer* of tick/bar freshness
+(`market_data.freshness`'s age-based classification, which reads "no tick
+row exists yet" as maximally-stale `DEAD` unconditionally, with zero
+time-of-day awareness) had no way to distinguish "the feed is genuinely
+dead" from "it's 09:05 and NSE hasn't opened yet" — confirmed live-capable
+of two real, distinct bugs: a spurious `CRITICAL` `market_data_stale` alert
+firing for any workspace with an ACTIVE session between ~08:35 and 09:15,
+and — more seriously, since `MARKET_DATA_FAILOVER_ENABLED=true` is live in
+production — `FailoverMarketDataProvider._check_primary_health` tripping to
+the backup leg within `failover_threshold_seconds` (10.0s default) of a
+human logging in any time before ~09:15, purely because real data hasn't
+started yet, never because of an actual outage. Both are fixed by gating on
+this predicate instead of the broader `is_within_market_hours()` — see
+`scheduler.health_check._check_market_data_staleness` and
+`market_data.providers.failover.FailoverMarketDataProvider._check_primary_
+health`/`_check_recovery`.
+
+Deliberately does **not** gate the *replay-mode* case on `NORMAL_MARKET_OPEN`
+at all beyond what `current_phase` already does — TrueData's replay feed (see
+the 2026-08-10 section above) only ever streams in the *evening*
+(`REPLAY_MODE_MARKET_CLOSE = 23:30`), never before real market open, so the
+09:15 floor is always already satisfied by the time a replay session's own
+`ACTIVE_MARKET` phase begins; there is no scenario where replay data
+legitimately needs to be treated as "expected" before 09:15 wall-clock IST.
 """
 
 from __future__ import annotations
@@ -60,6 +91,11 @@ MARKET_CLOSE = time(16, 0)
 # See module docstring's 2026-08-10 section -- only reached when
 # Settings.market_data.is_replay_mode is explicitly set.
 REPLAY_MODE_MARKET_CLOSE = time(23, 30)
+# NSE's own cash/index session open -- see module docstring's 2026-09-01
+# section. The shared home for this constant; strategies needing it (e.g.
+# ORB's opening-range anchor) should import it from here rather than
+# keeping their own private copy.
+NORMAL_MARKET_OPEN = time(9, 15)
 
 # This system only ever trades these two underlyings -- kept here (not
 # imported from a specific broker adapter, e.g. `broker_adapter.shoonya
@@ -110,3 +146,17 @@ def current_phase(now: time | None = None, replay_mode: bool | None = None) -> M
 
 def is_within_market_hours(now: time | None = None, replay_mode: bool | None = None) -> bool:
     return current_phase(now, replay_mode) is not MarketPhase.CLOSED
+
+
+def is_data_flow_expected(now: time | None = None, replay_mode: bool | None = None) -> bool:
+    """True only once a real tick is plausible -- `active_market` (09:00+)
+    AND at/past NSE's own 09:15 session open. A strict subset of
+    `is_within_market_hours`'s wider 08:30-16:00 span; see module docstring's
+    2026-09-01 section for why this exists as a second, narrower predicate
+    rather than moving `PRE_MARKET_END`/tightening `is_within_market_hours`
+    itself -- connectivity readiness (warm up the WS handshake, sit idle)
+    and "should absence of a tick be treated as meaningful" are genuinely
+    different questions with different answers in the 09:00-09:15 gap.
+    """
+    t = now if now is not None else now_ist().time()
+    return current_phase(t, replay_mode) is MarketPhase.ACTIVE_MARKET and t >= NORMAL_MARKET_OPEN

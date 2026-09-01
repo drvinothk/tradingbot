@@ -33,7 +33,8 @@ class _FakeRealBroker(BrokerPort):
 
     def __init__(self) -> None:
         self.closed = False
-        self.margin_raises: BrokerAuthError | None = None
+        self.margin_raises: Exception | None = None
+        self.margin_calls = 0
 
     def authenticate(self) -> AuthResult:
         return AuthResult(session_token="tok", account_id="acc")
@@ -77,6 +78,7 @@ class _FakeRealBroker(BrokerPort):
         return []
 
     def get_margin(self) -> MarginInfo:
+        self.margin_calls += 1
         if self.margin_raises is not None:
             raise self.margin_raises
         return MarginInfo(0.0, 0.0, 0.0, datetime.now(UTC))
@@ -157,6 +159,73 @@ def test_non_auth_calls_are_unaffected_when_connected():
     broker = composition.get_broker()
     assert broker.get_positions() == []
     assert composition.is_shoonya_configured() is True
+
+
+# -- shoonya_connection_live() (2026-09-01) -- active counterpart to the
+# push-only is_shoonya_configured() flag.
+
+
+def test_connection_live_is_false_with_no_adapter_installed_and_makes_no_call():
+    assert composition.shoonya_connection_live() is False
+
+
+def test_connection_live_is_true_on_a_successful_probe():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+
+    assert composition.shoonya_connection_live() is True
+    assert fake.margin_calls == 1
+
+
+def test_connection_live_is_false_and_flips_is_shoonya_configured_on_auth_error():
+    fake = _FakeRealBroker()
+    fake.margin_raises = BrokerAuthError("session expired")
+    composition.set_broker(fake)
+
+    assert composition.shoonya_connection_live() is False
+    # get_margin() goes through get_broker()'s _AuthAwareBroker wrapping --
+    # a real auth failure here must also flip the passive flag for every
+    # other caller, not just this probe.
+    assert composition.is_shoonya_configured() is False
+
+
+def test_connection_live_is_optimistic_on_a_transient_non_auth_error_with_no_prior_result():
+    fake = _FakeRealBroker()
+    fake.margin_raises = TimeoutError("network blip")
+    composition.set_broker(fake)
+
+    assert composition.shoonya_connection_live() is True
+
+
+def test_connection_live_falls_back_to_last_known_result_on_a_later_transient_error():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+    assert composition.shoonya_connection_live() is True  # caches True
+
+    composition._shoonya_probe_cache = (0.0, True)  # force the TTL to have expired
+    fake.margin_raises = TimeoutError("network blip")
+
+    assert composition.shoonya_connection_live() is True
+
+
+def test_connection_live_is_ttl_cached_and_does_not_reprobe_within_the_window():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+
+    assert composition.shoonya_connection_live() is True
+    assert composition.shoonya_connection_live() is True
+    assert fake.margin_calls == 1, "second call within the TTL must not re-probe"
+
+
+def test_connection_live_reprobes_once_the_ttl_expires():
+    fake = _FakeRealBroker()
+    composition.set_broker(fake)
+    assert composition.shoonya_connection_live() is True
+    assert fake.margin_calls == 1
+
+    composition._shoonya_probe_cache = (0.0, True)  # force expiry (deadline in the past)
+    assert composition.shoonya_connection_live() is True
+    assert fake.margin_calls == 2
 
 
 # -- Ops-Hardening Phase 5: get_execution_broker gating ----------------------

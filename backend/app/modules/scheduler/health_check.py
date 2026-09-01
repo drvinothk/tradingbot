@@ -60,7 +60,7 @@ from app.modules.market_data.freshness import (
     FreshnessThresholds,
     underlying_feed_state,
 )
-from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_within_market_hours
+from app.modules.market_data.market_hours import TRADABLE_UNDERLYINGS, is_data_flow_expected
 from app.modules.ops import weekend_rest
 from app.modules.ops.metrics_service import record_metric
 from app.modules.scheduler.base import IntervalScheduler
@@ -233,9 +233,13 @@ class HealthCheckScheduler(IntervalScheduler):
         (60s) or `OPTION_CHAIN_THRESHOLDS`, since "worth alerting a human"
         is a coarser granularity than either of those existing tiers.
 
-        Gated on `is_within_market_hours()` — no ticks are expected outside
-        it at all, so checking then would just alert on nothing new every
-        5 minutes overnight. Also skipped on any weekend
+        Gated on `is_data_flow_expected()` (2026-09-01), not the wider
+        `is_within_market_hours()` — the latter opens at 08:30, a full 45
+        minutes before NSE's real 09:15 session open, and with zero ticks
+        yet written this check would otherwise read that gap as a dead feed
+        and fire a spurious CRITICAL alert every cycle between roughly 08:35
+        and 09:15 (see `market_hours.is_data_flow_expected`'s own docstring
+        for the full incident). Also skipped on any weekend
         (`weekend_rest.is_weekend_ist()`, calendar — *not* the awake/dormant
         state): NSE is closed Sat/Sun, so a stale NIFTY/BANKNIFTY feed is
         expected and never actionable, whether or not a user happens to be
@@ -246,7 +250,7 @@ class HealthCheckScheduler(IntervalScheduler):
         its `None` default — infra-level, not paper-suppressed, same
         reasoning as `health_check_failed` above.
         """
-        if not workspace_ids or not is_within_market_hours() or weekend_rest.is_weekend_ist():
+        if not workspace_ids or not is_data_flow_expected() or weekend_rest.is_weekend_ist():
             return
 
         for symbol in TRADABLE_UNDERLYINGS:

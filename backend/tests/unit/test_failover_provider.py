@@ -12,6 +12,7 @@ it from interfering).
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from datetime import time as dt_time
 
 import pytest
 
@@ -22,6 +23,13 @@ from app.modules.market_data.providers.failover import FailoverMarketDataProvide
 _THRESHOLD = 5.0
 _RECOVERY = 20.0
 _BACKUP_RETRY = 30.0
+# 2026-09-01: every test in this file that drives run_once()'s real
+# trip/recovery logic needs is_data_flow_expected(now_ist_provider()) to be
+# True, or the new pre-09:15 gate (see failover.py's own module docstring)
+# silently no-ops every check -- real wall-clock IST time must never leak
+# into this file's determinism, same reasoning `_FakeClock` already exists
+# for the monotonic clock. Safely inside the 09:15-16:00 window.
+_SAFE_TIME = dt_time(10, 0)
 # Large enough that the real background thread (started for real by
 # subscribe_ticks -- see failover.py's own docstring) never fires a second
 # automatic run_once() during a test's real (sub-second) execution time; its
@@ -137,6 +145,7 @@ def make_provider():
             backup_retry_seconds=backup_retry_seconds,
             poll_interval_seconds=_POLL_INTERVAL,
             clock=clock,
+            now_ist_provider=lambda: _SAFE_TIME,
         )
         created.append(provider)
         return provider
@@ -243,6 +252,7 @@ def test_switch_to_backup_alerts_at_warning_not_critical(make_provider, monkeypa
         backup_retry_seconds=_BACKUP_RETRY,
         poll_interval_seconds=_POLL_INTERVAL,
         clock=clock,
+        now_ist_provider=lambda: _SAFE_TIME,
         alert_session_factory=lambda: _FakeAlertDB([workspace_id]),
     )
     try:
@@ -890,3 +900,122 @@ def test_replace_backup_new_subscribe_failure_is_swallowed_not_raised(make_provi
     failing_backup = _FakeProvider(subscribe_error=RuntimeError("shoonya ws down"))
 
     provider.replace_backup(failing_backup)  # must not raise
+
+
+# -- pre-09:15 "no data flow expected yet" gate (2026-09-01) -----------------
+
+
+class _FakeWallClock:
+    """Settable stand-in for `now_ist_provider` -- separate from `_FakeClock`
+    (the monotonic clock `_check_primary_health` uses for staleness math)
+    since these are genuinely different clocks in production too: one real
+    `time.monotonic`, one real `now_ist().time()`.
+    """
+
+    def __init__(self, start: dt_time) -> None:
+        self.now = start
+
+    def __call__(self) -> dt_time:
+        return self.now
+
+
+def test_no_trip_before_normal_market_open_even_past_threshold():
+    """The actual live-risk regression test: a human logging into Shoonya
+    any time before NSE's real 09:15 open must never trip failover just
+    because real data hasn't started yet -- see failover.py's own module
+    docstring for the full incident.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    wall_clock = _FakeWallClock(dt_time(8, 45))
+    provider = FailoverMarketDataProvider(
+        primary=primary,
+        backup=backup,
+        primary_name="shoonya",
+        backup_name="angel_one",
+        failover_threshold_seconds=_THRESHOLD,
+        recovery_stabilization_seconds=_RECOVERY,
+        backup_retry_seconds=_BACKUP_RETRY,
+        poll_interval_seconds=_POLL_INTERVAL,
+        clock=clock,
+        now_ist_provider=wall_clock,
+    )
+    try:
+        provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+        # No primary tick has ever landed -- expected, real data hasn't
+        # started -- and well past what would normally be the trip threshold.
+        clock.advance(_THRESHOLD + 100.0)
+        provider.run_once()
+
+        assert provider.active_provider_name == "shoonya"
+        assert backup.subscribe_calls == []
+        assert backup.is_ready_calls == 0  # never even checked -- gate short-circuits first
+    finally:
+        provider.disconnect()
+
+
+def test_trip_resumes_once_normal_market_open_time_is_reached():
+    """The gate must not permanently suppress trips -- once wall-clock IST
+    crosses 09:15, a genuinely stale primary must still trip normally.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    wall_clock = _FakeWallClock(dt_time(8, 45))
+    provider = FailoverMarketDataProvider(
+        primary=primary,
+        backup=backup,
+        primary_name="shoonya",
+        backup_name="angel_one",
+        failover_threshold_seconds=_THRESHOLD,
+        recovery_stabilization_seconds=_RECOVERY,
+        backup_retry_seconds=_BACKUP_RETRY,
+        poll_interval_seconds=_POLL_INTERVAL,
+        clock=clock,
+        now_ist_provider=wall_clock,
+    )
+    try:
+        provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+        clock.advance(_THRESHOLD + 1.0)
+        provider.run_once()
+        assert provider.active_provider_name == "shoonya"  # still pre-09:15, no trip
+
+        wall_clock.now = dt_time(9, 15)
+        clock.advance(_THRESHOLD + 1.0)  # still stale by monotonic-clock math
+        provider.run_once()
+
+        assert provider.active_provider_name == "angel_one"
+        assert backup.subscribe_calls == [["NIFTY"]]
+    finally:
+        provider.disconnect()
+
+
+def test_no_recovery_evaluation_before_normal_market_open():
+    """Symmetry check for _check_recovery -- reachable pre-09:15 only via a
+    manual override trip (automatic trips are already gated), but recovery
+    must not evaluate primary health as "back" before data flow is even
+    expected.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    wall_clock = _FakeWallClock(dt_time(8, 45))
+    provider = FailoverMarketDataProvider(
+        primary=primary,
+        backup=backup,
+        primary_name="shoonya",
+        backup_name="angel_one",
+        failover_threshold_seconds=_THRESHOLD,
+        recovery_stabilization_seconds=_RECOVERY,
+        backup_retry_seconds=_BACKUP_RETRY,
+        poll_interval_seconds=_POLL_INTERVAL,
+        clock=clock,
+        now_ist_provider=wall_clock,
+    )
+    try:
+        provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+        provider.set_manual_override("angel_one")
+        provider.set_manual_override(None)  # resumes automatic evaluation, still pre-09:15
+
+        primary.fire_tick(_tick())  # primary looks perfectly healthy
+        provider.run_once()
+
+        # Recovery must not even start its stabilization timer yet.
+        assert provider.active_provider_name == "angel_one"
+    finally:
+        provider.disconnect()
