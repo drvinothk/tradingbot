@@ -521,3 +521,57 @@ Approve? (yes / yes+add-allow-rules / no)
   ('OI_Volume_Conviction','EMA_Micro_Conviction','EMA_Micro_Conviction_PCR','VWAP_Conviction','Liquidity_Sweep_Conviction')`
   — safe any time before 09:00 IST tomorrow (none has run yet); after a run
   starts, stop it via the UI first.
+
+- **2026-09-02 ~03:26 IST — Control Room refinement deploy, `main` commit
+  `e99a800`.** Four changes: (1) removed the 5 hardcoded per-strategy
+  trade-count caps (`ema_max_trades_per_session`/`oi_max_trades_per_session`/
+  `sweep_max_trades_per_session`/ATR's `max_trades_per_session`/ORB
+  Conviction's own `max_trades_per_day`) — paper left deliberately uncapped
+  (explicit user choice), `RiskDefaults.max_trades_per_day` seed default
+  raised 5 -> 15; (2) `market_hours.is_data_flow_expected()` gained a 15:15
+  IST upper bound (live-mode only, mirrors the existing 09:15 floor) so
+  `market_data_stale`/failover checks stop firing in NSE's real wind-down
+  window; (3) Control Room P&L card: new "Total Cost" (real Shoonya-report-
+  derived brokerage/STT/exchange/SEBI/stamp/GST estimate,
+  `reporting/costs.py`) and "Largest Single Profit", "Max Drawdown
+  (Cumulative)" renamed "Total Drawdown", both boxes widened; (4) fixed a
+  CSS cascade bug so every strategy-type header on the Advanced page (ORB,
+  OI/Volume Confirmed, ..., all 10 types) renders bright instead of muted
+  gray. Additive only, **no migration** (alembic already at `0030`, head,
+  confirmed unchanged before and after).
+
+  Tested: 1467/1467 backend pytest pass, ruff/mypy clean, frontend `tsc -b
+  && vite build` clean. Layout verified pre-deploy via a throwaway static
+  HTML harness linking the real dev-server `index.css` (no login
+  credentials were available to drive the real authenticated Control Room
+  page locally).
+
+  Safety gate (checked live on the box, its own clock): `Wed Sep 2
+  03:25:10 IST 2026` (outside 09:15-15:30 IST — formality), session
+  `paper_only`/active, **zero open positions**, alembic `0030` (head, no
+  migration in this deploy). Backup `app.bak-20260902-032611` (backend) /
+  `dist.bak-20260902-032611` (frontend).
+
+  Commands run (backend): tarball `app/` (creds excluded, verified 0 via
+  `tar --force-local -tzf`) -> scp -> backup -> extract ->
+  credentials-survived check (11 files) -> grep confirmed
+  `estimate_trade_cost`/`DATA_FLOW_EXPECTED_END` present -> `import
+  app.main` sanity check -> `sudo systemctl restart trading-bot` ->
+  `active`, `NRestarts=0`, `/health` -> `{"status":"ok"}`. Startup log:
+  Shoonya session restored from disk cache, startup recovery found 1
+  active session with no open positions, no stale strategy runs, market
+  phase `startup -> closed` (expected at 03:26 IST) — nothing unexpected.
+  Commands run (frontend): `npm run build` -> tarball `dist/` -> scp ->
+  `sudo cp -a` backup -> swap in new `dist/` -> `chown www-data`. Verified
+  live: `https://144-24-137-112.sslip.io/` -> `200`, `/control-room` ->
+  `200`, `/advanced` -> `200`, served `index-0BRnkXkO.js`/
+  `index-DNxOeN-w.css` matching the local build hash exactly; grepped the
+  live bundle for `Total Cost`/`Total Drawdown`/`Largest Single
+  Profit`/`metric-box-wide` — all present.
+
+  Rollback (backend): `cd /home/ubuntu/trading-bot/backend && rm -rf app
+  && mv app.bak-20260902-032611 app && sudo systemctl restart
+  trading-bot`. Rollback (frontend): `sudo rm -rf
+  /var/www/trading-bot/dist && sudo mv
+  /var/www/trading-bot/dist.bak-20260902-032611 /var/www/trading-bot/dist
+  && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
