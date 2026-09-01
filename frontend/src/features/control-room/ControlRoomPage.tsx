@@ -381,9 +381,17 @@ function TodaysActivityCard({
   const scopeSessionId = anyLive ? liveSessionId : paperSessionId
   const scopeLabel = anyLive ? 'Live' : 'Paper'
 
+  // scopeMode ('live'/'paper') keeps this card's Total Trades/Win Rate/Max
+  // Drawdown scoped to the same population as its already-per-trade-scoped
+  // P&L above -- without it, a live_enabled session holding both live-routed
+  // and force_paper strategies together (normal since 2026-08-28) blends the
+  // force_paper strategy's own paper trades into stats labeled "Live". See
+  // build_daily_report's own docstring.
+  const scopeMode = anyLive ? 'live' : 'paper'
   const dailyReportQuery = useQuery({
-    queryKey: ['reports', 'daily', scopeSessionId],
-    queryFn: () => api.get<DailyReportOut>(`/reports/sessions/${scopeSessionId}/daily`),
+    queryKey: ['reports', 'daily', scopeSessionId, scopeMode],
+    queryFn: () =>
+      api.get<DailyReportOut>(`/reports/sessions/${scopeSessionId}/daily?mode=${scopeMode}`),
     enabled: scopeSessionId != null,
     refetchInterval: 15_000,
   })

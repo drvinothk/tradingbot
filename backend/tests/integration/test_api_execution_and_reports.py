@@ -579,6 +579,23 @@ def test_full_flow_orders_positions_reports_square_off(
         # Daily report after the square-off: exactly one closed trade now.
         daily_after = api_client.get(f"/api/v1/reports/sessions/{session_id}/daily").json()
         assert daily_after["trade_count"] == 1
+
+        # mode query param (2026-09-01): this trade is paper, so ?mode=paper
+        # sees it and ?mode=live doesn't -- the HTTP-level round trip for
+        # what Control Room's "Today's Activity" card now passes explicitly.
+        daily_paper = api_client.get(
+            f"/api/v1/reports/sessions/{session_id}/daily", params={"mode": "paper"}
+        ).json()
+        assert daily_paper["trade_count"] == 1
+        daily_live = api_client.get(
+            f"/api/v1/reports/sessions/{session_id}/daily", params={"mode": "live"}
+        ).json()
+        assert daily_live["trade_count"] == 0
+
+        daily_invalid = api_client.get(
+            f"/api/v1/reports/sessions/{session_id}/daily", params={"mode": "bogus"}
+        )
+        assert daily_invalid.status_code == 422
     finally:
         _cleanup_instrument_and_dependents(engine, instrument_id)
 

@@ -16,7 +16,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.domain.execution.models import Position, TradeOutcome
+from app.domain.execution.models import Order, OrderMode, Position, TradeOutcome
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import Signal, StrategyRun, TradeIntent, TradeIntentStatus
 
@@ -133,13 +133,47 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
     )
 
 
-def build_daily_report(db: Session, trading_session: TradingSession) -> DailyReport:
-    outcomes = (
-        db.query(TradeOutcome)
-        .filter(TradeOutcome.trading_session_id == trading_session.id)
-        .all()
+def build_daily_report(
+    db: Session, trading_session: TradingSession, *, mode: OrderMode | None = None
+) -> DailyReport:
+    """`mode=None` (the default, and the only behavior before 2026-09-01) is
+    the full session, unfiltered -- what `ReportsPage`'s session-picker view
+    needs and has always shown. `mode=OrderMode.LIVE`/`PAPER` scopes trade
+    stats to real vs paper fills only, via `Position.opening_order_id`'s own
+    `Order.mode` (the same ground-truth field `TradeRow.mode` already reads
+    on the frontend, and `fetch_completed_trades_for_day` already joins the
+    same way) -- **not** the session's or strategy's current config, which
+    can drift after the fact.
+
+    Added because a single `live_enabled` session can hold both live-routed
+    and `force_paper` strategies together since the 2026-08-28
+    `paper_plus_guarded_live` retirement -- Control Room's "Today's Activity
+    (Live)" card was pulling this endpoint unfiltered, so a force_paper
+    strategy's own paper trades were silently blending into stats labeled
+    "Live" (trade_count/win_rate/max_drawdown all affected; the P&L figure
+    itself was already correct, since that one's computed client-side per-
+    trade). `signal_count`/`dispatched_count` stay session-wide regardless of
+    `mode` -- a `Signal` fires before any live/paper routing decision exists,
+    so there's no honest way to retroactively scope it. `filled_count` *is*
+    scoped when `mode` is given, via the same Position->Order join, since it
+    represents the same "how many positions actually opened" population
+    `trade_count` does.
+    """
+    outcomes_query = db.query(TradeOutcome).filter(
+        TradeOutcome.trading_session_id == trading_session.id
     )
-    stats = _compute_stats(outcomes)
+    filled_query = db.query(Position).filter(
+        Position.trading_session_id == trading_session.id
+    )
+    if mode is not None:
+        outcomes_query = outcomes_query.join(
+            Position, TradeOutcome.position_id == Position.id
+        ).join(Order, Position.opening_order_id == Order.id).filter(Order.mode == mode)
+        filled_query = filled_query.join(
+            Order, Position.opening_order_id == Order.id
+        ).filter(Order.mode == mode)
+
+    stats = _compute_stats(outcomes_query.all())
 
     signal_count = (
         db.query(Signal).filter(Signal.trading_session_id == trading_session.id).count()
@@ -152,9 +186,7 @@ def build_daily_report(db: Session, trading_session: TradingSession) -> DailyRep
         )
         .count()
     )
-    filled_count = (
-        db.query(Position).filter(Position.trading_session_id == trading_session.id).count()
-    )
+    filled_count = filled_query.count()
 
     return DailyReport(
         **vars(stats),

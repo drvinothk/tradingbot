@@ -10,7 +10,7 @@ import io
 import uuid
 from datetime import date, datetime, time
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.core.clock import IST
 from app.core.db.session import get_db
 from app.core.security.rbac import require_permission
+from app.domain.execution.models import OrderMode
 from app.domain.identity.models import User
 from app.domain.ops.models import MarketDataDiagnosticRun, MarketDataDiagnosticSnapshot
 from app.domain.session.models import TradingSession
@@ -55,6 +56,12 @@ class ScorecardOut(PerformanceStatsOut):
 @router.get("/sessions/{session_id}/daily", response_model=DailyReportOut)
 def get_daily_report(
     session_id: uuid.UUID,
+    # Optional, defaults to the full session (unfiltered) -- unchanged
+    # behavior for ReportsPage's own session-picker view. Control Room's
+    # "Today's Activity" card passes this explicitly to scope a mixed
+    # live+force_paper session's stats to just the mode it's actually
+    # displaying -- see build_daily_report's own docstring for why.
+    mode: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("strategy.view")),
 ) -> DailyReportOut:
@@ -69,7 +76,16 @@ def get_daily_report(
     if trading_session is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
 
-    report = build_daily_report(db, trading_session)
+    parsed_mode: OrderMode | None = None
+    if mode is not None:
+        try:
+            parsed_mode = OrderMode(mode)
+        except ValueError as exc:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, f"Invalid mode: {mode!r}"
+            ) from exc
+
+    report = build_daily_report(db, trading_session, mode=parsed_mode)
     return DailyReportOut(**vars(report))
 
 

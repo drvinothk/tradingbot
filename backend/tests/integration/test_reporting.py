@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime
 import pytest
 from sqlalchemy.orm import Session
 
-from app.domain.execution.models import ExitReason, Position
+from app.domain.execution.models import ExitReason, OrderMode, Position, PositionStatus
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
@@ -28,6 +28,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, OrderResult
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.service import close_position, dispatch_trade_intent
 from app.modules.reporting.service import build_daily_report, build_scorecard
@@ -251,6 +252,158 @@ def test_build_daily_report_with_no_trades_is_all_zero(
     assert report.profit_factor is None
     assert report.max_drawdown == 0.0
     assert report.total_realized_pnl == 0.0
+
+
+class _FakeLiveBroker:
+    """LIVE-classified double (not an `isinstance` of `MockBrokerAdapter`,
+    so `is_execution_broker_live` tags orders through it as
+    `OrderMode.LIVE`) that fills entry/exit orders synchronously at an
+    exact, test-controlled `fill_price` -- deliberately ignoring
+    `request.limit_price`, which for a LIVE order is buffered by
+    `live_limit_order_buffer_pct` (see `_resolve_order_pricing`) and would
+    otherwise make this test's hand-computed PnL fragile against that
+    config value. A `stop:`-prefixed order (the resting protective SL-LMT
+    `place_protective_stop` auto-places on every LIVE entry) comes back
+    `OPEN`, not `FILLED` -- `MockBrokerAdapter` always fills synchronously,
+    which would otherwise trip `place_protective_stop`'s own "stop fired at
+    placement" defensive path and finalize the position as a STOP exit
+    immediately at entry, before this test ever calls `close_position`
+    itself. Same shape as `test_execution_paper_service.py`'s own
+    `_FakeLiveBrokerWithModify`, trimmed to what this test needs.
+    """
+
+    def __init__(self) -> None:
+        self.fill_price: float | None = None
+        self._orders: dict[str, OrderResult] = {}
+
+    def place_order(self, request: OrderRequest) -> OrderResult:
+        is_stop = request.idempotency_key.startswith("stop:")
+        if is_stop:
+            result = OrderResult(
+                idempotency_key=request.idempotency_key,
+                broker_order_id=f"FAKE-{request.idempotency_key}",
+                status=BrokerOrderStatus.OPEN,
+                filled_qty=0,
+                avg_fill_price=None,
+            )
+        else:
+            assert self.fill_price is not None, "test must set fill_price before dispatching"
+            result = OrderResult(
+                idempotency_key=request.idempotency_key,
+                broker_order_id=f"FAKE-{request.idempotency_key}",
+                status=BrokerOrderStatus.FILLED,
+                filled_qty=request.qty,
+                avg_fill_price=self.fill_price,
+            )
+        self._orders[request.idempotency_key] = result
+        return result
+
+    def cancel_order(self, broker_order_id: str) -> OrderResult:
+        for result in self._orders.values():
+            if result.broker_order_id == broker_order_id:
+                cancelled = OrderResult(
+                    idempotency_key=result.idempotency_key,
+                    broker_order_id=result.broker_order_id,
+                    status=BrokerOrderStatus.CANCELLED,
+                    filled_qty=result.filled_qty,
+                    avg_fill_price=result.avg_fill_price,
+                )
+                self._orders[result.idempotency_key] = cancelled
+                return cancelled
+        raise KeyError(f"Unknown fake order: {broker_order_id}")
+
+    def get_positions(self) -> list:
+        return []
+
+
+def test_build_daily_report_mode_filter_separates_live_from_paper_trades(
+    db: Session, broker, workspace, broker_account, instrument, user, monkeypatch
+):
+    """2026-09-01: a single `live_enabled` session can hold both live-routed
+    and `force_paper` strategies together (since the 2026-08-28
+    `paper_plus_guarded_live` retirement) -- `build_daily_report`'s `mode`
+    filter is what keeps Control Room's "Today's Activity (Live)" card from
+    blending a force_paper strategy's own paper trades into stats labeled
+    Live. One trade of each mode, same strategy/session, proves the filter
+    actually separates them rather than just happening to match session-wide
+    counts.
+    """
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    live_broker = _FakeLiveBroker()
+
+    trading_session = _trading_session(db, workspace, broker_account, user)
+    strategy_run = _strategy_config_and_run(
+        db, workspace, trading_session, user, "mode-filter-strategy"
+    )
+
+    # Paper win, via the plain mock broker: (120-100)*25 = +500.
+    _closed_trade(
+        db, broker, trading_session, strategy_run, _contract(db, instrument, 23000, "P"),
+        entry_price=100.0, exit_price=120.0, intended_price=120.0, exit_reason=ExitReason.TARGET,
+    )
+
+    # Live loss, driven directly (not via _closed_trade, which manipulates
+    # MockBrokerAdapter._prices -- _FakeLiveBroker has no such attribute,
+    # and needs its own fill_price set before each call instead): entry 100,
+    # stop exit at 92 -> (92-100)*25 = -200.
+    live_contract = _contract(db, instrument, 23050, "L")
+    now = datetime.now(UTC)
+    live_signal = Signal(
+        id=uuid.uuid4(), workspace_id=trading_session.workspace_id,
+        strategy_config_id=strategy_run.strategy_config_id, strategy_run_id=strategy_run.id,
+        trading_session_id=trading_session.id, option_contract_id=live_contract.id,
+        side=SignalSide.BUY, entry_price=100.0, stop_price=90.0, target_price=110.0,
+        qty_lots=1, generated_at=now,
+    )
+    db.add(live_signal)
+    db.flush()
+    live_intent = TradeIntent(
+        id=uuid.uuid4(), workspace_id=trading_session.workspace_id, signal_id=live_signal.id,
+        strategy_run_id=strategy_run.id, trading_session_id=trading_session.id,
+        option_contract_id=live_contract.id, idempotency_key=f"signal:{live_signal.id}",
+        side=SignalSide.BUY, qty_lots=1, entry_price=100.0, stop_price=90.0, target_price=110.0,
+        status=TradeIntentStatus.DISPATCHED, created_at=now, dispatched_at=now,
+    )
+    db.add(live_intent)
+    db.flush()
+
+    live_broker.fill_price = 100.0
+    dispatch_trade_intent(db, trading_session, live_intent, broker=live_broker)  # type: ignore[arg-type]
+    live_position = db.query(Position).filter(Position.trade_intent_id == live_intent.id).one()
+    assert live_position.status == PositionStatus.OPEN  # not the "stop fired at placement" path
+
+    live_broker.fill_price = 92.0
+    live_outcome = close_position(
+        db, trading_session, live_position, ExitReason.STOP, 92.0, broker=live_broker  # type: ignore[arg-type]
+    )
+    assert live_outcome is not None
+
+    unfiltered = build_daily_report(db, trading_session)
+    assert unfiltered.trade_count == 2
+    assert unfiltered.total_realized_pnl == pytest.approx(300.0)
+
+    live_report = build_daily_report(db, trading_session, mode=OrderMode.LIVE)
+    assert live_report.trade_count == 1
+    assert live_report.filled_count == 1
+    assert live_report.total_realized_pnl == pytest.approx(-200.0)
+
+    paper_report = build_daily_report(db, trading_session, mode=OrderMode.PAPER)
+    assert paper_report.trade_count == 1
+    assert paper_report.filled_count == 1
+    assert paper_report.total_realized_pnl == pytest.approx(500.0)
+
+    # A Signal fires before any live/paper routing decision exists, so this
+    # stays session-wide regardless of the mode filter -- see
+    # build_daily_report's own docstring.
+    assert live_report.signal_count == 2
+    assert paper_report.signal_count == 2
 
 
 def test_build_scorecard_aggregates_across_sessions_for_the_same_strategy(
