@@ -686,9 +686,14 @@ work, or vice versa.
   lock 0.4 is unbacktested for OI/EMA (ORB only); the multi-leg engine itself
   has zero backtest coverage; OI's edge is IS +322 / OOS +89 (decaying, watch
   the OOS half in paper); and four stub configs (`Bank nifty`, `Test `,
-  `Test 1`, `Test 4`) remain enabled and will auto-spawn, with **`Test 1`
-  carrying `runtime_mode = NULL`** so it follows the session rather than being
-  pinned to paper — clear those before any live session.
+  `Test 1`, `Test 4`) remain enabled and auto-spawn daily — deliberate, not a
+  leftover: these are additional in-progress/not-yet-backtested candidates
+  the user is iterating on and wants trading every day until a final set is
+  reached, not a bug to clean up. Worth remembering: `Test 1` carries
+  `runtime_mode = NULL`, so it follows the session mode rather than being
+  pinned to paper — if the master switch is ever flipped to `live_enabled`
+  while it's still in this exploratory state, it would route live along with
+  everything else on that session.
 
 - **2026-08-29: weekend rest mode — implemented, tested, DEPLOYED to OCI.**
   Root cause of weekend Telegram spam: every time-of-day gate in the
