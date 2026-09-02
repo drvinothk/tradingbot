@@ -571,6 +571,13 @@ def manual_reconcile_position(
     correction is out of scope; a genuinely partial real-world exit belongs
     on the existing multi-leg exit path (`exit_legs.py`), not this one-shot
     repair tool.
+
+    Can 409 for a second reason beyond "already closed" (checked above): a
+    race lost against `close_position`'s own retry or reconciliation's
+    auto-repair, both of which can close this exact position between this
+    endpoint's own OPEN check and `close_position_from_external_fill`'s
+    lock acquisition -- see that function's own 2026-09-02 QC-follow-up
+    docstring paragraph.
     """
     position = (
         db.query(Position)
@@ -617,6 +624,16 @@ def manual_reconcile_position(
     outcome = close_position_from_external_fill(
         db, trading_session, position, fill, exit_reason=ExitReason.MANUAL
     )
+    if outcome is None:
+        # Lost a race with another closer (close_position's own retry, or
+        # reconciliation's auto-repair) between the OPEN check above and
+        # close_position_from_external_fill's own lock acquisition -- the
+        # position is already closed, just not by this request.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "position was closed by another process in the meantime -- refresh and check its "
+            "current state before retrying",
+        )
 
     record_event(
         db,

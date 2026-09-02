@@ -45,11 +45,18 @@ from app.domain.strategy.models import (
     TradeIntentStatus,
 )
 from app.modules.broker_adapter import composition
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, OrderResult
+from app.modules.broker_adapter.base.contracts import (
+    BrokerOrderStatus,
+    OrderRequest,
+    OrderResult,
+    TradeFill,
+)
+from app.modules.broker_adapter.base.contracts import OrderSide as ContractOrderSide
 from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
     close_position,
+    close_position_from_external_fill,
     dispatch_trade_intent,
     evaluate_open_position,
     reconcile_pending_live_exit_orders,
@@ -923,6 +930,43 @@ def test_close_position_is_idempotent_when_already_closed(
         db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
     )
     assert second is None
+    assert db.query(Order).filter(Order.position_id == position.id).count() == 1
+
+
+def test_close_position_from_external_fill_returns_none_when_already_closed(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-02 QC follow-up: close_position_from_external_fill now
+    acquires LOCK_EXECUTION_SINGLETON and re-checks OPEN status itself
+    (after a db.refresh, not a possibly-stale attribute a caller loaded
+    earlier) -- exactly close_position's own idempotent-no-op contract,
+    proven the same way test_close_position_is_idempotent_when_already_
+    closed proves it for close_position. Simulates the real risk this
+    closes: _attempt_auto_repair loads a position, then does a
+    broker.get_recent_trades() network round-trip before calling this
+    function -- a real window for another closer to win the race in.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    first = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+    assert first is not None
+
+    fill = TradeFill(
+        broker_order_id="SHOONYA-MANUAL-1",
+        contract_symbol=option_contract.symbol,
+        side=ContractOrderSide.SELL,
+        qty=position.qty,
+        avg_price=999.0,
+        ts=datetime.now(UTC),
+    )
+    second = close_position_from_external_fill(db, trading_session, position, fill)
+
+    assert second is None
+    assert db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).count() == 1
     assert db.query(Order).filter(Order.position_id == position.id).count() == 1
 
 

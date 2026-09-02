@@ -1239,7 +1239,7 @@ def close_position_from_external_fill(
     position: Position,
     fill: TradeFill,
     exit_reason: ExitReason = ExitReason.RECONCILED,
-) -> TradeOutcome:
+) -> TradeOutcome | None:
     """Closes `position` using a real fill this module never placed itself
     -- recovered from the broker's own order history
     (`BrokerPort.get_recent_trades`) by reconciliation's auto-repair path,
@@ -1271,70 +1271,93 @@ def close_position_from_external_fill(
     -- both distinct from `close_position`'s own `exit:{position.id}` (and
     its own `:retryN` attempts) and `exit_legs.py`'s `exit:{position.id}:
     {leg_index}`, so the two repair paths can never collide with each other
-    or with a normal exit attempt. Callers must still only invoke this for
-    a position confirmed OPEN (checked by the caller first -- `run_
-    reconciliation` for the auto-repair path, the endpoint itself for
-    manual), since this function itself does not re-check under
-    `LOCK_EXECUTION_SINGLETON` the way `close_position` does -- both
-    callers already run inside their own single request/reconciliation-pass
-    transaction, not re-derived here to avoid a second lock acquisition
-    mid-pass.
+    or with a normal exit attempt.
+
+    **2026-09-02 QC follow-up, same day as the fix above**: this function
+    used to assume its callers already held `LOCK_EXECUTION_SINGLETON` --
+    true only for the EVENT-triggered path nested inside `close_position`'s
+    own lock scope. It was false for `PositionManager`'s POLL-triggered
+    `run_full_reconciliation`, `ReconciliationLockRecoveryScheduler`, and
+    this endpoint's own manual-reconcile call -- none of which acquire it.
+    A concurrent `close_position` (locked) and this function (previously
+    unlocked) for the *same* position use disjoint idempotency-key prefixes
+    (`exit:{id}[:retryN]` vs `exit-external:{id}`/`exit-manual:{id}`), so
+    neither would ever notice the other, and `trade_outcomes`'s own
+    `uq_trade_outcome_position_leg` unique constraint on `(position_id,
+    position_exit_leg_id)` does not catch it either -- Postgres never
+    treats two NULL `position_exit_leg_id` values as equal. Fixed by
+    acquiring the lock here (reentrant -- a free no-op on the already-
+    nested EVENT path, real protection everywhere else) and re-checking
+    OPEN status *after* a `db.refresh(position)`, not the possibly-stale
+    attribute a caller loaded earlier -- `_attempt_auto_repair` in
+    particular loads `position` before a `broker.get_recent_trades()`
+    network round-trip, a real gap for another closer to win the race in.
+    Returns `None` on a lost race (mirrors `close_position`'s own `None`
+    contract for "someone else already closed this") -- callers must treat
+    that as "nothing to do here", not an error.
     """
-    option_contract = db.get(OptionContract, position.option_contract_id)
-    if option_contract is None:
-        raise ValueError(f"unknown option_contract_id {position.option_contract_id}")
-    opening_order = db.get(Order, position.opening_order_id)
-    if opening_order is None:
-        raise ValueError(f"unknown opening_order_id {position.opening_order_id}")
+    with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
+        db.refresh(position)
+        if position.status != PositionStatus.OPEN:
+            return None
 
-    now = _utcnow()
-    entry_side = SignalSide(position.side)
-    exit_side = _opposite(entry_side)
-    order_mode = OrderMode(opening_order.mode)
-    idempotency_prefix = "exit-manual" if exit_reason == ExitReason.MANUAL else "exit-external"
+        option_contract = db.get(OptionContract, position.option_contract_id)
+        if option_contract is None:
+            raise ValueError(f"unknown option_contract_id {position.option_contract_id}")
+        opening_order = db.get(Order, position.opening_order_id)
+        if opening_order is None:
+            raise ValueError(f"unknown opening_order_id {position.opening_order_id}")
 
-    closing_order = Order(
-        id=uuid.uuid4(),
-        workspace_id=trading_session.workspace_id,
-        trading_session_id=trading_session.id,
-        option_contract_id=option_contract.id,
-        trade_intent_id=None,
-        position_id=position.id,
-        idempotency_key=f"{idempotency_prefix}:{position.id}",
-        mode=order_mode,
-        side=_to_domain_side(exit_side),
-        order_type=OrderType.MARKET,
-        qty=position.qty,
-        status=OrderStatus.FILLED,
-        filled_qty=fill.qty or position.qty,
-        avg_fill_price=fill.avg_price,
-        broker_order_id=fill.broker_order_id,
-        submitted_at=fill.ts,
-        updated_at=now,
-        intended_exit_reason=exit_reason,
-    )
-    db.add(closing_order)
-    db.flush()
-    db.add(
-        OrderEvent(
-            id=uuid.uuid4(),
-            order_id=closing_order.id,
-            event_type="filled",
-            raw_payload={
-                "source": "reconciliation_auto_repair"
-                if exit_reason != ExitReason.MANUAL
-                else "manual_reconcile_endpoint",
-                "broker_order_id": fill.broker_order_id,
-                "avg_fill_price": fill.avg_price,
-                "qty": fill.qty,
-            },
-            ts=now,
+        now = _utcnow()
+        entry_side = SignalSide(position.side)
+        exit_side = _opposite(entry_side)
+        order_mode = OrderMode(opening_order.mode)
+        idempotency_prefix = (
+            "exit-manual" if exit_reason == ExitReason.MANUAL else "exit-external"
         )
-    )
 
-    return _finalize_position_close(
-        db, trading_session, position, closing_order, exit_reason, order_mode, None
-    )
+        closing_order = Order(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract.id,
+            trade_intent_id=None,
+            position_id=position.id,
+            idempotency_key=f"{idempotency_prefix}:{position.id}",
+            mode=order_mode,
+            side=_to_domain_side(exit_side),
+            order_type=OrderType.MARKET,
+            qty=position.qty,
+            status=OrderStatus.FILLED,
+            filled_qty=fill.qty or position.qty,
+            avg_fill_price=fill.avg_price,
+            broker_order_id=fill.broker_order_id,
+            submitted_at=fill.ts,
+            updated_at=now,
+            intended_exit_reason=exit_reason,
+        )
+        db.add(closing_order)
+        db.flush()
+        db.add(
+            OrderEvent(
+                id=uuid.uuid4(),
+                order_id=closing_order.id,
+                event_type="filled",
+                raw_payload={
+                    "source": "reconciliation_auto_repair"
+                    if exit_reason != ExitReason.MANUAL
+                    else "manual_reconcile_endpoint",
+                    "broker_order_id": fill.broker_order_id,
+                    "avg_fill_price": fill.avg_price,
+                    "qty": fill.qty,
+                },
+                ts=now,
+            )
+        )
+
+        return _finalize_position_close(
+            db, trading_session, position, closing_order, exit_reason, order_mode, None
+        )
 
 
 def reconcile_pending_live_exit_orders(

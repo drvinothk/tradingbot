@@ -435,6 +435,79 @@ def test_run_reconciliation_auto_repairs_a_local_open_broker_flat_live_position(
     assert trading_session.mode == SafeMode.LIVE_ENABLED
 
 
+def test_run_reconciliation_auto_repair_falls_through_when_a_race_closes_the_position_first(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-09-02 QC follow-up: _attempt_auto_repair now treats a None from
+    close_position_from_external_fill (lost a race against a concurrent
+    close_position or manual-reconcile) exactly like "nothing to repair" --
+    False, not an exception -- so the normal alert/escalate path still
+    runs, same as if get_recent_trades had found no match at all.
+    Monkeypatched directly since genuinely racing two sessions against the
+    same row isn't reliable in this suite; the lock/re-check itself has its
+    own dedicated service-layer test
+    (test_close_position_from_external_fill_returns_none_when_already_closed
+    in test_execution_paper_service.py).
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    inner = MockBrokerAdapter()
+    entry_broker = _FakeLiveDelegatingBroker(inner)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+
+    fill = TradeFill(
+        broker_order_id="SHOONYA-MANUAL-1",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=100.30,
+        ts=datetime.now(UTC),
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_positions(self) -> list[BrokerPosition]:
+            return []  # broker shows flat, same shape as the auto-repair test
+
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            return [fill] if contract_symbol == option_contract.symbol else []
+
+    # A concurrent closer wins the race inside close_position_from_external_
+    # fill's own lock -- it returns None.
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.close_position_from_external_fill",
+        lambda *args, **kwargs: None,
+    )
+
+    run = run_reconciliation(
+        db, _RepairBroker(inner), trading_session, ReconciliationTrigger.EVENT  # type: ignore[arg-type]
+    )
+
+    # Falls through to the normal mismatch path -- not repaired here, and
+    # crucially not an exception either.
+    assert run.mismatches_found == 1
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
 def test_run_reconciliation_does_not_auto_repair_a_paper_mismatch(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

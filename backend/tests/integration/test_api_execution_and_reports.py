@@ -653,6 +653,51 @@ def test_manual_reconcile_position_rejects_an_already_closed_position(
         _cleanup_instrument_and_dependents(engine, instrument_id)
 
 
+def test_manual_reconcile_position_returns_409_when_a_race_closes_it_first(
+    api_client: TestClient, seeded_admin, engine, monkeypatch
+):
+    """2026-09-02 QC follow-up: close_position_from_external_fill can now
+    return None if it loses a race against a concurrent close_position or
+    auto-repair (it re-checks OPEN status under LOCK_EXECUTION_SINGLETON,
+    not the object this endpoint's own pre-check loaded earlier). Simulated
+    by monkeypatching the function itself -- genuinely racing two threads
+    against the test DB isn't reliable; the lock/re-check itself has its
+    own dedicated service-layer test
+    (test_close_position_from_external_fill_returns_none_when_already_closed).
+    This proves only the endpoint's own handling of that None.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        monkeypatch.setattr(
+            "app.api.v1.execution.close_position_from_external_fill",
+            lambda *args, **kwargs: None,
+        )
+
+        resp = api_client.post(
+            f"/api/v1/positions/{position_id}/manual-reconcile", json={"exit_price": 100.0}
+        )
+        assert resp.status_code == 409
+        assert "closed by another process" in resp.json()["detail"]
+
+        # The endpoint's own pre-check saw OPEN and let the request through --
+        # confirm the position genuinely wasn't touched by this request.
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "open"
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
 def test_manual_reconcile_position_denies_unknown_or_cross_workspace_position_id(
     api_client: TestClient, seeded_admin
 ):

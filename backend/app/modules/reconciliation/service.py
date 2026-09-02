@@ -204,6 +204,13 @@ def _attempt_auto_repair(
     from app.modules.execution_engine.paper.service import close_position_from_external_fill
 
     outcome = close_position_from_external_fill(db, trading_session, position, match)
+    if outcome is None:
+        # Lost a race with another closer (close_position, or a concurrent
+        # manual-reconcile) between the OPEN query above and this call's own
+        # lock acquisition -- not a failure, just nothing left to repair.
+        # local_qty will read 0 on the very next reconciliation pass since
+        # the winner already closed it, so this self-heals within one cycle.
+        return False
     db.flush()
     logger.warning(
         "reconciliation auto-repaired position %s (%s): closed at %.4f from broker's own "
