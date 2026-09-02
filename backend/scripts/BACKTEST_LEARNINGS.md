@@ -8,6 +8,164 @@ costs are applied only in analysis.
 
 ---
 
+## 2026-09-02 (~23:45 IST) — Phase 9 continued: Batch 2 (EMA) + Batch 3 fully analyzed, Batch 4 (full conviction battery) launched detached, reaper cadence changed to daily
+
+Continues the entry below (same session, same pin `83ee6ad`). Methodology
+unchanged: `analyze_walkforward.py`, `FLAT_COST_PER_LOT=10.0`, 0.5%/side
+slippage, 10k-resample bootstrap for `P(mean≤0)`, bar = `P(mean≤0)≤0.15`
+(fast single-metric screen, not the full 8-gate archive-triage bar from the
+2026-09-01 full-archive re-analysis entry).
+
+### QC on Batch 2 + Batch 3 raw data, before trusting any number below
+
+- All 26 result files load cleanly, correct columns, no missing/corrupted
+  shards, no zero-byte files.
+- **Sanity check passed**: trade count falls monotonically (or holds flat)
+  as `N` increases within every config family — ORB base-entry 44→44→43→39→
+  33→13→7→0 (N1..N15), OI base-entry 45→42→36 (N1..N3) — exactly what a
+  stricter monotonic-close filter should do. No config shows trade count
+  *rising* with `N`, which would indicate a filter bug.
+- **Expected duplication, not a bug**: `*_off` and `*_n1` are byte-identical
+  in every Batch 2 pair (VWAP base/full/nopcr, EMA base/full).
+  `momentum_lookback_bars=1` has nothing to compare against, so the
+  "strictly monotonic" check is vacuously true and the gate is a no-op at
+  N=1 — confirms the pipeline reproduces correctly, not corruption. Table
+  below merges these pairs into one row rather than showing duplicates.
+- **One fragile result flagged, not hidden**: ORB base-entry N=8 (n=13)
+  passes the bar strongly (P=0.014), but sits between N=6 (n=33, fails
+  badly) and N=10 (n=7, fails badly) with no smooth trend — classic
+  small-n noise spike, not a real signal. Treat as unreliable until
+  independently re-confirmed (it *is* re-tested, on the full conviction
+  baseline this time, by Batch 4 below — N=8 is in that grid).
+
+### Batch 2 (`s6_mom2`) — COMPLETE, 15 configs, off/N1/N2 matrix, ANALYZED
+
+| Strategy | Config | n | win% | E/lot | PF | P(mean≤0) | bar (≤0.15)? |
+|---|---|---|---|---|---|---|---|
+| VWAP | base, off/N1 (identical) | 16 | 25.0% | −352 | 0.26 | 0.986 | fail |
+| VWAP | base, N2 | 16 | 18.8% | −406 | 0.20 | 0.995 | fail |
+| VWAP | full, off/N1 (identical) | 15 | 53.3% | +84 | 1.50 | 0.248 | fail |
+| VWAP | full, N2 | 15 | 46.7% | +15 | 1.08 | 0.451 | fail |
+| VWAP | nopcr, off/N1 (identical) | 16 | 50.0% | −44 | 0.83 | 0.623 | fail |
+| VWAP | nopcr, N2 | 16 | 43.8% | −130 | 0.63 | 0.796 | fail |
+| EMA | base, off/N1 (identical) | 47 | 40.4% | −56 | 0.78 | 0.752 | fail |
+| EMA | base, N2 | 47 | 42.6% | −95 | 0.65 | 0.878 | fail |
+| EMA | full, off/N1 (identical) | 12 | 58.3% | **+304** | 3.05 | **0.039** | **pass** |
+| EMA | full, N2 | 11 | 54.5% | +264 | 2.63 | **0.071** | **pass** |
+
+`m2_ema_base_off` (n=47) also serves as the clean rerun of the reaper-
+corrupted Batch-1 `m1_base_ema` — this closes "Not yet done" item 5 from
+the entry below; that corrupted number can now be fully discarded.
+
+**Read**: VWAP and OI never benefit from momentum at any N tested (0/1/2/3)
+— consistent failure across both batches, no reversal. EMA's `full`
+variant passing is not new information — it's the already-known
+`EMA_Micro_Conviction`/`_PCR` result reproduced, not a new finding from
+this batch.
+
+### Batch 3 (`s6_mom3`) — COMPLETE, 11 configs, base-entry-only wide-N grid, ANALYZED
+
+| Strategy (base entry) | N | n | win% | E/lot | PF | P(mean≤0) | bar (≤0.15)? |
+|---|---|---|---|---|---|---|---|
+| ORB | 1 | 44 | 40.9% | −177 | 0.60 | 0.869 | fail |
+| ORB | 2 | 44 | 43.2% | −152 | 0.65 | 0.817 | fail |
+| ORB | 4 | 43 | 46.5% | −205 | 0.60 | 0.878 | fail |
+| ORB | 5 | 39 | 38.5% | −139 | 0.66 | 0.825 | fail |
+| ORB | 6 | 33 | 45.5% | −135 | 0.65 | 0.799 | fail |
+| ORB | 8 ⚠️ | 13 | 53.8% | +330 | 5.02 | **0.014** | pass, **fragile — see QC note** |
+| ORB | 10 | 7 | 42.9% | −114 | 0.63 | 0.674 | fail |
+| ORB | 15 | 0 | — | — | — | n/a | too strict, zero trades |
+| OI | 1 | 45 | 40.0% | −147 | 0.55 | 0.941 | fail |
+| OI | 2 | 42 | 40.5% | −73 | 0.76 | 0.745 | fail |
+| OI | 3 | 36 | 36.1% | −233 | 0.50 | 0.921 | fail |
+
+**Read — this is scope divergence, not a reproducibility failure.** Batch
+1's "ORB benefits from momentum" finding (N=1 fail → N=5 pass, E climbing
+122→226) was on the *full* `ORB_Conviction` (`require_prior_day_trend` +
+`max_or_range_nifty_points=65` + tuned exits). This batch's *base*-entry
+ORB (no other conviction gates, momentum only) shows no clean trend at
+all — N1-N6 all fail, N8 spikes (flagged fragile above), N10 fails again,
+N15 has zero trades. The two config families are genuinely different
+strategies sharing a name prefix; Batch 3 was never a rerun of Batch 1's
+ORB config, so this isn't evidence the earlier result doesn't reproduce —
+it's evidence the effect is specific to the full conviction baseline, not
+base entry. Batch 4 below tests that directly.
+
+### Batch 4 (`s6_mom4`) — LAUNCHED 2026-09-02 23:39 IST, RUNNING (resume here)
+
+**Why**: per explicit user instruction, given Batch 3's base-entry ORB
+didn't reproduce Batch 1's full-conviction ORB finding, run a *full
+battery* on the two conviction baselines that mattered — including a
+fresh `off` reference and fresh N=1/N=5 — rather than trust Batch 1's N=1/
+N=5 numbers stitched against new N values from a different date. Every N
+in this grid is now directly comparable within one run/pin.
+
+15 configs, exact same param blobs as Batch 1's `m1_orb_n1`/`m1_oi_n1`
+(the real live top-level params — `d_pdt_w65`/`w7_s18_a12_l06` for ORB,
+`o3_atr_pcrl` arm.30/lock.85 for OI), momentum toggled off/N1..N-max, same
+`off`-drops-the-momentum-keys convention as Batch 2:
+
+- `ORB_Conviction` (full): off, N∈{1,2,3,4,5,6,8,10} — 9 configs. Wide
+  grid because Batch 1 showed only a mild trade-count drop N1→N5 (40→35),
+  so the entry set stays large enough to be worth exploring further.
+- `OI_Volume_Conviction` (full): off, N∈{1,2,3,4,5} — 6 configs. Capped at
+  5 because Batch 1 already showed a steep drop N1→N5 (14→4) — going
+  further would be sample-starved before it starts.
+
+**QC'd before any compute spent**: every config line verified against the
+real production `_build_strategy` (imports `app.api.v1.strategies
+._build_strategy` directly, constructs each `StrategyConfig` stub, checks
+every intended param actually landed on the resulting `Strategy` object) —
+all 15 clean, no gate silently missing, no unintended gate on. One
+false-positive in the QC check itself (comparing raw `"10:15"` string
+against the parsed `datetime.time(10, 15)` object) — fixed in the checker,
+not a real config problem.
+
+**Launch mechanism**: `sudo /opt/backtest/run_bt.sh env RUN_TAG=mom4
+./run_sweep.sh sweep_configs/phase9_momentum_batch4.txt` — a detached
+`systemd-run` transient unit (`backtest-20260902-180928.service`) inside
+`backtest.slice`, survives laptop/session disconnect by design (same
+mechanism `/opt/backtest/run_bt.sh` already provided; Batch 3 additionally
+used a wait-loop to sequence after Batch 2 — not needed here, nothing else
+queued).
+
+`backtest-reaper.timer` stopped before launch (confirmed `inactive`), to
+be re-enabled only once Batch 4 fully completes and results are pulled —
+per standing rule 13. Reaper cadence itself changed today from hourly to
+**daily at 16:00 IST**, `Persistent=true` — disk headroom made hourly
+unnecessary, and `Persistent=true` means a resume after a paused sweep
+that missed that day's 16:00 slot fires an immediate catch-up run, which
+is safe by construction since resume only ever happens once nothing is
+active. Both the box's and local `backtest_engine/README.md` updated and
+checksum-verified in sync.
+
+**ETA**: ~23-25 min/config at `SHARD_COUNT=4` (ORB/OI family rate),
+running at the full 200% off-hours CPU quota (launched at night) —
+expect completion **~05:30-06:00 IST**, then re-enable the reaper and
+analyze with the same `analyze_walkforward.py` methodology as above.
+
+### Not yet done (resume here)
+
+1. **Analyze Batch 4** once it completes — this is the real test of
+   whether momentum genuinely helps the full `ORB_Conviction`/
+   `OI_Volume_Conviction` baselines, on a clean single-session dataset
+   covering off/N1 through the practical N ceiling for each.
+2. **Real RSI14-oscillator gate** (`require_rsi_alignment`, band-vs-50 —
+   distinct from the momentum/"micro-trend" gate) still fully deferred:
+   base VWAP + RSI, full VWAP conviction + RSI (regression check, already
+   known net-harmful from Sweep #4 Phase 7), base EMA + RSI, full EMA
+   conviction + RSI (both EMA combos genuinely untested).
+3. If Batch 4 finds a real N that clears the bar cleanly (not a thin/
+   fragile n like Batch 3's N=8), that becomes a real production-decision
+   candidate for `ORB_Conviction`/`OI_Volume_Conviction` — judge against
+   real paper data first, per standing rule, not deploy straight off a
+   backtest pass.
+4. `backend/scripts/BACKTEST_LEARNINGS.md` synced to the box copy (was
+   stale there, missing this entire Phase 9 series) — done as part of this
+   update, checksum-verified.
+
+---
+
 ## 2026-09-02 (~03:34 IST, session ongoing) — Phase 9: new `require_momentum_alignment` gate built, tested, one live paper deploy; Batches 1–2 done/running, Batch 3 queued+auto-chained
 
 New gate, new sweep series, not a continuation of Sweep #4's own gate set.
