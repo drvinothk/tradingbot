@@ -43,6 +43,7 @@ def _row(
     trade_mode: str = "paper",
     trade_id: uuid.UUID | None = None,
     pnl: float = 500.0,
+    entry_slippage: float | None = 0.0,
     vix: float | None = 13.5,
     oi: int | None = 125000,
     pcr_oi: float | None = 0.9,
@@ -70,6 +71,7 @@ def _row(
         exit_reason="target",
         realized_pnl=pnl,
         slippage=1.5,
+        entry_slippage=entry_slippage,
         vix=vix,
         oi=oi,
         pcr_oi=pcr_oi,
@@ -129,20 +131,22 @@ def test_creates_workbook_with_correct_sheet_and_headers(tmp_path):
     assert ws.cell(row=2, column=3).value == "2026-08-18"
     assert ws.cell(row=1, column=5).value == "Paper/Live"
     assert ws.cell(row=2, column=5).value == "paper"
-    assert ws.cell(row=1, column=18).value == "VIX (at entry)"
-    assert ws.cell(row=2, column=18).value == row.vix
-    assert ws.cell(row=1, column=19).value == "OI (at entry)"
-    assert ws.cell(row=2, column=19).value == row.oi
-    assert ws.cell(row=1, column=20).value == "PCR - OI (at entry)"
-    assert ws.cell(row=2, column=20).value == row.pcr_oi
-    assert ws.cell(row=1, column=21).value == "PCR - Volume (at entry)"
-    assert ws.cell(row=2, column=21).value == row.pcr_vol
-    assert ws.cell(row=1, column=22).value == "Leg"
-    assert ws.cell(row=2, column=22).value == "1/1"
-    assert ws.cell(row=1, column=23).value == "Leg Kind"
-    assert ws.cell(row=2, column=23).value == "—"
-    assert ws.cell(row=1, column=24).value == "Trade ID (internal)"
-    assert ws.cell(row=2, column=24).value == str(row.trade_outcome_id)
+    assert ws.cell(row=1, column=18).value == "Entry Slippage"
+    assert ws.cell(row=2, column=18).value == row.entry_slippage
+    assert ws.cell(row=1, column=19).value == "VIX (at entry)"
+    assert ws.cell(row=2, column=19).value == row.vix
+    assert ws.cell(row=1, column=20).value == "OI (at entry)"
+    assert ws.cell(row=2, column=20).value == row.oi
+    assert ws.cell(row=1, column=21).value == "PCR - OI (at entry)"
+    assert ws.cell(row=2, column=21).value == row.pcr_oi
+    assert ws.cell(row=1, column=22).value == "PCR - Volume (at entry)"
+    assert ws.cell(row=2, column=22).value == row.pcr_vol
+    assert ws.cell(row=1, column=23).value == "Leg"
+    assert ws.cell(row=2, column=23).value == "1/1"
+    assert ws.cell(row=1, column=24).value == "Leg Kind"
+    assert ws.cell(row=2, column=24).value == "—"
+    assert ws.cell(row=1, column=25).value == "Trade ID (internal)"
+    assert ws.cell(row=2, column=25).value == str(row.trade_outcome_id)
 
 
 def test_none_env_metrics_write_as_blank_cells(tmp_path):
@@ -155,10 +159,10 @@ def test_none_env_metrics_write_as_blank_cells(tmp_path):
     path = export_trade_log_for_workspace(workspace_id, [row], date(2026, 8, 18))
 
     ws = openpyxl.load_workbook(path)["orb"]
-    assert ws.cell(row=2, column=18).value is None
     assert ws.cell(row=2, column=19).value is None
     assert ws.cell(row=2, column=20).value is None
     assert ws.cell(row=2, column=21).value is None
+    assert ws.cell(row=2, column=22).value is None
 
 
 def test_routes_by_strategy_not_underlying_or_expiry(tmp_path):

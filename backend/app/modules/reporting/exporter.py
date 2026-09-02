@@ -92,6 +92,7 @@ _HEADERS = [
     "Exit Reason",
     "Realized PnL",
     "Slippage",
+    "Entry Slippage",
     "VIX (at entry)",
     "OI (at entry)",
     "PCR - OI (at entry)",
@@ -127,6 +128,10 @@ class TradeLogRow:
     exit_reason: str
     realized_pnl: float
     slippage: float
+    # Position.entry_slippage -- open-side counterpart of `slippage` above.
+    # `None` for a position that predates the entry_slippage column, not
+    # fabricated as 0.
+    entry_slippage: float | None
     # VIX/PCR/OI environment metrics as of this trade's entry time, not
     # "current" -- see strategy_engine.env_metrics.get_env_metrics's own
     # docstring for the as_of_utc reconstruction this is built from. `None`
@@ -269,6 +274,9 @@ def fetch_completed_trades_for_day(db: Session, target_date: date) -> list[Trade
                 exit_reason=str(outcome.exit_reason),
                 realized_pnl=float(outcome.realized_pnl),
                 slippage=float(outcome.slippage),
+                entry_slippage=(
+                    float(position.entry_slippage) if position.entry_slippage is not None else None
+                ),
                 vix=vix,
                 oi=oi,
                 pcr_oi=pcr_oi,
@@ -311,6 +319,7 @@ def _row_field_map(row: TradeLogRow) -> dict[str, object]:
         "Exit Reason": row.exit_reason,
         "Realized PnL": row.realized_pnl,
         "Slippage": row.slippage,
+        "Entry Slippage": row.entry_slippage,
         "VIX (at entry)": row.vix,
         "OI (at entry)": row.oi,
         "PCR - OI (at entry)": row.pcr_oi,

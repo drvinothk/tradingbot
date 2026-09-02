@@ -41,7 +41,9 @@ class PerformanceStatsOut(BaseModel):
     largest_single_loss: float
     largest_single_win: float
     total_realized_pnl: float
+    # Exit-side only -- see total_entry_slippage below.
     total_slippage: float
+    total_entry_slippage: float
     total_cost: float
     signal_count: int
     dispatched_count: int

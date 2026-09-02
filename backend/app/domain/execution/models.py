@@ -237,6 +237,13 @@ class Position(Base, UUIDPkMixin):
     side: Mapped[OrderSide] = mapped_column(String(10))
     qty: Mapped[int] = mapped_column(Integer)
     entry_price: Mapped[float] = mapped_column(Numeric(12, 4))
+    # Open-side counterpart of TradeOutcome.slippage/PositionExitLeg.slippage
+    # -- same signed_pnl formula, computed once at open (never recomputed),
+    # positive meaning a favorable fill relative to the intended entry price
+    # (TradeIntent.entry_price). See _open_position_from_fill's own comment
+    # for why the price arguments are swapped relative to the exit-side
+    # formula. Nullable only for rows created before this column existed.
+    entry_slippage: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     status: Mapped[PositionStatus] = mapped_column(String(10), default=PositionStatus.OPEN)
 
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

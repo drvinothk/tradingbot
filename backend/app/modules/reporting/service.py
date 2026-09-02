@@ -46,7 +46,17 @@ class PerformanceStats:
     # largest_single_loss/max_drawdown above.
     largest_single_win: float
     total_realized_pnl: float
+    # Exit-side only (TradeOutcome.slippage) -- see total_entry_slippage
+    # below for the open-side counterpart. Kept separate rather than
+    # combined into one number so each leg of a trade's execution quality
+    # stays independently visible.
     total_slippage: float
+    # Position.entry_slippage summed across every closed trade this scope
+    # covers -- open-side counterpart of total_slippage above. Read once per
+    # position (identical across every exit leg of the same position, same
+    # "frozen at open, never recomputed" reasoning as entry_price itself),
+    # not summed per-leg like total_slippage is.
+    total_entry_slippage: float
     # Approximate real brokerage/STT/exchange/SEBI/stamp/GST cost across
     # every closed trade -- see reporting.costs.estimate_trade_cost's own
     # docstring for the source and reasoning. Not part of realized_pnl
@@ -81,6 +91,7 @@ class _TradeRow:
     closed_at: datetime
     realized_pnl: float
     slippage: float
+    entry_slippage: float
     cost: float
 
 
@@ -97,11 +108,18 @@ class _PositionAccumulator:
     realized_pnl: float
     slippage: float
     entry_price: float
+    # Identical across every leg (see _collapse_to_trades) -- carried
+    # through the accumulator the same way entry_price is, not summed.
+    entry_slippage: float
     total_qty: int
     exit_cost: float
 
 
-def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
+def _collapse_to_trades(
+    outcomes: list[TradeOutcome],
+    entry_slippage_by_position: dict[uuid.UUID, float] | None = None,
+) -> list[_TradeRow]:
+    entry_slippage_by_position = entry_slippage_by_position or {}
     by_position: dict[uuid.UUID, _PositionAccumulator] = {}
     for o in outcomes:
         leg_exit_cost = estimate_exit_leg_cost(float(o.exit_price), o.qty)
@@ -116,6 +134,11 @@ def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
                 # by the multi-leg exit engine) -- see exit_legs.py's own
                 # TradeOutcome construction.
                 entry_price=float(o.entry_price),
+                # 0.0 (not fabricated as "no slippage", just the safe
+                # default) for a position predating the entry_slippage
+                # column -- same convention as the exit side's own
+                # lost-trigger-price case.
+                entry_slippage=entry_slippage_by_position.get(o.position_id, 0.0),
                 total_qty=o.qty,
                 exit_cost=leg_exit_cost,
             )
@@ -126,6 +149,7 @@ def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
                 realized_pnl=existing.realized_pnl + float(o.realized_pnl),
                 slippage=existing.slippage + float(o.slippage),
                 entry_price=existing.entry_price,
+                entry_slippage=existing.entry_slippage,
                 # Every leg's own qty is a slice of the position's one real
                 # entry order's full quantity -- summing them back recovers
                 # it, regardless of how many exit legs there are.
@@ -137,6 +161,7 @@ def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
             closed_at=acc.closed_at,
             realized_pnl=acc.realized_pnl,
             slippage=acc.slippage,
+            entry_slippage=acc.entry_slippage,
             # The position's one real entry order, priced on its full
             # original quantity, charged exactly once here -- plus every
             # exit leg's own order cost, already summed above.
@@ -146,7 +171,10 @@ def _collapse_to_trades(outcomes: list[TradeOutcome]) -> list[_TradeRow]:
     ]
 
 
-def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
+def _compute_stats(
+    outcomes: list[TradeOutcome],
+    entry_slippage_by_position: dict[uuid.UUID, float] | None = None,
+) -> PerformanceStats:
     if not outcomes:
         return PerformanceStats(
             trade_count=0,
@@ -161,10 +189,13 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
             largest_single_win=0.0,
             total_realized_pnl=0.0,
             total_slippage=0.0,
+            total_entry_slippage=0.0,
             total_cost=0.0,
         )
 
-    ordered = sorted(_collapse_to_trades(outcomes), key=lambda o: o.closed_at)
+    ordered = sorted(
+        _collapse_to_trades(outcomes, entry_slippage_by_position), key=lambda o: o.closed_at
+    )
     pnls = [o.realized_pnl for o in ordered]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
@@ -196,8 +227,26 @@ def _compute_stats(outcomes: list[TradeOutcome]) -> PerformanceStats:
         largest_single_win=max(wins) if wins else 0.0,
         total_realized_pnl=sum(pnls),
         total_slippage=sum(float(o.slippage) for o in ordered),
+        total_entry_slippage=sum(o.entry_slippage for o in ordered),
         total_cost=sum(o.cost for o in ordered),
     )
+
+
+def _entry_slippage_by_position(
+    db: Session, position_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, float]:
+    """One extra lightweight query -- Position.entry_slippage isn't on
+    TradeOutcome, so it can't be read off the outcomes list `_compute_stats`
+    already has. Missing/null entries are simply absent from the dict;
+    `_collapse_to_trades` already defaults a lookup miss to 0.0."""
+    if not position_ids:
+        return {}
+    return {
+        position_id: float(entry_slippage)
+        for position_id, entry_slippage in db.query(Position.id, Position.entry_slippage)
+        .filter(Position.id.in_(position_ids), Position.entry_slippage.isnot(None))
+        .all()
+    }
 
 
 def build_daily_report(
@@ -240,7 +289,10 @@ def build_daily_report(
             Order, Position.opening_order_id == Order.id
         ).filter(Order.mode == mode)
 
-    stats = _compute_stats(outcomes_query.all())
+    outcomes = outcomes_query.all()
+    stats = _compute_stats(
+        outcomes, _entry_slippage_by_position(db, [o.position_id for o in outcomes])
+    )
 
     signal_count = (
         db.query(Signal).filter(Signal.trading_session_id == trading_session.id).count()
@@ -272,7 +324,9 @@ def build_scorecard(db: Session, strategy_config_id: uuid.UUID) -> Scorecard:
         .filter(StrategyRun.strategy_config_id == strategy_config_id)
         .all()
     )
-    stats = _compute_stats(outcomes)
+    stats = _compute_stats(
+        outcomes, _entry_slippage_by_position(db, [o.position_id for o in outcomes])
+    )
 
     signal_count = (
         db.query(Signal).filter(Signal.strategy_config_id == strategy_config_id).count()
