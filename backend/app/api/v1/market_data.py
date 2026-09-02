@@ -115,8 +115,23 @@ class UnderlyingFeedTelemetryOut(BaseModel):
     pcr_age_seconds: float | None = None
 
 
+class VolumeProxySymbolTelemetryOut(BaseModel):
+    # A "calculated"/derived symbol — genuinely subscribed on the wire but
+    # never persisted to price_bars/indicator_snapshots, so it's otherwise
+    # invisible here. Today this is only ever the Shoonya front-month future
+    # whose volume is spliced onto NIFTY/BANKNIFTY's own index ticks (see
+    # `ShoonyaWSClient.set_volume_proxy`'s own docstring) -- empty for any
+    # other provider or before the first subscribe has run.
+    target_symbol: str | None
+    source_symbol: str | None
+    subscribed: bool
+    last_price: float | None
+    last_cum_volume: float | None
+
+
 class MarketDataTelemetryOut(BaseModel):
     underlyings: list[UnderlyingFeedTelemetryOut]
+    calculated_symbols: list[VolumeProxySymbolTelemetryOut] = []
 
 
 def _latest_indicator_values(db: Session, instrument_id: uuid.UUID) -> dict[str, float]:
@@ -163,6 +178,19 @@ def get_market_data_telemetry(
     `underlying_feed_freshness` -- see that function's own docstring for why
     reusing the tradable-underlying thresholds would show VIX as permanently
     stale by design, not as a real problem.
+
+    2026-09-02: added `calculated_symbols` -- the `underlyings` list above
+    is still a hardcoded (TRADABLE_UNDERLYINGS + ENV_METRIC_SYMBOLS) set,
+    not literally "every genuinely streamed symbol" despite this endpoint's
+    own frontend copy claiming that; the Shoonya VWAP volume-proxy fix
+    (2026-08-27) subscribes a real front-month future per underlying that
+    never reaches `price_bars`/`indicator_snapshots` since it's cache-only
+    (never dispatched), so it was invisible here. Read directly off the
+    live `ShoonyaWSClient`'s in-memory state via
+    `ShoonyaBrokerAdapter.get_volume_proxy_symbols` -- best-effort, wrapped
+    in try/except so a resolution hiccup can never break the rest of this
+    response; empty for any non-Shoonya provider or before the first
+    subscribe has run.
     """
     from app.domain.market.models import Instrument
     from app.modules.market_data.freshness import (
@@ -234,7 +262,22 @@ def get_market_data_telemetry(
             )
         )
 
-    return MarketDataTelemetryOut(underlyings=underlyings)
+    calculated_symbols: list[VolumeProxySymbolTelemetryOut] = []
+    try:
+        from app.modules.broker_adapter.composition import get_broker, unwrap_broker
+        from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+        inner = unwrap_broker(get_broker())
+        if isinstance(inner, ShoonyaBrokerAdapter):
+            calculated_symbols = [
+                VolumeProxySymbolTelemetryOut(**row) for row in inner.get_volume_proxy_symbols()
+            ]
+    except Exception:
+        logger.warning(
+            "Failed to read volume-proxy telemetry; omitting from response", exc_info=True
+        )
+
+    return MarketDataTelemetryOut(underlyings=underlyings, calculated_symbols=calculated_symbols)
 
 
 @router.patch("/provider-preference", response_model=ProviderPreferenceOut)

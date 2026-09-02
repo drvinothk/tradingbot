@@ -417,6 +417,61 @@ def test_unsubscribe_target_also_drops_its_volume_proxy_source():
     assert client._volume_proxy == {}
 
 
+# -- get_volume_proxy_snapshot (telemetry read-only accessor) --
+
+
+def test_get_volume_proxy_snapshot_empty_before_any_proxy_is_set():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+
+    assert client.get_volume_proxy_snapshot() == []
+
+
+def test_get_volume_proxy_snapshot_reports_symbols_before_any_frame_arrives():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+
+    snapshot = client.get_volume_proxy_snapshot()
+
+    assert snapshot == [
+        {
+            "target_symbol": "NIFTY",
+            "source_symbol": "NIFTY29SEP26F",
+            "subscribed": True,
+            "last_price": None,
+            "last_cum_volume": None,
+        }
+    ]
+
+
+def test_get_volume_proxy_snapshot_reflects_latest_source_frame():
+    client, _, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+    client._handle_message(_fut_tick(1_002_500))
+    client._handle_message(_idx_tick())  # establishes the proxy's cumulative baseline
+
+    row = client.get_volume_proxy_snapshot()[0]
+
+    assert row["last_price"] == 24300.0
+    assert row["last_cum_volume"] == 1_002_500
+
+
+def test_get_volume_proxy_snapshot_never_includes_the_forwarded_target_itself():
+    client, ticks, _ = _client()
+    client.subscribe([("NIFTY", "NSE", "26000")])
+    client.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+    client._handle_message(_fut_tick(1_000_000))
+    client._handle_message(_idx_tick())
+
+    snapshot = client.get_volume_proxy_snapshot()
+
+    assert len(snapshot) == 1
+    assert snapshot[0]["source_symbol"] == "NIFTY29SEP26F"
+    assert len(ticks) == 1  # sanity: the target tick was still forwarded normally
+
+
 # -- `_run`'s session_is_live gate (2026-09-01) -------------------------------
 #
 # `_run`/`_receive_loop` still need a live server to test meaningfully in

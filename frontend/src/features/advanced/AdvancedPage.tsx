@@ -17,6 +17,7 @@ import type {
   InstrumentOut,
   MarketDataTelemetryOut,
   UnderlyingFeedTelemetryOut,
+  VolumeProxySymbolTelemetryOut,
   MaxTradesPerDayOut,
   ProviderPreferenceOut,
   RuntimeMode,
@@ -1267,15 +1268,18 @@ function MarketDataTelemetryCard() {
   })
 
   const underlyings = telemetryQuery.data?.underlyings ?? []
+  const calculatedSymbols = telemetryQuery.data?.calculated_symbols ?? []
 
   return (
     <div className="card">
       <h3>Market Data Adapter telemetry</h3>
       <p className="muted">
         Live per-underlying feed freshness, reusing the same staleness classification the trading
-        gates themselves use — not a separate counter system. Also lists every genuinely streamed
+        gates themselves use — not a separate counter system. Also lists every tradable/metric
         symbol (including INDIA VIX) plus the computed indicator/PCR values already persisted for
-        each, even where no strategy gates on them yet.
+        each, even where no strategy gates on them yet, plus any calculated symbol streamed purely
+        to feed another symbol's indicators (e.g. the front-month future used as NIFTY/BANKNIFTY's
+        volume source — see the table below).
       </p>
       <div className="form-row">
         <label>Active provider</label>
@@ -1331,6 +1335,37 @@ function MarketDataTelemetryCard() {
         tradable underlyings — it needs an option-chain snapshot, which only exists once
         something has scanned that underlying's nearest expiry today.
       </p>
+      {calculatedSymbols.length > 0 && (
+        <>
+          <h4 style={{ margin: '1rem 0 0.25rem' }}>Calculated symbols</h4>
+          <p className="muted" style={{ fontSize: '0.75rem', margin: '0 0 0.5rem' }}>
+            Genuinely subscribed on the wire but never persisted to price_bars/indicator_snapshots
+            themselves — streamed purely to feed another symbol's indicator above.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Source symbol</th>
+                <th>Feeds</th>
+                <th>Subscribed</th>
+                <th>Last price</th>
+                <th>Last cumulative volume</th>
+              </tr>
+            </thead>
+            <tbody>
+              {calculatedSymbols.map((c: VolumeProxySymbolTelemetryOut, idx: number) => (
+                <tr key={`${c.source_symbol ?? 'unknown'}-${idx}`}>
+                  <td>{c.source_symbol ?? '—'}</td>
+                  <td>{c.target_symbol ?? '—'}</td>
+                  <td>{c.subscribed ? 'Yes' : 'No'}</td>
+                  <td>{formatIndicatorValue(c.last_price)}</td>
+                  <td>{formatIndicatorValue(c.last_cum_volume)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
     </div>
   )
 }

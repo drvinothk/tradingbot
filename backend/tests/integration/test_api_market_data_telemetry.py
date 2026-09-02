@@ -199,3 +199,79 @@ def test_telemetry_computes_pcr_from_the_latest_snapshot_at_the_nearest_expiry(
     assert nifty_row.pcr_vol == 300 / 500
     assert nifty_row.pcr_age_seconds is not None
     assert 90 <= nifty_row.pcr_age_seconds < 150
+
+
+def test_telemetry_calculated_symbols_empty_for_mock_broker(db: Session, user):
+    """The `_reset_broker_singleton` autouse fixture leaves every test on a
+    fresh `MockBrokerAdapter` by default -- `calculated_symbols` (the
+    Shoonya-only volume-proxy telemetry) must stay empty rather than error.
+    """
+    _instrument(db, "NIFTY")
+    _instrument(db, "BANKNIFTY")
+    _instrument(db, "INDIA VIX")
+
+    result = get_market_data_telemetry(db=db, user=user)
+
+    assert result.calculated_symbols == []
+
+
+def _install_fake_shoonya_adapter_with_volume_proxy():
+    """Mirrors `test_api_shoonya.py`'s own `_install_fake_shoonya_adapter`
+    helper -- network-free `ShoonyaBrokerAdapter` construction, just with a
+    real `ShoonyaWSClient` wired in and one volume-proxy mapping fed a
+    frame, so `get_volume_proxy_symbols()` has something real to report.
+    """
+    from pydantic import SecretStr
+
+    from app.config.settings import ShoonyaSettings
+    from app.modules.broker_adapter import composition
+    from app.modules.broker_adapter.base.contracts import AuthResult
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+    from app.modules.broker_adapter.shoonya.ws_client import ShoonyaWSClient
+
+    class _FakeRestClient:
+        def close(self):
+            pass
+
+    settings = ShoonyaSettings(
+        client_id="TESTCID",
+        secret_code=SecretStr("TESTSECRET"),
+        user_id="FA12345",
+        api_host="https://api.shoonya.test/NorenWClientAPI",
+        ws_host="wss://api.shoonya.test/NorenWSAPI/",
+    )
+    auth_result = AuthResult(session_token="tok", account_id="FA12345")
+    adapter = ShoonyaBrokerAdapter(settings, auth_result, rest_client=_FakeRestClient())
+
+    ws = ShoonyaWSClient(
+        "wss://api.shoonya.test/NorenWSAPI/",
+        uid="FA12345",
+        actid="FA12345",
+        access_token="tok",
+        on_tick=lambda t: None,
+    )
+    ws.subscribe([("NIFTY", "NSE", "26000")])
+    ws.set_volume_proxy(("NIFTY", "NSE", "26000"), ("NIFTY29SEP26F", "NFO", "68407"))
+    ws._handle_message(
+        '{"t": "tf", "e": "NFO", "tk": "68407", "lp": "24300.0", "v": "1002500"}'
+    )
+    ws._handle_message('{"t": "tf", "e": "NSE", "tk": "26000", "lp": "24100.0"}')
+    adapter._ws = ws
+    composition.set_broker(adapter)
+
+
+def test_telemetry_includes_calculated_symbols_for_shoonya_volume_proxy(db: Session, user):
+    _instrument(db, "NIFTY")
+    _instrument(db, "BANKNIFTY")
+    _instrument(db, "INDIA VIX")
+    _install_fake_shoonya_adapter_with_volume_proxy()
+
+    result = get_market_data_telemetry(db=db, user=user)
+
+    assert len(result.calculated_symbols) == 1
+    row = result.calculated_symbols[0]
+    assert row.target_symbol == "NIFTY"
+    assert row.source_symbol == "NIFTY29SEP26F"
+    assert row.subscribed is True
+    assert row.last_price == 24300.0
+    assert row.last_cum_volume == 1_002_500

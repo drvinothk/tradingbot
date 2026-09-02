@@ -965,6 +965,16 @@ class ShoonyaBrokerAdapter(BrokerPort):
             **_derive_nfo_bo_co_flags(prarr),
         }
 
+    def get_volume_proxy_symbols(self) -> list[dict]:
+        """Read-only passthrough to `ShoonyaWSClient.get_volume_proxy_snapshot`
+        for `GET /market-data/telemetry` — see that method's own docstring.
+        `[]` before the WS client has been constructed (no subscribe has run
+        yet), never raises.
+        """
+        if self._ws is None:
+            return []
+        return self._ws.get_volume_proxy_snapshot()
+
     def diagnose_ws_auth(self) -> dict:
         """One-shot, synchronous connect+auth against `ws_host` — bypasses
         `ShoonyaWSClient`'s background reconnect loop so a live diagnostic

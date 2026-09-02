@@ -325,8 +325,17 @@ export interface UnderlyingFeedTelemetryOut {
   pcr_age_seconds: number | null
 }
 
+export interface VolumeProxySymbolTelemetryOut {
+  target_symbol: string | null
+  source_symbol: string | null
+  subscribed: boolean
+  last_price: number | null
+  last_cum_volume: number | null
+}
+
 export interface MarketDataTelemetryOut {
   underlyings: UnderlyingFeedTelemetryOut[]
+  calculated_symbols: VolumeProxySymbolTelemetryOut[]
 }
 
 export interface PerformanceStatsOut {

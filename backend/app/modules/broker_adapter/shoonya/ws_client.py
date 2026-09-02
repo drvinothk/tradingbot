@@ -331,6 +331,40 @@ class ShoonyaWSClient:
         if to_remove:
             self._send_unsubscribe(to_remove)
 
+    def get_volume_proxy_snapshot(self) -> list[dict]:
+        """Read-only view of every active `set_volume_proxy` mapping, for a
+        diagnostic/telemetry caller (`GET /market-data/telemetry`) — the
+        volume-proxy source (a front-month future, cache-only per
+        `_SubscriptionEntry.dispatch`) is a genuinely subscribed, genuinely
+        streamed symbol that never reaches `on_tick`/`price_bars`, so it's
+        otherwise invisible to anything reading persisted indicator data.
+
+        Pure read under `self._lock`, no mutation, no network call — safe to
+        poll as often as the caller likes. Returns `[]` before any subscribe
+        has run `set_volume_proxy` yet.
+        """
+        with self._lock:
+            snapshot = []
+            for target_key, source_key in self._volume_proxy.items():
+                target_entry = self._entries_by_key.get(target_key)
+                source_entry = self._entries_by_key.get(source_key)
+                source_frame = self._last_known_by_key.get(source_key, {})
+                lp = source_frame.get("lp")
+                snapshot.append(
+                    {
+                        "target_symbol": target_entry.contract_symbol
+                        if target_entry is not None
+                        else None,
+                        "source_symbol": source_entry.contract_symbol
+                        if source_entry is not None
+                        else source_key,
+                        "subscribed": source_key in self._entries_by_key,
+                        "last_price": float(lp) if lp is not None else None,
+                        "last_cum_volume": self._proxy_last_cum_v.get(target_key),
+                    }
+                )
+            return snapshot
+
     # -- connection lifecycle -------------------------------------------------
 
     def _run(self) -> None:
