@@ -696,6 +696,39 @@ tbody tr:hover {
   color: var(--text-muted);
 }
 
+/* Total P&L summary line under each visible scope's metrics-strip -- a
+   single muted text row, not a metric-box, so it adds only one line of
+   height rather than another full box. The figure itself still gets the
+   normal pnl-positive/pnl-negative color so profit/loss reads at a glance
+   despite the muted surrounding label. */
+.total-pnl-row {
+  font-size: 0.8rem;
+  margin: 0.35rem 0 0;
+}
+
+/* Bottom-right footer strip holding the Paper visibility toggle -- kept to
+   a single thin row so ticking/unticking Paper never changes the card's
+   own height, only whether the substrip above this row is present. */
+.card-footer-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 0.6rem;
+}
+
+.paper-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.paper-toggle input[type='checkbox'] {
+  cursor: pointer;
+}
+
 /* ---------- Advanced page: Global Controls ribbon ---------- */
 /* Global daily settings + Global settings (firewall/provider) side by
    side at the top of Advanced instead of scattered through the page --

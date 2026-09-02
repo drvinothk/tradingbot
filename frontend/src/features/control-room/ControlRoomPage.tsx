@@ -486,6 +486,23 @@ function useScopeMetrics(
   }
 }
 
+// User-controlled, not activity-controlled -- Live is always shown, Paper is
+// only ever shown when this box is ticked. Persisted so a preference set
+// once (e.g. "always show Paper so I can check it after market close")
+// survives a reload instead of resetting to whatever happened to be trading
+// at the time, which is exactly the gap this replaces (the old
+// `showPaperSubRibbon` only ever appeared while a live-routed strategy was
+// active, so Paper was unreachable outside market hours).
+const SHOW_PAPER_STORAGE_KEY = 'controlRoom.showPaperPanel'
+
+function readShowPaperPreference(): boolean {
+  try {
+    return window.localStorage.getItem(SHOW_PAPER_STORAGE_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
 function TodaysActivityCard({
   runs,
   liveRows,
@@ -499,8 +516,6 @@ function TodaysActivityCard({
   liveSessionId: string | null
   paperSessionId: string | null
 }) {
-  const anyLive = runs.some((r) => r.is_live)
-
   // A live_enabled session can hold both live-routed and FORCE_PAPER
   // strategies together (no separate mock-broker session exists in that
   // case -- see useSessionBuckets' own docstring) -- so when there's no
@@ -516,31 +531,60 @@ function TodaysActivityCard({
   const liveMetrics = useScopeMetrics(liveSessionId, 'live', liveRows, runs)
   const paperMetrics = useScopeMetrics(paperReportSessionId, 'paper', paperRows, runs)
 
-  const primaryMetrics = anyLive ? liveMetrics : paperMetrics
-  const primaryLabel = anyLive ? 'Live' : 'Paper'
+  const [showPaper, setShowPaper] = useState(readShowPaperPreference)
 
-  // The sub-ribbon only ever appears once Live is primary, and only when
-  // there's genuine paper-side activity to show underneath it -- a
-  // workspace with no paper strategies at all never gets an empty ribbon.
-  const showPaperSubRibbon = anyLive && (paperRows.length > 0 || runs.some((r) => !r.is_live))
+  const handleShowPaperChange = (checked: boolean) => {
+    setShowPaper(checked)
+    try {
+      window.localStorage.setItem(SHOW_PAPER_STORAGE_KEY, String(checked))
+    } catch {
+      // localStorage unavailable (private browsing etc) -- preference just
+      // won't survive a reload, not worth surfacing an error for.
+    }
+  }
 
   return (
     <div className="card">
       <div className="card-header">
         <h3>Today&apos;s Activity</h3>
-        <span className="muted">({primaryLabel})</span>
+        <span className="badge badge-success">Live</span>
       </div>
       <div className="metrics-strip">
-        <ActivityMetricsBoxes metrics={primaryMetrics} />
+        <ActivityMetricsBoxes metrics={liveMetrics} />
       </div>
-      {showPaperSubRibbon && (
+      <TotalPnlRow metrics={liveMetrics} />
+      {showPaper && (
         <>
           <div className="muted metrics-substrip-label">Paper</div>
           <div className="metrics-strip metrics-substrip">
             <ActivityMetricsBoxes metrics={paperMetrics} />
           </div>
+          <TotalPnlRow metrics={paperMetrics} />
         </>
       )}
+      <div className="card-footer-row">
+        <label className="paper-toggle">
+          <input
+            type="checkbox"
+            checked={showPaper}
+            onChange={(e) => handleShowPaperChange(e.target.checked)}
+          />
+          Paper
+        </label>
+      </div>
+    </div>
+  )
+}
+
+function TotalPnlRow({ metrics }: { metrics: ScopeMetrics }) {
+  if (metrics.sessionId === null) return null
+  return (
+    <div className="total-pnl-row muted">
+      Total P&amp;L{' '}
+      <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+        {metrics.totalPnl >= 0 ? '+' : ''}
+        {fmtAmt(metrics.totalPnl)}
+      </span>
     </div>
   )
 }
