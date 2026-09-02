@@ -130,6 +130,7 @@ from app.modules.market_data.freshness import (
     latest_snapshot_tick,
 )
 from app.modules.market_data.providers.base import BaseMarketDataProvider
+from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 from app.modules.reconciliation.service import run_reconciliation
 from app.modules.risk_engine.service import record_trade_outcome_effects
 from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME, get_recent_completed_bars
@@ -1882,26 +1883,37 @@ def current_contract_price(
     option contract's symbol key, which this function then returned as if
     it were that option's own live premium. It fed straight into both the
     persisted `QuoteTick` (Control Room's LTP column) and this function's
-    caller, `PositionManager`'s stop/target/trail check. Guarded below: an
-    index-option premium never approaches its own strike for anything this
-    system trades (NIFTY/BANKNIFTY weekly/near-month), so `ltp >= strike` is
-    a cheap, safe, universal ceiling -- rejecting falls through to the same
-    REST-snapshot/broker.get_quote fallback chain already used for a
-    missing/stale tick, never fabricates a price.
+    caller, `PositionManager`'s stop/target/trail check. Originally guarded
+    with a narrower `ltp >= strike` check -- found asymmetric the same day
+    (2026-09-02, post-incident review of that day's own trades): an OTM
+    leak where spot sits *below* the option's strike (e.g. spot ~23,870
+    under a 24,000-strike call) slipped straight through it undetected.
+    Replaced with the shared `tick_plausibility.is_plausible_option_tick`
+    (bid/ask/volume-all-zero + a flat premium ceiling, both symmetric
+    regardless of strike) -- the same check `MarketDataIngestionService`
+    uses at its own WS/REST write sites, so all three no longer drift
+    independently. Rejecting still falls through to the same REST-snapshot/
+    broker.get_quote fallback chain already used for a missing/stale tick,
+    never fabricates a price.
     """
     if market_data_provider is not None:
         fresh_tick = fresh_tick_or_none(
             market_data_provider.get_latest_tick(option_contract.symbol), _utcnow()
         )
         if fresh_tick is not None:
-            if fresh_tick.ltp >= float(option_contract.strike):
+            if not is_plausible_option_tick(
+                fresh_tick.ltp, fresh_tick.bid, fresh_tick.ask, fresh_tick.volume
+            ):
                 logger.error(
-                    "REJECTED implausible live tick for option %s: ltp=%.4f >= strike=%.4f "
-                    "-- likely a token-resolution mismatch (see this function's own docstring); "
-                    "falling back to REST snapshot/broker.get_quote instead of trusting it",
+                    "REJECTED implausible live tick for option %s: ltp=%.4f bid=%.4f ask=%.4f "
+                    "volume=%d -- likely a token-resolution mismatch (see this function's own "
+                    "docstring); falling back to REST snapshot/broker.get_quote instead of "
+                    "trusting it",
                     option_contract.symbol,
                     fresh_tick.ltp,
-                    float(option_contract.strike),
+                    fresh_tick.bid,
+                    fresh_tick.ask,
+                    fresh_tick.volume,
                 )
             else:
                 return fresh_tick

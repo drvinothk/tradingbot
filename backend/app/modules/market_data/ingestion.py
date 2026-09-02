@@ -29,6 +29,7 @@ from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
 from app.modules.market_data.indicators.bar_aggregator import Bar
 from app.modules.market_data.indicators.engine import IndicatorEngine
 from app.modules.market_data.providers.base import BaseMarketDataProvider
+from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 
 logger = logging.getLogger("app.market_data")
 
@@ -86,6 +87,18 @@ _MIN_PLAUSIBLE_PRICE_BY_SYMBOL: dict[str, float] = {
     "NIFTY": 5000.0,
     "BANKNIFTY": 10000.0,
 }
+
+# 2026-09-02 — the mirror-image live incident: a real NIFTY spot tick
+# (~23,870) was returned by the broker under an *option* contract's symbol
+# instead of the underlying's own (see tick_plausibility.py's module
+# docstring for the full incident + why the check itself lives there,
+# shared with `record_option_chain_snapshot` below and
+# `execution_engine.paper.service.current_contract_price`). Unlike the
+# underlying-side guard above, an option contract has no per-symbol entry
+# here — there are hundreds of them — so this is a cap on how many distinct
+# option symbols get a detailed log line, not a plausibility threshold
+# itself (that lives in tick_plausibility.MAX_PLAUSIBLE_OPTION_PREMIUM).
+_MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED = 25
 
 # REST-poll cadence — deliberately shorter than the 60s bar timeframe so a
 # just-closed candle is picked up within roughly half a bar, not up to a
@@ -213,6 +226,17 @@ class MarketDataIngestionService:
             else _MIN_PLAUSIBLE_PRICE_BY_SYMBOL
         )
         self._implausible_price_logged: set[str] = set()
+        # Option contracts number in the hundreds across a trading day
+        # (every strike x expiry touched), unlike the 2-symbol underlying
+        # set _implausible_price_logged was sized for -- a persistent
+        # option-side corruption bug hitting many strikes could still flood
+        # logs at "once per symbol" granularity. Capped separately: once
+        # _MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED distinct option symbols
+        # have each logged their one detailed warning, later ones are
+        # counted but not logged in detail -- see
+        # _warn_implausible_option_price_once.
+        self._implausible_option_price_logged: set[str] = set()
+        self._implausible_option_price_suppressed_count = 0
         self._last_tick_at: dict[str, datetime] = {}
         self._fallback_symbols: set[str] = set()
         self._ws_recovery_probe_every_n_polls = ws_recovery_probe_every_n_polls
@@ -257,6 +281,49 @@ class MarketDataIngestionService:
             symbol,
             self._min_plausible_price_by_symbol.get(symbol, 0.0),
             symbol,
+        )
+
+    def _warn_implausible_option_price_once(
+        self, symbol: str, ltp: float, bid: float, ask: float, volume: int, source: str
+    ) -> None:
+        """Option-side counterpart to `_warn_implausible_price_once` — see
+        that method and `tick_plausibility.py`'s module docstring for the
+        incident this exists to catch. Capped at
+        `_MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED` distinct symbols (not just
+        deduped per-symbol like the underlying side) since an option-side
+        corruption bug could plausibly hit far more than the 2 symbols the
+        underlying guard was sized for.
+        """
+        if symbol in self._implausible_option_price_logged:
+            return
+        if len(self._implausible_option_price_logged) >= _MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED:
+            self._implausible_option_price_suppressed_count += 1
+            if self._implausible_option_price_suppressed_count == 1:
+                logger.error(
+                    "REACHED %d distinct option symbols with a REJECTED implausible price "
+                    "(source=%s) -- further occurrences will be counted, not logged in detail, "
+                    "to avoid flooding logs. This many distinct symbols affected suggests a "
+                    "systemic issue, not an isolated bad tick -- worth investigating directly "
+                    "rather than relying on per-symbol log lines.",
+                    _MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED,
+                    source,
+                )
+            return
+        self._implausible_option_price_logged.add(symbol)
+        logger.error(
+            "REJECTED implausible %s price for option contract %r: ltp=%.4f bid=%.4f ask=%.4f "
+            "volume=%d -- looks like a leaked underlying/wrong-instrument tick, not a real "
+            "option premium (see tick_plausibility.py). Dropping rather than persisting -- "
+            "falls through to the existing REST-snapshot/broker.get_quote fallback chain "
+            "instead. Logged once per option symbol per process (capped at %d distinct symbols) "
+            "to avoid flooding logs.",
+            source,
+            symbol,
+            ltp,
+            bid,
+            ask,
+            volume,
+            _MAX_IMPLAUSIBLE_OPTION_SYMBOLS_LOGGED,
         )
 
     def _build_symbol_map(self, contract_symbols: list[str]) -> dict[str, _SymbolRef]:
@@ -736,6 +803,17 @@ class MarketDataIngestionService:
             # _poll_once), so it can't silently "fix" this by switching
             # paths; both correctly degrade to stale/no-data instead.
             return
+        if kind == "option_contract" and not is_plausible_option_tick(
+            tick.ltp, tick.bid, tick.ask, tick.volume
+        ):
+            self._warn_implausible_option_price_once(
+                tick.contract_symbol, tick.ltp, tick.bid, tick.ask, tick.volume, "WS tick"
+            )
+            # Same "don't fake freshness for a rejected value" discipline as
+            # the instrument branch above -- mirrored regardless of whether
+            # anything currently watches an option contract's own tick
+            # recency the way the WS-health watchdog does for underlyings.
+            return
         # Recorded regardless of what happens below — this is the WS-health
         # signal `_check_ws_health` reads, decoupled from whether the DB
         # write itself succeeds.
@@ -817,8 +895,39 @@ def record_option_chain_snapshot(
     """One-shot fetch + persist — called on a schedule (Scheduler) or on
     demand, not via the streaming path; option chain snapshots are a
     point-in-time picture, not a per-tick stream.
+
+    Per-entry plausibility filtered the same way `_on_tick`'s option branch
+    is (see `tick_plausibility.py`) before anything is persisted — this is
+    the single write point for every strategy's `rank_from_latest_snapshot`
+    entry-price/ranking source and `current_contract_price`'s REST fallback
+    (`latest_snapshot_tick`), so filtering here protects both for free
+    rather than needing a separate guard in each reader. A rejected entry
+    is dropped, not zeroed — `latest_snapshot_tick`/`rank_from_latest_snapshot`
+    already treat "contract not in this chain" as a normal gap (an expired/
+    rolled-off contract, say), so this degrades the same safe way. Not
+    deduped per-symbol like the WS path's warning — chain snapshots refresh
+    on a ~25s+ cadence per instrument/expiry, not per tick, so log volume is
+    naturally bounded without needing the same cap.
     """
     chain = broker.get_option_chain(underlying_symbol, expiry)
+    plausible_entries = []
+    for e in chain.entries:
+        if is_plausible_option_tick(e.ltp, e.bid, e.ask, e.volume):
+            plausible_entries.append(e)
+        else:
+            logger.error(
+                "REJECTED implausible option-chain entry for %r (underlying=%s, expiry=%s): "
+                "ltp=%.4f bid=%.4f ask=%.4f volume=%d -- looks like a leaked underlying/"
+                "wrong-instrument value, not a real option premium (see tick_plausibility.py). "
+                "Dropping this entry from the snapshot rather than persisting it.",
+                e.contract_symbol,
+                underlying_symbol,
+                expiry,
+                e.ltp,
+                e.bid,
+                e.ask,
+                e.volume,
+            )
     with session_factory() as db:
         row = OptionChainSnapshotRow(
             id=uuid.uuid4(),
@@ -836,7 +945,7 @@ def record_option_chain_snapshot(
                     "volume": e.volume,
                     "oi": e.oi,
                 }
-                for e in chain.entries
+                for e in plausible_entries
             ],
         )
         db.add(row)

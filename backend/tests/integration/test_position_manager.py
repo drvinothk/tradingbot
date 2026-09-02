@@ -390,6 +390,45 @@ def test_run_once_rejects_an_implausible_option_tick_and_falls_back_to_broker_qu
     assert position.status == PositionStatus.OPEN
 
 
+def test_run_once_rejects_an_implausible_option_tick_below_its_own_strike(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-03 fix: the original `ltp >= strike` guard (see the test
+    above) was asymmetric -- a leaked underlying tick whose value sits
+    *below* the option's strike slips straight through it. Live-confirmed
+    2026-09-02, post-incident: a real NIFTY spot tick (~23,870) landed
+    under a NIFTY24000C option contract's symbol -- 23,870 < strike 24,000,
+    so the old check would have trusted it. Reproduced here at this
+    fixture's own scale (strike=22000, tick ltp=21000 < strike, bid=ask=
+    volume=0 matching the real incident's tick shape exactly) -- pins the
+    replacement `tick_plausibility.is_plausible_option_tick` check, which
+    is symmetric regardless of strike.
+    """
+    from app.modules.broker_adapter.base.contracts import Tick
+
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract,
+        broker, stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - safe fallback price
+    provider = _FakeLiveProvider()
+    provider.ticks[option_contract.symbol] = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=21000.0, bid=0.0, ask=0.0, volume=0, oi=None, ts=datetime.now(UTC),
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=provider,
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
 def test_run_once_exits_on_stop_hit(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

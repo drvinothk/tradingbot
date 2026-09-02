@@ -1126,6 +1126,63 @@ def test_option_chain_snapshot_is_persisted_and_usable_after_session_close(
     assert len(row.chain_data) == 42  # 21 strikes * 2 (CE/PE) for NIFTY
 
 
+def test_record_option_chain_snapshot_drops_an_implausible_entry(
+    seeded_universe, test_session_factory, db: Session
+):
+    """2026-09-02 live incident, chain-snapshot side: a real underlying
+    spot value (~23,870) can land under one option strike's `ltp` in a
+    broker's raw GetOptionChain response the same way it did on the WS tick
+    path -- this is the write point every strategy's rank_from_latest_
+    snapshot and current_contract_price's REST fallback both read from, so
+    filtering here protects both without a separate guard in either reader.
+    """
+    from dataclasses import replace
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=8)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    class _CorruptedEntryBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            entries[0] = replace(entries[0], ltp=23870.0, bid=0.0, ask=0.0, volume=0)
+            return replace(chain, entries=tuple(entries))
+
+    row = record_option_chain_snapshot(
+        nifty.id, _CorruptedEntryBroker(), "NIFTY", EXPIRY, session_factory=test_session_factory  # type: ignore[arg-type]
+    )
+
+    # 42 real entries (see the sibling "persisted and usable" test above)
+    # minus the 1 corrupted one, dropped rather than persisted.
+    assert len(row.chain_data) == 41
+    assert all(e["ltp"] < 5000 for e in row.chain_data)
+
+
+def test_on_tick_rejects_an_implausible_price_for_an_option_contract(
+    seeded_universe, test_session_factory, db: Session, caplog
+):
+    """WS-tick counterpart of the chain-snapshot test above — see
+    tick_plausibility.py's own module docstring for the full 2026-09-02
+    incident. A leaked underlying-scale tick under an option contract's
+    symbol must be dropped, not persisted to quote_ticks.
+    """
+    option_symbol = next(i.symbol for i in seeded_universe if i.is_option)
+    broker = MockBrokerAdapter(instruments=seeded_universe, seed=9)
+    service = MarketDataIngestionService(_provider(broker), session_factory=test_session_factory)
+    service._symbol_map = service._build_symbol_map([option_symbol])  # noqa: SLF001
+
+    corrupted_tick = Tick(
+        contract_symbol=option_symbol,
+        ltp=23870.35, bid=0.0, ask=0.0, volume=0, oi=None, ts=datetime.now(UTC),
+    )
+    with caplog.at_level(logging.ERROR, logger="app.market_data"):
+        service._on_tick(corrupted_tick)  # noqa: SLF001
+
+    assert db.query(QuoteTick).filter(QuoteTick.option_contract_id.isnot(None)).count() == 0
+    assert "REJECTED implausible" in caplog.text
+    assert option_symbol not in service._last_tick_at  # noqa: SLF001 -- must not look healthy
+
+
 def test_ensure_fresh_option_chain_refreshes_when_none_exists(
     seeded_universe, test_session_factory, db: Session
 ):
