@@ -13,7 +13,15 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
-from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
+from app.domain.execution.models import (
+    ExitReason,
+    Order,
+    OrderMode,
+    OrderStatus,
+    Position,
+    PositionStatus,
+    TradeOutcome,
+)
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import SystemAlert
@@ -503,6 +511,262 @@ def test_run_reconciliation_auto_repair_falls_through_when_a_race_closes_the_pos
 
     # Falls through to the normal mismatch path -- not repaired here, and
     # crucially not an exception either.
+    assert run.mismatches_found == 1
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
+def test_run_reconciliation_auto_repair_ignores_a_stale_claimed_fill_from_earlier_position(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-09-03 fix: a same-day re-entry on the same strike can leave an
+    earlier, already-closed position's own exit fill inside
+    `get_recent_trades`'s result with the identical side/qty as the
+    *current* position being auto-repaired -- taking the first list match
+    (the pre-fix behavior) risked closing the current position at that
+    stale earlier price. The stale fill's timestamp is deliberately set no
+    earlier than the current position's own open time, so this only passes
+    if the already-claimed-broker_order_id exclusion is doing the real
+    work -- not just timestamp ordering.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    inner = MockBrokerAdapter()
+    entry_broker = _FakeLiveDelegatingBroker(inner)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+
+    # Position A: opened and closed normally earlier today -- its exit
+    # Order is a real local record with a real broker_order_id, exactly
+    # like an ordinary close_position exit leaves behind.
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position_a = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+    now = datetime.now(UTC)
+    stale_exit_order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        position_id=position_a.id,
+        idempotency_key=f"exit:{position_a.id}",
+        mode=OrderMode.LIVE,
+        side=OrderSide.SELL,
+        qty=position_a.qty,
+        status=OrderStatus.FILLED,
+        filled_qty=position_a.qty,
+        avg_fill_price=999.0,
+        broker_order_id="SHOONYA-A-STALE-EXIT",
+        submitted_at=now,
+        updated_at=now,
+    )
+    db.add(stale_exit_order)
+    db.flush()
+    position_a.status = PositionStatus.CLOSED
+    position_a.closing_order_id = stale_exit_order.id
+    position_a.closed_at = now
+    db.add(position_a)
+    db.flush()
+
+    # Position B: today's real, currently-open position on the same strike.
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position_b = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+
+    stale_fill = TradeFill(
+        broker_order_id="SHOONYA-A-STALE-EXIT",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position_b.qty,
+        avg_price=999.0,
+        ts=position_b.opened_at,
+    )
+    real_fill = TradeFill(
+        broker_order_id="SHOONYA-B-REAL-EXIT",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position_b.qty,
+        avg_price=105.55,
+        ts=position_b.opened_at,
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_positions(self) -> list[BrokerPosition]:
+            return []  # broker flat -- position B was squared off directly there
+
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            if contract_symbol != option_contract.symbol:
+                return []
+            return [stale_fill, real_fill]
+
+    run = run_reconciliation(
+        db, _RepairBroker(inner), trading_session, ReconciliationTrigger.EVENT  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 0
+    assert run.action_taken == "none"
+    db.refresh(position_b)
+    assert position_b.status == PositionStatus.CLOSED
+
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position_b.id).one()
+    assert float(outcome.exit_price) == pytest.approx(105.55)
+
+
+def test_run_reconciliation_auto_repair_declines_on_genuinely_ambiguous_orphaned_fills(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Two orphaned same-day fills (neither recorded locally by this app,
+    both otherwise plausible) must not be silently disambiguated by picking
+    one -- the function's own 'never guess' scope requires declining and
+    falling through to the normal alert/escalate path instead.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    inner = MockBrokerAdapter()
+    entry_broker = _FakeLiveDelegatingBroker(inner)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+
+    fill_1 = TradeFill(
+        broker_order_id="SHOONYA-ORPHAN-1",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=100.0,
+        ts=position.opened_at,
+    )
+    fill_2 = TradeFill(
+        broker_order_id="SHOONYA-ORPHAN-2",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=150.0,
+        ts=position.opened_at,
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_positions(self) -> list[BrokerPosition]:
+            return []
+
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            if contract_symbol != option_contract.symbol:
+                return []
+            return [fill_1, fill_2]
+
+    run = run_reconciliation(
+        db, _RepairBroker(inner), trading_session, ReconciliationTrigger.EVENT  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 1
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    assert db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).count() == 0
+
+
+def test_run_reconciliation_auto_repair_declines_when_two_fills_both_lack_a_broker_order_id(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Two distinct orphaned fills that both happen to be missing
+    broker_order_id (a best-effort field on some real broker payloads --
+    see normalizer.parse_trade_fill) must not collapse into one '' key and
+    silently resolve via max() -- each still counts as its own candidate,
+    so ambiguity is still correctly detected rather than papered over.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    inner = MockBrokerAdapter()
+    entry_broker = _FakeLiveDelegatingBroker(inner)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+
+    fill_1 = TradeFill(
+        broker_order_id="",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=100.0,
+        ts=position.opened_at,
+    )
+    fill_2 = TradeFill(
+        broker_order_id="",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=150.0,
+        ts=position.opened_at,
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_positions(self) -> list[BrokerPosition]:
+            return []
+
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            if contract_symbol != option_contract.symbol:
+                return []
+            return [fill_1, fill_2]
+
+    run = run_reconciliation(
+        db, _RepairBroker(inner), trading_session, ReconciliationTrigger.EVENT  # type: ignore[arg-type]
+    )
+
     assert run.mismatches_found == 1
     db.refresh(position)
     assert position.status == PositionStatus.OPEN

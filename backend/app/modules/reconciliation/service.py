@@ -123,6 +123,33 @@ def _local_net_qty_by_symbol(
     return result
 
 
+def _already_claimed_broker_order_ids(
+    db: Session, workspace_id: uuid.UUID, symbol: str
+) -> set[str]:
+    """Every non-empty `Order.broker_order_id` this system has already
+    recorded against `symbol` in this workspace -- both entry and exit
+    orders, from any trading session (a restart can start a new
+    `TradingSession` row mid-day, and an earlier session's claimed orders
+    must still count). Not date-scoped beyond that: `symbol` already encodes
+    the expiry (e.g. `NIFTY18AUG26C24400`), so a prior week's contract can
+    never collide here.
+
+    Built 2026-09-03 as part of `_attempt_auto_repair`'s fill-matching fix --
+    see that function's own docstring for why this exists.
+    """
+    rows = (
+        db.query(Order.broker_order_id)
+        .join(OptionContract, OptionContract.id == Order.option_contract_id)
+        .filter(
+            Order.workspace_id == workspace_id,
+            OptionContract.symbol == symbol,
+            Order.broker_order_id != "",
+        )
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
 def _attempt_auto_repair(
     db: Session,
     broker: BrokerPort,
@@ -161,6 +188,34 @@ def _attempt_auto_repair(
       scope (multi-leg partial exits already have their own, unrelated
       code path, `exit_legs.py`); an inexact match falls through to the
       existing alert/escalate path rather than closing on a guess.
+
+    **2026-09-03 fix -- candidate fills are now filtered, not just the first
+    qty/side match taken.** `get_recent_trades` returns every fill for
+    `symbol` *today*, not just fills relevant to this one position -- a
+    routine same-day re-entry on the same strike (this codebase's own
+    strategies do this) can leave an earlier, already-closed position's exit
+    fill in that list with the identical side/qty as the position actually
+    being repaired now. Taking the first list match risked closing the
+    *current* position at a *stale* price from an unrelated earlier trade.
+    Now: (1) drop any fill whose `broker_order_id` this system has already
+    recorded against an `Order` on this symbol (i.e. anything this app
+    itself placed, entry or exit -- see `_already_claimed_broker_order_ids`)
+    -- this is exact and doesn't depend on the fill's own timestamp; (2)
+    drop any fill older than `position.opened_at` as a second, weaker layer
+    (weaker because the real fill timestamp field is itself unconfirmed
+    against a live account -- `normalizer.parse_trade_fill` falls back to
+    "now" when none of its three guessed field names match, which trivially
+    passes this filter); (3) among what's left, prefer the most recently
+    timestamped fill rather than assuming `get_recent_trades`'s own list
+    order is chronological (undocumented); (4) if more than one fill with a
+    *different* `broker_order_id` still remains after (1)-(2), it's
+    genuinely ambiguous -- decline exactly like a real "no match", per this
+    function's own "never guess" scope above. A fill with no
+    `broker_order_id` at all (the field is best-effort, see
+    `normalizer.parse_trade_fill`) is never collapsed together with another
+    such fill for this ambiguity check -- two distinct orphaned fills that
+    both happen to be missing an id must still count as two, not silently
+    resolve to whichever `max()` picks.
     """
     if order_mode != OrderMode.LIVE or local_qty == 0:
         return False
@@ -194,10 +249,35 @@ def _attempt_auto_repair(
         )
         return False
 
-    match = next(
-        (f for f in fills if f.side == closing_side and f.qty == abs(local_qty)),
-        None,
-    )
+    candidates = [f for f in fills if f.side == closing_side and f.qty == abs(local_qty)]
+    if not candidates:
+        return False
+
+    claimed = _already_claimed_broker_order_ids(db, trading_session.workspace_id, symbol)
+    unclaimed = [f for f in candidates if f.broker_order_id not in claimed]
+    recent_enough = [f for f in unclaimed if f.ts >= position.opened_at]
+
+    # A fill with no broker_order_id (the field is best-effort on some real
+    # payloads -- see normalizer.parse_trade_fill) must never collapse
+    # together with another such fill under one "" key: that would hide a
+    # real ambiguity between two genuinely different orphaned fills instead
+    # of declining on it.
+    distinct_fill_keys = {
+        f.broker_order_id if f.broker_order_id else f"<no-id>:{i}"
+        for i, f in enumerate(recent_enough)
+    }
+    if len(distinct_fill_keys) > 1:
+        logger.warning(
+            "reconciliation auto-repair found %d ambiguous candidate fills for %s "
+            "(position %s) -- declining rather than guessing: %s",
+            len(distinct_fill_keys),
+            symbol,
+            position.id,
+            [(f.broker_order_id, f.qty, f.avg_price, f.ts.isoformat()) for f in recent_enough],
+        )
+        return False
+
+    match = max(recent_enough, key=lambda f: f.ts, default=None)
     if match is None:
         return False
 
