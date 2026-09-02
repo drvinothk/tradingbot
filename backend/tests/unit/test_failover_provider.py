@@ -467,7 +467,12 @@ def test_recovery_timer_resets_on_a_drop_mid_window(make_provider):
     assert provider.active_provider_name == "angel_one"
 
 
-def test_recovery_unsubscribes_backup_and_flips_back(make_provider):
+def test_recovery_disconnects_backup_and_flips_back(make_provider):
+    """2026-09-02: recovery fully disconnects backup (stops its WS thread),
+    not just unsubscribe_ticks -- see failover.py's _stop_backup docstring
+    for the real incident (a recovered-but-still-connected backup silently
+    retrying dead credentials forever) this closes.
+    """
     primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
     provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
     _subscribe_and_trip_to_backup(provider, primary, clock)
@@ -482,7 +487,15 @@ def test_recovery_unsubscribes_backup_and_flips_back(make_provider):
     provider.run_once()
 
     assert provider.active_provider_name == "shoonya"
-    assert backup.unsubscribe_calls == [["NIFTY"]]
+    assert backup.disconnect_calls == 1
+
+    # A later real trip must resume cleanly -- exactly as if backup had
+    # never been subscribed at all (fresh subscribe_ticks call, not blocked
+    # by a stale backoff window left over from before the disconnect).
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+    assert backup.subscribe_calls == [["NIFTY"], ["NIFTY"]]
 
 
 def test_get_latest_tick_and_get_price_history_reflect_active_leg(make_provider):
@@ -754,7 +767,7 @@ def test_manual_override_to_backup_subscribes_and_activates_it(make_provider):
     assert backup.subscribe_calls == [["NIFTY"]]
 
 
-def test_manual_override_to_primary_does_not_touch_backup(make_provider):
+def test_manual_override_to_primary_does_not_touch_a_dormant_backup(make_provider):
     primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
     provider = make_provider(primary, backup, clock)
     provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
@@ -763,6 +776,48 @@ def test_manual_override_to_primary_does_not_touch_backup(make_provider):
 
     assert provider.active_provider_name == "shoonya"
     assert backup.subscribe_calls == []
+    assert backup.disconnect_calls == 0
+
+
+def test_manual_override_to_primary_stops_an_already_active_backup(make_provider):
+    """2026-09-02: the real incident this closes -- overriding back to
+    primary while backup was already active (e.g. from an earlier automatic
+    trip, or a previous override) must stop backup's connection outright,
+    not just leave it subscribed-but-inactive. Without this, backup keeps
+    reconnecting in the background forever on its own schedule, invisible
+    since nothing polls an inactive backup's health -- exactly what let
+    Alice Blue hammer a dead session with `createWsSess` every ~30-40s
+    indefinitely after the override moved away from it.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    provider.set_manual_override("angel_one")
+    assert backup.subscribe_calls == [["NIFTY"]]
+
+    provider.set_manual_override("shoonya")
+
+    assert provider.active_provider_name == "shoonya"
+    assert provider.manual_override == "shoonya"
+    assert backup.disconnect_calls == 1
+
+
+def test_manual_override_back_to_backup_resumes_after_being_stopped(make_provider):
+    """Switching to backup, away from it (stopping it), then back to it
+    again must resume cleanly -- a fresh subscribe, not blocked by the
+    stopped state or a stale backoff window.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock)
+    provider.subscribe_ticks(["NIFTY"], on_tick=lambda t: None)
+    provider.set_manual_override("angel_one")
+    provider.set_manual_override("shoonya")
+    assert backup.disconnect_calls == 1
+
+    provider.set_manual_override("angel_one")
+
+    assert provider.active_provider_name == "angel_one"
+    assert backup.subscribe_calls == [["NIFTY"], ["NIFTY"]]
 
 
 def test_manual_override_rejects_an_unrecognized_provider_name(make_provider):

@@ -40,7 +40,10 @@ on the first real failover trip — holding a live backup connection open at
 all times would mean an unconditional login on every process start for a
 feed this project has already flagged as fragile (Angel One's proxy
 dependency, rate limits), for zero benefit while primary is healthy. Once
-recovered, backup is explicitly unsubscribed again.
+recovered, backup is explicitly disconnected again (2026-09-02: a full
+`disconnect()`, not just `unsubscribe_ticks()` -- see `_stop_backup`'s own
+docstring for why leaving the connection alive was a real live bug, not a
+harmless no-op).
 
 Only the active leg's ticks are ever forwarded to the caller's `on_tick` —
 the inactive leg's ticks still update its own health timestamp (needed to
@@ -294,6 +297,17 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         unaffected either way -- `_last_primary_tick_at` keeps updating
         regardless of `_active`, so recovery health data isn't stale by the
         time the override is cleared).
+
+        2026-09-02: forcing *to* the primary leg while backup is currently
+        subscribed now also stops it (`_stop_backup`) -- previously this
+        left an already-subscribed backup's connection alive and
+        reconnecting in the background indefinitely, since `run_once`'s own
+        `_check_recovery` (the only other thing that would ever stop it)
+        never runs while an override is set. See `_stop_backup`'s own
+        docstring for the real incident this closes. Forcing *to* the
+        backup leg is unaffected by this -- that path already resubscribes
+        via `_ensure_backup_subscribed` above, which for a backup stopped
+        this way behaves exactly as if it had never been subscribed.
         """
         if provider_name is not None and provider_name not in (
             self._primary_name,
@@ -311,6 +325,9 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
                 f"Failed to subscribe backup provider {self._backup_name!r} for the "
                 "manual override -- not applied."
             )
+
+        if provider_name == self._primary_name and self._backup_subscribed:
+            self._stop_backup(reason="manual override moved to primary")
 
         with self._lock:
             if provider_name is not None:
@@ -702,6 +719,53 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._backup_subscribed = True
         return True
 
+    def _stop_backup(self, *, reason: str) -> None:
+        """Fully tears down the backup connection -- `disconnect()`, not
+        just `unsubscribe_ticks()` -- so its WS thread actually stops
+        instead of continuing to reconnect in the background forever.
+        Shared by `_check_recovery` (primary restored) and
+        `set_manual_override` (forced away from backup).
+
+        2026-09-02: before this existed, both call sites only called
+        `unsubscribe_ticks()`, which drops symbol callbacks but leaves the
+        backup provider's own connection/thread alive and reconnecting on
+        its own schedule -- nothing ever polls an inactive backup's health
+        again once it's unsubscribed. Live-confirmed root cause of a real
+        incident: Alice Blue (backup) tripped in automatically several
+        times on 2026-08-31/09-01, each time recovering via the
+        unsubscribe-only path above -- so its `AliceBlueWSClient` kept
+        running unattended, and once its cached session eventually
+        expired, it silently hammered `createWsSess` with dead credentials
+        every ~30-40s indefinitely, invisible until an operator happened to
+        grep the logs. `disconnect()` is the one `BaseMarketDataProvider`
+        method every provider guarantees (an `@abstractmethod`, same
+        reasoning as this class's own `close()` above) -- it's the correct
+        full stop.
+
+        Resuming later — a fresh automatic trip, or a manual override back
+        to backup — goes through `_ensure_backup_subscribed` ->
+        `subscribe_ticks()` exactly as if backup had never been subscribed
+        at all; for `AliceBlueMarketDataProvider` specifically that
+        reconstructs a brand new `AliceBlueWSClient` against whatever
+        session is live *then*, catching a since-expired token at the next
+        real reconnect attempt instead of silently retrying a doomed one
+        forever in between.
+
+        Resets `_next_backup_attempt_at` too, so a stale backoff window
+        from before this call can't block that next resume.
+        """
+        try:
+            self._backup.disconnect()
+        except Exception:
+            logger.exception(
+                "Failed to disconnect backup provider %r (%s) -- continuing anyway, "
+                "its ticks are simply dropped since it's no longer active",
+                self._backup_name,
+                reason,
+            )
+        self._backup_subscribed = False
+        self._next_backup_attempt_at = None
+
     def _check_recovery(self, now: float) -> None:
         if not is_data_flow_expected(self._now_ist_provider()):
             # Symmetry with _check_primary_health -- see module docstring's
@@ -756,12 +820,4 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             message=recovery_message,
             dedup_suffix="recovered",
         )
-        try:
-            self._backup.unsubscribe_ticks(sorted(self._symbols))
-        except Exception:
-            logger.exception(
-                "Failed to unsubscribe backup provider %r after recovery — continuing "
-                "anyway, its ticks are simply dropped since it's no longer active",
-                self._backup_name,
-            )
-        self._backup_subscribed = False
+        self._stop_backup(reason="primary recovered")
