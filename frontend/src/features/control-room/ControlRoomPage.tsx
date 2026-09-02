@@ -501,8 +501,20 @@ function TodaysActivityCard({
 }) {
   const anyLive = runs.some((r) => r.is_live)
 
+  // A live_enabled session can hold both live-routed and FORCE_PAPER
+  // strategies together (no separate mock-broker session exists in that
+  // case -- see useSessionBuckets' own docstring) -- so when there's no
+  // distinct paper session, fall back to the live session's own id and let
+  // the server-side `mode=paper` filter do the real scoping (exactly what
+  // build_daily_report's `mode` param exists for). Without this fallback
+  // the report query never fires at all (disabled on a null session id),
+  // so Total Cost/Win Rate/Drawdown/Largest Loss/Largest Profit silently
+  // render as '--' even though the trade rows themselves (session-
+  // independent, keyed off each row's own mode) show real data.
+  const paperReportSessionId = paperSessionId ?? liveSessionId
+
   const liveMetrics = useScopeMetrics(liveSessionId, 'live', liveRows, runs)
-  const paperMetrics = useScopeMetrics(paperSessionId, 'paper', paperRows, runs)
+  const paperMetrics = useScopeMetrics(paperReportSessionId, 'paper', paperRows, runs)
 
   const primaryMetrics = anyLive ? liveMetrics : paperMetrics
   const primaryLabel = anyLive ? 'Live' : 'Paper'
