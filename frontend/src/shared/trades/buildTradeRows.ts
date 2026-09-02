@@ -13,6 +13,7 @@ export type TradeRowStatus =
   | 'position_open'
   | 'closing'
   | 'rejected'
+  | 'cancelled'
   | 'closed'
 
 export interface TradeRow {
@@ -40,6 +41,13 @@ export interface TradeRow {
   trailStopPrice: number | null
   pnl: number | null
   isPnlRealized: boolean
+  // Position.entry_slippage / net TradeOutcome.slippage -- positive means a
+  // favorable fill relative to what was intended. Both null for any row
+  // that isn't a position (pending approval, order-sent, in-flight exit --
+  // none of those have a fill/close to measure yet); exitSlippage stays
+  // null while the position is still open too.
+  entrySlippage: number | null
+  exitSlippage: number | null
   // How the position actually closed (target/stop/trail/manual/eod/...) --
   // `null` until the position closes (or for row types that never carry a
   // TradeOutcome at all, e.g. pending approvals/orders).
@@ -82,10 +90,17 @@ const STATUS_ORDER: Record<TradeRowStatus, number> = {
   position_open: 2,
   closing: 3,
   rejected: 4,
-  closed: 5,
+  cancelled: 5,
+  closed: 6,
 }
 
-const REJECTED_ORDER_STATUSES = new Set(['rejected', 'cancelled'])
+// Both statuses mean "this order never became/stayed a fill" -- used for
+// control flow (should this order still be treated as in-flight?). The
+// *displayed* status is NOT collapsed from this any more (see below) -- a
+// broker-rejected order and a system-cancelled order (e.g. a resting
+// protective stop cancelled because the position exited a different way)
+// are materially different and must render as different statuses/labels.
+const TERMINAL_UNFILLED_ORDER_STATUSES = new Set(['rejected', 'cancelled'])
 
 /** Resolves the lot size for a tradable-contract symbol (e.g.
  * "NIFTY25AUG26C24250") by matching it against `GET /instruments`'
@@ -174,6 +189,8 @@ export function buildTradeRows(
         trailStopPrice: null,
         pnl: null,
         isPnlRealized: false,
+        entrySlippage: null,
+        exitSlippage: null,
         exitReason: null,
         openedAt: null,
         closedAt: null,
@@ -195,14 +212,14 @@ export function buildTradeRows(
   const positionIdsWithPendingExit = new Set<string>()
 
   for (const order of orders) {
-    const isRejectedOrCancelled = REJECTED_ORDER_STATUSES.has(order.status)
+    const isTerminalUnfilled = TERMINAL_UNFILLED_ORDER_STATUSES.has(order.status)
     const isExitOrder = Boolean(order.position_id)
 
     if (order.status === 'filled') {
       continue // filled orders are represented by their resulting Position row instead
     }
 
-    if (isExitOrder && !isRejectedOrCancelled) {
+    if (isExitOrder && !isTerminalUnfilled) {
       // In-flight exit order -- previously dropped silently (its
       // position_id made it look like "already represented by the
       // Position row"), which left a submitted-but-unfilled exit
@@ -230,6 +247,8 @@ export function buildTradeRows(
         trailStopPrice: null,
         pnl: null,
         isPnlRealized: false,
+        entrySlippage: null,
+        exitSlippage: null,
         exitReason: null,
         openedAt: null,
         closedAt: null,
@@ -241,15 +260,18 @@ export function buildTradeRows(
       continue
     }
 
-    // Entry orders (order-sent / rejected), and rejected/cancelled exit
-    // orders (which fall back to the same 'rejected' treatment as before).
+    // Entry orders (order-sent / rejected), and terminal-unfilled exit
+    // orders -- a cancelled exit order (e.g. a resting protective stop
+    // cancelled because the position exited a different way, like a
+    // structure-break) is a distinct, non-alarming outcome from a broker
+    // rejection and must not share its status or label.
     const label = order.strategy_type
       ? friendlyTradeLabel(order.strategy_type, order.contract_symbol, order.submitted_at)
-      : `Order · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
+      : `${isExitOrder ? 'Exit order' : 'Order'} · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
     const orderLotSize = resolveLotSize(order.contract_symbol, instruments)
     rows.push({
       key: `order-${order.id}`,
-      status: isRejectedOrCancelled ? 'rejected' : 'order_sent',
+      status: order.status === 'cancelled' ? 'cancelled' : order.status === 'rejected' ? 'rejected' : 'order_sent',
       label,
       strategyType: order.strategy_type,
       strike: order.strike,
@@ -264,6 +286,8 @@ export function buildTradeRows(
       trailStopPrice: null,
       pnl: null,
       isPnlRealized: false,
+      entrySlippage: null,
+      exitSlippage: null,
       exitReason: null,
       openedAt: null,
       closedAt: null,
@@ -308,6 +332,8 @@ export function buildTradeRows(
       trailStopPrice: position.trail_stop_price,
       pnl: isOpen ? position.unrealized_pnl : position.realized_pnl,
       isPnlRealized: !isOpen,
+      entrySlippage: position.entry_slippage,
+      exitSlippage: isOpen ? null : position.exit_slippage,
       exitReason: isOpen ? null : position.exit_reason,
       openedAt: position.opened_at,
       closedAt: position.closed_at,

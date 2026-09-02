@@ -525,33 +525,53 @@ tbody tr:hover {
    row). Flex-basis sizes each box to what its own stat count actually
    needs and reflows box-by-box as space runs out, instead of reserving
    whole grid tracks. */
+/* Single row, always -- previously wrapped to a second row on shorter
+   screens once the 4 boxes' combined min-width exceeded the container.
+   Decimal-free values (see fmtAmt in ControlRoomPage.tsx) freed up enough
+   horizontal room that a plain nowrap + trimmed-down per-box min-widths
+   below is now enough to keep this on one line on real screen sizes;
+   overflow-x is just a safety net for an unrealistically narrow viewport
+   rather than the primary fix. */
 .metrics-strip {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 0.9rem;
   margin-bottom: 1.25rem;
+  overflow-x: auto;
 }
 
 .metric-box {
-  flex: 1 1 210px;
-  min-width: 210px;
+  flex: 1 1 190px;
+  min-width: 150px;
 }
 
-/* P&L (+Total Cost+Win Rate) and Total Drawdown (+Largest Loss+Largest
-   Profit) each carry a 3-way split now instead of 2 -- sized wider than a
-   plain .metric-box, but only as much as a third short stat column
+/* Realized Profit / Unrealized P&L / Cost+Win Rate and Total Drawdown
+   (+Largest Loss+Largest Profit) each carry a 3-way split -- sized wider
+   than a plain .metric-box, but only as much as a third short stat column
    actually needs, not a full doubled track. */
 .metric-box-wide {
-  flex: 1 1 300px;
-  min-width: 300px;
+  flex: 1 1 280px;
+  min-width: 230px;
 }
 
-/* Today's Activity split boxes (P&L+WinRate, TotalTrades+OpenTrades,
-   MaxDrawdown+LargestLoss, OpenRisk+PotentialProfit) -- main stat on the
-   left keeps the box's existing look untouched, secondary stat on the
-   right is visually subordinate (muted color, no bold weight) but the same
-   font size as the main value per design, divided by the same left-border
-   pattern .global-settings-split already established. */
+/* Open Risk + Potential Profit doesn't need as much room as the other
+   split boxes -- narrower than the plain .metric-box default so the whole
+   strip fits on one row; relies on the same label-wrapping behaviour as
+   "Largest Single Loss" above (metric-label has no white-space: nowrap,
+   so a long label naturally wraps to 2 lines in a narrow secondary
+   column instead of forcing the box wider). */
+.metric-box-narrow {
+  flex: 1 1 150px;
+  min-width: 130px;
+}
+
+/* Today's Activity split boxes (Realized Profit+Unrealized P&L+Cost/Win
+   Rate, TotalTrades+OpenTrades, MaxDrawdown+LargestLoss+LargestProfit,
+   OpenRisk+PotentialProfit) -- main stat(s) on the left keep the box's
+   existing look untouched, secondary stat on the right is visually
+   subordinate (muted color, no bold weight) but the same font size as the
+   main value per design, divided by the same left-border pattern
+   .global-settings-split already established. */
 .metric-box-split {
   display: flex;
   align-items: flex-start;
@@ -561,6 +581,15 @@ tbody tr:hover {
 .metric-box-main {
   flex: 2 1 auto;
   min-width: 0;
+}
+
+/* The P&L box now has two full-weight main stats side by side (Realized
+   Profit, Unrealized P&L) -- divide them the same way a main/secondary
+   pair is already divided, without touching either's color/weight (both
+   stay full-weight, unlike a muted .metric-box-secondary). */
+.metric-box-main + .metric-box-main {
+  border-left: 1px solid var(--border);
+  padding-left: 1rem;
 }
 
 .metric-box-secondary {
@@ -577,6 +606,34 @@ tbody tr:hover {
 .metric-box-secondary .metric-value {
   color: var(--text-muted);
   font-weight: 600;
+}
+
+/* Cost/Win Rate stacked column on the right of the P&L box -- two
+   label+value pairs stacked in the same vertical space a single
+   .metric-box-secondary stat would normally take, so adding this column
+   doesn't grow the card's height. Deliberately smaller font than
+   .metric-box-secondary (which only ever holds one stat) to fit both. */
+.metric-box-stacked {
+  flex: 0 0 auto;
+  min-width: 92px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.25rem;
+  border-left: 1px solid var(--border);
+  padding-left: 1rem;
+}
+
+.metric-box-stacked-item .metric-label {
+  color: var(--text-muted);
+  font-size: 0.62rem;
+  margin-bottom: 0.1rem;
+}
+
+.metric-box-stacked-item .metric-value {
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.9rem;
 }
 
 /* Paper sub-ribbon under the main (Live) metrics-strip, shown only once a
@@ -596,19 +653,42 @@ tbody tr:hover {
   margin-bottom: 0.5rem;
 }
 
+/* These three must stay smaller than the primary strip's own .metric-box/
+   .metric-box-wide/.metric-box-narrow sizes above (230/150/130px), not
+   just smaller than their own pre-single-row-fix values -- the primary
+   strip shrank as part of forcing a single row (see its own comment); if
+   the substrip doesn't shrink at least as much, its *larger* total width
+   means it alone overflows nowrap+overflow-x and the right-hand boxes
+   silently scroll out of view instead of wrapping like they used to. This
+   was a real regression, caught after that fix (2026-09-02): substrip
+   sizes here were left at their old values while the primary strip's
+   were tightened around them. */
 .metrics-substrip .metric-box {
-  flex-basis: 170px;
-  min-width: 170px;
+  flex-basis: 130px;
+  min-width: 110px;
   padding: 0.6rem 0.75rem;
 }
 
 .metrics-substrip .metric-box-wide {
-  flex-basis: 250px;
-  min-width: 250px;
+  flex-basis: 190px;
+  min-width: 160px;
+}
+
+.metrics-substrip .metric-box-narrow {
+  flex-basis: 100px;
+  min-width: 90px;
 }
 
 .metrics-substrip .metric-box .metric-value {
   font-size: 1.1rem;
+}
+
+/* Same-specificity override of the rule above, placed after it so the
+   cascade picks this one -- the stacked Cost/Win Rate column needs to stay
+   smaller than the substrip's own already-shrunk 1.1rem, or the two
+   stacked rows no longer fit the shorter substrip box height. */
+.metrics-substrip .metric-box-stacked .metric-value {
+  font-size: 0.72rem;
 }
 
 .metrics-substrip .metric-box .metric-label,

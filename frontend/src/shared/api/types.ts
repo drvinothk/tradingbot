@@ -219,6 +219,9 @@ export interface PositionLegOut {
   trail_stop_price: number | null
   exit_reason: string | null
   realized_pnl: number | null
+  // PositionExitLeg.slippage -- signed_pnl(intended trigger, actual exit),
+  // same convention as PositionOut.exit_slippage below, scoped to this leg.
+  slippage: number | null
   closed_at: string | null
 }
 
@@ -243,9 +246,16 @@ export interface PositionOut {
   stop_price: number | null
   trail_stop_price: number | null
   ltp: number | null
+  // Position.entry_slippage -- signed_pnl(actual fill, intended entry
+  // price), positive = favorable entry fill. Set once at open; null only
+  // for a position that predates this column.
+  entry_slippage: number | null
   unrealized_pnl: number | null
   exit_price: number | null
   realized_pnl: number | null
+  // Net TradeOutcome.slippage across every closed leg -- null while still
+  // open (no TradeOutcome exists yet).
+  exit_slippage: number | null
   // How the position actually closed (target/stop/trail/manual/eod/...) --
   // `null` for an open position or one with no recorded outcome yet.
   exit_reason: string | null
@@ -269,6 +279,21 @@ export interface SquareOffPositionOut {
   slippage?: number
   exit_reason?: string
   closed_at?: string
+}
+
+// POST /positions/{id}/manual-reconcile -- fallback for a position stuck
+// OPEN that neither a normal exit retry nor reconciliation's own
+// auto-repair (which tries the broker's own order history first) could
+// resolve. Always succeeds or 4xxs (no partial/`success: false` shape the
+// way SquareOffPositionOut has, since this is a direct correction, not an
+// order placement that can be left pending).
+export interface ManualReconcilePositionOut {
+  success: boolean
+  position_id: string
+  exit_price: number
+  realized_pnl: number
+  exit_reason: string
+  closed_at: string
 }
 
 export interface DailyLimitsOut {
@@ -316,7 +341,9 @@ export interface PerformanceStatsOut {
   largest_single_loss: number
   largest_single_win: number
   total_realized_pnl: number
+  // Exit-side only -- see total_entry_slippage below.
   total_slippage: number
+  total_entry_slippage: number
   total_cost: number
   signal_count: number
   dispatched_count: number

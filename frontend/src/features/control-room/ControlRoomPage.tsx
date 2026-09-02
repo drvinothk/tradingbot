@@ -11,23 +11,36 @@ import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared
 import { exitReasonLabel, stagedExitSummary, strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
   DailyReportOut,
+  ManualReconcilePositionOut,
   RunningStrategyOut,
   SessionOut,
   SquareOffPositionOut,
 } from '../../shared/api/types'
 
 // Rows that actually reached a live position today -- excludes
-// 'pending_approval' (nothing fired yet) and 'rejected' (never became a
-// trade). Shared by the Live Trades Today tile, the per-strategy table, and
-// the MTM per-lot calc so all three numbers agree with each other.
+// 'pending_approval' (nothing fired yet), 'rejected' (broker refused it),
+// and 'cancelled' (withdrawn before it could fill -- never became a trade
+// either way). Shared by the Live Trades Today tile, the per-strategy
+// table, and the MTM per-lot calc so all three numbers agree with each
+// other.
 const REAL_TRADE_STATUSES = new Set<TradeRowStatus>(['position_open', 'closing', 'closed'])
 
 const STATUS_LABELS: Record<TradeRowStatus, string> = {
   pending_approval: 'Pending Approval',
   order_sent: 'Order Sent',
   position_open: 'Position Open',
-  closing: 'Closing (exit sent)',
+  // A resting SL/TSL/target exit order that's already live at the broker,
+  // just not yet triggered/filled -- "Closing (exit sent)" read as if the
+  // position were already in the process of closing, when really nothing
+  // has happened yet at the broker beyond placing the order.
+  closing: 'Exit order sent — awaiting trigger',
   rejected: 'Rejected',
+  // Distinct from 'rejected': the broker never refused this order -- it was
+  // withdrawn (most commonly a resting protective SL/TSL cancelled because
+  // the position ended up exiting a different way, e.g. a structure-break
+  // exit). Previously collapsed into 'Rejected', which misread a routine,
+  // expected cancellation as a broker error.
+  cancelled: 'Cancelled',
   closed: 'Closed',
 }
 
@@ -37,6 +50,9 @@ const STATUS_BADGE_CLASS: Record<TradeRowStatus, string> = {
   position_open: 'badge-success',
   closing: 'badge-warning',
   rejected: 'badge-live',
+  // Neutral, not alarming -- a cancellation isn't a failure state the way a
+  // broker rejection is.
+  cancelled: 'badge',
   closed: 'badge',
 }
 
@@ -53,6 +69,15 @@ const EMERGENCY_MODES = new Set(['kill_switch', 'degraded_mode', 'reconciliation
 // dependency checks the way `?? []` (a fresh array literal every render)
 // would.
 const EMPTY_RUNS: RunningStrategyOut[] = []
+
+// Every currency/amount figure on this page is now shown rounded to the
+// nearest whole rupee -- decimals add no decision-relevant precision at a
+// glance and cost horizontal space this page is otherwise tight on. Only
+// applies to display -- the underlying numbers (from the API, used for
+// sorting/summing/comparisons) are untouched.
+function fmtAmt(value: number): string {
+  return Math.round(value).toString()
+}
 
 export function ControlRoomPage() {
   const queryClient = useQueryClient()
@@ -380,9 +405,26 @@ interface ScopeMetrics {
   perLotPnl: number | null
   totalLots: number
   realTradeCount: number
+  // Rows that have actually closed -- excludes 'position_open'/'closing',
+  // which are still live trades in progress, not "trades" for a Total
+  // Trades count. See `report?.trade_count` (server-side, TradeOutcome-
+  // backed, same closed-only definition) which is preferred once loaded;
+  // this is only the client-side fallback used before that query resolves
+  // or when there's no session at all.
+  closedTradeCount: number
   openTrades: number
   openRisk: number | null
   potentialProfit: number | null
+  // P&L from trades that have already closed today (TradeRow.pnl on a
+  // 'closed' row is Position.realized_pnl) -- distinct from the
+  // still-moving unrealized figure below, and from "Potential Profit"
+  // (an estimate of what a still-open position would net if its target
+  // were hit, not what it's worth right now).
+  realizedPnl: number
+  // The running/live P&L of positions that are open right now (Position
+  // .unrealized_pnl as of the last tick) -- marks-to-market, not a
+  // hypothetical target-hit estimate.
+  unrealizedPnl: number
 }
 
 function useScopeMetrics(
@@ -409,6 +451,11 @@ function useScopeMetrics(
   const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
   const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
   const openTrades = rows.filter((r) => r.status === 'position_open').length
+  const closedRows = rows.filter((r) => r.status === 'closed')
+  const openRows = rows.filter((r) => r.status === 'position_open')
+  const closedTradeCount = closedRows.length
+  const realizedPnl = closedRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  const unrealizedPnl = openRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
 
   // Open risk/potential profit are scoped the same way -- only positions
   // belonging to strategies in this scope, so Live never mixes a paper
@@ -429,10 +476,13 @@ function useScopeMetrics(
     perLotPnl,
     totalLots,
     realTradeCount: realTradeRows.length,
+    closedTradeCount,
     openTrades,
     openRisk: openRisks.length > 0 ? openRisks.reduce((sum, v) => sum + v, 0) : null,
     potentialProfit:
       potentialProfits.length > 0 ? potentialProfits.reduce((sum, v) => sum + v, 0) : null,
+    realizedPnl,
+    unrealizedPnl,
   }
 }
 
@@ -493,41 +543,56 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
         : report.trade_count > 1
           ? `${Math.round(report.win_rate * 100)}%`
           : '—'
+  // Closed-trade count only -- an open position isn't a "trade" for this
+  // headline number yet (it has its own Open Trades box next to it).
+  // `report.trade_count` (server-side, once loaded) is already scoped this
+  // way -- see build_daily_report's docstring -- so it's preferred; the
+  // client-side fallback (before the report loads, or with no session at
+  // all) must match that same closed-only definition rather than falling
+  // back to `realTradeCount`, which used to include open/closing rows.
   const totalTradesDisplay =
-    sessionId === null ? metrics.realTradeCount : (report?.trade_count ?? metrics.realTradeCount)
-  const maxDrawdownDisplay =
-    sessionId === null ? '—' : report ? report.max_drawdown.toFixed(2) : '…'
+    sessionId === null ? metrics.closedTradeCount : (report?.trade_count ?? metrics.closedTradeCount)
+  const maxDrawdownDisplay = sessionId === null ? '—' : report ? fmtAmt(report.max_drawdown) : '…'
   const largestLossDisplay =
-    sessionId === null ? '—' : report ? report.largest_single_loss.toFixed(2) : '…'
+    sessionId === null ? '—' : report ? fmtAmt(report.largest_single_loss) : '…'
   const largestWinDisplay =
-    sessionId === null ? '—' : report ? report.largest_single_win.toFixed(2) : '…'
-  const totalCostDisplay =
-    sessionId === null ? '—' : report ? report.total_cost.toFixed(2) : '…'
+    sessionId === null ? '—' : report ? fmtAmt(report.largest_single_win) : '…'
+  const totalCostDisplay = sessionId === null ? '—' : report ? fmtAmt(report.total_cost) : '…'
 
   return (
     <>
+      {/* Realized Profit (left) / Unrealized P&L (middle) / Cost+Win Rate
+          (right, stacked -- same overall box height as the two main
+          columns, smaller font to fit two label+value pairs in that
+          space). */}
       <div className="metric-box metric-box-split metric-box-wide">
         <div className="metric-box-main">
-          <div className="metric-label">P&amp;L</div>
+          <div className="metric-label">Realized Profit</div>
           <div className="metric-value">
-            <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-              {metrics.totalPnl >= 0 ? '+' : ''}
-              {metrics.totalPnl.toFixed(2)}
+            <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {metrics.realizedPnl >= 0 ? '+' : ''}
+              {fmtAmt(metrics.realizedPnl)}
             </span>
           </div>
-          <div className="metric-subvalue muted">
-            {metrics.perLotPnl !== null
-              ? `${metrics.perLotPnl >= 0 ? '+' : ''}${metrics.perLotPnl.toFixed(2)} / lot`
-              : '— / lot'}
+        </div>
+        <div className="metric-box-main">
+          <div className="metric-label">Unrealized P&amp;L</div>
+          <div className="metric-value">
+            <span className={metrics.unrealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+              {metrics.unrealizedPnl >= 0 ? '+' : ''}
+              {fmtAmt(metrics.unrealizedPnl)}
+            </span>
           </div>
         </div>
-        <div className="metric-box-secondary">
-          <div className="metric-label">Total Cost</div>
-          <div className="metric-value">{totalCostDisplay}</div>
-        </div>
-        <div className="metric-box-secondary">
-          <div className="metric-label">Win Rate</div>
-          <div className="metric-value">{winRateDisplay}</div>
+        <div className="metric-box-stacked">
+          <div className="metric-box-stacked-item">
+            <div className="metric-label">Total Cost</div>
+            <div className="metric-value">{totalCostDisplay}</div>
+          </div>
+          <div className="metric-box-stacked-item">
+            <div className="metric-label">Win Rate</div>
+            <div className="metric-value">{winRateDisplay}</div>
+          </div>
         </div>
       </div>
 
@@ -560,17 +625,17 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
         </div>
       </div>
 
-      <div className="metric-box metric-box-split">
+      <div className="metric-box metric-box-split metric-box-narrow">
         <div className="metric-box-main">
           <div className="metric-label">Open Risk</div>
           <div className="metric-value">
-            {metrics.openRisk !== null ? metrics.openRisk.toFixed(2) : '—'}
+            {metrics.openRisk !== null ? fmtAmt(metrics.openRisk) : '—'}
           </div>
         </div>
         <div className="metric-box-secondary">
           <div className="metric-label">Potential Profit</div>
           <div className="metric-value">
-            {metrics.potentialProfit !== null ? metrics.potentialProfit.toFixed(2) : '—'}
+            {metrics.potentialProfit !== null ? fmtAmt(metrics.potentialProfit) : '—'}
           </div>
         </div>
       </div>
@@ -728,7 +793,7 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
       key: `approval:${approval.approval_id}`,
       kind: 'approval' as const,
       badgeLabel: 'Approval',
-      message: `${strategyTypeLabel(run.strategy_type)} ${approval.side} ${approval.qty_lots} lot${approval.qty_lots === 1 ? '' : 's'} @ ${approval.entry_price.toFixed(2)}`,
+      message: `${strategyTypeLabel(run.strategy_type)} ${approval.side} ${approval.qty_lots} lot${approval.qty_lots === 1 ? '' : 's'} @ ${fmtAmt(approval.entry_price)}`,
       whenLabel: `expires ${new Date(approval.expires_at).toLocaleTimeString()}`,
       sortValue: new Date(approval.expires_at).getTime(),
     })),
@@ -842,7 +907,7 @@ function LiveTradesByStrategy({ liveRows }: { liveRows: TradeRow[] }) {
                   <td>
                     <span className={stats.pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
                       {stats.pnl >= 0 ? '+' : ''}
-                      {stats.pnl.toFixed(2)}
+                      {fmtAmt(stats.pnl)}
                     </span>
                   </td>
                   <td>
@@ -905,6 +970,7 @@ function TradeBucketCard({
   // filter state, so filtering one never affects the other.
   const [statusFilter, setStatusFilter] = useState<TradeRowStatus | 'all'>('all')
   const [strategyFilter, setStrategyFilter] = useState<string>('all')
+  const [optionTypeFilter, setOptionTypeFilter] = useState<'all' | 'CE' | 'PE'>('all')
 
   const unhiddenRows = rows.filter((r) => !hiddenRowKeys.has(r.key))
 
@@ -927,7 +993,8 @@ function TradeBucketCard({
   const visibleRows = unhiddenRows.filter(
     (r) =>
       (statusFilter === 'all' || r.status === statusFilter) &&
-      (strategyFilter === 'all' || r.strategyType === strategyFilter),
+      (strategyFilter === 'all' || r.strategyType === strategyFilter) &&
+      (optionTypeFilter === 'all' || r.optionType === optionTypeFilter),
   )
 
   // Totals row -- recomputed from visibleRows, so it updates live as the
@@ -971,6 +1038,25 @@ function TradeBucketCard({
     onError: (err) => onError(err instanceof ApiError ? err.message : 'Square-off failed'),
     onSettled: () => setActingRowKey(null),
   })
+  // Fallback for a position Square Off itself can't clear -- e.g. it's
+  // already exhausted its own automatic exit-order retries
+  // (exit_order_attempts_exhausted) or reconciliation's own broker-history
+  // auto-repair found no matching fill. A human who has independently
+  // confirmed the real exit price (the broker's own app, a contract note)
+  // can close the local record with it directly. Always closes the
+  // position's full remaining qty -- see the endpoint's own docstring.
+  const manualReconcileMutation = useMutation({
+    mutationFn: ({ positionId, exitPrice }: { positionId: string; exitPrice: number }) =>
+      api.post<ManualReconcilePositionOut>(`/positions/${positionId}/manual-reconcile`, {
+        exit_price: exitPrice,
+      }),
+    onSuccess: (result) => {
+      onChanged()
+      onError(`Manually reconciled — closed at ${fmtAmt(result.exit_price)}, P&L ${fmtAmt(result.realized_pnl)}.`)
+    },
+    onError: (err) => onError(err instanceof ApiError ? err.message : 'Manual reconcile failed'),
+    onSettled: () => setActingRowKey(null),
+  })
 
   return (
     <div className="card">
@@ -998,6 +1084,14 @@ function TradeBucketCard({
                 {strategyTypeLabel(s)}
               </option>
             ))}
+          </select>
+          <select
+            value={optionTypeFilter}
+            onChange={(e) => setOptionTypeFilter(e.target.value as 'all' | 'CE' | 'PE')}
+          >
+            <option value="all">CE &amp; PE</option>
+            <option value="CE">CE only</option>
+            <option value="PE">PE only</option>
           </select>
         </div>
       )}
@@ -1066,6 +1160,24 @@ function TradeBucketCard({
                       setActingRowKey(row.key)
                       squareOffMutation.mutate(row.positionId)
                     }}
+                    onManualReconcile={() => {
+                      if (!row.positionId) return
+                      const typed = window.prompt(
+                        'Manually close this position with a known real exit price ' +
+                          '(from the broker\'s own app or a contract note). This bypasses the ' +
+                          'normal exit path entirely -- only use it when Square Off has already ' +
+                          'failed and you have independently confirmed the real fill. Enter the ' +
+                          'exit price:',
+                      )
+                      if (typed === null) return
+                      const exitPrice = Number(typed)
+                      if (!Number.isFinite(exitPrice) || exitPrice <= 0) {
+                        onError(`"${typed}" is not a valid positive price.`)
+                        return
+                      }
+                      setActingRowKey(row.key)
+                      manualReconcileMutation.mutate({ positionId: row.positionId, exitPrice })
+                    }}
                     onHide={() => onHideRow(row.key)}
                     isPending={actingRowKey === row.key}
                   />
@@ -1081,7 +1193,7 @@ function TradeBucketCard({
                   <td>
                     <span className={totalsPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
                       {totalsPnl >= 0 ? '+' : ''}
-                      {totalsPnl.toFixed(2)}
+                      {fmtAmt(totalsPnl)}
                       {totalsHasOpenPosition ? ' (incl. open)' : ''}
                     </span>
                   </td>
@@ -1103,6 +1215,7 @@ function TradeRowView({
   onApprove,
   onReject,
   onSquareOff,
+  onManualReconcile,
   onHide,
   isPending,
 }: {
@@ -1110,6 +1223,7 @@ function TradeRowView({
   onApprove: () => void
   onReject: () => void
   onSquareOff: () => void
+  onManualReconcile: () => void
   onHide: () => void
   isPending: boolean
 }) {
@@ -1138,11 +1252,22 @@ function TradeRowView({
           '—'
         )}
       </td>
-      <td>{row.entryPrice !== null ? row.entryPrice.toFixed(2) : '—'}</td>
+      <td>
+        {row.entryPrice !== null ? fmtAmt(row.entryPrice) : '—'}
+        {row.entrySlippage !== null && (
+          <div
+            className={row.entrySlippage >= 0 ? 'pnl-positive' : 'pnl-negative'}
+            style={{ fontSize: '0.7rem' }}
+          >
+            slip {row.entrySlippage >= 0 ? '+' : ''}
+            {fmtAmt(row.entrySlippage)}
+          </div>
+        )}
+      </td>
       <td>
         {row.status === 'position_open' ? (
           row.ltp !== null ? (
-            row.ltp.toFixed(2)
+            fmtAmt(row.ltp)
           ) : (
             <span className="muted">
               — <span className="badge badge-wip">no tick yet</span>
@@ -1155,8 +1280,8 @@ function TradeRowView({
       <td>
         {row.targetPrice !== null || slTsl !== null ? (
           <>
-            {row.targetPrice !== null ? row.targetPrice.toFixed(2) : '—'} /{' '}
-            {slTsl !== null ? `${slTsl.toFixed(2)} (${slTslLabel})` : '—'}
+            {row.targetPrice !== null ? fmtAmt(row.targetPrice) : '—'} /{' '}
+            {slTsl !== null ? `${fmtAmt(slTsl)} (${slTslLabel})` : '—'}
           </>
         ) : (
           '—'
@@ -1166,11 +1291,20 @@ function TradeRowView({
         {row.pnl !== null ? (
           <span className={row.pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
             {row.pnl >= 0 ? '+' : ''}
-            {row.pnl.toFixed(2)}
+            {fmtAmt(row.pnl)}
             {row.isPnlRealized ? '' : ' (unrl.)'}
           </span>
         ) : (
           '—'
+        )}
+        {row.exitSlippage !== null && (
+          <div
+            className={row.exitSlippage >= 0 ? 'pnl-positive' : 'pnl-negative'}
+            style={{ fontSize: '0.7rem' }}
+          >
+            slip {row.exitSlippage >= 0 ? '+' : ''}
+            {fmtAmt(row.exitSlippage)}
+          </div>
         )}
       </td>
       <td>{isStaged ? stagedExitSummary(row.legs) : exitReasonLabel(row.exitReason)}</td>
@@ -1197,12 +1331,12 @@ function TradeRowView({
             </button>
           </div>
         )}
-        {(row.status === 'closed' || row.status === 'rejected') && !showMore && (
+        {(row.status === 'closed' || row.status === 'rejected' || row.status === 'cancelled') && !showMore && (
           <button className="btn-ghost" onClick={() => setShowMore(true)}>
             View more
           </button>
         )}
-        {(row.status === 'closed' || row.status === 'rejected') && showMore && (
+        {(row.status === 'closed' || row.status === 'rejected' || row.status === 'cancelled') && showMore && (
           <button className="btn-ghost" onClick={onHide}>
             Delete
           </button>
@@ -1220,6 +1354,16 @@ function TradeRowView({
             onClick={onSquareOff}
           >
             {row.hasPendingExit ? 'Exit sent...' : 'Square off'}
+          </button>
+        )}
+        {row.status === 'position_open' && showMore && (
+          <button
+            className="btn-ghost"
+            disabled={isPending}
+            title="Fallback for a position Square Off can't close -- enter a known real exit price to close it locally."
+            onClick={onManualReconcile}
+          >
+            Manual reconcile
           </button>
         )}
         {isStaged && (
@@ -1244,6 +1388,7 @@ function TradeRowView({
                 <th>Target</th>
                 <th>Exit Via</th>
                 <th>P&amp;L</th>
+                <th>Slippage</th>
                 <th>Closed</th>
               </tr>
             </thead>
@@ -1255,14 +1400,24 @@ function TradeRowView({
                   </td>
                   <td>{leg.kind}</td>
                   <td>{leg.qty}</td>
-                  <td>{leg.stop_price !== null ? leg.stop_price.toFixed(2) : '—'}</td>
-                  <td>{leg.target_price !== null ? leg.target_price.toFixed(2) : '—'}</td>
+                  <td>{leg.stop_price !== null ? fmtAmt(leg.stop_price) : '—'}</td>
+                  <td>{leg.target_price !== null ? fmtAmt(leg.target_price) : '—'}</td>
                   <td>{exitReasonLabel(leg.exit_reason)}</td>
                   <td>
                     {leg.realized_pnl !== null ? (
                       <span className={leg.realized_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
                         {leg.realized_pnl >= 0 ? '+' : ''}
-                        {leg.realized_pnl.toFixed(2)}
+                        {fmtAmt(leg.realized_pnl)}
+                      </span>
+                    ) : (
+                      '—'
+                    )}
+                  </td>
+                  <td>
+                    {leg.slippage !== null ? (
+                      <span className={leg.slippage >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                        {leg.slippage >= 0 ? '+' : ''}
+                        {fmtAmt(leg.slippage)}
                       </span>
                     ) : (
                       '—'
