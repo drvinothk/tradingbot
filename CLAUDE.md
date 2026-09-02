@@ -625,6 +625,109 @@ work, or vice versa.
 
 ## Known open items
 
+- **2026-09-02: first real live-trade day since the 2026-08-28 checklist —
+  most items confirmed, one real incident found and fixed same-day (commit
+  `206b7a0`), two follow-up gaps flagged by post-fix QC, not yet closed.**
+  Session flipped `paper_only -> live_enabled` at 10:59 IST (6 configs
+  live-routed: `Test`/oi_volume_confirmed, `Bank nifty`/orb,
+  `Test 4`/vwap_pullback, `Test 1`/ema_micro_pullback,
+  `VWAP_RSI_modified`/vwap_pullback_conviction, plus `ORB_Conviction`,
+  `OI_Volume_Conviction`, `EMA_Micro_Conviction`), back to `paper_only` at
+  14:49 IST.
+  - **Newly confirmed live**: the 2026-08-28 checklist's items 5/6/7 got a
+    third/fourth real confirmation (`reconciliation_lock` auto-recovery
+    restoring `live_enabled`, twice today — 12:22-12:24 and 14:06-14:48
+    IST). **New**: the multi-leg staged-exit engine (zero backtest/live
+    coverage before today, per the 2026-09-01 conviction-config entry
+    below) fired for real for the first time — `ORB_Conviction` (4 legs,
+    195/195/130/130 = 3/3/2/2 × 65 ✓), `EMA_Micro_Conviction` (3 legs,
+    260/195/195 = 4/3/3 ✓), `OI_Volume_Conviction` (same 4/3/3 ✓) all
+    closed with correct per-leg qty splits and differentiated exit kinds
+    (core/runner/tight/wide/target). Minor cosmetic finding, not fixed:
+    the parent `Position.qty` reads `0` for a multi-leg position (the real
+    qty only lives on `position_exit_legs`; `Order.filled_qty` is correct).
+    Telegram push confirmed firing correctly for `reconciliation_mismatch`/
+    `exit_order_unfilled`/`protective_stop_cancel_unresolved` while
+    `live_enabled` (the paper-suppression override worked). **Still no
+    evidence for**: explicit `params.qty_lots` override winning live, the
+    order-ack-timeout dup-order fallback, or Telegram push specifically for
+    `order_rejected`/`broker_disconnected` (zero of either category fired
+    today).
+  - **The incident**: at 14:07:50 IST Shoonya cancelled the resting exit
+    order for a live `VWAP_RSI_modified` position (broker-side, not
+    requested by this app). `close_position`'s retry loop used a *fixed*
+    `exit:{position.id}` idempotency key, so every later cycle found that
+    same dead CANCELLED order and never placed a new one — 29 identical
+    `exit_order_unfilled` alerts over 39 minutes with zero further action,
+    while the local `positions` row stayed OPEN and the broker was flat,
+    tripping `reconciliation_lock`. Same failure hit a `Test 1` position on
+    a different contract concurrently. Resolved by hand at the time: user
+    squared off both directly in the Shoonya app, then closed the local
+    records via a one-off manual correction using the real fill price.
+  - **Same-day fix, commit `206b7a0`** (merged with two other concurrent
+    sessions' unrelated work into `0f0016d`, pushed to `origin/main`, and
+    deployed+live-verified on OCI ~18:37 IST the same day — a real deploy
+    gotcha caught in the process: the tarball only packaged `backend/app/`,
+    silently missing a *different* session's new migration file that lives
+    outside that tree; caught by checking `alembic current` after the first
+    upgrade attempt instead of trusting its silence, fixed by scp'ing the
+    migration directly). `close_position` retries now get a fresh `:retryN`
+    idempotency key per attempt (capped at `_MAX_EXIT_ORDER_ATTEMPTS = 5`,
+    then a distinct `exit_order_attempts_exhausted` alert instead of
+    retrying forever). Three more fixes from the same incident chain:
+    `current_contract_price` now rejects a live option tick whose `ltp` >=
+    its own strike (catches a token-resolution mismatch — confirmed live,
+    a real NIFTY spot tick landed under an option contract's symbol key
+    and was trusted as its premium); `ShoonyaBrokerAdapter.cancel_order`
+    now follows up with `get_order_status` when the ack carries no status
+    field (Shoonya's real `CancelOrder` ack is always status-less/PENDING,
+    so `cancel_resting_protective_stop` could never previously confirm a
+    real cancel); the broker's own rejection/cancellation reason
+    (emsg/rejreason) is now persisted on `order_events` and surfaced in the
+    `exit_order_unfilled` alert text. **New reconciliation auto-repair**:
+    `run_reconciliation`, on a `local OPEN / broker flat` mismatch, now
+    tries the new `BrokerPort.get_recent_trades` (Shoonya/mock/backtest
+    implementations added) to recover the real fill and close the position
+    automatically *before* alerting/escalating — falls back to a new
+    `POST /positions/{id}/manual-reconcile` endpoint + Control Room UI
+    action (gated `risk.override`) for the case no matching broker fill
+    can be found, replacing the one-off SQL correction with an audited,
+    repeatable path. 1488 backend tests pass (up from 1475), ruff/mypy
+    clean.
+  - **🔴 Two follow-up gaps found by post-fix architecture/QC review,
+    NOT yet fixed**: (1) `close_position_from_external_fill` (the function
+    behind both the new auto-repair path and the new manual-reconcile
+    endpoint) does **not** acquire `LOCK_EXECUTION_SINGLETON` itself, and
+    its two real callers — `PositionManager`'s POLL-triggered
+    `run_full_reconciliation` (`position_manager.py:615`),
+    `ReconciliationLockRecoveryScheduler`
+    (`reconciliation_lock_recovery.py:92`), and the manual
+    recovery/manual-reconcile endpoints — don't acquire it either. Only the
+    EVENT-triggered call nested inside `close_position`'s/
+    `dispatch_trade_intent`'s own already-locked scope is actually
+    protected. A concurrent `close_position` (locked) and auto-repair/
+    manual-reconcile (unlocked) for the *same* position use disjoint
+    idempotency-key prefixes (`exit:{id}[:retryN]` vs
+    `exit-external:{id}`/`exit-manual:{id}`), so neither would ever notice
+    the other — and `trade_outcomes`' own `uq_trade_outcome_position_leg`
+    unique constraint does **not** catch this either, since Postgres never
+    treats two NULL `position_exit_leg_id` values as equal. This is exactly
+    the "two processes believing they're the execution authority" failure
+    class this codebase's own locking discipline exists to prevent (see
+    the "Idempotency and single-writer discipline" convention above) — just
+    not yet demonstrated live. (2) `exit_legs.py`'s per-leg exit function
+    (~line 660) has the *identical* fixed-idempotency-key bug
+    `close_position` just got fixed for — currently latent only because
+    multi-leg exits are paper-only in code (`build_position_exit_legs`
+    returns `None` for LIVE) and `MockBrokerAdapter` always fills
+    synchronously, so a leg's exit order can never come back
+    CANCELLED/REJECTED today. Would resurface immediately if multi-leg
+    ever gets live support, or if `MockBrokerAdapter`'s fault-injection
+    (`simulate_disconnect`/`queue_fill_scenario`, see the guardrail-layer
+    entry above) is ever pointed at a multi-leg position. Neither gap is
+    fixed yet — flagged for a follow-up session, not blocking today's
+    fix from being correct for the exact incident it addresses.
+
 - **2026-09-01: full backtest-archive re-analysis (626 configs) + the three
   surviving conviction configs updated on OCI for a multi-leg paper run —
   APPLIED to the live DB, NOT yet committed/deployed (docs+scripts only in the
