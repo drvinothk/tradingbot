@@ -182,6 +182,68 @@ def test_modify_order_derives_exch_tsym_and_translates_field_names():
     assert "limit_price" not in payload
 
 
+def test_cancel_order_follows_up_with_get_order_status_on_the_real_status_less_ack():
+    """Live incident 2026-09-02: Shoonya's real `CancelOrder` ack is
+    `{"stat": "Ok", "result": "<id>"}` -- no `status` field at all, per
+    `normalizer.parse_order_result`'s own docstring -- which
+    `parse_order_result` defaults to `PENDING`.
+    `cancel_resting_protective_stop` only proceeds to place a fresh exit
+    order on a real `BrokerOrderStatus.CANCELLED`, so a bare `PENDING`
+    always fell into its "ambiguous, don't proceed" branch against a real
+    account. This pins the fix: `cancel_order` must follow up with
+    `get_order_status` (same pattern `place_order` already has for its own
+    `pending` ack) to get the real post-cancel state.
+    """
+    rest = _FakeRestClient()
+
+    def _status_less_cancel(uid, broker_order_id):
+        rest._record("cancel_order", uid, broker_order_id)
+        return {"stat": "Ok", "result": broker_order_id}
+
+    rest.cancel_order = _status_less_cancel
+    rest.order_status_response = [{"norenordno": "ORD1", "status": "CANCELED"}]
+    adapter, rest = _adapter(rest)
+
+    result = adapter.cancel_order("ORD1")
+
+    assert result.status == BrokerOrderStatus.CANCELLED
+    assert [c[0] for c in rest.calls] == ["cancel_order", "single_order_history"]
+
+
+def test_cancel_order_does_not_follow_up_when_the_ack_already_carries_a_real_status():
+    """The default fake's `cancel_order` response includes a `status` field
+    (not the real, status-less Shoonya shape -- see the test above) --
+    exercises the common/back-compat case where no follow-up is needed,
+    confirming the fix doesn't add an unconditional extra round-trip.
+    """
+    adapter, rest = _adapter()
+
+    result = adapter.cancel_order("ORD1")
+
+    assert result.status == BrokerOrderStatus.CANCELLED
+    assert [c[0] for c in rest.calls] == ["cancel_order"]
+
+
+def test_cancel_order_keeps_the_original_ack_when_the_follow_up_itself_fails():
+    """A transient failure fetching post-cancel status must not turn 'cancel
+    request accepted' into a false failure -- same reasoning as
+    `place_order`'s identical `except ShoonyaApiError` branch.
+    """
+    rest = _FakeRestClient()
+    rest.cancel_order = lambda uid, broker_order_id: {"stat": "Ok", "result": broker_order_id}
+
+    def _raise(uid, broker_order_id):
+        raise ShoonyaApiError("SingleOrdHist", "simulated failure")
+
+    rest.single_order_history = _raise
+    adapter, rest = _adapter(rest)
+
+    result = adapter.cancel_order("ORD1")
+
+    assert result.status == BrokerOrderStatus.PENDING
+    assert result.broker_order_id == "ORD1"
+
+
 def test_modify_order_requires_contract_symbol():
     adapter, _ = _adapter()
 

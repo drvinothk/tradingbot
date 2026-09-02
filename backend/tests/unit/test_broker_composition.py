@@ -20,6 +20,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
@@ -82,6 +83,9 @@ class _FakeRealBroker(BrokerPort):
         if self.margin_raises is not None:
             raise self.margin_raises
         return MarginInfo(0.0, 0.0, 0.0, datetime.now(UTC))
+
+    def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+        return []
 
     def close(self) -> None:
         self.closed = True

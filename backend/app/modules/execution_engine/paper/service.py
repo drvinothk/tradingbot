@@ -63,6 +63,7 @@ from app.domain.broker.models import ReconciliationTrigger
 from app.domain.execution.models import (
     ExitReason,
     Order,
+    OrderEvent,
     OrderMode,
     OrderStatus,
     OrderType,
@@ -86,6 +87,7 @@ from app.modules.broker_adapter.base.contracts import (
     OrderRequest,
     OrderResult,
     Tick,
+    TradeFill,
 )
 from app.modules.broker_adapter.base.contracts import OrderType as BrokerOrderType
 from app.modules.broker_adapter.base.errors import ConfigurationError
@@ -142,6 +144,16 @@ logger = logging.getLogger("app.execution_engine.paper.service")
 # tightening only.
 TRAIL_ACTIVATION_FRACTION = Decimal("0.5")
 TRAIL_LOCK_FRACTION = Decimal("0.5")
+
+# Live incident 2026-09-02: a cancelled/rejected exit order used to
+# permanently strand `close_position` -- the fixed `exit:{position.id}`
+# idempotency key made every later attempt find that same dead order and
+# never place a new one (see close_position's own comment at the retry
+# block). Retries now get a fresh `:retryN` suffix, capped here so a
+# genuinely un-exitable position (e.g. exchange rejecting every attempt)
+# alerts distinctly and stops trying, rather than placing a new live
+# broker order every PositionManager cycle forever.
+_MAX_EXIT_ORDER_ATTEMPTS = 5
 
 # Phase 4: generic spread-blowout exit — the same threshold for every
 # strategy regardless of structure_level (unlike the trail, this isn't
@@ -418,6 +430,20 @@ def _open_position_from_fill(
 ) -> Position:
     now = _utcnow()
     entry_price = _dec(order.avg_fill_price)
+    # Entry-side slippage -- the open-side counterpart of `close_position`'s
+    # exit slippage (see `_finalize_position_close`/`_finalize_leg_and_
+    # maybe_position`), same `signed_pnl` formula, but with the two price
+    # arguments swapped: exit slippage is positive when the exit fills
+    # *better* than the trigger price that justified it (sold higher /
+    # bought back lower). For an entry, "better" is the opposite direction
+    # -- paying *less* (long) or receiving *more* (short) than the intended
+    # entry price. Passing the same argument order as the exit side would
+    # make a worse entry fill read as positive; swapping keeps "positive =
+    # favorable execution" true for both, so the two numbers are directly
+    # comparable in the UI.
+    entry_slippage = signed_pnl(
+        entry_price, _dec(trade_intent.entry_price), Decimal(order.filled_qty), side
+    )
 
     position = Position(
         id=uuid.uuid4(),
@@ -429,6 +455,7 @@ def _open_position_from_fill(
         side=_to_domain_side(side),
         qty=order.filled_qty,
         entry_price=float(entry_price),
+        entry_slippage=float(entry_slippage),
         status=PositionStatus.OPEN,
         opened_at=now,
     )
@@ -896,10 +923,65 @@ def close_position(
             # cancel_outcome is CancelOutcome.CANCELLED -- fall through to
             # the existing exit-order placement logic below, unchanged.
 
-        exit_order = (
-            db.query(Order).filter(Order.idempotency_key == exit_idempotency_key).one_or_none()
+        # Live incident 2026-09-02: querying by the exact fixed key alone
+        # treats a *cancelled/rejected* prior attempt the same as a filled
+        # one -- "already handled" -- and never places a new order again,
+        # permanently stranding the position open (29 identical
+        # exit_order_unfilled alerts, no further action, until a human
+        # manually squared off at the broker). Every attempt for this
+        # position shares the `exit:{position.id}` prefix (a retry appends
+        # `:retryN`, mirroring exit_legs.py's own `exit:{position_id}:
+        # {leg_index}` convention for the unrelated multi-leg case -- no
+        # collision risk, this function never runs for a multi-leg position,
+        # see the `position_has_exit_legs` early-return above), so they can
+        # all be found and counted together via `position_id` (never via a
+        # LIKE-pattern match alone, which the explicit position_id filter
+        # makes redundant but harmless either way).
+        exit_attempts = (
+            db.query(Order)
+            .filter(
+                Order.position_id == position.id,
+                Order.idempotency_key.like(f"{exit_idempotency_key}%"),
+            )
+            .order_by(Order.submitted_at.desc())
+            .all()
         )
-        if exit_order is None:
+        exit_order = exit_attempts[0] if exit_attempts else None
+        needs_new_attempt = exit_order is None or exit_order.status in (
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+        )
+
+        if needs_new_attempt:
+            if len(exit_attempts) >= _MAX_EXIT_ORDER_ATTEMPTS:
+                logger.error(
+                    "position %s: %d exit order attempts all cancelled/rejected -- giving up "
+                    "automatic retries, leaving OPEN for manual intervention",
+                    position.id,
+                    len(exit_attempts),
+                )
+                send_alert(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    trading_session_id=trading_session.id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="exit_order_attempts_exhausted",
+                    message=(
+                        f"Position {position.id}: {len(exit_attempts)} exit order attempts all "
+                        f"cancelled/rejected; automatic retries exhausted -- needs manual "
+                        f"square-off."
+                    ),
+                    mode=order_mode,
+                    dedup_key=f"exit_order_attempts_exhausted:{position.id}",
+                )
+                return None
+
+            attempt_idempotency_key = (
+                exit_idempotency_key
+                if exit_order is None
+                else f"{exit_idempotency_key}:retry{len(exit_attempts)}"
+            )
+
             # intended_price is already the price level that justified this
             # exit (stop/target/trail/structure-break/spread-blowout, or the
             # current market price for EOD/manual) -- pass it through as the
@@ -923,7 +1005,7 @@ def close_position(
 
             order_result = broker.place_order(
                 OrderRequest(
-                    idempotency_key=exit_idempotency_key,
+                    idempotency_key=attempt_idempotency_key,
                     contract_symbol=option_contract.symbol,
                     side=_to_broker_side(exit_side),
                     order_type=exit_broker_order_type,
@@ -941,7 +1023,7 @@ def close_position(
                 side=_to_domain_side(exit_side),
                 order_type=exit_domain_order_type,
                 qty=position.qty,
-                idempotency_key=exit_idempotency_key,
+                idempotency_key=attempt_idempotency_key,
                 now=now,
                 position_id=position.id,
                 # The caller's real reason for this exit, captured now --
@@ -954,7 +1036,18 @@ def close_position(
             db.add(exit_order)
             db.flush()
             db.add(
-                _new_order_event(exit_order.id, order_result, event_type="filled", now=now)
+                _new_order_event(
+                    exit_order.id,
+                    order_result,
+                    event_type="filled",
+                    now=now,
+                    # 2026-09-02: matches dispatch_trade_intent's own entry-
+                    # order call (line ~358) -- a synchronous broker
+                    # rejection right at placement carries its reason here
+                    # too, not just on a later reconciliation-discovered
+                    # resolution.
+                    include_raw_message=True,
+                )
             )
 
         # Narrowly scoped: only a non-FILLED (or price-less) exit order hits
@@ -965,13 +1058,37 @@ def close_position(
         # next PositionManager cycle or a manual reconcile can still see and
         # retry it — no new state machine, reuses the existing SystemAlert
         # pattern every other hard-stop condition in this codebase already
-        # uses.
+        # uses. A CANCELLED/REJECTED exit_order reaching here (rather than
+        # triggering a new attempt above) only happens once
+        # _MAX_EXIT_ORDER_ATTEMPTS is hit -- handled and returned already in
+        # the block above, so this is unreachable for that case; left as the
+        # PENDING/OPEN/PARTIALLY_FILLED in-flight case only.
+        assert exit_order is not None  # either found above or just created in needs_new_attempt
         if exit_order.status != OrderStatus.FILLED or exit_order.avg_fill_price is None:
             logger.error(
-                "exit order for position %s did not fill (status=%s) — "
+                "exit order for position %s did not fill (status=%s, attempt %d/%d) — "
                 "leaving position OPEN for reconciliation/retry",
                 position.id,
                 exit_order.status,
+                len(exit_attempts) if not needs_new_attempt else len(exit_attempts) + 1,
+                _MAX_EXIT_ORDER_ATTEMPTS,
+            )
+            # 2026-09-02: the broker's own rejection/cancellation reason
+            # (Shoonya emsg/rejreason, parsed into OrderResult.raw_message)
+            # used to be captured nowhere reachable from here -- diagnosing
+            # a real incident needed a direct DB/SSH lookup. Pulled from the
+            # latest order_events row for this exact order (now populated
+            # via include_raw_message=True, see _apply_resolved_pending_
+            # exit_order and the initial dispatch above) so the alert text
+            # itself carries the answer.
+            latest_event = (
+                db.query(OrderEvent)
+                .filter(OrderEvent.order_id == exit_order.id)
+                .order_by(OrderEvent.ts.desc())
+                .first()
+            )
+            raw_message = (
+                str(latest_event.raw_payload.get("raw_message", "")) if latest_event else ""
             )
             send_alert(
                 db,
@@ -981,7 +1098,9 @@ def close_position(
                 category="exit_order_unfilled",
                 message=(
                     f"Exit order for position {position.id} did not fill "
-                    f"(status={exit_order.status}); position left OPEN."
+                    f"(status={exit_order.status}"
+                    + (f", broker: {raw_message}" if raw_message else "")
+                    + "); position left OPEN."
                 ),
                 mode=order_mode,
                 dedup_key=f"exit_order_unfilled:{position.id}",
@@ -1114,6 +1233,110 @@ def _finalize_position_close(
     return outcome
 
 
+def close_position_from_external_fill(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    fill: TradeFill,
+    exit_reason: ExitReason = ExitReason.RECONCILED,
+) -> TradeOutcome:
+    """Closes `position` using a real fill this module never placed itself
+    -- recovered from the broker's own order history
+    (`BrokerPort.get_recent_trades`) by reconciliation's auto-repair path,
+    for the case a human closed the position directly in the broker's own
+    app (see `reconciliation.service`'s own docstring for the 2026-09-02
+    incident that motivated this: two live positions stuck OPEN locally
+    after a manual broker-app square-off, fixed by hand via a one-off SQL
+    transaction at the time -- this function is that same fix, generalized
+    into reusable code instead of a repeat-by-hand). Mirrors that
+    correction's exact shape: a synthetic `filled` closing `Order` row
+    (`mode` taken from the position's own *opening* order -- never assumed
+    -- matching every other exit path's `resolve_broker_for_position`-
+    adjacent discipline of never guessing a position's mode), then the same
+    `_finalize_position_close` every other exit path shares.
+
+    `exit_reason` defaults to `ExitReason.RECONCILED` -- the honest answer
+    when the fill came from `BrokerPort.get_recent_trades` (this system has
+    no idea whether the human closed it for a stop/target/discretionary
+    reason). The one other caller, the manual-reconcile API endpoint
+    (`POST /positions/{id}/manual-reconcile`, for the case even
+    `get_recent_trades` couldn't find a matching fill), passes
+    `ExitReason.MANUAL` instead -- a human directly typed this price in,
+    which is a materially different, and equally honest, provenance to
+    record. Never anything else; this function doesn't invent a default
+    beyond those two real, known-honest cases.
+
+    Idempotency: `idempotency_key` is scoped `exit-external:{position.id}`
+    for a RECONCILED close or `exit-manual:{position.id}` for a MANUAL one
+    -- both distinct from `close_position`'s own `exit:{position.id}` (and
+    its own `:retryN` attempts) and `exit_legs.py`'s `exit:{position.id}:
+    {leg_index}`, so the two repair paths can never collide with each other
+    or with a normal exit attempt. Callers must still only invoke this for
+    a position confirmed OPEN (checked by the caller first -- `run_
+    reconciliation` for the auto-repair path, the endpoint itself for
+    manual), since this function itself does not re-check under
+    `LOCK_EXECUTION_SINGLETON` the way `close_position` does -- both
+    callers already run inside their own single request/reconciliation-pass
+    transaction, not re-derived here to avoid a second lock acquisition
+    mid-pass.
+    """
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        raise ValueError(f"unknown option_contract_id {position.option_contract_id}")
+    opening_order = db.get(Order, position.opening_order_id)
+    if opening_order is None:
+        raise ValueError(f"unknown opening_order_id {position.opening_order_id}")
+
+    now = _utcnow()
+    entry_side = SignalSide(position.side)
+    exit_side = _opposite(entry_side)
+    order_mode = OrderMode(opening_order.mode)
+    idempotency_prefix = "exit-manual" if exit_reason == ExitReason.MANUAL else "exit-external"
+
+    closing_order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        trade_intent_id=None,
+        position_id=position.id,
+        idempotency_key=f"{idempotency_prefix}:{position.id}",
+        mode=order_mode,
+        side=_to_domain_side(exit_side),
+        order_type=OrderType.MARKET,
+        qty=position.qty,
+        status=OrderStatus.FILLED,
+        filled_qty=fill.qty or position.qty,
+        avg_fill_price=fill.avg_price,
+        broker_order_id=fill.broker_order_id,
+        submitted_at=fill.ts,
+        updated_at=now,
+        intended_exit_reason=exit_reason,
+    )
+    db.add(closing_order)
+    db.flush()
+    db.add(
+        OrderEvent(
+            id=uuid.uuid4(),
+            order_id=closing_order.id,
+            event_type="filled",
+            raw_payload={
+                "source": "reconciliation_auto_repair"
+                if exit_reason != ExitReason.MANUAL
+                else "manual_reconcile_endpoint",
+                "broker_order_id": fill.broker_order_id,
+                "avg_fill_price": fill.avg_price,
+                "qty": fill.qty,
+            },
+            ts=now,
+        )
+    )
+
+    return _finalize_position_close(
+        db, trading_session, position, closing_order, exit_reason, order_mode, None
+    )
+
+
 def reconcile_pending_live_exit_orders(
     db: Session,
     trading_session: TradingSession,
@@ -1218,6 +1441,16 @@ def _apply_resolved_pending_exit_order(
             event_type="filled" if order.status == OrderStatus.FILLED else "resolved",
             now=now,
             source="reconcile_pending_live_exit_orders",
+            # 2026-09-02: previously omitted here (only the very first
+            # "filled" event at dispatch ever got it) -- the one piece of
+            # data that would have told a human *why* an exit/stop order
+            # kept cancelling (Shoonya's emsg/rejreason, already parsed
+            # into OrderResult.raw_message) was silently dropped on every
+            # later resolution, which is exactly the resolution path a
+            # broker-side cancel/reject discovered late by reconciliation
+            # goes through. See close_position's own exit_order_unfilled
+            # alert, which now surfaces this too.
+            include_raw_message=True,
         )
     )
 
@@ -1617,13 +1850,38 @@ def current_contract_price(
     Only ever falls through to `broker.get_quote()` as an absolute last
     resort, matching `evaluate_open_position`'s own "never leave a stop
     check silently unevaluated" discipline -- always returns *something*.
+
+    **Live incident 2026-09-02**: `BrokerPortMarketDataAdapter._handle_tick`
+    caches whatever `tick.contract_symbol` the broker reports with zero
+    validation -- a token-resolution mismatch (the underlying's own token
+    momentarily colliding with an option contract's, e.g. from a stale
+    scrip-master resync) let a real NIFTY spot tick (~23870) land under an
+    option contract's symbol key, which this function then returned as if
+    it were that option's own live premium. It fed straight into both the
+    persisted `QuoteTick` (Control Room's LTP column) and this function's
+    caller, `PositionManager`'s stop/target/trail check. Guarded below: an
+    index-option premium never approaches its own strike for anything this
+    system trades (NIFTY/BANKNIFTY weekly/near-month), so `ltp >= strike` is
+    a cheap, safe, universal ceiling -- rejecting falls through to the same
+    REST-snapshot/broker.get_quote fallback chain already used for a
+    missing/stale tick, never fabricates a price.
     """
     if market_data_provider is not None:
         fresh_tick = fresh_tick_or_none(
             market_data_provider.get_latest_tick(option_contract.symbol), _utcnow()
         )
         if fresh_tick is not None:
-            return fresh_tick
+            if fresh_tick.ltp >= float(option_contract.strike):
+                logger.error(
+                    "REJECTED implausible live tick for option %s: ltp=%.4f >= strike=%.4f "
+                    "-- likely a token-resolution mismatch (see this function's own docstring); "
+                    "falling back to REST snapshot/broker.get_quote instead of trusting it",
+                    option_contract.symbol,
+                    fresh_tick.ltp,
+                    float(option_contract.strike),
+                )
+            else:
+                return fresh_tick
 
     freshness_state = ensure_fresh_option_chain(
         db,

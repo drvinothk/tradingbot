@@ -23,6 +23,7 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import (
     ExitReason,
     Order,
+    OrderSide,
     Position,
     PositionExitLeg,
     PositionExitLegStatus,
@@ -36,6 +37,9 @@ from app.domain.market.models import OptionContract, QuoteTick
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
 from app.modules.audit_service.service import record_event
+from app.modules.broker_adapter.base.contracts import OrderSide as _ContractOrderSide
+from app.modules.broker_adapter.base.contracts import TradeFill
+from app.modules.execution_engine.paper.service import close_position_from_external_fill
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
 from app.modules.scheduler.eod_square_off import (
     UnresolvableOptionContractError,
@@ -115,6 +119,9 @@ class PositionLegOut(BaseModel):
     trail_stop_price: float | None = None
     exit_reason: str | None = None
     realized_pnl: float | None = None
+    # PositionExitLeg.slippage -- same signed_pnl formula as the net
+    # exit_slippage below, scoped to this one leg. None until the leg closes.
+    slippage: float | None = None
     closed_at: datetime | None = None
 
 
@@ -148,6 +155,12 @@ class PositionOut(BaseModel):
     # broker call (see `_latest_ticks`'s own docstring). `None` for a closed
     # position (exit_price/realized_pnl below cover that case instead) or an
     # open one with no tick yet.
+    # Open-side slippage (Position.entry_slippage), set once at fill time --
+    # positive means a favorable entry fill relative to the intended entry
+    # price. Picked up automatically by PositionOut.model_validate(position)
+    # below since the column name matches; declared here only for the
+    # response schema.
+    entry_slippage: float | None = None
     ltp: float | None = None
     # Freshness of `ltp` itself, classified via the same
     # `market_data.freshness` module every other price read in this codebase
@@ -162,6 +175,10 @@ class PositionOut(BaseModel):
     unrealized_pnl: float | None = None
     exit_price: float | None = None
     realized_pnl: float | None = None
+    # Net TradeOutcome.slippage across every closed leg (single value for a
+    # single-exit position) -- None while the position is still open (no
+    # TradeOutcome row exists yet).
+    exit_slippage: float | None = None
     # How the position actually closed (target/stop/trail/manual/eod/...) --
     # `TradeOutcome.exit_reason`, `None` for an open position (nothing has
     # closed it yet) or one with no `TradeOutcome` row at all.
@@ -323,6 +340,7 @@ def list_positions(
                 realized_pnl=(
                     float(lg.realized_pnl) if lg.realized_pnl is not None else None
                 ),
+                slippage=float(lg.slippage) if lg.slippage is not None else None,
                 closed_at=lg.closed_at,
             )
             for lg in position_legs
@@ -369,6 +387,7 @@ def list_positions(
             position_outcomes = outcomes_by_position.get(position.id, [])
             if position_outcomes:
                 out.realized_pnl = sum(float(o.realized_pnl) for o in position_outcomes)
+                out.exit_slippage = sum(float(o.slippage) for o in position_outcomes)
                 # A single-exit position has exactly one outcome; a staged
                 # one has N — report the last leg's fill as the exit price
                 # and either its lone reason or a "staged" marker.
@@ -514,6 +533,115 @@ def square_off_position(
         "exit_price": outcome.exit_price,
         "realized_pnl": outcome.realized_pnl,
         "slippage": outcome.slippage,
+        "exit_reason": outcome.exit_reason.value
+        if hasattr(outcome.exit_reason, "value")
+        else outcome.exit_reason,
+        "closed_at": outcome.closed_at.isoformat(),
+    }
+
+
+class ManualReconcileRequest(BaseModel):
+    exit_price: float
+
+
+@router.post("/positions/{position_id}/manual-reconcile")
+def manual_reconcile_position(
+    position_id: uuid.UUID,
+    body: ManualReconcileRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> dict:
+    """Fallback path, built 2026-09-02, for a position stuck OPEN that
+    neither `close_position`'s own retry logic nor reconciliation's
+    auto-repair (`reconciliation.service._attempt_auto_repair`, which tries
+    `BrokerPort.get_recent_trades` first -- always prefer that over this)
+    could resolve on their own -- e.g. the broker's order history doesn't
+    have a matching fill (already rolled off, or the position was closed
+    through a route that never generated a matching trade record). A human
+    who has independently confirmed the real exit price (typically by
+    looking directly at the broker's own app or contract note) can close
+    the local record with it here, same effect as the one-off SQL
+    correction the 2026-09-02 incident needed by hand, through the UI with
+    a proper audit trail instead.
+
+    Gated on `risk.override` -- the same permission bar
+    `recover_from_reconciliation_lock` already uses for this class of
+    "human is directly correcting system state" action. Always closes the
+    position's *entire* remaining qty (`position.qty`) -- a partial manual
+    correction is out of scope; a genuinely partial real-world exit belongs
+    on the existing multi-leg exit path (`exit_legs.py`), not this one-shot
+    repair tool.
+    """
+    position = (
+        db.query(Position)
+        .filter(Position.id == position_id, Position.workspace_id == user.workspace_id)
+        .one_or_none()
+    )
+    if position is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Position not found")
+    if position.status != PositionStatus.OPEN:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"position is {position.status}, not open"
+        )
+    if body.exit_price <= 0:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "exit_price must be positive")
+
+    trading_session = db.get(TradingSession, position.trading_session_id)
+    if trading_session is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Trading session not found")
+
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"position references option_contract_id {position.option_contract_id}, which no "
+            "longer resolves -- a data-integrity problem, not something this endpoint can fix",
+        )
+
+    # TradeFill.side is app.modules.broker_adapter.base.contracts.OrderSide
+    # -- a deliberately separate type from the domain OrderSide used for
+    # `position.side` above (see that enum's own docstring on why this
+    # codebase keeps them distinct); same "buy"/"sell" string values, so a
+    # plain construction from the domain side's value is correct.
+    closing_side = (
+        _ContractOrderSide.SELL if position.side == OrderSide.BUY else _ContractOrderSide.BUY
+    )
+    fill = TradeFill(
+        broker_order_id="",
+        contract_symbol=option_contract.symbol,
+        side=closing_side,
+        qty=position.qty,
+        avg_price=body.exit_price,
+        ts=_utcnow(),
+    )
+    outcome = close_position_from_external_fill(
+        db, trading_session, position, fill, exit_reason=ExitReason.MANUAL
+    )
+
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.MANUAL_OVERRIDE,
+        event_type="position.manual_reconcile",
+        entity_type="position",
+        entity_id=position.id,
+        trading_session_id=trading_session.id,
+        payload={"exit_price": body.exit_price, "realized_pnl": outcome.realized_pnl},
+    )
+    db.commit()
+
+    return {
+        "success": True,
+        "position_id": str(position.id),
+        # float(...) -- TradeOutcome.exit_price/realized_pnl are Numeric
+        # columns; returned raw they serialize as JSON strings, not numbers
+        # (the same latent quirk square_off_position's own response has,
+        # just never asserted numerically there -- see CLAUDE.md's
+        # "Decimal vs float" rule).
+        "exit_price": float(outcome.exit_price),
+        "realized_pnl": float(outcome.realized_pnl),
         "exit_reason": outcome.exit_reason.value
         if hasattr(outcome.exit_reason, "value")
         else outcome.exit_reason,

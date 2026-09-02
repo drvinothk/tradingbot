@@ -81,7 +81,15 @@ def seeded_admin(engine):
         db.add(role)
         db.flush()
         permission_ids: list[uuid.UUID] = []
-        for code in ("session.start", "session.stop", "strategy.view", "strategy.edit"):
+        for code in (
+            "session.start",
+            "session.stop",
+            "strategy.view",
+            "strategy.edit",
+            # risk.override: POST /positions/{id}/manual-reconcile's own
+            # permission bar (same as recover_from_reconciliation_lock).
+            "risk.override",
+        ):
             permission = Permission(id=uuid.uuid4(), code=code, description="")
             db.add(permission)
             db.flush()
@@ -521,6 +529,137 @@ def test_square_off_position_denies_unknown_or_cross_workspace_position_id(
 ):
     _login(api_client, seeded_admin)
     resp = api_client.post(f"/api/v1/positions/{uuid.uuid4()}/square-off")
+    assert resp.status_code == 404
+
+
+# -- POST /positions/{id}/manual-reconcile (2026-09-02) -----------------------
+
+
+def test_manual_reconcile_position_requires_login(api_client: TestClient):
+    resp = api_client.post(
+        f"/api/v1/positions/{uuid.uuid4()}/manual-reconcile", json={"exit_price": 100.0}
+    )
+    assert resp.status_code == 401
+
+
+def test_manual_reconcile_position_closes_with_the_given_price(
+    api_client: TestClient, seeded_admin, engine
+):
+    """Fallback path for a position stuck OPEN that neither a normal exit
+    retry nor reconciliation's own broker-history auto-repair could
+    resolve -- a human enters a known real exit price directly (see
+    CLAUDE.md's 2026-09-02 entry for the incident this generalizes: two
+    live positions closed by hand via a one-off SQL transaction at the
+    time). Proves the endpoint closes the position with exactly that price,
+    tagged `exit_reason=manual` and audited.
+    """
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        resp = api_client.post(
+            f"/api/v1/positions/{position_id}/manual-reconcile", json={"exit_price": 123.45}
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["position_id"] == position_id
+        assert body["exit_price"] == pytest.approx(123.45)
+        assert body["exit_reason"] == "manual"
+        assert body["closed_at"] is not None
+
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "closed"
+        assert positions_after[0]["exit_reason"] == "manual"
+
+        session_factory = sessionmaker(bind=engine, future=True)
+        with session_factory() as db:
+            from app.domain.audit.models import ActorType, AuditEvent
+
+            manual_events = (
+                db.query(AuditEvent)
+                .filter(
+                    AuditEvent.workspace_id == seeded_admin["workspace_id"],
+                    AuditEvent.event_type == "position.manual_reconcile",
+                )
+                .all()
+            )
+            assert len(manual_events) == 1
+            assert manual_events[0].actor_type == ActorType.USER
+            assert manual_events[0].actor_id == seeded_admin["user_id"]
+            assert manual_events[0].payload["exit_price"] == pytest.approx(123.45)
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_manual_reconcile_position_rejects_a_non_positive_price(
+    api_client: TestClient, seeded_admin, engine
+):
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        resp = api_client.post(
+            f"/api/v1/positions/{position_id}/manual-reconcile", json={"exit_price": 0}
+        )
+        assert resp.status_code == 422
+
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "open"
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_manual_reconcile_position_rejects_an_already_closed_position(
+    api_client: TestClient, seeded_admin, engine
+):
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        first = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert first.status_code == 200
+
+        second = api_client.post(
+            f"/api/v1/positions/{position_id}/manual-reconcile", json={"exit_price": 100.0}
+        )
+        assert second.status_code == 409
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
+def test_manual_reconcile_position_denies_unknown_or_cross_workspace_position_id(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    resp = api_client.post(
+        f"/api/v1/positions/{uuid.uuid4()}/manual-reconcile", json={"exit_price": 100.0}
+    )
     assert resp.status_code == 404
 
 

@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
-from app.domain.execution.models import Position
+from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import SystemAlert
@@ -28,9 +28,15 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
-from app.modules.broker_adapter.base.contracts import OrderRequest, OrderSide, OrderType
+from app.modules.broker_adapter.base.contracts import (
+    BrokerOrderStatus,
+    OrderRequest,
+    OrderSide,
+    OrderType,
+    TradeFill,
+)
 from app.modules.broker_adapter.base.contracts import Position as BrokerPosition
-from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
+from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import dispatch_trade_intent
 from app.modules.reconciliation.service import run_full_reconciliation, run_reconciliation
 
@@ -324,6 +330,136 @@ def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live_on_live
     assert run.mismatches_found == 1
     assert run.action_taken == "reconciliation_lock_entered"
     assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+
+
+class _FakeLiveDelegatingBroker:
+    """Reads as live (`not isinstance(_, MockBrokerAdapter)`) while
+    delegating real behavior to an inner mock -- same trick
+    `test_execution_paper_service.py`'s own `_FakeLiveBroker` uses.
+    """
+
+    def __init__(self, inner: MockBrokerAdapter) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_run_reconciliation_auto_repairs_a_local_open_broker_flat_live_position(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Live incident 2026-09-02: two real live positions got stuck OPEN
+    locally after being squared off directly in the broker's own app,
+    tripping reconciliation_lock -- fixed by hand via a one-off SQL
+    transaction at the time. This pins the generalized fix: reconciliation
+    itself should recover the real fill from the broker's own order history
+    and close the position, never even reaching an alert/lock.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    inner = MockBrokerAdapter()
+    entry_broker = _FakeLiveDelegatingBroker(inner)
+    # dispatch_trade_intent's own LIVE-mode preflight gate is orthogonal to
+    # this test (it's about pre-trade margin/option-chain freshness, not
+    # anything this test exercises) -- neutralized the same way every other
+    # "genuinely live" dispatch in this suite already does.
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    # A LIVE entry fill also places a real protective SL-LMT
+    # (place_protective_stop) -- the mock adapter always fills synchronously
+    # with no concept of a genuinely resting order, which would otherwise
+    # trip that function's own defensive "filled at placement" branch and
+    # finalize the position as STOP right here, before this test ever gets
+    # to reconciliation. Queue the entry's own fill explicitly, then a
+    # PENDING ack for the stop placement right after it, so the position
+    # stays genuinely OPEN -- exactly the real-incident shape (a resting
+    # stop that hasn't resolved yet).
+    inner.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0),
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, entry_broker  # type: ignore[arg-type]
+    )
+
+    fill = TradeFill(
+        broker_order_id="SHOONYA-MANUAL-1",
+        contract_symbol=option_contract.symbol,
+        side=OrderSide.SELL,
+        qty=position.qty,
+        avg_price=100.30,
+        ts=datetime.now(UTC),
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_positions(self) -> list[BrokerPosition]:
+            return []  # broker shows flat -- the human squared off directly there
+
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            return [fill] if contract_symbol == option_contract.symbol else []
+
+    run = run_reconciliation(
+        db, _RepairBroker(inner), trading_session, ReconciliationTrigger.EVENT  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 0
+    assert run.action_taken == "none"
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.RECONCILED
+    assert float(outcome.exit_price) == pytest.approx(100.30)
+
+    # Never even alerted/escalated -- the repair happened before that check.
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "reconciliation_mismatch",
+        )
+        .count()
+        == 0
+    )
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+
+
+def test_run_reconciliation_does_not_auto_repair_a_paper_mismatch(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Auto-repair is LIVE-only -- nothing outside this codebase can ever
+    generate a real fill for the mock's own book, so a paper-side
+    local-open/broker-flat mismatch (the mock's process-memory book losing
+    state across a restart, a different already-understood bug) must still
+    take the normal alert path, not attempt a repair.
+    """
+    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)
+    broker.seed_position(option_contract.symbol, 0, 0.0)  # simulate the mock's book going flat
+
+    run = run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
+
+    assert run.mismatches_found == 1
+    assert run.action_taken == "alert_raised"
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "reconciliation_mismatch",
+        )
+        .count()
+        == 1
+    )
 
 
 def test_paper_book_mismatch_never_locks_a_live_active_session(

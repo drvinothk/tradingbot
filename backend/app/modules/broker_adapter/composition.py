@@ -80,6 +80,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
@@ -234,6 +235,13 @@ class _AuthAwareBroker(BrokerPort):
     def get_margin(self) -> MarginInfo:
         try:
             return self._inner.get_margin()
+        except BrokerAuthError as exc:
+            self._mark_disconnected(exc)
+            raise
+
+    def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+        try:
+            return self._inner.get_recent_trades(contract_symbol)
         except BrokerAuthError as exc:
             self._mark_disconnected(exc)
             raise

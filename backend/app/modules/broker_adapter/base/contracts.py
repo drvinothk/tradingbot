@@ -183,3 +183,23 @@ class MarginInfo:
     used_margin: float
     total_margin: float
     ts: datetime
+
+
+@dataclass(frozen=True)
+class TradeFill:
+    """One real, filled order for a contract, read from the broker's own
+    order/trade history — not this system's own `Order` table. Built
+    2026-09-02 for reconciliation's auto-repair path: when a local position
+    is still OPEN but the broker shows it flat, this is how the real exit
+    price/time is recovered instead of guessing or asking a human to type
+    it in (see `reconciliation.service`'s own docstring for the incident
+    this closes — a position squared off directly in the broker app, which
+    this system's own order-lifecycle code never saw).
+    """
+
+    broker_order_id: str
+    contract_symbol: str
+    side: OrderSide
+    qty: int
+    avg_price: float
+    ts: datetime

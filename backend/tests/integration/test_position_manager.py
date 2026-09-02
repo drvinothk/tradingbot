@@ -350,6 +350,46 @@ def test_run_once_falls_back_to_broker_quote_when_live_tick_is_stale(
     assert position.status == PositionStatus.OPEN
 
 
+def test_run_once_rejects_an_implausible_option_tick_and_falls_back_to_broker_quote(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Live incident 2026-09-02: a token-resolution mismatch let a real
+    underlying spot tick (~23870) land under an *option* contract's symbol
+    key in the market-data provider's cache, with nothing rejecting it --
+    `current_contract_price` trusted it as the option's own live premium,
+    which would have fed straight into this exact stop/target check. Pins
+    the fix: an option tick whose ltp is >= its own strike (option_contract
+    fixture strike=22000) must be rejected and fall back to
+    `broker.get_quote`, not treated as this cycle's real price -- proven by
+    setting the implausible tick's price far past target (92.0) while the
+    broker's own quote stays a safe, non-triggering price; a wrongly-trusted
+    tick would close the position on a phantom target hit instead.
+    """
+    from app.modules.broker_adapter.base.contracts import Tick
+
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract,
+        broker, stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - safe fallback price
+    provider = _FakeLiveProvider()
+    provider.ticks[option_contract.symbol] = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=23870.35, bid=23870.0, ask=23871.0, volume=10, oi=None, ts=datetime.now(UTC),
+    )
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=provider,
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
 def test_run_once_exits_on_stop_hit(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

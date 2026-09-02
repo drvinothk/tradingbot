@@ -53,6 +53,7 @@ from app.core.db.base import utcnow as _utcnow
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
+    BrokerOrderStatus,
     DepthSnapshot,
     InstrumentInfo,
     MarginInfo,
@@ -62,6 +63,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 from app.modules.broker_adapter.base.errors import CriticalSafetyException
 from app.modules.broker_adapter.shoonya import normalizer
@@ -1206,8 +1208,34 @@ class ShoonyaBrokerAdapter(BrokerPort):
         return normalizer.parse_order_result(raw, idempotency_key=broker_order_id)
 
     def cancel_order(self, broker_order_id: str) -> OrderResult:
+        """`CancelOrder`'s own ack is the same narrow `{"stat": "Ok",
+        "result": "<id>"}` shape `ModifyOrder` has (see
+        `normalizer.parse_order_result`'s own docstring) -- no `status`
+        field, so it always parses to `PENDING`. **Live incident
+        2026-09-02**: `cancel_resting_protective_stop` only ever proceeds to
+        place a fresh exit order on a real `BrokerOrderStatus.CANCELLED`
+        result -- a bare `PENDING` from this function falls into its
+        "ambiguous, don't proceed" branch every time, against a real
+        account, regardless of whether the cancel actually succeeded. Same
+        fix `place_order` already has for its own `pending` ack: one
+        follow-up `get_order_status` call to get the real post-cancel state
+        instead of trusting the status-less ack alone. Best-effort -- a
+        transient failure on the follow-up call must not turn "cancel
+        request accepted" into a false failure, so the original ack is
+        returned unchanged if the follow-up itself errors (same reasoning
+        as `place_order`'s identical `except ShoonyaApiError` branch).
+        """
         raw = self._rest.cancel_order(self._uid, broker_order_id)
-        return normalizer.parse_order_result(raw, idempotency_key=broker_order_id)
+        result = normalizer.parse_order_result(raw, idempotency_key=broker_order_id)
+        if result.status == BrokerOrderStatus.PENDING:
+            try:
+                result = self.get_order_status(broker_order_id)
+            except ShoonyaApiError:
+                logger.exception(
+                    "Failed to fetch order status right after CancelOrder for %s",
+                    broker_order_id,
+                )
+        return result
 
     def get_order_status(self, broker_order_id: str) -> OrderResult:
         rows = self._rest.single_order_history(self._uid, broker_order_id)
@@ -1274,3 +1302,27 @@ class ShoonyaBrokerAdapter(BrokerPort):
     def get_margin(self) -> MarginInfo:
         raw = self._rest.get_limits(self._uid, self._actid)
         return normalizer.parse_margin(raw)
+
+    def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+        """Built 2026-09-02 for reconciliation's auto-repair path -- reuses
+        `OrderBook` (already used by `_find_order_by_remarks`'s ack-timeout
+        fallback) rather than a dedicated `TradeBook` call, since a filled
+        order is already visible there and this avoids adding a second,
+        unconfirmed REST endpoint. No `exch`/date-range filter is applied --
+        `OrderBook` is this account's current-day order list per Noren's own
+        convention, matching the "same day" scope reconciliation actually
+        needs.
+        """
+        rows = self._rest.order_book(self._uid)
+        fills = []
+        for row in rows:
+            if str(row.get("tsym", "")) != contract_symbol:
+                continue
+            try:
+                status = normalizer.map_order_status(str(row.get("status", "")))
+            except normalizer.NormalizationError:
+                continue
+            if status != BrokerOrderStatus.FILLED:
+                continue
+            fills.append(normalizer.parse_trade_fill(row))
+        return fills

@@ -28,6 +28,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 
 TickCallback = Callable[[Tick], None]
@@ -114,3 +115,17 @@ class BrokerPort(ABC):
     def get_margin(self) -> MarginInfo:
         """Available funds/margin for the account — Risk Service's pre-trade
         capital check calls this instead of a fixed stub value."""
+
+    @abstractmethod
+    def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+        """Real, filled orders for `contract_symbol` from the broker's own
+        order/trade history (not this system's `Order` table) — built
+        2026-09-02 for reconciliation's auto-repair path: when a local
+        position is OPEN but the broker shows it flat (e.g. a human squared
+        off directly in the broker's own app, outside this system entirely),
+        this is how the real exit fill gets recovered instead of a human
+        having to type a price in by hand. Ordering/limit is
+        implementation-defined; callers should sort/filter for what they
+        need (most recent first is typical). The mock adapter returns `[]`
+        unconditionally — see its own docstring for why that's correct, not
+        a stub."""

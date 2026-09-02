@@ -29,10 +29,31 @@ runs both passes (paper always; live whenever a real broker is connected)
 so periodic/manual/startup callers actually cover both books instead of
 whichever one a session-level, no-strategy-context broker resolution
 happens to prefer (see that function's own docstring).
+
+**2026-09-02: auto-repair for the "local OPEN, broker flat" mismatch
+shape.** Live incident: two real live positions got stuck OPEN locally
+after their exit orders were cancelled by the broker and this system's own
+`close_position` retry logic got permanently stuck (see CLAUDE.md's
+2026-09-02 entry) — the user had to square off both directly in the
+Shoonya app. That left the local `positions` table OPEN while the broker
+showed flat, tripping `reconciliation_lock`; fixed by hand at the time via
+a one-off SQL transaction (a synthetic closing `Order` row + `TradeOutcome`
+using the real fill prices from the broker app). `_attempt_auto_repair`
+(below) generalizes that exact fix into normal code: before alerting or
+escalating on a `local_qty != 0, broker_qty == 0` mismatch, it tries
+`BrokerPort.get_recent_trades` to recover the real fill and closes the
+position with it via `execution_engine.paper.service
+.close_position_from_external_fill` — same shape as the by-hand fix, just
+automatic and auditable (`reconciliation.auto_repaired` event) instead of
+a repeat SSH session next time. Deliberately narrow — see that function's
+own docstring for the exact conditions it requires before ever touching a
+position, and why an ambiguous case still falls through to the existing
+alert/escalate path unchanged.
 """
 
 from __future__ import annotations
 
+import logging
 import uuid
 
 from sqlalchemy.orm import Session
@@ -54,6 +75,8 @@ from app.modules.broker_adapter.composition import (
     is_execution_broker_connected,
     is_execution_broker_live,
 )
+
+logger = logging.getLogger("app.reconciliation.service")
 
 # Only this mode ever escalates to reconciliation_lock — matches
 # ALLOWED_TRANSITIONS in app.core.modes.transitions exactly.
@@ -100,6 +123,113 @@ def _local_net_qty_by_symbol(
     return result
 
 
+def _attempt_auto_repair(
+    db: Session,
+    broker: BrokerPort,
+    trading_session: TradingSession,
+    symbol: str,
+    local_qty: int,
+    order_mode: OrderMode,
+) -> bool:
+    """Auto-repair path, built 2026-09-02 (see this module's own docstring
+    for the incident): a local position stuck OPEN while the broker shows
+    the symbol flat almost always means a human closed it directly in the
+    broker's own app -- something this system's own order-lifecycle code
+    never saw and so never recorded. Rather than escalating straight to an
+    alert (or, worse, `reconciliation_lock`) for something explainable and
+    fixable from data the broker already has, try to recover the real fill
+    first via `BrokerPort.get_recent_trades` and close the local position
+    with it. Returns `True` only on an actual repair; `False` (the far more
+    common case -- nothing to repair, or genuinely ambiguous) falls through
+    to the existing alert/escalate behavior unchanged.
+
+    **Deliberately narrow, "never guess" scope**:
+    - LIVE only. A paper mismatch of this shape is a different, already-
+      understood bug class (the mock's process-memory book losing state
+      across a restart -- see CLAUDE.md's 2026-08-27 entry) with its own
+      fix; nothing external can ever generate a paper fill to recover.
+    - Only `local_qty != 0 and broker_qty == 0` (broker flat) -- a mismatch
+      where the broker shows a *different nonzero* qty, or shows a position
+      this system has no local record of at all, is a shape this function
+      doesn't attempt to reason about; escalate as before.
+    - Only when *exactly one* local OPEN position exists for this symbol —
+      more than one makes "which position does this one fill belong to"
+      genuinely ambiguous; skip rather than guess.
+    - Only when the matching `TradeFill`'s `qty` exactly equals
+      `abs(local_qty)` and its `side` is the closing side (opposite the
+      position's own side) -- a partial-fill sum reconstruction is out of
+      scope (multi-leg partial exits already have their own, unrelated
+      code path, `exit_legs.py`); an inexact match falls through to the
+      existing alert/escalate path rather than closing on a guess.
+    """
+    if order_mode != OrderMode.LIVE or local_qty == 0:
+        return False
+
+    positions = (
+        db.query(Position)
+        .join(Order, Order.id == Position.opening_order_id)
+        .join(OptionContract, OptionContract.id == Position.option_contract_id)
+        .filter(
+            Position.trading_session_id == trading_session.id,
+            Position.status == PositionStatus.OPEN,
+            Order.mode == order_mode,
+            OptionContract.symbol == symbol,
+        )
+        .all()
+    )
+    if len(positions) != 1:
+        return False
+    position = positions[0]
+
+    closing_side = OrderSide.SELL if position.side == OrderSide.BUY else OrderSide.BUY
+    try:
+        fills = broker.get_recent_trades(symbol)
+    except Exception:  # noqa: BLE001 - a repair attempt failing must never
+        # block the existing alert/escalate path that follows -- this is a
+        # best-effort convenience, not a safety-critical call.
+        logger.exception(
+            "get_recent_trades failed for %s during reconciliation auto-repair -- "
+            "falling through to the normal alert/escalate path",
+            symbol,
+        )
+        return False
+
+    match = next(
+        (f for f in fills if f.side == closing_side and f.qty == abs(local_qty)),
+        None,
+    )
+    if match is None:
+        return False
+
+    from app.modules.execution_engine.paper.service import close_position_from_external_fill
+
+    outcome = close_position_from_external_fill(db, trading_session, position, match)
+    db.flush()
+    logger.warning(
+        "reconciliation auto-repaired position %s (%s): closed at %.4f from broker's own "
+        "order history (broker_order_id=%s) -- local was OPEN, broker was flat",
+        position.id,
+        symbol,
+        match.avg_price,
+        match.broker_order_id,
+    )
+    record_event(
+        db,
+        workspace_id=trading_session.workspace_id,
+        actor_type=ActorType.SYSTEM,
+        event_category=EventCategory.BROKER_RECONCILIATION,
+        event_type="reconciliation.auto_repaired",
+        trading_session_id=trading_session.id,
+        payload={
+            "symbol": symbol,
+            "position_id": str(position.id),
+            "exit_price": float(outcome.exit_price),
+            "broker_order_id": match.broker_order_id,
+        },
+    )
+    return True
+
+
 def run_reconciliation(
     db: Session,
     broker: BrokerPort,
@@ -116,6 +246,15 @@ def run_reconciliation(
     for symbol in set(local_by_symbol) | set(broker_by_symbol):
         local_qty, option_contract_id = local_by_symbol.get(symbol, (0, None))
         broker_qty = broker_by_symbol.get(symbol, 0)
+
+        if broker_qty == 0 and local_qty != 0 and _attempt_auto_repair(
+            db, broker, trading_session, symbol, local_qty, order_mode
+        ):
+            # Repaired -- re-read local qty (now 0, the position this
+            # symbol's mismatch was about is CLOSED) so this symbol is
+            # correctly reported clean below, not as a still-open mismatch.
+            local_qty = 0
+
         is_mismatched = local_qty != broker_qty
 
         if option_contract_id is not None:

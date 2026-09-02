@@ -62,6 +62,7 @@ from app.modules.broker_adapter.base.contracts import (
     Position,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 
 
@@ -453,6 +454,44 @@ def parse_position(raw: dict) -> Position:
         contract_symbol=str(_require(raw, "tsym")),
         qty=_int(raw, "netqty"),
         avg_price=_float(raw, "netavgprc", default=0.0),
+    )
+
+
+def parse_trade_fill(raw: dict) -> TradeFill:
+    """One `OrderBook` row already confirmed `status == "COMPLETE"` by the
+    caller (`ShoonyaBrokerAdapter.get_recent_trades`) — this function
+    doesn't re-check status, only extracts the fill itself. `trantype`
+    reuses the same `B`/`S` convention `to_place_order_payload` writes.
+
+    **Fill timestamp is best-effort, unconfirmed against a real account**
+    (this codebase has no live-captured `OrderBook` row to confirm Noren's
+    exact field name from, unlike `avgprc`/`fillshares`/`norenordno`, which
+    every other function in this module already relies on with real
+    evidence) — tries the field names documented across community Noren-OMS
+    forks (`norentm`, `exch_tm`, `flltm`) and falls back to "now" rather
+    than raising, since `get_recent_trades`'s only caller (reconciliation's
+    auto-repair path) needs the real *price* above all -- an approximate
+    timestamp on an already-rare repair path is a far smaller risk than
+    failing the whole repair over a field name that may not even be the one
+    Shoonya actually uses.
+    """
+    ts_raw = raw.get("norentm") or raw.get("exch_tm") or raw.get("flltm")
+    ts = _utcnow()
+    if ts_raw:
+        for fmt in ("%d-%m-%Y %H:%M:%S", "%H:%M:%S %d-%m-%Y"):
+            try:
+                ts = datetime.strptime(str(ts_raw), fmt).replace(tzinfo=UTC)
+                break
+            except ValueError:
+                continue
+
+    return TradeFill(
+        broker_order_id=str(raw.get("norenordno") or raw.get("nOrdNo") or ""),
+        contract_symbol=str(_require(raw, "tsym")),
+        side=_SHOONYA_TO_SIDE.get(str(raw.get("trantype", "")).strip().upper(), OrderSide.BUY),
+        qty=_int(raw, "fillshares", default=0),
+        avg_price=_float(raw, "avgprc", default=0.0),
+        ts=ts,
     )
 
 

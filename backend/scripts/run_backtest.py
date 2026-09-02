@@ -310,6 +310,7 @@ from app.modules.broker_adapter.base.contracts import (  # noqa: E402
     OrderResult,
     PriceCandle,
     Tick,
+    TradeFill,
 )
 from app.modules.broker_adapter.base.contracts import (
     OptionType as ContractOptionType,
@@ -811,6 +812,9 @@ class HistoricalBrokerAdapter(BrokerPort):
 
     def get_positions(self) -> list[BrokerPosition]:
         self._not_implemented("get_positions")
+
+    def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+        self._not_implemented("get_recent_trades")
 
 
 # ---------------------------------------------------------------------------

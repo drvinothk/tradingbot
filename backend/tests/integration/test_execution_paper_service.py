@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from sqlalchemy.orm import Session
@@ -826,8 +827,10 @@ def test_close_position_routes_realized_pnl_and_slippage_through_the_shared_sign
     module docstring for the three-way duplication this closed). Pins that
     it now genuinely calls the shared `app.core.pnl.signed_pnl` -- not just
     a formula that happens to still match it -- by monkeypatching the name
-    imported into this module and asserting it's actually invoked (twice:
-    once for realized_pnl, once for slippage). Against the pre-fix code this
+    imported into this module and asserting it's actually invoked three
+    times: once for `Position.entry_slippage` at open (`_open_position_
+    from_fill`, via `dispatch_trade_intent`'s synchronous fill), then
+    realized_pnl and exit slippage at close. Against the pre-fix code this
     assertion would fail outright, since `signed_pnl` was never imported or
     called there at all.
     """
@@ -851,9 +854,57 @@ def test_close_position_routes_realized_pnl_and_slippage_through_the_shared_sign
     )
 
     assert outcome is not None
-    # realized_pnl(entry, exit) and slippage(intended, exit) -- both routed
-    # through the same shared function.
-    assert len(calls) == 2
+    assert len(calls) == 3
+    # entry_slippage(actual_fill, intended_entry, qty, side) -- argument
+    # order deliberately swapped relative to the exit-side calls below (see
+    # _open_position_from_fill's own comment): both are Decimal('80.0') in
+    # this fixture, i.e. no entry slippage since the mock fills exactly at
+    # the requested price.
+    assert calls[0] == (Decimal("80.0"), Decimal("80.0"), Decimal("25"), SignalSide.BUY)
+    # realized_pnl(entry, exit)
+    assert calls[1] == (Decimal("80.0000"), Decimal("72.0"), Decimal("25"), SignalSide.BUY)
+    # slippage(intended_trigger, exit)
+    assert calls[2] == (72.0, Decimal("72.0"), Decimal("25"), SignalSide.BUY)
+    assert position.entry_slippage == 0.0
+
+
+def test_entry_slippage_sign_is_favorable_positive_unfavorable_negative(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The zero-slippage case above can't catch an argument-order mistake --
+    0 is symmetric regardless of which price comes first. This forces a
+    real, nonzero fill-vs-intended gap via `queue_fill_scenario` on both
+    sides: every strategy in this codebase only ever enters long (buys an
+    option -- no strategy produces a SELL entry signal), so both cases here
+    are BUY, varying only whether the fill lands better or worse than
+    intended. See `_open_position_from_fill`'s own comment for why the
+    argument order is deliberately swapped from the exit-side formula.
+    """
+    better_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, side=SignalSide.BUY, entry_price=80.0
+    )
+    broker.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=76.0),
+    )
+    dispatch_trade_intent(db, trading_session, better_intent, broker=broker)
+    better_position = db.query(Position).filter(Position.trade_intent_id == better_intent.id).one()
+    # Paid 76 instead of the intended 80 -- 4 better per unit, 25 qty --
+    # favorable, must be positive.
+    assert better_position.entry_slippage == 100.0
+
+    worse_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, side=SignalSide.BUY, entry_price=80.0
+    )
+    broker.queue_fill_scenario(
+        option_contract.symbol,
+        FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=84.0),
+    )
+    dispatch_trade_intent(db, trading_session, worse_intent, broker=broker)
+    worse_position = db.query(Position).filter(Position.trade_intent_id == worse_intent.id).one()
+    # Paid 84 instead of the intended 80 -- 4 worse per unit -- unfavorable,
+    # must be negative.
+    assert worse_position.entry_slippage == -100.0
 
 
 def test_close_position_is_idempotent_when_already_closed(
@@ -912,6 +963,99 @@ def test_close_position_leaves_position_open_when_exit_order_is_rejected(
         db.query(SystemAlert)
         .filter(SystemAlert.trading_session_id == trading_session.id)
         .filter(SystemAlert.category == "exit_order_unfilled")
+        .one()
+    )
+    assert str(position.id) in alert.message
+
+
+def test_close_position_retries_with_a_new_order_after_a_prior_attempt_was_rejected(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Live incident 2026-09-02: a cancelled/rejected exit order used to
+    permanently strand `close_position` -- the fixed `exit:{position.id}`
+    idempotency key made every later call find that same dead order and
+    never place a new one. This pins the fix: a *second* call after a
+    rejected first attempt must place a genuinely new order (a distinct
+    `:retry0`-suffixed idempotency key) rather than re-reporting the same
+    dead one, and a normal fill on that retry must actually close the
+    position.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    broker.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+    )
+    first = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+    assert first is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+    # No fault scenario queued this time -- the retry should hit the mock's
+    # normal always-fills behavior.
+    second = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+
+    assert second is not None
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    exit_orders = (
+        db.query(Order)
+        .filter(Order.position_id == position.id)
+        .order_by(Order.submitted_at)
+        .all()
+    )
+    # The retry's suffix is `len(exit_attempts)` at the time it's placed --
+    # 1 prior attempt (the original, unsuffixed `exit:{id}` key) exists when
+    # this second call runs, so the retry is `:retry1`, not `:retry0`.
+    assert [o.idempotency_key for o in exit_orders] == [
+        f"exit:{position.id}",
+        f"exit:{position.id}:retry1",
+    ]
+    assert exit_orders[0].status == OrderStatus.REJECTED
+    assert exit_orders[1].status == OrderStatus.FILLED
+
+
+def test_close_position_gives_up_after_max_exit_order_attempts(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A genuinely un-exitable position (every attempt rejected) must stop
+    placing new live broker orders once `_MAX_EXIT_ORDER_ATTEMPTS` is hit,
+    alerting distinctly instead of retrying forever.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    for _ in range(5):
+        broker.queue_fill_scenario(
+            option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+        )
+        outcome = close_position(
+            db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+        )
+        assert outcome is None
+
+    assert db.query(Order).filter(Order.position_id == position.id).count() == 5
+
+    # 6th call: attempts are exhausted, must not place a 6th order.
+    outcome = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+    assert outcome is None
+    assert db.query(Order).filter(Order.position_id == position.id).count() == 5
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.trading_session_id == trading_session.id)
+        .filter(SystemAlert.category == "exit_order_attempts_exhausted")
         .one()
     )
     assert str(position.id) in alert.message
