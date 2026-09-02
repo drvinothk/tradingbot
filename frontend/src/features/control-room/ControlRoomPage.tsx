@@ -552,14 +552,12 @@ function TodaysActivityCard({
       <div className="metrics-strip">
         <ActivityMetricsBoxes metrics={liveMetrics} />
       </div>
-      <TotalPnlRow metrics={liveMetrics} />
       {showPaper && (
         <>
           <div className="muted metrics-substrip-label">Paper</div>
           <div className="metrics-strip metrics-substrip">
             <ActivityMetricsBoxes metrics={paperMetrics} />
           </div>
-          <TotalPnlRow metrics={paperMetrics} />
         </>
       )}
       <div className="card-footer-row">
@@ -576,10 +574,14 @@ function TodaysActivityCard({
   )
 }
 
+// Centered specifically under the Realized Profit / Unrealized P&L columns
+// (its parent, .metric-box-pnl-group, spans exactly those two columns' width
+// -- the Total Cost/Win Rate stacked column is a separate flex child, so
+// centering here never drifts toward it).
 function TotalPnlRow({ metrics }: { metrics: ScopeMetrics }) {
   if (metrics.sessionId === null) return null
   return (
-    <div className="total-pnl-row muted">
+    <div className="total-pnl-row total-pnl-row-centered muted">
       Total P&amp;L{' '}
       <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
         {metrics.totalPnl >= 0 ? '+' : ''}
@@ -622,23 +624,28 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
           columns, smaller font to fit two label+value pairs in that
           space). */}
       <div className="metric-box metric-box-split metric-box-wide">
-        <div className="metric-box-main">
-          <div className="metric-label">Realized Profit</div>
-          <div className="metric-value">
-            <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-              {metrics.realizedPnl >= 0 ? '+' : ''}
-              {fmtAmt(metrics.realizedPnl)}
-            </span>
+        <div className="metric-box-pnl-group">
+          <div className="metric-box-pnl-values">
+            <div className="metric-box-main">
+              <div className="metric-label">Realized Profit</div>
+              <div className="metric-value">
+                <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                  {metrics.realizedPnl >= 0 ? '+' : ''}
+                  {fmtAmt(metrics.realizedPnl)}
+                </span>
+              </div>
+            </div>
+            <div className="metric-box-main">
+              <div className="metric-label">Unrealized P&amp;L</div>
+              <div className="metric-value">
+                <span className={metrics.unrealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                  {metrics.unrealizedPnl >= 0 ? '+' : ''}
+                  {fmtAmt(metrics.unrealizedPnl)}
+                </span>
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="metric-box-main">
-          <div className="metric-label">Unrealized P&amp;L</div>
-          <div className="metric-value">
-            <span className={metrics.unrealizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-              {metrics.unrealizedPnl >= 0 ? '+' : ''}
-              {fmtAmt(metrics.unrealizedPnl)}
-            </span>
-          </div>
+          <TotalPnlRow metrics={metrics} />
         </div>
         <div className="metric-box-stacked">
           <div className="metric-box-stacked-item">

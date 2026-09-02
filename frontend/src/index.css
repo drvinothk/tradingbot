@@ -592,6 +592,26 @@ tbody tr:hover {
   padding-left: 1rem;
 }
 
+/* Wraps the Realized Profit / Unrealized P&L pair plus the Total P&L line
+   underneath them, as one column -- flex:4 matches the combined flex:2+2 of
+   the two .metric-box-main children it now holds, so it claims exactly the
+   same width against .metric-box-stacked that they did before this wrapper
+   existed. .metric-box-pnl-values is the row of the two figures themselves
+   (unchanged sizing/divider from .metric-box-main's own rules); the Total
+   P&L row sits below that row, centered under just this column -- never
+   under the separate Total Cost/Win Rate stacked column beside it. */
+.metric-box-pnl-group {
+  flex: 4 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.metric-box-pnl-values {
+  display: flex;
+  gap: 1rem;
+}
+
 .metric-box-secondary {
   flex: 1 1 auto;
   min-width: 0;
@@ -622,6 +642,12 @@ tbody tr:hover {
   gap: 0.25rem;
   border-left: 1px solid var(--border);
   padding-left: 1rem;
+  /* .metric-box-pnl-group beside this is now taller (values row + Total P&L
+     row) than a bare .metric-box-main ever was -- center this column against
+     that full height instead of sitting top-aligned per the parent's own
+     align-items: flex-start, so Cost/Win Rate doesn't read as stranded near
+     the top of a now-taller box. */
+  align-self: center;
 }
 
 .metric-box-stacked-item .metric-label {
@@ -696,14 +722,23 @@ tbody tr:hover {
   color: var(--text-muted);
 }
 
-/* Total P&L summary line under each visible scope's metrics-strip -- a
-   single muted text row, not a metric-box, so it adds only one line of
-   height rather than another full box. The figure itself still gets the
-   normal pnl-positive/pnl-negative color so profit/loss reads at a glance
-   despite the muted surrounding label. */
+/* Total P&L line, squeezed into the Realized Profit/Unrealized P&L box
+   itself (.metric-box-pnl-group above) rather than a separate row below the
+   whole card -- a single muted text line, not a metric-box, so it adds only
+   one line of height to that one box rather than another full box or a
+   card-wide footer. The figure itself still gets the normal
+   pnl-positive/pnl-negative color so profit/loss reads at a glance despite
+   the muted surrounding label. */
 .total-pnl-row {
   font-size: 0.8rem;
   margin: 0.35rem 0 0;
+}
+
+/* Centered under .metric-box-pnl-group's own width -- i.e. under the
+   Realized Profit + Unrealized P&L columns specifically, not the full box
+   (which also includes the separate Total Cost/Win Rate stacked column). */
+.total-pnl-row-centered {
+  text-align: center;
 }
 
 /* Bottom-right footer strip holding the Paper visibility toggle -- kept to
