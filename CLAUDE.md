@@ -694,8 +694,9 @@ work, or vice versa.
     can be found, replacing the one-off SQL correction with an audited,
     repeatable path. 1488 backend tests pass (up from 1475), ruff/mypy
     clean.
-  - **🔴 Two follow-up gaps found by post-fix architecture/QC review,
-    NOT yet fixed**: (1) `close_position_from_external_fill` (the function
+  - **Two follow-up gaps found by post-fix architecture/QC review — #1
+    FIXED and deployed same day (commit `d1ea1ad`), #2 documented and
+    deliberately deferred**: (1) `close_position_from_external_fill` (the function
     behind both the new auto-repair path and the new manual-reconcile
     endpoint) does **not** acquire `LOCK_EXECUTION_SINGLETON` itself, and
     its two real callers — `PositionManager`'s POLL-triggered
@@ -724,9 +725,25 @@ work, or vice versa.
     CANCELLED/REJECTED today. Would resurface immediately if multi-leg
     ever gets live support, or if `MockBrokerAdapter`'s fault-injection
     (`simulate_disconnect`/`queue_fill_scenario`, see the guardrail-layer
-    entry above) is ever pointed at a multi-leg position. Neither gap is
-    fixed yet — flagged for a follow-up session, not blocking today's
-    fix from being correct for the exact incident it addresses.
+    entry above) is ever pointed at a multi-leg position. **Deliberately
+    left latent/undeployed** — fix when multi-leg-live is actually planned,
+    not before.
+  - **Gap #1 fix, commit `d1ea1ad`, same day, deployed ~19:10 IST**:
+    `close_position_from_external_fill` now acquires the lock itself
+    (reentrant, so the already-nested EVENT path is unaffected) and
+    re-checks `PositionStatus.OPEN` after a `db.refresh(position)` rather
+    than a caller's possibly-stale in-memory object — `_attempt_auto_repair`
+    specifically loads `position` before a `broker.get_recent_trades()`
+    network round-trip, a real gap for another closer to win the race in.
+    Returns `None` on a lost race, mirroring `close_position`'s own
+    contract; both real callers updated to treat that as a no-op (`_attempt
+    _auto_repair` returns `False`, self-healing on the next reconciliation
+    pass; `manual_reconcile_position` returns `409`, already surfaced
+    generically by the existing frontend error handler — no frontend change
+    needed). 1491 backend tests pass (up from 1488, 3 new — one per layer:
+    service, reconciliation, endpoint), ruff/mypy clean, deployed via
+    full-tree `backend/app` tarball, clean restart, zero errors, zero open
+    positions at deploy time.
 
 - **2026-09-01: full backtest-archive re-analysis (626 configs) + the three
   surviving conviction configs updated on OCI for a multi-leg paper run —
