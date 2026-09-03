@@ -258,19 +258,21 @@ export function buildTradeRows(
       // to it, nothing else in this codebase ever sets 'sl_limit'), but
       // sync_resting_protective_stop re-prices that same resting order in
       // place once the position's trail activates rather than placing a new
-      // one -- so label it TSL once this position has actually started
-      // trailing, matching the position's own summary row instead of
-      // contradicting it. Anything else carries its own real
-      // intended_exit_reason, recorded by close_position at the moment it
-      // placed this exact order. `null` only for a row from before that
-      // field existed.
-      const exitKind = isRestingProtectiveStop
-        ? (trailStopPriceByPositionId.get(order.position_id as string) ?? null) !== null
-          ? 'TSL'
-          : 'SL'
+      // one -- so both the label and the Exit Via column (exitReason below)
+      // say trail once this position has actually started trailing,
+      // matching the position's own summary row instead of contradicting
+      // it. Anything else carries its own real intended_exit_reason,
+      // recorded by close_position at the moment it placed this exact
+      // order. `null` only for a row from before that field existed.
+      const isRestingStopTrailing =
+        isRestingProtectiveStop &&
+        (trailStopPriceByPositionId.get(order.position_id as string) ?? null) !== null
+      const orderExitReason = isRestingProtectiveStop
+        ? isRestingStopTrailing
+          ? 'trail'
+          : 'stop'
         : order.intended_exit_reason
-          ? exitReasonLabel(order.intended_exit_reason)
-          : null
+      const exitKind = orderExitReason ? exitReasonLabel(orderExitReason) : null
       const label = order.strategy_type
         ? friendlyTradeLabel(order.strategy_type, order.contract_symbol, order.submitted_at)
         : exitKind
@@ -295,7 +297,7 @@ export function buildTradeRows(
         isPnlRealized: false,
         entrySlippage: null,
         exitSlippage: null,
-        exitReason: isRestingProtectiveStop ? 'stop' : order.intended_exit_reason,
+        exitReason: orderExitReason,
         openedAt: null,
         closedAt: null,
         timestamp: order.submitted_at,
