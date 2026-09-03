@@ -2,10 +2,14 @@
 
 **Status: Parts 2, 3a, 3b, 3c implemented (commit `eab6613`, pushed +
 deployed to OCI), then QC'd the same day — one real idempotency gap found
-and fixed (commit `4b20054`, local only as of this edit, not yet
-pushed/deployed — see "QC pass findings" below). 1581 backend tests pass,
-ruff + mypy clean. Part 3d (reconciliation leg-awareness) and Part 1 (the 3
-new staged configs) are PENDING — see "What is pending" below.**
+and fixed (commit `4b20054`). Part 3d (reconciliation leg-awareness) then
+built the same day — staged-exit LIVE readiness is now code-complete. Part 1
+(the 3 new staged configs) has a tested, ready-to-run script
+(`apply_sb6_2leg_configs.py`), not yet applied to the live OCI DB. 1585
+backend tests pass, ruff + mypy clean. Local commits `4b20054`/`3b19147` plus
+Part 3d/Part 1 (uncommitted as of this edit) are all still local-only, not
+yet pushed/deployed — see "What is pending" below and the repo's own
+`git log`/`git status` for the current, authoritative state.**
 
 Full plan (with the Phase-2 QC / blast-radius audit that preceded the code):
 `~/.claude/plans/fizzy-weaving-hopcroft.md` on this machine (not in the repo).
@@ -206,29 +210,73 @@ not yet pushed/deployed — see repo `git log` for current state.
 
 ---
 
-## What is pending
+## Part 3d — reconciliation leg-awareness (DONE, 2026-09-04, same day)
 
-### Part 3d — reconciliation leg-awareness (needed before any live staged test)
+`_apply_resolved_pending_exit_order` and `close_position_from_external_fill`
+are now leg-aware, closing this session's own remaining live-readiness gap.
 
-`_apply_resolved_pending_exit_order` (`service.py:1514`) is **not leg-aware**:
-- A late-resolved `exit:{pos}:{leg}[:retryN]` fill → routes to
-  `_finalize_position_close` (closes the *whole* position) instead of
-  `_finalize_leg_and_maybe_position` (that one leg).
-- A carrier `stop:` fill (disconnect backstop) → routes to
-  `_finalize_position_close` as STOP instead of closing *all remaining legs*
-  (`close_all_open_legs`) at the fill price.
-- `stop:` CANCELLED/REJECTED discovered late → already handled correctly
-  (clears `resting_order_id`).
+- **New shared helper** `finalize_all_open_legs_from_one_fill`
+  (`exit_legs.py`) — closes every still-OPEN leg of a legged position against
+  ONE already-filled `Order` row, without placing any new broker order (the
+  fill already happened). Retires the carrier `StopPlan` first (clears
+  `resting_order_id`, marks `TRIGGERED`) so each leg's own carrier-resize/
+  cancel bookkeeping is a pure no-op — nothing left to resize/cancel, the
+  carrier is either the fill itself or already superseded by it. Naturally
+  idempotent: only currently-OPEN legs are touched, so a retry (all legs
+  already CLOSED) is a no-op. Used by two callers:
+  - `_apply_resolved_pending_exit_order`'s `is_protective_stop` branch, when
+    the position is legged — the whole-position carrier stop firing closes
+    every remaining leg at once, not the position as a single unit.
+  - `close_position_from_external_fill` — a recovered broker fill (auto-repair
+    or `POST /positions/{id}/manual-reconcile`) closes every leg against that
+    one fill.
+- **New `finalize_leg_from_resolved_exit_order`** (`exit_legs.py`) — the
+  late-resolution counterpart to `_close_leg` for a single per-leg exit order
+  (`exit:{position}:{leg_index}[:retryN]`). Parses `leg_index` out of the
+  order's own idempotency key (`_leg_index_from_idempotency_key`); no-ops if
+  the key doesn't parse, the leg doesn't exist, or it's already CLOSED (same
+  idempotent-by-construction reasoning). Used by
+  `_apply_resolved_pending_exit_order`'s non-protective-stop branch, when the
+  position is legged.
+- `_apply_resolved_pending_exit_order` now branches on
+  `position_has_exit_legs` before deciding which of the two helpers above (or
+  the unchanged single-position `_finalize_position_close`) to call; the
+  CANCELLED/REJECTED-discovered-late branch (clears a dead `resting_order_id`)
+  needed no change — it already worked identically for a legged position's
+  carrier.
+- `close_position_from_external_fill` resolves a real broker
+  (`resolve_broker_for_position`) and routes to
+  `finalize_all_open_legs_from_one_fill` when the position is legged, instead
+  of `_finalize_position_close`.
+- Startup recovery (`_run_startup_recovery_check` / `_resume_strategy_runners`)
+  needed no change, confirmed — both go through `run_full_reconciliation` /
+  `close_position_from_external_fill`, now leg-aware for free.
 
-Also: `close_position_from_external_fill` (auto-repair + `POST /positions/{id}/manual-reconcile`)
-assumes a single-exit position — must close all open legs from the recovered
-fill for a legged position. Startup recovery
-(`_run_startup_recovery_check` / `_resume_strategy_runners`) then works for free
-once the reconciliation loop is leg-aware.
+**Verification**: 3 new dedicated tests in `test_exit_legs.py`
+(`test_late_resolved_per_leg_exit_order_closes_only_that_leg`,
+`test_late_resolved_carrier_stop_closes_all_remaining_legs`,
+`test_close_position_from_external_fill_closes_all_legs`), each confirmed
+failing before the fix (`git stash` the two source files, rerun, red) and
+passing after. 1585 backend tests pass total (up from 1581), ruff + mypy
+clean, no schema change.
 
-### Part 1 — the 3 new staged configs (config insert on the live OCI DB)
+**Staged-exit LIVE readiness is now code-complete** — the remaining live
+blast-radius gate is operational, not code: no `exit_legs` config is routed
+off `runtime_mode=force_paper` yet (see Part 3b's own note above; unchanged
+by this).
 
-Add three `strategy_configs` rows, `is_enabled=true`, `runtime_mode=force_paper`:
+---
+
+## Part 1 — the 3 new staged configs (script ready, NOT yet applied to OCI)
+
+`backend/scripts/apply_sb6_2leg_configs.py` — clones each base config's
+CURRENT live `params`, adds the structure-break tuning + 2-leg `exit_legs`
+spec below, and creates the new config via a direct DB session running the
+exact same `validate_exit_leg_templates` call `POST /strategies` does (never
+the raw-`psql`-INSERT shortcut that skips validation and fails-safe to
+no-legs at signal time). Idempotent (skips a name that already exists).
+`--dry-run` prints the exact params without writing anything — always run
+that first.
 
 | New config | strategy_type | clone of |
 |---|---|---|
@@ -236,7 +284,7 @@ Add three `strategy_configs` rows, `is_enabled=true`, `runtime_mode=force_paper`
 | `Test 4 (sb6-2leg)` | `vwap_pullback` | `Test 4` |
 | `Test (sb6-2leg)` | `oi_volume_confirmed` | `Test` |
 
-`params` for each:
+`params` delta merged onto each base config's own current params:
 
 ```json
 {
@@ -251,18 +299,35 @@ Add three `strategy_configs` rows, `is_enabled=true`, `runtime_mode=force_paper`
 }
 ```
 
-No restart needed (`auto_spawner` reads `is_enabled` per run; `_build_strategy`
-reads `params` at spawn). Prefer the config endpoint (runs
-`validate_exit_leg_templates`); a raw `psql` INSERT works but skips validation
-and would fail-safe to no-legs at signal time.
+`runtime_mode` is hardcoded `force_paper` on all three (never inherited from
+the base config — `Test 1`'s own `runtime_mode` is `NULL`, i.e. it follows
+the session mode; a brand-new, unbacktested staged-exit variant must not
+inherit that).
 
-### Other
+**Not run against the live OCI DB from this session** — this local session
+has no live DB/SSH access (confirmed: even a read-only credential lookup was
+blocked by the sandbox's own safety classifier), and applying it is a live
+production-config mutation, the same category of action every other config
+change in this repo's history goes through an explicit, separately-confirmed
+step for. Self-verified everything reachable without that access: `--dry-run`
+against the local dev DB runs clean (correctly reports all three base
+configs not found there, confirming no crash/import/query error), and the
+`exit_legs` payload itself independently validates via
+`validate_exit_leg_templates` with zero errors. No restart needed once
+applied (`auto_spawner` reads `is_enabled` per run; `_build_strategy` reads
+`params` at spawn).
 
+## What is pending
+
+- **Apply Part 1's script to the live OCI DB** — `--dry-run` first, read the
+  printed params, then apply for real. Needs live DB/SSH access this session
+  doesn't have.
 - Decide `EMA_Micro_Conviction` `qty_lots` (2 → `[1,1]` drops a leg; 3 →
-  `[1,1,1]`).
+  `[1,1,1]`) — a separate, already-live conviction config, unrelated to the
+  3 new configs above.
 - The A/B comparison metric (structure-break-affected trades only: net PnL, max
   adverse excursion, winner→loser flips) — prefer the validated reconstruction
   harness on one live config over trusting parallel-config PnL (risk-engine
   slot competition biases it).
 - A real minimum-size live staged-exit test (one config, `qty_lots: 2`, one
-  trading day) once 3d lands.
+  trading day) — Part 3d is done, so this is now unblocked, just not yet run.

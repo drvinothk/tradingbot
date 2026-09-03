@@ -18,8 +18,13 @@ sleep-inhibitor release, and `record_trade_outcome_effects` with P&L summed
 across every leg (QC finding 1 — never per leg, which would trip kill_switch
 mid-trade / corrupt the loss streak).
 
-LIVE positions never get legs yet — per-leg broker resting SL-LMTs + their
-async-fill reconciliation are a deliberately-gated follow-up (see the plan).
+LIVE positions build legs the same way as paper (the gate opened 2026-09-04):
+one whole-position carrier `StopPlan` (`build_carrier_stop_plan`) rather than
+one broker resting SL-LMT per leg — see that function's own docstring for
+why. Per-leg exit orders and the carrier's own fill are both leg-aware end to
+end, including late/async resolution (`finalize_all_open_legs_from_one_fill`,
+called from `service._apply_resolved_pending_exit_order` and
+`service.close_position_from_external_fill`).
 """
 
 from __future__ import annotations
@@ -1114,3 +1119,129 @@ def _finalize_position_after_last_leg(
     record_trade_outcome_effects(
         db, trading_session, total_realized, is_live=(order_mode == OrderMode.LIVE)
     )
+
+
+def finalize_all_open_legs_from_one_fill(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    exit_order: Order,
+    exit_reason: ExitReason,
+    order_mode: OrderMode,
+    broker: BrokerPort,
+) -> TradeOutcome | None:
+    """Close every still-OPEN leg of a legged position against ONE already-
+    filled `Order` row — used when a single broker-side event accounts for
+    the whole remaining position at once:
+
+    - the whole-position carrier stop firing, discovered late by
+      `reconcile_pending_live_exit_orders` (`_apply_resolved_pending_exit_
+      order`'s `is_protective_stop` branch — the carrier is a *single*
+      resting SL-LMT for the whole remaining qty, so its fill closes every
+      leg still open, not just one);
+    - a recovered external fill for a legged position
+      (`close_position_from_external_fill`'s auto-repair / manual-reconcile
+      paths — a human closed the whole position directly at the broker).
+
+    Unlike `close_all_open_legs` (EOD / margin-breach / manual square-off),
+    this does **not** place any new broker order per leg — the fill already
+    happened; every remaining leg is reconciled against it using the same
+    `exit_order`/price for each, mirroring `close_all_open_legs`'s own
+    "one price, applied to every remaining leg" contract.
+
+    Retires the carrier `StopPlan` first (clears `resting_order_id`, marks
+    `TRIGGERED`) so `_finalize_leg_and_maybe_position`'s own per-leg carrier-
+    resize/cancel bookkeeping is a pure no-op for the rest of this call —
+    there is nothing left to resize/cancel at the broker; the carrier stop
+    is either the fill event itself or has already been superseded by it.
+
+    Naturally idempotent: only currently-OPEN legs are touched, so calling
+    this again after every leg is already CLOSED (a retried/duplicate
+    resolution of the same fill) is a no-op that returns `None`.
+    """
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    if carrier is not None and carrier.resting_order_id is not None:
+        carrier.resting_order_id = None
+        carrier.resting_order_price = None
+        carrier.status = StopPlanStatus.TRIGGERED
+        carrier.updated_at = _utcnow()
+        db.add(carrier)
+        db.flush()
+
+    open_legs = (
+        db.query(PositionExitLeg)
+        .filter(
+            PositionExitLeg.position_id == position.id,
+            PositionExitLeg.status == PositionExitLegStatus.OPEN,
+        )
+        .order_by(PositionExitLeg.leg_index)
+        .all()
+    )
+    last_outcome: TradeOutcome | None = None
+    for leg in open_legs:
+        last_outcome = _finalize_leg_and_maybe_position(
+            db, trading_session, position, leg, exit_order, exit_reason, order_mode, None, broker
+        )
+    return last_outcome
+
+
+def finalize_leg_from_resolved_exit_order(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    exit_order: Order,
+    exit_reason: ExitReason,
+    order_mode: OrderMode,
+    broker: BrokerPort,
+) -> TradeOutcome | None:
+    """Late-resolution counterpart to `_close_leg` for a single per-leg exit
+    order (`exit:{position_id}:{leg_index}[:retryN]`), discovered
+    filled/resolved by `reconcile_pending_live_exit_orders` well after
+    `_close_leg_locked` originally placed it (the LIVE ack-timeout /
+    async-fill case, same reasoning as the single-exit
+    `_apply_resolved_pending_exit_order` this mirrors). Parses `leg_index`
+    out of the order's own idempotency key — safe, since only
+    `_close_leg_locked` ever constructs this exact key shape
+    (`f"exit:{position.id}:{leg.leg_index}"` + an optional `:retryN`), and
+    only for a legged position.
+
+    Returns `None` (no-op) if the key can't be parsed, the leg doesn't
+    exist, or the leg is already CLOSED (a retried/duplicate resolution of
+    the same fill, or a leg that closed via some other path in the
+    meantime) — naturally idempotent, same reasoning as
+    `finalize_all_open_legs_from_one_fill`.
+    """
+    leg_index = _leg_index_from_idempotency_key(exit_order.idempotency_key)
+    if leg_index is None:
+        return None
+    leg = (
+        db.query(PositionExitLeg)
+        .filter(
+            PositionExitLeg.position_id == position.id,
+            PositionExitLeg.leg_index == leg_index,
+        )
+        .one_or_none()
+    )
+    if leg is None or leg.status != PositionExitLegStatus.OPEN:
+        return None
+    return _finalize_leg_and_maybe_position(
+        db, trading_session, position, leg, exit_order, exit_reason, order_mode, None, broker
+    )
+
+
+def _leg_index_from_idempotency_key(key: str) -> int | None:
+    """`exit:{position_id}:{leg_index}` or `...:{leg_index}:retry{n}` ->
+    `leg_index`; `None` if `key` isn't a per-leg exit key at all (a `stop:`
+    carrier key, or a plain `exit:{position_id}` single-exit key with no leg
+    segment — that shape never actually reaches a legged position's exit
+    orders, see `close_position`'s own `position_has_exit_legs`
+    early-return, but parsing defensively rather than assuming costs
+    nothing here).
+    """
+    parts = key.split(":")
+    if len(parts) < 3 or parts[0] != "exit":
+        return None
+    try:
+        return int(parts[2])
+    except ValueError:
+        return None

@@ -16,11 +16,14 @@ from app.domain.execution.models import (
     ExitReason,
     Order,
     OrderMode,
+    OrderStatus,
+    OrderType,
     Position,
     PositionExitLeg,
     PositionExitLegStatus,
     PositionStatus,
     StopPlan,
+    StopPlanStatus,
     TradeOutcome,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
@@ -38,7 +41,12 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
-from app.modules.broker_adapter.base.contracts import BrokerOrderStatus
+from app.modules.broker_adapter.base.contracts import (
+    BrokerOrderStatus,
+    OrderResult,
+    TradeFill,
+)
+from app.modules.broker_adapter.base.contracts import OrderSide as ContractOrderSide
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.exit_legs import (
     _close_leg,
@@ -52,8 +60,10 @@ from app.modules.execution_engine.paper.protective_stop import (
 from app.modules.execution_engine.paper.service import (
     _MAX_EXIT_ORDER_ATTEMPTS,
     close_position,
+    close_position_from_external_fill,
     dispatch_trade_intent,
     evaluate_open_position,
+    reconcile_pending_live_exit_orders,
 )
 from app.modules.reconciliation.service import _local_net_qty_by_symbol
 from app.modules.reporting.service import build_scorecard
@@ -546,6 +556,243 @@ def test_carrier_stop_creation_is_idempotent(
 
     assert carrier_again is not None and carrier_again.id == carrier_first.id
     assert db.query(StopPlan).filter(StopPlan.position_id == position.id).count() == 1
+
+
+# --- Part 3d: leg-aware reconciliation (2026-09-04) -----------------------
+
+
+class _FakeExitStatusBroker:
+    """Minimal `BrokerPort` double for the reconciliation tests below: a
+    single scripted `get_order_status` result, plus no-op `modify_order`/
+    `cancel_order` so an incidental carrier-resize/cancel call (a real leg
+    close can trigger one via `_sync_carrier_stop_after_leg_close`) doesn't
+    blow up on a missing method -- mirrors `test_execution_paper_service.py`'s
+    own `_FakeOrderStatusBroker`, extended with the two extra methods this
+    module's carrier-stop code path can call that the single-exit tests
+    never needed.
+    """
+
+    def __init__(self, result: OrderResult) -> None:
+        self._result = result
+        self.modify_calls: list[dict] = []
+        self.cancel_calls: list[str] = []
+
+    def get_order_status(self, broker_order_id: str) -> OrderResult:
+        return self._result
+
+    def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
+        self.modify_calls.append({"broker_order_id": broker_order_id, **changes})
+        return OrderResult(
+            idempotency_key="",
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.OPEN,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
+    def cancel_order(self, broker_order_id: str) -> OrderResult:
+        self.cancel_calls.append(broker_order_id)
+        return OrderResult(
+            idempotency_key="",
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.CANCELLED,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
+    def get_positions(self) -> list:
+        # `_finalize_leg_and_maybe_position` always ends with a
+        # `run_reconciliation(EVENT)` call (same as the synchronous
+        # `_close_leg`/`close_all_open_legs` path) -- this fake isn't a
+        # `MockBrokerAdapter`, so it reads as a LIVE broker there, but these
+        # tests' positions were opened via the PAPER `broker` fixture, so
+        # `_local_net_qty_by_symbol`'s LIVE-scoped query already finds
+        # nothing local to compare against -- an empty broker book matches
+        # trivially, no mismatch/lock risk either way.
+        return []
+
+
+def _make_pending_live_leg_order(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    *,
+    idempotency_key: str,
+    qty: int,
+    broker_order_id: str,
+) -> Order:
+    now = datetime.now(UTC)
+    order = Order(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        option_contract_id=position.option_contract_id,
+        position_id=position.id,
+        idempotency_key=idempotency_key,
+        mode=OrderMode.LIVE,
+        side=ContractOrderSide.SELL,
+        order_type=OrderType.LIMIT,
+        qty=qty,
+        status=OrderStatus.PENDING,
+        filled_qty=0,
+        avg_fill_price=None,
+        broker_order_id=broker_order_id,
+        submitted_at=now,
+        updated_at=now,
+    )
+    db.add(order)
+    db.flush()
+    return order
+
+
+def test_late_resolved_per_leg_exit_order_closes_only_that_leg(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # Part 3d: a per-leg exit:{position}:{leg_index} order that doesn't fill
+    # synchronously must, once reconciliation discovers it filled, close
+    # only that one leg -- not route to the whole-position finalize path.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    legs = _legs(db, position.id)
+    leg0 = legs[0]
+
+    exit_order = _make_pending_live_leg_order(
+        db,
+        trading_session,
+        position,
+        idempotency_key=f"exit:{position.id}:{leg0.leg_index}",
+        qty=leg0.qty,
+        broker_order_id="LEG-EXIT-1",
+    )
+    fake_broker = _FakeExitStatusBroker(
+        OrderResult(
+            idempotency_key=exit_order.idempotency_key,
+            broker_order_id="LEG-EXIT-1",
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=leg0.qty,
+            avg_fill_price=91.5,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(leg0)
+    db.refresh(position)
+    db.refresh(exit_order)
+    assert exit_order.status == OrderStatus.FILLED
+    assert leg0.status == PositionExitLegStatus.CLOSED
+    assert leg0.exit_reason == ExitReason.RECONCILED
+    assert position.status == PositionStatus.OPEN  # other two legs still open
+    assert position.qty == 250 - leg0.qty
+    remaining = [lg for lg in _legs(db, position.id) if lg.status == PositionExitLegStatus.OPEN]
+    assert len(remaining) == 2
+
+    outcome = (
+        db.query(TradeOutcome).filter(TradeOutcome.position_exit_leg_id == leg0.id).one()
+    )
+    assert float(outcome.exit_price) == pytest.approx(91.5)
+
+
+def test_late_resolved_carrier_stop_closes_all_remaining_legs(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # Part 3d: the whole-position carrier stop (stop:{position_id}) filling
+    # late must close EVERY still-open leg against that one fill, not the
+    # whole position as a single unit -- and must retire the carrier row.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    carrier.resting_order_id = "CARRIER-STOP-1"
+    carrier.resting_order_price = 70.56
+    db.add(carrier)
+    db.flush()
+
+    stop_order = _make_pending_live_leg_order(
+        db,
+        trading_session,
+        position,
+        idempotency_key=f"stop:{position.id}",
+        qty=position.qty,
+        broker_order_id="CARRIER-STOP-1",
+    )
+    fake_broker = _FakeExitStatusBroker(
+        OrderResult(
+            idempotency_key=stop_order.idempotency_key,
+            broker_order_id="CARRIER-STOP-1",
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=position.qty,
+            avg_fill_price=70.0,
+        )
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+
+    db.refresh(position)
+    db.refresh(carrier)
+    assert position.status == PositionStatus.CLOSED
+    assert position.qty == 0
+    legs = _legs(db, position.id)
+    assert all(lg.status == PositionExitLegStatus.CLOSED for lg in legs)
+    assert all(lg.exit_reason == ExitReason.STOP for lg in legs)
+    assert carrier.resting_order_id is None
+    assert carrier.status == StopPlanStatus.TRIGGERED
+    # The carrier's own cancel_order must never be called -- it already
+    # filled at the broker, there is nothing left to cancel.
+    assert fake_broker.cancel_calls == []
+
+    outcomes = db.query(TradeOutcome).filter(
+        TradeOutcome.position_exit_leg_id.in_([lg.id for lg in legs])
+    ).all()
+    assert len(outcomes) == 3
+    assert all(float(o.exit_price) == pytest.approx(70.0) for o in outcomes)
+
+
+def test_close_position_from_external_fill_closes_all_legs(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # Part 3d: the auto-repair / manual-reconcile path's own single
+    # synthetic fill must close every leg of a legged position, not just
+    # the position as a whole.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+
+    fill = TradeFill(
+        broker_order_id="RECOVERED-1",
+        contract_symbol=option_contract.symbol,
+        side=ContractOrderSide.SELL,
+        qty=position.qty,
+        avg_price=88.0,
+        ts=datetime.now(UTC),
+    )
+    outcome = close_position_from_external_fill(
+        db, trading_session, position, fill, exit_reason=ExitReason.MANUAL
+    )
+
+    assert outcome is not None
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    assert position.qty == 0
+    legs = _legs(db, position.id)
+    assert all(lg.status == PositionExitLegStatus.CLOSED for lg in legs)
+    assert all(lg.exit_reason == ExitReason.MANUAL for lg in legs)
+    outcomes = db.query(TradeOutcome).filter(
+        TradeOutcome.position_exit_leg_id.in_([lg.id for lg in legs])
+    ).all()
+    assert len(outcomes) == 3
+    assert all(float(o.exit_price) == pytest.approx(88.0) for o in outcomes)
 
 
 # --- evaluation ---------------------------------------------------------

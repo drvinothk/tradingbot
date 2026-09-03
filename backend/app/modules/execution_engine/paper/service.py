@@ -109,6 +109,8 @@ from app.modules.execution_engine.paper.exit_legs import (
     build_position_exit_legs,
     close_all_open_legs,
     evaluate_leg_position,
+    finalize_all_open_legs_from_one_fill,
+    finalize_leg_from_resolved_exit_order,
     position_has_exit_legs,
 )
 from app.modules.execution_engine.paper.order_helpers import (
@@ -1363,6 +1365,13 @@ def close_position_from_external_fill(
     Returns `None` on a lost race (mirrors `close_position`'s own `None`
     contract for "someone else already closed this") -- callers must treat
     that as "nothing to do here", not an error.
+
+    **2026-09-04, Part 3d**: a legged position closes every still-OPEN leg
+    against this one recovered fill (`finalize_all_open_legs_from_one_fill`)
+    instead of the whole-position `_finalize_position_close` path -- the
+    recovered fill genuinely does represent the whole remaining position (a
+    human squared it off directly at the broker, or `get_recent_trades`
+    found the one matching trade), it just has to be attributed per leg.
     """
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
         db.refresh(position)
@@ -1422,6 +1431,18 @@ def close_position_from_external_fill(
                 ts=now,
             )
         )
+
+        # 2026-09-04, Part 3d: this function's own single synthetic `Order`
+        # represents the *whole* recovered fill (position.qty at one price)
+        # -- for a legged position that means every still-OPEN leg closes
+        # against it at once, not the position as a single unit. Mirrors the
+        # carrier-stop-fill branch in `_apply_resolved_pending_exit_order`
+        # (same shape: one external fill, N legs to reconcile against it).
+        if position_has_exit_legs(db, position.id):
+            leg_broker = resolve_broker_for_position(db, trading_session, position)
+            return finalize_all_open_legs_from_one_fill(
+                db, trading_session, position, closing_order, exit_reason, order_mode, leg_broker
+            )
 
         return _finalize_position_close(
             db, trading_session, position, closing_order, exit_reason, order_mode, None
@@ -1507,7 +1528,9 @@ def reconcile_pending_live_exit_orders(
         if result is None or result.status not in _TERMINAL_BROKER_ORDER_STATUSES:
             continue
 
-        _apply_resolved_pending_exit_order(db, trading_session, position, order, result)
+        _apply_resolved_pending_exit_order(
+            db, trading_session, position, order, result, resolved_broker
+        )
         db.flush()
 
 
@@ -1517,6 +1540,7 @@ def _apply_resolved_pending_exit_order(
     position: Position,
     order: Order,
     result: OrderResult,
+    broker: BrokerPort,
 ) -> None:
     now = _utcnow()
     order.status = _map_status(result.status)
@@ -1556,6 +1580,18 @@ def _apply_resolved_pending_exit_order(
     # (e.g. a row from before this field existed). See `ExitReason
     # .RECONCILED`'s own docstring for the full incident this closes.
     is_protective_stop = order.idempotency_key.startswith("stop:")
+    # 2026-09-04, Part 3d: a legged position's exit orders never reach
+    # `close_position` (it early-returns to `close_all_open_legs` for any
+    # position with legs), so an `exit:` order discovered here for a legged
+    # position is always the per-leg key `_close_leg_locked` places
+    # (`exit:{position_id}:{leg_index}[:retryN]`), never the whole-position
+    # `exit:{position_id}` key. The `stop:` key is shared either way (see
+    # `place_protective_stop`'s own docstring), but for a legged position it
+    # names the single whole-position *carrier* stop
+    # (`build_carrier_stop_plan`), not a per-position resting stop — its
+    # fill closes every remaining leg at once, not the whole position via
+    # one Order the way the non-legged path does.
+    is_legged = position_has_exit_legs(db, position.id)
     resolved_exit_reason: ExitReason | None = None
 
     if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
@@ -1566,15 +1602,25 @@ def _apply_resolved_pending_exit_order(
         else:
             exit_reason = ExitReason.RECONCILED
         resolved_exit_reason = exit_reason
-        _finalize_position_close(
-            db,
-            trading_session,
-            position,
-            order,
-            exit_reason,
-            OrderMode(order.mode),
-            None,
-        )
+        if is_legged:
+            if is_protective_stop:
+                finalize_all_open_legs_from_one_fill(
+                    db, trading_session, position, order, exit_reason, OrderMode(order.mode), broker
+                )
+            else:
+                finalize_leg_from_resolved_exit_order(
+                    db, trading_session, position, order, exit_reason, OrderMode(order.mode), broker
+                )
+        else:
+            _finalize_position_close(
+                db,
+                trading_session,
+                position,
+                order,
+                exit_reason,
+                OrderMode(order.mode),
+                None,
+            )
     elif is_protective_stop:
         # The resting stop resolved to CANCELLED/REJECTED without this app
         # having initiated the cancel itself -- `close_position`'s own
