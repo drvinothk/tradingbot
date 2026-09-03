@@ -44,6 +44,15 @@ import uuid
 sys.path.insert(0, ".")
 
 from app.core.db.session import session_scope  # noqa: E402
+
+# Workspace itself is never referenced directly below -- imported purely so
+# SQLAlchemy's mapper configuration sees the `workspaces` table (StrategyConfig
+# .workspace_id's FK target) before the first flush. Without it, a script that
+# only ever imports strategy models raises NoReferencedTableError at flush
+# time (found live, 2026-09-04, against the OCI DB) -- same "both sides of a
+# FK need their model class imported" requirement bootstrap_admin.py's own
+# import list already satisfies for the same reason.
+from app.domain.identity.models import Workspace  # noqa: E402,F401
 from app.domain.strategy.exit_legs import (  # noqa: E402
     deserialize_exit_leg_templates,
     validate_exit_leg_templates,
