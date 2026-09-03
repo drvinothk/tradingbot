@@ -53,10 +53,15 @@ from app.domain.strategy.models import StrategyConfig, StrategyRuntimeMode  # no
 # (base config name, strategy_type, new config name) -- strategy_type is
 # passed explicitly (not just looked up on the base row) so a base config
 # ever getting renamed/retyped can't silently misroute the clone.
+#
+# The oi_volume_confirmed base config's real live name is "Test " -- a
+# trailing space, confirmed live (2026-09-04 dry-run against the OCI DB;
+# also visible in CLAUDE.md's own "Test " backtick-quoting). "Test" without
+# it does not match any row.
 NEW_CONFIGS: list[tuple[str, str, str]] = [
     ("Test 1", "ema_micro_pullback", "Test 1 (sb6-2leg)"),
     ("Test 4", "vwap_pullback", "Test 4 (sb6-2leg)"),
-    ("Test", "oi_volume_confirmed", "Test (sb6-2leg)"),
+    ("Test ", "oi_volume_confirmed", "Test (sb6-2leg)"),
 ]
 
 # The delta on top of each base config's own current params -- exactly the
