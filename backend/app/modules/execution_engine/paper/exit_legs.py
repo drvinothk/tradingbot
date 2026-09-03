@@ -333,19 +333,24 @@ def build_position_exit_legs(
 def _alert_collapsed(
     db: Session, trading_session: TradingSession, position: Position, why: str, *, is_live: bool
 ) -> None:
-    """`is_live` drives both `severity` and `mode`, not just the message text.
-    The two paper-only collapse reasons (position too small, fill not a lot
-    multiple) are a harmless, expected fallback — WARNING, `mode=PAPER`,
-    never pushed to Telegram, unchanged from before. The LIVE-position
-    reason is different in kind: a strategy's staged-exit *risk config* was
-    silently ignored on a real-money position, which the operator should
-    actually be told about — CRITICAL, `mode=LIVE`, eligible for Telegram
-    once `exit_legs_collapsed` is on `TELEGRAM_ALLOWED_CATEGORIES` (all
-    other gates — window, dedup — still apply as normal). Found via a 2026-
-    08-30 QC pass: every call site previously hardcoded `mode=OrderMode
-    .PAPER` regardless of which case fired, silently making the LIVE case
-    unable to ever reach Telegram even after allowlisting, since `send_alert`
-    always paper-suppresses a `mode=PAPER` alert.
+    """`is_live` drives both `severity` and `mode`, not just the message text
+    — CRITICAL/`mode=LIVE` (eligible for Telegram once `exit_legs_collapsed`
+    is on `TELEGRAM_ALLOWED_CATEGORIES`; all other gates — window, dedup —
+    still apply as normal) when `is_live` is True, else WARNING/`mode=PAPER`
+    (never pushed to Telegram). Found via a 2026-08-30 QC pass: every call
+    site previously hardcoded `mode=OrderMode.PAPER` regardless of which case
+    fired, silently making the LIVE case unable to ever reach Telegram even
+    after allowlisting, since `send_alert` always paper-suppresses a
+    `mode=PAPER` alert.
+
+    Since the Part-3b LIVE gate opened, callers choose `is_live` per reason,
+    not just per position: the "position too small" (1-lot) collapse is
+    always WARNING/PAPER regardless of the position's real mode — it's the
+    LIVE default sizing (1 lot), so treating it as a real-money-risk event
+    would make it the single noisiest Telegram category in the app. "fill not
+    a lot multiple" passes the position's real `is_live` — a genuinely
+    anomalous fill (not just routine 1-lot sizing) on a real-money position
+    still gets CRITICAL/LIVE treatment.
     """
     logger.warning("exit_legs collapsed for position %s: %s", position.id, why)
     send_alert(
@@ -424,7 +429,20 @@ def build_carrier_stop_plan(
     carrier: it is never an exit-decision input (`evaluate_open_position`
     branches to `evaluate_leg_position` before its own stop check), only a
     holder for `resting_order_id` / `resting_order_price` and a resize anchor.
+
+    Idempotent, mirroring `build_position_exit_legs`'s own guard: if a carrier
+    already exists for this position (a retried `_open_position_from_fill` via
+    `_apply_resolved_pending_order` — `build_position_exit_legs` itself already
+    returns the existing legs rather than duplicating them on that path), this
+    returns the existing row unchanged rather than inserting a second one.
+    `stop_plans.position_id` is DB-unique, so without this check a retry would
+    raise `IntegrityError` (confirmed via a direct repro) instead of no-op'ing
+    the way the rest of this entry-fill flow already does.
     """
+    existing = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    if existing is not None:
+        return existing
+
     leg_stops = [_dec(lg.stop_price) for lg in legs if lg.stop_price is not None]
     if not leg_stops:
         return None

@@ -1671,7 +1671,10 @@ def evaluate_open_position(
         return None
 
     # Multi-leg (staged) exit: a position with `position_exit_legs` is driven
-    # entirely by the leg-aware evaluator; it has no StopPlan/TrailPlan.
+    # entirely by the leg-aware evaluator. It has no TrailPlan; it may have a
+    # StopPlan (the whole-position carrier resting stop, see exit_legs.py's
+    # build_carrier_stop_plan), but that row is never an exit-decision input
+    # here — this branch is taken before the StopPlan lookup below either way.
     if position_has_exit_legs(db, position.id):
         return evaluate_leg_position(
             db, trading_session, position, tick_price, broker, bid, ask, underlying_price

@@ -40,7 +40,11 @@ from app.domain.strategy.models import (
 )
 from app.modules.broker_adapter.base.contracts import BrokerOrderStatus
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
-from app.modules.execution_engine.paper.exit_legs import _close_leg, build_position_exit_legs
+from app.modules.execution_engine.paper.exit_legs import (
+    _close_leg,
+    build_carrier_stop_plan,
+    build_position_exit_legs,
+)
 from app.modules.execution_engine.paper.protective_stop import (
     place_protective_stop,
     resize_resting_protective_stop,
@@ -511,6 +515,37 @@ def test_leg_creation_is_idempotent(
     )
     assert again is not None and len(again) == 3
     assert len(_legs(db, position.id)) == 3  # no duplicates
+
+
+def test_carrier_stop_creation_is_idempotent(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # QC 2026-09-04: build_carrier_stop_plan used to have no equivalent guard
+    # to build_position_exit_legs' own idempotency check above -- a retried
+    # _open_position_from_fill for a legged position (e.g. via
+    # reconcile_pending_live_orders/_apply_resolved_pending_order re-resolving
+    # the same entry order) would raise IntegrityError on stop_plans'
+    # position_id unique constraint instead of no-op'ing like the rest of
+    # this flow. Confirmed failing before the fix via a direct repro.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    carrier_first = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    legs_again = build_position_exit_legs(
+        db, trading_session, position, intent, filled_qty=250, lot_size=25, is_live=False
+    )
+    assert legs_again is not None
+
+    carrier_again = build_carrier_stop_plan(
+        db, trading_session, position, legs_again, option_contract, broker, is_live=False
+    )
+    db.flush()
+
+    assert carrier_again is not None and carrier_again.id == carrier_first.id
+    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).count() == 1
 
 
 # --- evaluation ---------------------------------------------------------
