@@ -64,9 +64,13 @@ class ConfigurationError(Exception):
 
 
 class CriticalSafetyException(Exception):
-    """Ops-Hardening Phase 5. Raised by a broker adapter's own
-    `place_order` (e.g. `ShoonyaBrokerAdapter`'s 1-lot hardcap, pre-flight
-    checks) when a hard safety invariant is violated. Deliberately *not* a
-    `BrokerError` subclass, same reasoning as `ConfigurationError` — this
-    is "we refused to send the order," not "the broker rejected it."
+    """Ops-Hardening Phase 5. For a broker adapter's own `place_order`
+    pre-flight checks, when a hard safety invariant is violated before ever
+    reaching the broker. Deliberately *not* a `BrokerError` subclass, same
+    reasoning as `ConfigurationError` — this is "we refused to send the
+    order," not "the broker rejected it." (`ShoonyaBrokerAdapter` no longer
+    has an example of this — its own 1-lot hardcap was removed 2026-09-03
+    once `RiskLimitConfig.per_trade_lot_cap` became a real, UI-editable
+    setting rather than a fixed, non-editable adapter-level floor — but the
+    type stays available for a genuine future case.)
     """

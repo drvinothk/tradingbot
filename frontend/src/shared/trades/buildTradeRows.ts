@@ -5,7 +5,7 @@ import type {
   PositionOut,
   RunningStrategyOut,
 } from '../api/types'
-import { friendlyTradeLabel } from '../format/friendlyLabel'
+import { exitReasonLabel, friendlyTradeLabel } from '../format/friendlyLabel'
 
 export type TradeRowStatus =
   | 'pending_approval'
@@ -49,8 +49,11 @@ export interface TradeRow {
   entrySlippage: number | null
   exitSlippage: number | null
   // How the position actually closed (target/stop/trail/manual/eod/...) --
-  // `null` until the position closes (or for row types that never carry a
-  // TradeOutcome at all, e.g. pending approvals/orders).
+  // TradeOutcome.exit_reason once genuinely closed. A 'closing' row (an
+  // in-flight, not-yet-filled exit order) instead carries that same order's
+  // *intended* reason (Order.intended_exit_reason) -- what's driving this
+  // pending exit, not yet a confirmed outcome. `null` for row types that
+  // never have either (pending approvals, order-sent/rejected/cancelled).
   exitReason: string | null
   openedAt: string | null
   closedAt: string | null
@@ -170,6 +173,17 @@ export function buildTradeRows(
     if (run.open_position) runByPositionId.set(run.open_position.position_id, run)
   }
 
+  // Position.trail_stop_price, looked up by position id -- needed below
+  // while walking `orders` (which runs before the `positions` loop further
+  // down) so the resting protective stop's own row can say "TSL" instead of
+  // "SL" once this position has actually started trailing, matching the
+  // position's own summary row (slTsl/slTslLabel in ControlRoomPage.tsx)
+  // instead of contradicting it.
+  const trailStopPriceByPositionId = new Map<string, number | null>()
+  for (const position of positions) {
+    trailStopPriceByPositionId.set(position.id, position.trail_stop_price)
+  }
+
   for (const run of runs) {
     for (const approval of run.pending_approvals) {
       rows.push({
@@ -203,17 +217,29 @@ export function buildTradeRows(
     }
   }
 
-  // Populated while walking `orders` below -- an exit Order always carries
-  // `position_id` (see execution.models.Order's own docstring on the
-  // entry/exit split), so any exit order still in flight (submitted, not
-  // yet filled/rejected/cancelled) flags the position it's closing so the
-  // position row itself can disable Square Off rather than inviting a
-  // second, duplicate close attempt.
+  // Populated while walking `orders` below -- a *genuine* in-flight close
+  // attempt (submitted, not yet filled/rejected/cancelled) flags the
+  // position it's closing so the position row itself can disable Square Off
+  // rather than inviting a second, duplicate close attempt. Deliberately
+  // excludes the LIVE resting protective SL-LMT (`order_type === 'sl_limit'`,
+  // placed once at entry and left resting for the position's entire open
+  // lifetime -- see execution_engine.paper.protective_stop's own docstring)
+  // -- that order isn't "closing" anything, it's the normal state of every
+  // open LIVE position, and `close_position` already cancels it safely
+  // before placing its own exit order (see that function's own comment on
+  // the "never have both a resting SL-LMT and a fresh exit order active at
+  // once" invariant, including the race where the stop fills a moment
+  // before the cancel lands). Treating it as a pending exit here previously
+  // left Square Off permanently disabled for the whole life of any live
+  // position, forcing the manual-reconcile fallback (which force-closes the
+  // *local* record without confirming the broker side, unlike Square Off)
+  // as the only available action.
   const positionIdsWithPendingExit = new Set<string>()
 
   for (const order of orders) {
     const isTerminalUnfilled = TERMINAL_UNFILLED_ORDER_STATUSES.has(order.status)
     const isExitOrder = Boolean(order.position_id)
+    const isRestingProtectiveStop = order.order_type === 'sl_limit'
 
     if (order.status === 'filled') {
       continue // filled orders are represented by their resulting Position row instead
@@ -225,11 +251,33 @@ export function buildTradeRows(
       // Position row"), which left a submitted-but-unfilled exit
       // invisible while the position still showed as fully open with
       // Square Off clickable. Represent it explicitly instead.
-      positionIdsWithPendingExit.add(order.position_id as string)
+      if (!isRestingProtectiveStop) positionIdsWithPendingExit.add(order.position_id as string)
       const exitLotSize = resolveLotSize(order.contract_symbol, instruments)
+      // What's actually driving this pending exit -- the resting stop is
+      // always a stop-loss *order* by construction (order_type is exclusive
+      // to it, nothing else in this codebase ever sets 'sl_limit'), but
+      // sync_resting_protective_stop re-prices that same resting order in
+      // place once the position's trail activates rather than placing a new
+      // one -- so both the label and the Exit Via column (exitReason below)
+      // say trail once this position has actually started trailing,
+      // matching the position's own summary row instead of contradicting
+      // it. Anything else carries its own real intended_exit_reason,
+      // recorded by close_position at the moment it placed this exact
+      // order. `null` only for a row from before that field existed.
+      const isRestingStopTrailing =
+        isRestingProtectiveStop &&
+        (trailStopPriceByPositionId.get(order.position_id as string) ?? null) !== null
+      const orderExitReason = isRestingProtectiveStop
+        ? isRestingStopTrailing
+          ? 'trail'
+          : 'stop'
+        : order.intended_exit_reason
+      const exitKind = orderExitReason ? exitReasonLabel(orderExitReason) : null
       const label = order.strategy_type
         ? friendlyTradeLabel(order.strategy_type, order.contract_symbol, order.submitted_at)
-        : `Exit order · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
+        : exitKind
+          ? `${exitKind} exit · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
+          : `Exit order · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
       rows.push({
         key: `order-${order.id}`,
         status: 'closing',
@@ -249,7 +297,7 @@ export function buildTradeRows(
         isPnlRealized: false,
         entrySlippage: null,
         exitSlippage: null,
-        exitReason: null,
+        exitReason: orderExitReason,
         openedAt: null,
         closedAt: null,
         timestamp: order.submitted_at,

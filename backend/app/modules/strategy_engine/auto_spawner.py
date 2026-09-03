@@ -90,8 +90,8 @@ from app.modules.strategy_engine.service import new_strategy_run
 logger = logging.getLogger("app.strategy_engine.auto_spawner")
 
 # Real NSE weekly options go illiquid fast once genuinely far out -- this is
-# a hard safety ceiling, not a tuning knob (mirrors the 1-lot hardcap's own
-# "defense in depth, not configurable" reasoning from Ops-Hardening Phase 5).
+# a hard safety ceiling, not a tuning knob, deliberately not exposed as a
+# setting.
 MAX_DTE = 7
 
 # Matches StartStrategyRequest.interval_seconds's own default -- auto-spawned

@@ -114,8 +114,7 @@ class InstrumentFirewallConfig(Base, UUIDPkMixin, TimestampMixin):
     before routing a trade to the real broker -- an instrument not on this
     list gets a `ConfigurationError`, never a silent downgrade to paper, same
     "never silently fall back for a live-intent trade" principle
-    `ALLOW_REAL_MONEY_DISPATCH`/the 1-lot hardcap already established in
-    Phase 5.
+    `ALLOW_REAL_MONEY_DISPATCH` already established in Phase 5.
     """
 
     __tablename__ = "instrument_firewall_configs"

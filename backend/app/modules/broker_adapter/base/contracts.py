@@ -131,15 +131,15 @@ class OrderRequest:
     adapter implementation (mock and real) must treat a repeated key as
     "already submitted, return the prior result" rather than resubmitting.
 
-    Ops-Hardening Phase 5: `lot_size` and `tag` are broker-agnostic (any
-    future real adapter's own 1-lot hardcap needs `lot_size` the same way
-    `ShoonyaBrokerAdapter` does — this isn't a Shoonya-specific field), so
-    they live on this shared contract rather than being bolted onto one
-    adapter. `lot_size` defaults to 1 (existing callers that never set it —
-    tests constructing `OrderRequest` directly — get the strictest possible
-    hardcap rather than an accidentally-permissive default). `tag` defaults
-    to `""`; a real adapter appends it into whatever broker-visible
-    remarks/tag field it has, alongside `idempotency_key`.
+    Ops-Hardening Phase 5: `lot_size` and `tag` are broker-agnostic (a real
+    adapter's own order construction/normalization needs `lot_size` the
+    same way `ShoonyaBrokerAdapter` does — this isn't a Shoonya-specific
+    field), so they live on this shared contract rather than being bolted
+    onto one adapter. `lot_size` defaults to 1 (the conservative direction
+    for existing callers that never set it explicitly — tests constructing
+    `OrderRequest` directly). `tag` defaults to `""`; a real adapter appends
+    it into whatever broker-visible remarks/tag field it has, alongside
+    `idempotency_key`.
     """
 
     idempotency_key: str

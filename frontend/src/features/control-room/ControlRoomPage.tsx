@@ -32,8 +32,10 @@ const STATUS_LABELS: Record<TradeRowStatus, string> = {
   // A resting SL/TSL/target exit order that's already live at the broker,
   // just not yet triggered/filled -- "Closing (exit sent)" read as if the
   // position were already in the process of closing, when really nothing
-  // has happened yet at the broker beyond placing the order.
-  closing: 'Exit order sent — awaiting trigger',
+  // has happened yet at the broker beyond placing the order. The row's own
+  // label already says what was sent (e.g. "SL exit · sell · ...", see
+  // buildTradeRows.ts) so this status text doesn't need to repeat it.
+  closing: 'Awaiting trigger',
   rejected: 'Rejected',
   // Distinct from 'rejected': the broker never refused this order -- it was
   // withdrawn (most commonly a resting protective SL/TSL cancelled because
@@ -448,7 +450,16 @@ function useScopeMetrics(
 
   const realTradeRows = rows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
   const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
-  const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
+  // Lots only, not realTradeRows -- a 'closing' row is a still-resting exit
+  // order (most commonly the LIVE protective SL-LMT placed at entry, see
+  // buildTradeRows' own STATUS_LABELS comment: "just not yet triggered/
+  // filled") for a position that is, by construction, still status
+  // 'position_open' at the same time (the position only flips to 'closed'
+  // once that very order fills). Summing both double-counted every open
+  // LIVE position's lots -- once from its 'position_open' row, again from
+  // its own resting-stop 'closing' row carrying the same qty.
+  const lotsRows = rows.filter((r) => r.status === 'position_open' || r.status === 'closed')
+  const totalLots = lotsRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
   const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
   const openTrades = rows.filter((r) => r.status === 'position_open').length
   const closedRows = rows.filter((r) => r.status === 'closed')
@@ -459,9 +470,20 @@ function useScopeMetrics(
 
   // Open risk/potential profit are scoped the same way -- only positions
   // belonging to strategies in this scope, so Live never mixes a paper
-  // position's numbers in or vice versa.
+  // position's numbers in or vice versa. Scoped off the *position's own*
+  // recorded mode (open_position.mode), not run.is_live -- is_live answers
+  // "would a *new* dispatch go live right now" (current config), which can
+  // disagree with an already-open position opened under a different
+  // config/session state (e.g. a paper position still open from before the
+  // session flipped to live_enabled). Using is_live here previously leaked
+  // a still-open paper position's potential_profit/open_risk into the Live
+  // box with zero real live positions open. Falls back to is_live when
+  // there's no open position, or its mode couldn't be resolved server-side
+  // (a data-integrity gap -- see RunningPositionOut.mode's own docstring).
   const isLiveScope = mode === 'live'
-  const scopedRuns = runs.filter((r) => r.is_live === isLiveScope)
+  const scopedRuns = runs.filter((r) =>
+    r.open_position?.mode != null ? r.open_position.mode === mode : r.is_live === isLiveScope,
+  )
   const openRisks = scopedRuns
     .map((r) => r.open_position?.open_risk)
     .filter((v): v is number => v != null)
@@ -574,19 +596,27 @@ function TodaysActivityCard({
   )
 }
 
-// Centered specifically under the Realized Profit / Unrealized P&L columns
-// (its parent, .metric-box-pnl-group, spans exactly those two columns' width
-// -- the Total Cost/Win Rate stacked column is a separate flex child, so
-// centering here never drifts toward it).
+// Left-aligned under the Realized Profit / Unrealized P&L columns, Total
+// P&L and Per Lot side by side on one line -- Per Lot (perLotPnl) was
+// computed all along but never actually rendered anywhere.
 function TotalPnlRow({ metrics }: { metrics: ScopeMetrics }) {
   if (metrics.sessionId === null) return null
   return (
-    <div className="total-pnl-row total-pnl-row-centered muted">
+    <div className="total-pnl-row muted">
       Total P&amp;L{' '}
       <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
         {metrics.totalPnl >= 0 ? '+' : ''}
         {fmtAmt(metrics.totalPnl)}
       </span>
+      {metrics.perLotPnl !== null && (
+        <>
+          {' · '}Per Lot{' '}
+          <span className={metrics.perLotPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+            {metrics.perLotPnl >= 0 ? '+' : ''}
+            {fmtAmt(metrics.perLotPnl)}
+          </span>
+        </>
+      )}
     </div>
   )
 }
@@ -948,7 +978,18 @@ function LiveTradesByStrategy({ liveRows }: { liveRows: TradeRow[] }) {
     { trades: number; pnl: number; closedWins: number; closedTotal: number }
   >()
   for (const row of liveRows) {
-    if (row.strategyType === null || !REAL_TRADE_STATUSES.has(row.status)) continue
+    // 'position_open'/'closed' only, not REAL_TRADE_STATUSES -- a 'closing'
+    // row is a still-resting exit order (most commonly the LIVE protective
+    // SL-LMT) for a position that is, by construction, still counted via
+    // its own 'position_open' row at the same time (see useScopeMetrics'
+    // identical `lotsRows` fix above). Including 'closing' here inflated
+    // this table's per-strategy Trades column the same way it inflated
+    // Total Lots.
+    if (
+      row.strategyType === null ||
+      (row.status !== 'position_open' && row.status !== 'closed')
+    )
+      continue
     const entry = byStrategy.get(row.strategyType) ?? {
       trades: 0,
       pnl: 0,
@@ -1469,7 +1510,7 @@ function TradeRowView({
                 <th>Leg</th>
                 <th>Kind</th>
                 <th>Qty</th>
-                <th>Stop</th>
+                <th>Stop / TSL</th>
                 <th>Target</th>
                 <th>Exit Via</th>
                 <th>P&amp;L</th>
@@ -1478,39 +1519,50 @@ function TradeRowView({
               </tr>
             </thead>
             <tbody>
-              {row.legs.map((leg) => (
-                <tr key={leg.leg_index}>
-                  <td>
-                    {leg.leg_index + 1}/{row.legs.length}
-                  </td>
-                  <td>{leg.kind}</td>
-                  <td>{leg.qty}</td>
-                  <td>{leg.stop_price !== null ? fmtAmt(leg.stop_price) : '—'}</td>
-                  <td>{leg.target_price !== null ? fmtAmt(leg.target_price) : '—'}</td>
-                  <td>{exitReasonLabel(leg.exit_reason)}</td>
-                  <td>
-                    {leg.realized_pnl !== null ? (
-                      <span className={leg.realized_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-                        {leg.realized_pnl >= 0 ? '+' : ''}
-                        {fmtAmt(leg.realized_pnl)}
-                      </span>
-                    ) : (
-                      '—'
-                    )}
-                  </td>
-                  <td>
-                    {leg.slippage !== null ? (
-                      <span className={leg.slippage >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-                        {leg.slippage >= 0 ? '+' : ''}
-                        {fmtAmt(leg.slippage)}
-                      </span>
-                    ) : (
-                      '—'
-                    )}
-                  </td>
-                  <td>{leg.closed_at ? new Date(leg.closed_at).toLocaleTimeString() : '—'}</td>
-                </tr>
-              ))}
+              {row.legs.map((leg) => {
+                // Same convention as the summary row's own Target/SL-TSL
+                // column (slTsl/slTslLabel above) -- PositionLegOut.
+                // trail_stop_price is only non-null once *this leg's own*
+                // TrailPlan has activated (see api/v1/execution.py's leg
+                // construction), so per-leg TSL state is visible even when
+                // some legs of a staged position are trailing and others
+                // are still at their original static stop.
+                const legSlTsl = leg.trail_stop_price ?? leg.stop_price
+                const legSlTslLabel = leg.trail_stop_price !== null ? 'TSL' : 'SL'
+                return (
+                  <tr key={leg.leg_index}>
+                    <td>
+                      {leg.leg_index + 1}/{row.legs.length}
+                    </td>
+                    <td>{leg.kind}</td>
+                    <td>{leg.qty}</td>
+                    <td>{legSlTsl !== null ? `${fmtAmt(legSlTsl)} (${legSlTslLabel})` : '—'}</td>
+                    <td>{leg.target_price !== null ? fmtAmt(leg.target_price) : '—'}</td>
+                    <td>{exitReasonLabel(leg.exit_reason)}</td>
+                    <td>
+                      {leg.realized_pnl !== null ? (
+                        <span className={leg.realized_pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                          {leg.realized_pnl >= 0 ? '+' : ''}
+                          {fmtAmt(leg.realized_pnl)}
+                        </span>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td>
+                      {leg.slippage !== null ? (
+                        <span className={leg.slippage >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                          {leg.slippage >= 0 ? '+' : ''}
+                          {fmtAmt(leg.slippage)}
+                        </span>
+                      ) : (
+                        '—'
+                      )}
+                    </td>
+                    <td>{leg.closed_at ? new Date(leg.closed_at).toLocaleTimeString() : '—'}</td>
+                  </tr>
+                )
+              })}
             </tbody>
           </table>
         </td>

@@ -65,7 +65,6 @@ from app.modules.broker_adapter.base.contracts import (
     Tick,
     TradeFill,
 )
-from app.modules.broker_adapter.base.errors import CriticalSafetyException
 from app.modules.broker_adapter.shoonya import normalizer
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.rest_client import (
@@ -1091,21 +1090,6 @@ class ShoonyaBrokerAdapter(BrokerPort):
     # -- BrokerPort: orders ----------------------------------------------------
 
     def place_order(self, request: OrderRequest) -> OrderResult:
-        """Ops-Hardening Phase 5: the 1-lot hardcap below is deliberately
-        redundant with Risk Service's own DB-configurable `per_trade_lot_cap`
-        (`risk_limit_configs`) — defense in depth for the one check that
-        directly bounds real-money blast radius, not trusting a single,
-        operator-editable layer for it. Checked first, before the
-        idempotency-key short-circuit, so a malformed retry can never skip
-        it either.
-        """
-        if request.qty > request.lot_size:
-            raise CriticalSafetyException(
-                f"place_order blocked: qty={request.qty} exceeds the 1-lot hardcap "
-                f"(lot_size={request.lot_size}) for {request.contract_symbol!r} -- "
-                "refusing to place a real order above 1 lot."
-            )
-
         if request.idempotency_key in self._orders_by_idempotency_key:
             return self._orders_by_idempotency_key[request.idempotency_key]
 

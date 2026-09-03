@@ -115,6 +115,15 @@ export interface RunningPositionOut {
   // hits right now -- null when there's no target data to compute from at
   // all, distinct from a genuine 0.
   potential_profit: number | null
+  // This position's own opening order's actual recorded mode -- 'live' or
+  // 'paper' -- NOT the same as RunningStrategyOut.is_live (a "would a new
+  // dispatch go live right now" question). Use this, not is_live, to scope
+  // a still-open position into Live vs Paper metrics -- a paper position
+  // stays paper for its whole lifetime even if the strategy/session is
+  // later flipped to live_enabled. `null` only for the rare data-integrity
+  // gap where the opening order can't be resolved server-side -- same
+  // convention as PositionOut.mode; treat it as "unknown", not "paper".
+  mode: 'live' | 'paper' | null
 }
 
 export interface PendingApprovalOut {
@@ -207,6 +216,13 @@ export interface OrderOut {
   expiry_date: string | null
   option_type: string | null
   strategy_type: string | null
+  // Order.intended_exit_reason -- what the caller (close_position) recorded
+  // as *why* it placed this exit order, at the moment it placed it -- not
+  // yet a confirmed outcome. `null` for an entry order, a row from before
+  // this field existed, or the LIVE resting protective stop (which never
+  // sets it -- see execution_engine.paper.protective_stop; its own
+  // order_type === 'sl_limit' is what identifies it instead).
+  intended_exit_reason: string | null
 }
 
 export interface PositionLegOut {
@@ -307,6 +323,10 @@ export interface MaxTradesPerDayOut {
   max_trades_per_day: number
 }
 
+export interface MaxLotsPerTradeOut {
+  per_trade_lot_cap: number
+}
+
 export interface UnderlyingFeedTelemetryOut {
   symbol: string
   feed_age_seconds: number | null
@@ -377,6 +397,8 @@ export interface SystemAlertOut {
   created_at: string
   resolved_at: string | null
   is_resolved: boolean
+  occurrence_count: number
+  last_seen_at: string
 }
 
 export interface ReconciliationRunOut {
