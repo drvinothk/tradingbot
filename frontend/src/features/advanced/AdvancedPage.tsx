@@ -195,11 +195,15 @@ function GlobalDailyLimitsCard() {
         <strong>Daily plan</strong> (Reconciliation &amp; Recovery, below) — that Daily Plan is what
         Risk Service actually enforces live. Editing this changes what the <em>next</em> new session
         starts with; today's already-active session stays independently editable and untouched. Max
-        trades / strategy / day applies immediately, across every strategy. Max lots / trade is a
+        trades / strategy applies immediately, across every strategy. Max lots / trade is a
         standing ceiling (not daily-resetting) on every live order's size — a strategy's own
         configured Lots (Strategy Control, below) can never exceed it.
       </p>
-      <form onSubmit={handleSave} className="row-actions" style={{ alignItems: 'flex-end', flexWrap: 'wrap' }}>
+      <form
+        onSubmit={handleSave}
+        className="row-actions"
+        style={{ alignItems: 'flex-end', flexWrap: 'nowrap', overflowX: 'auto' }}
+      >
         <div className="form-row" style={{ marginBottom: 0 }}>
           <label htmlFor="daily-budget">Budget (₹)</label>
           <input
@@ -211,7 +215,7 @@ function GlobalDailyLimitsCard() {
               setBudget(e.target.value)
               setSaved(false)
             }}
-            style={{ width: '110px' }}
+            style={{ width: '92px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
@@ -225,7 +229,7 @@ function GlobalDailyLimitsCard() {
               setTarget(e.target.value)
               setSaved(false)
             }}
-            style={{ width: '110px' }}
+            style={{ width: '92px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
@@ -239,11 +243,11 @@ function GlobalDailyLimitsCard() {
               setLossCap(e.target.value)
               setSaved(false)
             }}
-            style={{ width: '110px' }}
+            style={{ width: '92px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
-          <label htmlFor="daily-max-trades">Max trades / strategy / day</label>
+          <label htmlFor="daily-max-trades">Max trades / strategy</label>
           <input
             id="daily-max-trades"
             type="number"
@@ -254,7 +258,7 @@ function GlobalDailyLimitsCard() {
               setMaxTradesInput(e.target.value)
               setSaved(false)
             }}
-            style={{ width: '110px' }}
+            style={{ width: '56px' }}
           />
         </div>
         <div className="form-row" style={{ marginBottom: 0 }}>
@@ -269,7 +273,7 @@ function GlobalDailyLimitsCard() {
               setMaxLotsInput(e.target.value)
               setSaved(false)
             }}
-            style={{ width: '110px' }}
+            style={{ width: '56px' }}
           />
         </div>
         <button type="submit" disabled={saving || loading}>
