@@ -24,7 +24,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Position, StopPlan
+from app.domain.execution.models import Order, Position, StopPlan
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
@@ -1088,6 +1088,26 @@ class RunningPositionOut(BaseModel):
     # `None` when there's no target data to compute from at all, distinct
     # from a genuine ₹0.
     potential_profit: float | None
+    # This position's own opening order's *actual recorded* mode -- 'live'
+    # or 'paper' -- deliberately NOT the same thing as RunningStrategyOut
+    # .is_live (which answers "would a *new* dispatch for this run go live
+    # right now", a current-config question). A position opened while the
+    # strategy was force_paper (or the session was paper_only) stays a
+    # paper position for its whole lifetime even if the config/session is
+    # later flipped to live_enabled -- exactly the same "entry order's own
+    # recorded mode, not current config" reasoning buildTradeRows.ts's own
+    # docstring already documents for TradeRow.mode. Without this, a still-
+    # open paper position belonging to a now-live-routed strategy leaked
+    # into the frontend's "Live" scope (phantom Potential Profit/Open Risk
+    # shown under Live with zero real live positions open).
+    # `None` only for the data-integrity gap where the opening Order row
+    # can't be resolved -- same "surface the gap, don't guess" convention
+    # `PositionOut.mode` already established in api.v1.execution (`str(...)
+    # if opening_order_mode is not None else None`). Deliberately NOT
+    # defaulted to "paper": for a real-money system, silently mislabeling
+    # an unresolvable position as paper would hide real live risk from the
+    # Live scope, the opposite of safe-by-default.
+    mode: str | None
 
 
 class PendingApprovalOut(BaseModel):
@@ -1311,6 +1331,16 @@ def list_running_strategies(
         position = get_open_position_for_run(db, run)
         trading_session = db.get(TradingSession, run.trading_session_id)
         is_live = trading_session is not None and is_strategy_routed_live(trading_session, run)
+        # This position's own opening Order.mode -- the per-position live/
+        # paper signal, never inferred from current session/config state,
+        # same ground truth as broker_adapter.composition
+        # ._position_opened_live (and execution_engine.paper.service's own
+        # "order.mode *is* the per-position live/paper signal" comment) --
+        # deliberately NOT `is_live` above, which answers a different
+        # question ("would a *new* dispatch go live right now") that can
+        # disagree with an already-open position's own history. See
+        # RunningPositionOut.mode's own docstring for the bug this closes.
+        opening_order = db.get(Order, position.opening_order_id) if position is not None else None
         pending_rows = (
             db.query(PendingTradeApproval, TradeIntent)
             .join(TradeIntent, PendingTradeApproval.trade_intent_id == TradeIntent.id)
@@ -1363,6 +1393,9 @@ def list_running_strategies(
                         entry_price=float(position.entry_price),
                         open_risk=compute_position_open_risk(db, position),
                         potential_profit=compute_position_potential_profit(db, position),
+                        mode=(
+                            str(opening_order.mode) if opening_order is not None else None
+                        ),
                     )
                     if position is not None
                     else None

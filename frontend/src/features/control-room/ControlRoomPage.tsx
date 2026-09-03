@@ -448,7 +448,16 @@ function useScopeMetrics(
 
   const realTradeRows = rows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
   const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
-  const totalLots = realTradeRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
+  // Lots only, not realTradeRows -- a 'closing' row is a still-resting exit
+  // order (most commonly the LIVE protective SL-LMT placed at entry, see
+  // buildTradeRows' own STATUS_LABELS comment: "just not yet triggered/
+  // filled") for a position that is, by construction, still status
+  // 'position_open' at the same time (the position only flips to 'closed'
+  // once that very order fills). Summing both double-counted every open
+  // LIVE position's lots -- once from its 'position_open' row, again from
+  // its own resting-stop 'closing' row carrying the same qty.
+  const lotsRows = rows.filter((r) => r.status === 'position_open' || r.status === 'closed')
+  const totalLots = lotsRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
   const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
   const openTrades = rows.filter((r) => r.status === 'position_open').length
   const closedRows = rows.filter((r) => r.status === 'closed')
@@ -459,9 +468,20 @@ function useScopeMetrics(
 
   // Open risk/potential profit are scoped the same way -- only positions
   // belonging to strategies in this scope, so Live never mixes a paper
-  // position's numbers in or vice versa.
+  // position's numbers in or vice versa. Scoped off the *position's own*
+  // recorded mode (open_position.mode), not run.is_live -- is_live answers
+  // "would a *new* dispatch go live right now" (current config), which can
+  // disagree with an already-open position opened under a different
+  // config/session state (e.g. a paper position still open from before the
+  // session flipped to live_enabled). Using is_live here previously leaked
+  // a still-open paper position's potential_profit/open_risk into the Live
+  // box with zero real live positions open. Falls back to is_live when
+  // there's no open position, or its mode couldn't be resolved server-side
+  // (a data-integrity gap -- see RunningPositionOut.mode's own docstring).
   const isLiveScope = mode === 'live'
-  const scopedRuns = runs.filter((r) => r.is_live === isLiveScope)
+  const scopedRuns = runs.filter((r) =>
+    r.open_position?.mode != null ? r.open_position.mode === mode : r.is_live === isLiveScope,
+  )
   const openRisks = scopedRuns
     .map((r) => r.open_position?.open_risk)
     .filter((v): v is number => v != null)
@@ -926,7 +946,18 @@ function LiveTradesByStrategy({ liveRows }: { liveRows: TradeRow[] }) {
     { trades: number; pnl: number; closedWins: number; closedTotal: number }
   >()
   for (const row of liveRows) {
-    if (row.strategyType === null || !REAL_TRADE_STATUSES.has(row.status)) continue
+    // 'position_open'/'closed' only, not REAL_TRADE_STATUSES -- a 'closing'
+    // row is a still-resting exit order (most commonly the LIVE protective
+    // SL-LMT) for a position that is, by construction, still counted via
+    // its own 'position_open' row at the same time (see useScopeMetrics'
+    // identical `lotsRows` fix above). Including 'closing' here inflated
+    // this table's per-strategy Trades column the same way it inflated
+    // Total Lots.
+    if (
+      row.strategyType === null ||
+      (row.status !== 'position_open' && row.status !== 'closed')
+    )
+      continue
     const entry = byStrategy.get(row.strategyType) ?? {
       trades: 0,
       pnl: 0,
