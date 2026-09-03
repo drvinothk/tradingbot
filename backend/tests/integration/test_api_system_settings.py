@@ -442,6 +442,53 @@ def test_get_max_trades_per_day_requires_login(api_client: TestClient):
     assert response.status_code == 401
 
 
+# -- GET/PATCH /system-settings/max-lots-per-trade ----------------------------
+
+
+def test_get_max_lots_per_trade_lazily_seeds_from_risk_defaults(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+
+    response = api_client.get("/api/v1/system-settings/max-lots-per-trade")
+
+    assert response.status_code == 200
+    assert response.json() == {"per_trade_lot_cap": 1}  # RiskDefaults.per_trade_lot_cap
+
+
+def test_patch_max_lots_per_trade_creates_a_new_risk_limit_config_version(
+    api_client: TestClient, seeded_admin
+):
+    _login(api_client, seeded_admin)
+    # Seed version 1 first, same as any other real usage.
+    api_client.get("/api/v1/system-settings/max-lots-per-trade")
+
+    response = api_client.patch(
+        "/api/v1/system-settings/max-lots-per-trade", json={"per_trade_lot_cap": 5}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"per_trade_lot_cap": 5}
+
+    get_response = api_client.get("/api/v1/system-settings/max-lots-per-trade")
+    assert get_response.json() == {"per_trade_lot_cap": 5}
+
+
+def test_patch_max_lots_per_trade_rejects_non_positive(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+
+    response = api_client.patch(
+        "/api/v1/system-settings/max-lots-per-trade", json={"per_trade_lot_cap": 0}
+    )
+
+    assert response.status_code == 422
+
+
+def test_get_max_lots_per_trade_requires_login(api_client: TestClient):
+    response = api_client.get("/api/v1/system-settings/max-lots-per-trade")
+    assert response.status_code == 401
+
+
 # -- POST /system-settings/restart-backend -----------------------------------
 
 

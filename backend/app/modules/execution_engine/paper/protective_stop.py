@@ -132,8 +132,9 @@ def place_protective_stop(
         # (this function's only caller) has nothing wrapping it either --
         # an uncaught exception here would abort the entire entry-fill
         # transaction for a position the broker has *already genuinely
-        # filled*. `place_order`'s own 1-lot `CriticalSafetyException` is a real,
-        # concrete example of a non-`BrokerError` this must still catch.
+        # filled*. A malformed request raising something other than
+        # `BrokerError` (e.g. a normalization bug) is a real, concrete
+        # example of what this must still catch.
         logger.exception(
             "protective SL-LMT placement failed for position %s -- falling back to "
             "local-only stop/target/trail monitoring for this position",

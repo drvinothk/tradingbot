@@ -19,6 +19,7 @@ import type {
   UnderlyingFeedTelemetryOut,
   VolumeProxySymbolTelemetryOut,
   MaxTradesPerDayOut,
+  MaxLotsPerTradeOut,
   ProviderPreferenceOut,
   RuntimeMode,
   SessionOut,
@@ -110,6 +111,15 @@ function GlobalDailyLimitsCard() {
       api.patch<MaxTradesPerDayOut>('/system-settings/max-trades-per-day', { max_trades_per_day }),
     onSuccess: (data) => queryClient.setQueryData(['system-settings', 'max-trades-per-day'], data),
   })
+  const maxLotsQuery = useQuery({
+    queryKey: ['system-settings', 'max-lots-per-trade'],
+    queryFn: () => api.get<MaxLotsPerTradeOut>('/system-settings/max-lots-per-trade'),
+  })
+  const setMaxLots = useMutation({
+    mutationFn: (per_trade_lot_cap: number) =>
+      api.patch<MaxLotsPerTradeOut>('/system-settings/max-lots-per-trade', { per_trade_lot_cap }),
+    onSuccess: (data) => queryClient.setQueryData(['system-settings', 'max-lots-per-trade'], data),
+  })
   // `null` means "not yet touched by the user" -- falls back to the
   // fetched value. Once the user types anything, including clearing the
   // field to '', the state itself becomes the source of truth (`??`, not
@@ -120,6 +130,7 @@ function GlobalDailyLimitsCard() {
   const [target, setTarget] = useState<string | null>(null)
   const [lossCap, setLossCap] = useState<string | null>(null)
   const [maxTrades, setMaxTradesInput] = useState<string | null>(null)
+  const [maxLots, setMaxLotsInput] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   const effectiveBudget = budget ?? (data ? String(data.daily_budget_amount) : '')
@@ -127,6 +138,8 @@ function GlobalDailyLimitsCard() {
   const effectiveLossCap = lossCap ?? (data ? String(data.daily_loss_cap) : '')
   const effectiveMaxTrades =
     maxTrades ?? (maxTradesQuery.data ? String(maxTradesQuery.data.max_trades_per_day) : '')
+  const effectiveMaxLots =
+    maxLots ?? (maxLotsQuery.data ? String(maxLotsQuery.data.per_trade_lot_cap) : '')
 
   async function handleSave(event: FormEvent) {
     event.preventDefault()
@@ -140,6 +153,7 @@ function GlobalDailyLimitsCard() {
       funding_mode: 'cash',
     }
     const maxTradesValue = Number(effectiveMaxTrades)
+    const maxLotsValue = Number(effectiveMaxLots)
     if (!body.daily_budget_amount || !body.daily_target_profit || !body.daily_loss_cap) {
       setError('Budget, target profit, and loss cap are all required and must be greater than zero.')
       return
@@ -148,18 +162,23 @@ function GlobalDailyLimitsCard() {
       setError('Max trades / strategy / day must be a whole number greater than zero.')
       return
     }
+    if (!maxLotsValue || !Number.isInteger(maxLotsValue)) {
+      setError('Max lots / trade must be a whole number greater than zero.')
+      return
+    }
     try {
       await Promise.all([
         setLimits.mutateAsync(body),
         setMaxTrades.mutateAsync(maxTradesValue),
+        setMaxLots.mutateAsync(maxLotsValue),
       ])
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Save failed')
     }
   }
 
-  const loading = isLoading || maxTradesQuery.isLoading
-  const saving = setLimits.isPending || setMaxTrades.isPending
+  const loading = isLoading || maxTradesQuery.isLoading || maxLotsQuery.isLoading
+  const saving = setLimits.isPending || setMaxTrades.isPending || setMaxLots.isPending
 
   return (
     <div className="card">
@@ -169,7 +188,9 @@ function GlobalDailyLimitsCard() {
         <strong>Daily plan</strong> (Reconciliation &amp; Recovery, below) — that Daily Plan is what
         Risk Service actually enforces live. Editing this changes what the <em>next</em> new session
         starts with; today's already-active session stays independently editable and untouched. Max
-        trades / strategy / day applies immediately, across every strategy.
+        trades / strategy / day applies immediately, across every strategy. Max lots / trade is a
+        standing ceiling (not daily-resetting) on every live order's size — a strategy's own
+        configured Lots (Strategy Control, below) can never exceed it.
       </p>
       <form onSubmit={handleSave} className="row-actions" style={{ alignItems: 'flex-end', flexWrap: 'wrap' }}>
         <div className="form-row" style={{ marginBottom: 0 }}>
@@ -214,6 +235,18 @@ function GlobalDailyLimitsCard() {
             disabled={loading}
             value={effectiveMaxTrades}
             onChange={(e) => setMaxTradesInput(e.target.value)}
+            style={{ width: '110px' }}
+          />
+        </div>
+        <div className="form-row" style={{ marginBottom: 0 }}>
+          <label htmlFor="daily-max-lots">Max lots / trade</label>
+          <input
+            id="daily-max-lots"
+            type="number"
+            min={1}
+            disabled={loading}
+            value={effectiveMaxLots}
+            onChange={(e) => setMaxLotsInput(e.target.value)}
             style={{ width: '110px' }}
           />
         </div>

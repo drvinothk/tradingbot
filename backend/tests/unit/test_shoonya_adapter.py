@@ -16,7 +16,6 @@ from app.modules.broker_adapter.base.contracts import (
     OrderSide,
     OrderType,
 )
-from app.modules.broker_adapter.base.errors import CriticalSafetyException
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
 from app.modules.broker_adapter.shoonya.rest_client import ShoonyaApiError
@@ -1191,62 +1190,34 @@ def test_get_price_history_converts_timeframe_seconds_to_whole_minutes():
     assert tpseries_calls[0][-1] == 5
 
 
-# -- Ops-Hardening Phase 5: 1-lot hardcap + order tagging --------------------
+# -- Order tagging + lot sizing -----------------------------------------
+# Ops-Hardening Phase 5 originally added a hardcoded 1-lot cap here as
+# defense-in-depth alongside Risk Service's own `per_trade_lot_cap`.
+# Removed 2026-09-03: `per_trade_lot_cap` (`risk_limit_configs`) is now a
+# real, UI-editable workspace setting (`GET`/`PATCH
+# /system-settings/max-lots-per-trade`) rather than a stuck-at-1, no-UI
+# value, so a second, adapter-level, non-editable copy of the same check
+# was no longer earning its complexity -- Risk Service's own cap (now
+# operator-controlled) plus real broker margin rejection are the
+# backstops for order size. See that endpoint's own comment and
+# `strategy_engine.sizing.resolve_qty_lots` for the full reasoning.
 
 
-def test_place_order_blocks_qty_above_one_lot():
+def test_place_order_reaches_the_broker_for_a_multi_lot_order():
     rest = _FakeRestClient()
     adapter, _ = _adapter(rest)
     request = OrderRequest(
-        idempotency_key="hardcap-1",
+        idempotency_key="multi-lot-1",
         contract_symbol="NIFTY30JUL26C24000",
         side=OrderSide.BUY,
         order_type=OrderType.MARKET,
-        qty=50,
+        qty=75,
         lot_size=25,
     )
 
-    with pytest.raises(CriticalSafetyException, match="1-lot hardcap"):
-        adapter.place_order(request)
-
-    assert rest.calls == [], "must never reach the broker at all"
-
-
-def test_place_order_allows_exactly_one_lot():
-    rest = _FakeRestClient()
-    adapter, _ = _adapter(rest)
-    request = OrderRequest(
-        idempotency_key="hardcap-2",
-        contract_symbol="NIFTY30JUL26C24000",
-        side=OrderSide.BUY,
-        order_type=OrderType.MARKET,
-        qty=25,
-        lot_size=25,
-    )
-
-    adapter.place_order(request)  # must not raise
+    adapter.place_order(request)  # must not raise -- no adapter-level lot cap anymore
 
     assert any(c[0] == "place_order" for c in rest.calls)
-
-
-def test_place_order_blocks_even_when_risk_service_would_have_allowed_it():
-    """Defense-in-depth: the hardcap fires independent of any qty a caller
-    (even one bypassing Risk Service's own per_trade_lot_cap entirely) might
-    pass -- this is the adapter's own floor, not a duplicate of that check.
-    """
-    rest = _FakeRestClient()
-    adapter, _ = _adapter(rest)
-    request = OrderRequest(
-        idempotency_key="hardcap-3",
-        contract_symbol="NIFTY30JUL26C24000",
-        side=OrderSide.BUY,
-        order_type=OrderType.MARKET,
-        qty=100,
-        lot_size=25,
-    )
-
-    with pytest.raises(CriticalSafetyException):
-        adapter.place_order(request)
 
 
 def test_remarks_combines_idempotency_key_and_tag():

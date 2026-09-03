@@ -375,6 +375,67 @@ def set_max_trades_per_day(
     return MaxTradesPerDayOut(max_trades_per_day=new_config.max_trades_per_day)
 
 
+# -- GET/PATCH /system-settings/max-lots-per-trade ----------------------------
+# 2026-09-03: exposes RiskLimitConfig.per_trade_lot_cap -- the field
+# evaluate_trade_intent's per_trade_lot_cap_exceeded check enforces
+# (`effective_lot_cap = min(risk_config.per_trade_lot_cap,
+# resolve_qty_lots(...))`), previously only settable via RiskDefaults
+# (env-settings, needs a restart, and stuck at 1 in practice). Same shape as
+# max-trades-per-day above -- there's no separate "default" concept here
+# either, since RiskLimitConfig has no per-session override of its own.
+#
+# Unlike max-trades-per-day, this is NOT a daily-resetting count -- it's a
+# standing per-order ceiling checked identically on every trade, every day,
+# until changed (hence "Max lots / trade" in the UI, not ".../ day"). This
+# endpoint also replaces a second, independent 1-lot hardcap that used to
+# live inside `ShoonyaBrokerAdapter.place_order` itself (Ops-Hardening Phase
+# 5) -- removed 2026-09-03 once this value became real, UI-editable, and
+# operator-controlled rather than a fixed adapter-level floor. Risk Service's
+# own cap (now settable here) plus real broker margin rejection are the
+# backstops for live order size going forward.
+
+
+class MaxLotsPerTradeOut(BaseModel):
+    per_trade_lot_cap: int
+
+
+class SetMaxLotsPerTradeRequest(BaseModel):
+    per_trade_lot_cap: int = Field(gt=0)
+
+
+@router.get("/max-lots-per-trade", response_model=MaxLotsPerTradeOut)
+def get_max_lots_per_trade(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> MaxLotsPerTradeOut:
+    config = get_active_risk_limit_config(db, user.workspace_id)
+    db.commit()  # get_active_risk_limit_config may lazily seed version 1
+    return MaxLotsPerTradeOut(per_trade_lot_cap=config.per_trade_lot_cap)
+
+
+@router.patch("/max-lots-per-trade", response_model=MaxLotsPerTradeOut)
+def set_max_lots_per_trade(
+    body: SetMaxLotsPerTradeRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("risk.override")),
+) -> MaxLotsPerTradeOut:
+    """Same concurrency-safety note as set_max_trades_per_day above --
+    create_new_risk_limit_config_version's read-current/deactivate/insert
+    sequence is wrapped in LOCK_RISK_EVALUATION_QUEUE, the same lock
+    evaluate_trade_intent itself holds.
+    """
+    with advisory_lock(db, LOCK_RISK_EVALUATION_QUEUE):
+        new_config = create_new_risk_limit_config_version(
+            db,
+            user.workspace_id,
+            actor_user=user,
+            reason="Advanced page: max lots per trade",
+            per_trade_lot_cap=body.per_trade_lot_cap,
+        )
+        db.commit()
+    return MaxLotsPerTradeOut(per_trade_lot_cap=new_config.per_trade_lot_cap)
+
+
 class RestartBackendRequest(BaseModel):
     reason: str
     force: bool = False

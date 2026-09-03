@@ -323,6 +323,10 @@ export interface MaxTradesPerDayOut {
   max_trades_per_day: number
 }
 
+export interface MaxLotsPerTradeOut {
+  per_trade_lot_cap: number
+}
+
 export interface UnderlyingFeedTelemetryOut {
   symbol: string
   feed_age_seconds: number | null
