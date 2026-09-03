@@ -598,8 +598,8 @@ tbody tr:hover {
    same width against .metric-box-stacked that they did before this wrapper
    existed. .metric-box-pnl-values is the row of the two figures themselves
    (unchanged sizing/divider from .metric-box-main's own rules); the Total
-   P&L row sits below that row, centered under just this column -- never
-   under the separate Total Cost/Win Rate stacked column beside it. */
+   P&L (+ Per Lot) row sits below that row, left-aligned under this column --
+   never under the separate Total Cost/Win Rate stacked column beside it. */
 .metric-box-pnl-group {
   flex: 4 1 auto;
   min-width: 0;

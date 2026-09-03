@@ -173,6 +173,17 @@ export function buildTradeRows(
     if (run.open_position) runByPositionId.set(run.open_position.position_id, run)
   }
 
+  // Position.trail_stop_price, looked up by position id -- needed below
+  // while walking `orders` (which runs before the `positions` loop further
+  // down) so the resting protective stop's own row can say "TSL" instead of
+  // "SL" once this position has actually started trailing, matching the
+  // position's own summary row (slTsl/slTslLabel in ControlRoomPage.tsx)
+  // instead of contradicting it.
+  const trailStopPriceByPositionId = new Map<string, number | null>()
+  for (const position of positions) {
+    trailStopPriceByPositionId.set(position.id, position.trail_stop_price)
+  }
+
   for (const run of runs) {
     for (const approval of run.pending_approvals) {
       rows.push({
@@ -243,13 +254,20 @@ export function buildTradeRows(
       if (!isRestingProtectiveStop) positionIdsWithPendingExit.add(order.position_id as string)
       const exitLotSize = resolveLotSize(order.contract_symbol, instruments)
       // What's actually driving this pending exit -- the resting stop is
-      // always a stop-loss by construction (order_type is exclusive to it,
-      // nothing else in this codebase ever sets 'sl_limit'); anything else
-      // carries its own real intended_exit_reason, recorded by
-      // close_position at the moment it placed this exact order. `null`
-      // only for a row from before that field existed.
+      // always a stop-loss *order* by construction (order_type is exclusive
+      // to it, nothing else in this codebase ever sets 'sl_limit'), but
+      // sync_resting_protective_stop re-prices that same resting order in
+      // place once the position's trail activates rather than placing a new
+      // one -- so label it TSL once this position has actually started
+      // trailing, matching the position's own summary row instead of
+      // contradicting it. Anything else carries its own real
+      // intended_exit_reason, recorded by close_position at the moment it
+      // placed this exact order. `null` only for a row from before that
+      // field existed.
       const exitKind = isRestingProtectiveStop
-        ? 'SL'
+        ? (trailStopPriceByPositionId.get(order.position_id as string) ?? null) !== null
+          ? 'TSL'
+          : 'SL'
         : order.intended_exit_reason
           ? exitReasonLabel(order.intended_exit_reason)
           : null
