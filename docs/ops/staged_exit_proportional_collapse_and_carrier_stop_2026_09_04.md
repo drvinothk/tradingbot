@@ -1,15 +1,16 @@
 # Staged-exit: proportional leg collapse + whole-position carrier stop + LIVE gate — session record (2026-09-04)
 
-**Status: Parts 2, 3a, 3b, 3c implemented (commit `eab6613`, pushed +
-deployed to OCI), then QC'd the same day — one real idempotency gap found
-and fixed (commit `4b20054`). Part 3d (reconciliation leg-awareness) then
-built the same day — staged-exit LIVE readiness is now code-complete. Part 1
-(the 3 new staged configs) has a tested, ready-to-run script
-(`apply_sb6_2leg_configs.py`), not yet applied to the live OCI DB. 1585
-backend tests pass, ruff + mypy clean. Local commits `4b20054`/`3b19147` plus
-Part 3d/Part 1 (uncommitted as of this edit) are all still local-only, not
-yet pushed/deployed — see "What is pending" below and the repo's own
-`git log`/`git status` for the current, authoritative state.**
+**Status: ALL parts done — Parts 2/3a/3b/3c/3d built, QC'd, committed, pushed,
+and DEPLOYED to OCI (144.24.137.112); Part 1's 3 new staged configs are LIVE
+in the OCI DB (all `is_enabled=true`, `runtime_mode=force_paper`,
+`underlying_symbol=NIFTY`). Commits `eab6613`..`3b345ca` on
+`feat/staged-exit-collapse-and-live-carrier-stop`, all pushed to origin.
+Zero open positions at deploy time (03:2x IST, well outside market hours);
+deploy verified via checksum-matched per-file scp, clean import, clean
+systemd restart, zero errors in logs, `/health` 200. 1585 backend tests
+pass, ruff + mypy clean, no schema change. The EMA_Micro_Conviction
+`qty_lots` item below is a documented decision only, deliberately not
+applied to the live config — see its own entry for why.**
 
 Full plan (with the Phase-2 QC / blast-radius audit that preceded the code):
 `~/.claude/plans/fizzy-weaving-hopcroft.md` on this machine (not in the repo).
@@ -267,7 +268,7 @@ by this).
 
 ---
 
-## Part 1 — the 3 new staged configs (script ready, NOT yet applied to OCI)
+## Part 1 — the 3 new staged configs (DONE, applied live to the OCI DB)
 
 `backend/scripts/apply_sb6_2leg_configs.py` — clones each base config's
 CURRENT live `params`, adds the structure-break tuning + 2-leg `exit_legs`
@@ -275,14 +276,12 @@ spec below, and creates the new config via a direct DB session running the
 exact same `validate_exit_leg_templates` call `POST /strategies` does (never
 the raw-`psql`-INSERT shortcut that skips validation and fails-safe to
 no-legs at signal time). Idempotent (skips a name that already exists).
-`--dry-run` prints the exact params without writing anything — always run
-that first.
 
 | New config | strategy_type | clone of |
 |---|---|---|
 | `Test 1 (sb6-2leg)` | `ema_micro_pullback` | `Test 1` |
 | `Test 4 (sb6-2leg)` | `vwap_pullback` | `Test 4` |
-| `Test (sb6-2leg)` | `oi_volume_confirmed` | `Test` |
+| `Test (sb6-2leg)` | `oi_volume_confirmed` | `Test ` (trailing space — real live name) |
 
 `params` delta merged onto each base config's own current params:
 
@@ -304,24 +303,35 @@ the base config — `Test 1`'s own `runtime_mode` is `NULL`, i.e. it follows
 the session mode; a brand-new, unbacktested staged-exit variant must not
 inherit that).
 
-**Not run against the live OCI DB from this session** — this local session
-has no live DB/SSH access (confirmed: even a read-only credential lookup was
-blocked by the sandbox's own safety classifier), and applying it is a live
-production-config mutation, the same category of action every other config
-change in this repo's history goes through an explicit, separately-confirmed
-step for. Self-verified everything reachable without that access: `--dry-run`
-against the local dev DB runs clean (correctly reports all three base
-configs not found there, confirming no crash/import/query error), and the
-`exit_legs` payload itself independently validates via
-`validate_exit_leg_templates` with zero errors. No restart needed once
-applied (`auto_spawner` reads `is_enabled` per run; `_build_strategy` reads
-`params` at spawn).
+**Two real bugs found and fixed via the script's own `--dry-run` +
+real-run discipline, live against the OCI DB, before either mattered**:
+(1) the `oi_volume_confirmed` base config's real name is `"Test "` (trailing
+space) — `"Test"` matched nothing, caught by `--dry-run`'s SKIP output
+before any write was attempted (commit `1439cf4`); (2) the real (non-dry-run)
+apply crashed on its first `db.flush()` with `sqlalchemy.exc
+.NoReferencedTableError` — the script only ever imported strategy models,
+never `app.domain.identity.models` (where `Workspace` lives), so SQLAlchemy's
+mapper configuration never registered the `workspaces` table
+`StrategyConfig.workspace_id`'s FK targets, same "both sides of a FK need
+their model class imported" requirement `bootstrap_admin.py`'s own import
+list already satisfies for the identical reason. Confirmed via a minimal
+local repro (an ad-hoc insert crashes identically without the import,
+succeeds with it) before redeploying the fix (commit `3b345ca`). Zero
+partial writes from the failed attempt — `session_scope`'s rollback-on-
+exception left no `sb6-2leg`-named rows, confirmed via a direct query
+before diagnosing either bug.
+
+**Applied and verified live** (all three, via SSH against the real OCI DB):
+`is_enabled=true`, `runtime_mode=force_paper`, `underlying_symbol=NIFTY`,
+correct `id`s assigned. Rerunning the script afterward correctly SKIPs all
+three (idempotency confirmed live, not just in tests). No restart needed
+(`auto_spawner` reads `is_enabled` per run; `_build_strategy` reads `params`
+at spawn) — none was done for this specifically; the trading-bot service
+restart earlier in this session (for the code deploy) predates this and
+these rows don't need one either way.
 
 ## What is pending
 
-- **Apply Part 1's script to the live OCI DB** — `--dry-run` first, read the
-  printed params, then apply for real. Needs live DB/SSH access this session
-  doesn't have.
 - **`EMA_Micro_Conviction` `qty_lots` for the eventual live test — DECIDED: 3,
   not 2.** Its 3-leg spec (fractions ~0.4/0.3/0.3) needs `qty_lots >= 3` for
   `allocate_leg_lots_floored` (Part 2) to keep all 3 legs; 2 lots drops the
