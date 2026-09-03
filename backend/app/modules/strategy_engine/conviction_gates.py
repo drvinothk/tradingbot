@@ -82,6 +82,36 @@ CONVICTION_GATE_PARAM_KEYS = {
     "momentum_lookback_bars",
 }
 
+# 2026-09-03: momentum-plateau exit params. Deliberately a *separate* set
+# from CONVICTION_GATE_PARAM_KEYS above, not folded into it -- the plateau
+# check is resolved live in `execution_engine.paper.service.
+# evaluate_open_position` off the owning `StrategyConfig.params` row
+# directly (see that module's `_resolve_momentum_plateau_params`), strategy-
+# type agnostic, so it applies to plain base strategies too, not just
+# `*_conviction` ones. Deliberately NOT unioned into any of `api.v1
+# .strategies`'s `*_PARAM_KEYS` sets, unlike CONVICTION_GATE_PARAM_KEYS --
+# those sets are also what `_build_strategy` forwards straight into each
+# strategy's own constructor (`**{k: v for k, v in params.items() if k in
+# X_PARAM_KEYS}`), and none of the 10 strategy constructors accept these
+# kwargs (confirmed live: unioning this in raised `TypeError: unexpected
+# keyword argument 'require_momentum_plateau_exit'` the first time this was
+# tried, in `orb_conviction.py`'s `ORBStrategy.__init__`). Same "inert
+# config the constructor doesn't need" pattern `ORB_PARAM_KEYS`'s own
+# comment already documents for `enabled_on_expiry_day` etc. -- these keys
+# simply live in `strategy_configs.params` JSON unfiltered (arbitrary keys
+# are always accepted there; PARAM_KEYS only gates constructor-forwarding,
+# never save-time validation) and are read back directly, never through a
+# constructed `Strategy` object's attributes.
+MOMENTUM_PLATEAU_PARAM_KEYS = {
+    "require_momentum_plateau_exit",
+    "plateau_use_slope",
+    "plateau_use_rsi",
+    "plateau_combine_mode",
+    "plateau_lookback_bars",
+    "plateau_slope_atr_fraction",
+    "plateau_rsi_flatten_delta",
+}
+
 # IST weekday names accepted by `skip_weekdays` -- identical set
 # `orb_conviction.py` already validates against.
 _WEEKDAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}

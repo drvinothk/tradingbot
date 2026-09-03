@@ -40,6 +40,7 @@ from __future__ import annotations
 import logging
 import uuid
 from abc import abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, time
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, TypeVar
@@ -229,6 +230,85 @@ def get_recent_indicator_values(
     if limit is not None:
         query = query.limit(limit)
     return [float(v) for (v,) in reversed(query.all())]
+
+
+@dataclass(frozen=True)
+class PlateauParams:
+    """Parsed `strategy_configs.params` momentum-plateau-exit keys. `enabled`
+    is `require_momentum_plateau_exit`; every other field defaults to
+    today's exact off-by-default behavior when absent from `params`. Shared
+    between `execution_engine.paper.service` (production, resolved live per
+    poll from the owning `StrategyConfig` row) and
+    `backtest_engine`'s `run_backtest.py` (resolved once from
+    `--strategy-params`) -- see `momentum_plateau_signals`'s own docstring
+    for why the *parsing* is shared but the *data-gathering* around it isn't.
+    """
+
+    enabled: bool = False
+    use_slope: bool = False
+    use_rsi: bool = False
+    combine_mode: Literal["any", "all"] = "any"
+    lookback_bars: int = 5
+    slope_atr_fraction: float = 0.3
+    rsi_flatten_delta: float = 5.0
+
+    @classmethod
+    def from_params(cls, params: dict[str, object]) -> PlateauParams:
+        combine_mode = params.get("plateau_combine_mode", "any")
+        return cls(
+            enabled=bool(params.get("require_momentum_plateau_exit", False)),
+            use_slope=bool(params.get("plateau_use_slope", False)),
+            use_rsi=bool(params.get("plateau_use_rsi", False)),
+            combine_mode="all" if combine_mode == "all" else "any",
+            lookback_bars=int(params.get("plateau_lookback_bars", 5)),  # type: ignore[call-overload]
+            slope_atr_fraction=float(params.get("plateau_slope_atr_fraction", 0.3)),  # type: ignore[arg-type]
+            rsi_flatten_delta=float(params.get("plateau_rsi_flatten_delta", 5.0)),  # type: ignore[arg-type]
+        )
+
+
+def momentum_plateau_signals(
+    closes: list[float],
+    rsi_values: list[float],
+    atr: float | None,
+    params: PlateauParams,
+) -> bool:
+    """True if the underlying's breakout drive has flattened out per
+    `params` -- price-slope and/or RSI14 barely moved over the last
+    `params.lookback_bars` completed bars. Pure function, no I/O: the two
+    callers (production's `_momentum_plateau_detected`, DB-backed; the
+    backtest's `_reconstruct_exit_current`, in-memory-series-backed, for the
+    same "avoid a Postgres round-trip per bar" reason `atr_series` already
+    exists) gather `closes`/`rsi_values`/`atr` differently, but both decide
+    with this one function -- a threshold tweak or bug fix here can't
+    accidentally apply to only one side.
+
+    `closes`/`rsi_values` may be longer than the window needed -- sliced
+    internally to the last `lookback_bars + 1` entries (oldest-first, same
+    convention `get_recent_completed_bars`/`get_recent_indicator_values`
+    already use) so callers don't need to pre-trim exactly. Returns `False`
+    (never raises) when a requested signal's data isn't available yet --
+    RSI14 not warmed up (14-bar Wilder smoothing), ATR14 not warmed up, or
+    simply too early in the trade for `lookback_bars + 1` bars to exist --
+    same "missing data isn't an adverse regime" convention the entry-side
+    `_momentum_alignment_reject` already uses.
+    """
+    if not params.use_slope and not params.use_rsi:
+        return False
+    window = params.lookback_bars + 1
+    results: list[bool] = []
+    if params.use_slope:
+        c = closes[-window:]
+        if len(c) < window or atr is None or atr <= 0:
+            results.append(False)
+        else:
+            results.append(abs(c[-1] - c[0]) < params.slope_atr_fraction * atr)
+    if params.use_rsi:
+        r = rsi_values[-window:]
+        if len(r) < window:
+            results.append(False)
+        else:
+            results.append(abs(r[-1] - r[0]) < params.rsi_flatten_delta)
+    return all(results) if params.combine_mode == "all" else any(results)
 
 
 def _parse_hhmm(value: str) -> time:

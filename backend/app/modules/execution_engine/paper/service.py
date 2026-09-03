@@ -78,7 +78,13 @@ from app.domain.execution.models import (
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
-from app.domain.strategy.models import SignalSide, StrategyRun, TradeIntent, TradeIntentStatus
+from app.domain.strategy.models import (
+    SignalSide,
+    StrategyConfig,
+    StrategyRun,
+    TradeIntent,
+    TradeIntentStatus,
+)
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
@@ -133,7 +139,14 @@ from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 from app.modules.reconciliation.service import run_reconciliation
 from app.modules.risk_engine.service import record_trade_outcome_effects
-from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME, get_recent_completed_bars
+from app.modules.strategy_engine.common_rules import (
+    BAR_TIMEFRAME,
+    PlateauParams,
+    get_latest_indicator_value,
+    get_recent_completed_bars,
+    get_recent_indicator_values,
+    momentum_plateau_signals,
+)
 
 logger = logging.getLogger("app.execution_engine.paper.service")
 
@@ -194,6 +207,49 @@ def _structure_break_confirmed_by_bar_close(
         return False
     close = _dec(bars[0].close)
     return close < buffered_level if favorable else close > buffered_level
+
+
+def _resolve_momentum_plateau_params(db: Session, trade_intent: TradeIntent) -> PlateauParams:
+    """Momentum-plateau params are read live off the owning `StrategyConfig`
+    row (`trade_intent.strategy_run_id` -> `StrategyRun.strategy_config_id`
+    -> `StrategyConfig.params`), not frozen onto `TradeIntent`/`StopPlan` at
+    signal time the way `structure_break_buffer` is -- unlike that ATR-scaled
+    *value* (computed once from market conditions at signal time), these are
+    static config knobs with no reason to be frozen, and reading live means
+    a param edit takes effect on this position's very next poll rather than
+    only on the next new position. Applies uniformly to every strategy type
+    (base and `*_conviction` alike) since it's resolved here, not threaded
+    through any strategy's own constructor. Missing row/params -> disabled
+    (`PlateauParams()` default), never an error.
+    """
+    strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+    if strategy_run is None:
+        return PlateauParams()
+    strategy_config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+    if strategy_config is None:
+        return PlateauParams()
+    return PlateauParams.from_params(strategy_config.params or {})
+
+
+def _momentum_plateau_detected(
+    db: Session, instrument_id: uuid.UUID, params: PlateauParams
+) -> bool:
+    """DB-backed wrapper around `momentum_plateau_signals` -- gathers the
+    last `params.lookback_bars + 1` underlying closes / RSI14 values / the
+    latest ATR14, then hands off to the shared pure function so production
+    and the backtest's own in-memory-series equivalent can never silently
+    diverge on the actual threshold logic (see that function's docstring).
+    """
+    window = params.lookback_bars + 1
+    closes = [
+        float(b.close)
+        for b in get_recent_completed_bars(db, instrument_id, BAR_TIMEFRAME, limit=window)
+    ]
+    rsi_values = get_recent_indicator_values(
+        db, instrument_id, "RSI14", BAR_TIMEFRAME, limit=window
+    )
+    atr = get_latest_indicator_value(db, instrument_id, "ATR14", BAR_TIMEFRAME)
+    return momentum_plateau_signals(closes, rsi_values, atr, params)
 
 
 def _raise_if_option_chain_stale(
@@ -1559,7 +1615,7 @@ def evaluate_open_position(
     ask: float | None = None,
     underlying_price: float | None = None,
 ) -> TradeOutcome | None:
-    """Checks stop/target/structure-break/spread-blowout/trail against
+    """Checks stop/target/structure-break/momentum-plateau/spread-blowout/trail against
     `tick_price` (plus, for the two Phase 4 checks, the option's own live
     `bid`/`ask` and the *underlying's* current price) and closes the position
     if triggered; otherwise advances the trail plan per the generic Phase-3
@@ -1740,6 +1796,30 @@ def evaluate_open_position(
             stop_plan.structure_break_candidate_extreme = None
             db.add(stop_plan)
             db.flush()
+
+    # 3b. Momentum plateau: the underlying's own breakout drive has
+    # flattened out (price-slope and/or RSI14 barely moved over the last
+    # N bars) — exit before a full reversal rather than waiting for
+    # stop/structure_break. Opt-in (`require_momentum_plateau_exit`,
+    # default off — see `PlateauParams`). Skipped once TRAIL is already
+    # ACTIVE: trail already owns "protect a favorable move in progress"
+    # from that point forward, and letting both systems manage the same
+    # exit at once risks them racing on the same close for no benefit.
+    if trail_plan is None or trail_plan.status != TrailPlanStatus.ACTIVE:
+        plateau_params = _resolve_momentum_plateau_params(db, trade_intent)
+        if plateau_params.enabled:
+            plateau_option_contract = db.get(OptionContract, position.option_contract_id)
+            if plateau_option_contract is not None and _momentum_plateau_detected(
+                db, plateau_option_contract.instrument_id, plateau_params
+            ):
+                return close_position(
+                    db,
+                    trading_session,
+                    position,
+                    ExitReason.MOMENTUM_PLATEAU,
+                    float(price),
+                    broker=broker,
+                )
 
     # 4. Spread blowout: the option's own liquidity has dried up past a
     # tradeable width — exit at the current price rather than risk being

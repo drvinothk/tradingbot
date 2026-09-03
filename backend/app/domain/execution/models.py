@@ -114,6 +114,12 @@ class ExitReason(enum.StrEnum):
     # distinct from STRUCTURE_BREAK (a liquidity problem, not a setup
     # invalidation) so reports/scorecards can tell the two apart.
     SPREAD_BLOWOUT = "spread_blowout"
+    # 2026-09-03: the underlying's own breakout drive has flattened out --
+    # price-slope and/or RSI14 stopped moving over the last N bars -- exit
+    # before a full reversal rather than waiting for stop/structure_break.
+    # Opt-in (`require_momentum_plateau_exit`), skipped once TRAIL is
+    # already ACTIVATED (see evaluate_open_position's own comment on why).
+    MOMENTUM_PLATEAU = "momentum_plateau"
     # Emergency square-off's one narrow automatic trigger (Addendum
     # hardening batch) — a detected negative available margin on a
     # live session, distinct from EOD_SQUARE_OFF so reports can tell a

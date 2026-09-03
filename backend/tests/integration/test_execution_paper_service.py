@@ -31,7 +31,13 @@ from app.domain.execution.models import (
     TrailPlanStatus,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
-from app.domain.market.models import Instrument, OptionContract, OptionType, PriceBar
+from app.domain.market.models import (
+    IndicatorSnapshot,
+    Instrument,
+    OptionContract,
+    OptionType,
+    PriceBar,
+)
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import FundingMode, SafeMode, TradingSession
 from app.domain.strategy.models import (
@@ -269,6 +275,54 @@ def _seed_price_bar(db: Session, instrument: Instrument, *, close: float) -> Pri
     db.add(bar)
     db.flush()
     return bar
+
+
+def _seed_plateau_history(
+    db: Session, instrument: Instrument, *, bars: int, base_close: float, atr: float = 10.0
+) -> None:
+    """`bars` sequential completed 60s `PriceBar` rows ending "now", closes
+    barely moving (a tiny back-and-forth, no net drift -- a plateau), plus a
+    matching flat RSI14 `IndicatorSnapshot` per bar and one ATR14 row -- the
+    underlying data `_momentum_plateau_detected` reads for the momentum-
+    plateau exit check.
+    """
+    now = datetime.now(UTC)
+    for i in range(bars):
+        ts = now - timedelta(minutes=bars - i)
+        close = base_close + (0.5 if i % 2 == 0 else -0.5)
+        db.add(
+            PriceBar(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                timeframe=BAR_TIMEFRAME,
+                bucket_start=ts,
+                open=close, high=close + 1, low=close - 1, close=close,
+                volume=1000,
+            )
+        )
+        db.add(
+            IndicatorSnapshot(
+                id=uuid.uuid4(),
+                instrument_id=instrument.id,
+                option_contract_id=None,
+                indicator_name="RSI14",
+                timeframe=BAR_TIMEFRAME,
+                value=55.0,
+                ts=ts,
+            )
+        )
+    db.add(
+        IndicatorSnapshot(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            option_contract_id=None,
+            indicator_name="ATR14",
+            timeframe=BAR_TIMEFRAME,
+            value=atr,
+            ts=now,
+        )
+    )
+    db.flush()
 
 
 # -- dispatch_trade_intent ----------------------------------------------------
@@ -2316,6 +2370,115 @@ def test_evaluate_open_position_zero_persistence_skips_bar_close_gate(
 
     assert outcome is not None
     assert outcome.exit_reason == ExitReason.STRUCTURE_BREAK
+
+
+def test_evaluate_open_position_exits_on_momentum_plateau(
+    db: Session, broker, trading_session, strategy_run, strategy_config, option_contract,
+    instrument,
+):
+    strategy_config.params = {
+        "require_momentum_plateau_exit": True,
+        "plateau_use_slope": True,
+        "plateau_lookback_bars": 5,
+        "plateau_slope_atr_fraction": 0.3,
+    }
+    db.add(strategy_config)
+    db.flush()
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # Underlying barely moved over the last 5 bars (base_close +/- 0.5),
+    # ATR14=10 -> flat threshold = 0.3*10 = 3.0, well above the observed
+    # ~1.0 net move -> plateaued.
+    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+
+    outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
+
+    assert outcome is not None
+    assert outcome.exit_reason == ExitReason.MOMENTUM_PLATEAU
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+
+def test_evaluate_open_position_momentum_plateau_default_off_is_a_no_op(
+    db: Session, broker, trading_session, strategy_run, strategy_config, option_contract,
+    instrument,
+):
+    """`require_momentum_plateau_exit` unset (the exact default every
+    pre-existing `strategy_configs` row has) -- must stay a no-op even
+    against underlying data that would otherwise plateau, so every existing
+    position's behavior is byte-identical to before this feature existed.
+    """
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+
+    outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
+def test_evaluate_open_position_momentum_plateau_skipped_once_trail_is_active(
+    db: Session, broker, trading_session, strategy_run, strategy_config, option_contract,
+    instrument,
+):
+    """Trail already owns "protect a favorable move in progress" once
+    active -- the plateau check must not also fire and race it, even when
+    the underlying data would otherwise plateau.
+    """
+    strategy_config.params = {
+        "require_momentum_plateau_exit": True,
+        "plateau_use_slope": True,
+        "plateau_lookback_bars": 5,
+        "plateau_slope_atr_fraction": 0.3,
+    }
+    db.add(strategy_config)
+    db.flush()
+
+    real_price = broker._price_for(option_contract.symbol)  # noqa: SLF001
+    entry_price = real_price
+    stop_price = real_price - 8.0
+    target_price = real_price + 20.0
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=entry_price, stop_price=stop_price, target_price=target_price,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one()
+    activation_price = float(trail_plan.activation_price)
+
+    # 1. Activate the trail.
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=activation_price, broker=broker
+    )
+    assert outcome is None
+    db.refresh(trail_plan)
+    assert trail_plan.status == TrailPlanStatus.ACTIVE
+
+    # 2. Underlying now plateaus -- must be skipped, trail owns the exit
+    # from here (price hasn't pulled back through the trailed stop yet).
+    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+    outcome = evaluate_open_position(
+        db, trading_session, position, tick_price=activation_price, broker=broker
+    )
+
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
 
 
 def test_evaluate_open_position_exits_on_spread_blowout(

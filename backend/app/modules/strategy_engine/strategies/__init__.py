@@ -1,4 +1,7 @@
-from app.modules.strategy_engine.conviction_gates import CONVICTION_GATE_PARAM_KEYS
+from app.modules.strategy_engine.conviction_gates import (
+    CONVICTION_GATE_PARAM_KEYS,
+    MOMENTUM_PLATEAU_PARAM_KEYS,
+)
 from app.modules.strategy_engine.strategies.atr_breakout import (
     ATR_BREAKOUT_PARAM_KEYS,
     ATRBreakoutStrategy,
@@ -37,6 +40,7 @@ __all__ = [
     "EMAMicroPullbackStrategy",
     "LiquiditySweepReversalConvictionStrategy",
     "LiquiditySweepReversalStrategy",
+    "MOMENTUM_PLATEAU_PARAM_KEYS",
     "OIVolumeConfirmedConvictionStrategy",
     "OIVolumeConfirmedStrategy",
     "ORBStrategy",
