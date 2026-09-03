@@ -216,6 +216,13 @@ export interface OrderOut {
   expiry_date: string | null
   option_type: string | null
   strategy_type: string | null
+  // Order.intended_exit_reason -- what the caller (close_position) recorded
+  // as *why* it placed this exit order, at the moment it placed it -- not
+  // yet a confirmed outcome. `null` for an entry order, a row from before
+  // this field existed, or the LIVE resting protective stop (which never
+  // sets it -- see execution_engine.paper.protective_stop; its own
+  // order_type === 'sl_limit' is what identifies it instead).
+  intended_exit_reason: string | null
 }
 
 export interface PositionLegOut {

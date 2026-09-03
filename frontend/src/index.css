@@ -732,13 +732,7 @@ tbody tr:hover {
 .total-pnl-row {
   font-size: 0.8rem;
   margin: 0.35rem 0 0;
-}
-
-/* Centered under .metric-box-pnl-group's own width -- i.e. under the
-   Realized Profit + Unrealized P&L columns specifically, not the full box
-   (which also includes the separate Total Cost/Win Rate stacked column). */
-.total-pnl-row-centered {
-  text-align: center;
+  text-align: left;
 }
 
 /* Bottom-right footer strip holding the Paper visibility toggle -- kept to

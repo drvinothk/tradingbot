@@ -105,6 +105,14 @@ class OrderOut(BaseModel):
     expiry_date: date | None = None
     option_type: str | None = None
     strategy_type: str | None = None
+    # Order.intended_exit_reason -- picked up automatically by
+    # model_validate(order) below since the column name matches, same as
+    # mode/side/order_type/status above; declared here only for the response
+    # schema. `None` for an entry order, a pre-2026-08-25 row, or the LIVE
+    # resting protective stop (which never sets it -- see
+    # execution_engine.paper.protective_stop.place_protective_stop; its own
+    # order_type='sl_limit' is the frontend's signal for that case instead).
+    intended_exit_reason: str | None = None
 
     model_config = {"from_attributes": True}
 
