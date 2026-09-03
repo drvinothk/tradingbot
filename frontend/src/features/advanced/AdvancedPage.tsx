@@ -132,6 +132,11 @@ function GlobalDailyLimitsCard() {
   const [maxTrades, setMaxTradesInput] = useState<string | null>(null)
   const [maxLots, setMaxLotsInput] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // Cleared on any field edit (below) and at the start of every save, set
+  // true only once all three PATCHes resolve -- the card had no success
+  // feedback at all before, so a save that worked looked identical to one
+  // that silently did nothing.
+  const [saved, setSaved] = useState(false)
 
   const effectiveBudget = budget ?? (data ? String(data.daily_budget_amount) : '')
   const effectiveTarget = target ?? (data ? String(data.daily_target_profit) : '')
@@ -144,6 +149,7 @@ function GlobalDailyLimitsCard() {
   async function handleSave(event: FormEvent) {
     event.preventDefault()
     setError(null)
+    setSaved(false)
     const body: DailyLimitsOut = {
       daily_budget_amount: Number(effectiveBudget),
       daily_target_profit: Number(effectiveTarget),
@@ -172,6 +178,7 @@ function GlobalDailyLimitsCard() {
         setMaxTrades.mutateAsync(maxTradesValue),
         setMaxLots.mutateAsync(maxLotsValue),
       ])
+      setSaved(true)
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Save failed')
     }
@@ -200,7 +207,10 @@ function GlobalDailyLimitsCard() {
             type="number"
             disabled={loading}
             value={effectiveBudget}
-            onChange={(e) => setBudget(e.target.value)}
+            onChange={(e) => {
+              setBudget(e.target.value)
+              setSaved(false)
+            }}
             style={{ width: '110px' }}
           />
         </div>
@@ -211,7 +221,10 @@ function GlobalDailyLimitsCard() {
             type="number"
             disabled={loading}
             value={effectiveTarget}
-            onChange={(e) => setTarget(e.target.value)}
+            onChange={(e) => {
+              setTarget(e.target.value)
+              setSaved(false)
+            }}
             style={{ width: '110px' }}
           />
         </div>
@@ -222,7 +235,10 @@ function GlobalDailyLimitsCard() {
             type="number"
             disabled={loading}
             value={effectiveLossCap}
-            onChange={(e) => setLossCap(e.target.value)}
+            onChange={(e) => {
+              setLossCap(e.target.value)
+              setSaved(false)
+            }}
             style={{ width: '110px' }}
           />
         </div>
@@ -234,7 +250,10 @@ function GlobalDailyLimitsCard() {
             min={1}
             disabled={loading}
             value={effectiveMaxTrades}
-            onChange={(e) => setMaxTradesInput(e.target.value)}
+            onChange={(e) => {
+              setMaxTradesInput(e.target.value)
+              setSaved(false)
+            }}
             style={{ width: '110px' }}
           />
         </div>
@@ -246,7 +265,10 @@ function GlobalDailyLimitsCard() {
             min={1}
             disabled={loading}
             value={effectiveMaxLots}
-            onChange={(e) => setMaxLotsInput(e.target.value)}
+            onChange={(e) => {
+              setMaxLotsInput(e.target.value)
+              setSaved(false)
+            }}
             style={{ width: '110px' }}
           />
         </div>
@@ -255,6 +277,7 @@ function GlobalDailyLimitsCard() {
         </button>
       </form>
       {error && <p className="error">{error}</p>}
+      {saved && !error && <p className="save-ok">Saved ✓</p>}
     </div>
   )
 }
