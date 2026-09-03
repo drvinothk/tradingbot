@@ -165,7 +165,7 @@ function GlobalDailyLimitsCard() {
       return
     }
     if (!maxTradesValue || !Number.isInteger(maxTradesValue)) {
-      setError('Max trades / strategy / day must be a whole number greater than zero.')
+      setError('Max trades / strategy must be a whole number greater than zero.')
       return
     }
     if (!maxLotsValue || !Number.isInteger(maxLotsValue)) {
