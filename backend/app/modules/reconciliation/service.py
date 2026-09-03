@@ -388,6 +388,12 @@ def run_reconciliation(
     if mismatches:
         current_mode = SafeMode(trading_session.mode)
         session_is_live_active = current_mode in _RECONCILIATION_LOCK_ELIGIBLE_MODES
+        # 2026-09-03: fold in which symbols mismatched, not just
+        # session+mode -- otherwise two genuinely different simultaneous
+        # mismatches on the same session/mode would collapse into one
+        # send_alert row under the new occurrence-count collapsing (see
+        # alerting.manager.send_alert), hiding one of them.
+        mismatch_signature = ",".join(sorted(str(m["symbol"]) for m in mismatches))
 
         send_alert(
             db,
@@ -410,7 +416,10 @@ def run_reconciliation(
             override_paper_mode_suppression=(
                 order_mode == OrderMode.PAPER and session_is_live_active
             ),
-            dedup_key=f"reconciliation_mismatch:{trading_session.id}:{order_mode.value}",
+            dedup_key=(
+                f"reconciliation_mismatch:{trading_session.id}:{order_mode.value}:"
+                f"{mismatch_signature}"
+            ),
         )
 
         # Only a *live-book* mismatch on a live-eligible session escalates to

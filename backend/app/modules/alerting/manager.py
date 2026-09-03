@@ -119,7 +119,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
 
 import httpx
@@ -258,6 +258,18 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
 
 _dedup_lock = threading.Lock()
 _last_pushed_by_key: dict[str, datetime] = {}
+
+# Row-collapse severity ranking (see send_alert's own docstring for why a
+# collapsed row keeps the higher severity rather than the latest one --
+# health_check_failed genuinely varies WARNING/CRITICAL within one category,
+# and a later, lower-severity recurrence must never mask an earlier CRITICAL
+# occurrence on the same row).
+_SEVERITY_RANK = {AlertSeverity.INFO: 0, AlertSeverity.WARNING: 1, AlertSeverity.CRITICAL: 2}
+
+
+def _max_severity(a: AlertSeverity, b: AlertSeverity) -> AlertSeverity:
+    return a if _SEVERITY_RANK[a] >= _SEVERITY_RANK[b] else b
+
 
 # See this module's own docstring ("2026-09-03: self-healing grace window")
 # for the full reasoning. Deliberately excludes protective_stop_cancel_failed/
@@ -418,21 +430,67 @@ def send_alert(
     `payload` JSONB column (dashboard/API consumers only — never included
     in the Telegram text). Defaults to `{}`, matching the column's own
     model-level default.
+
+    **2026-09-03: row-collapse.** A recurring alert with the same
+    `effective_dedup_key` no longer inserts a new row on every occurrence --
+    if an unresolved row for the same `(workspace_id, dedup_key)` already
+    exists and last recurred within `system_alert_collapse_window_hours`,
+    this updates that row in place (`occurrence_count` += 1, `last_seen_at`
+    bumped, `severity` raised to the max of the two -- never downgraded, see
+    `_max_severity` -- `message`/`payload` refreshed to this call's values).
+    Otherwise a fresh row is inserted, same as before. This fixed a real
+    incident: 198 near-identical `reconciliation_mismatch` rows in one day
+    (2026-09-02), and `is_resolved` never being written anywhere meant they
+    sat unresolved indefinitely, inflating the Control Room Attention card's
+    `groupAlertsIntoIncidents` count long after the underlying issue cleared.
+    `scheduler.alert_housekeeping.AlertHousekeepingScheduler` auto-resolves a
+    row once it stops recurring, and purges a resolved row after
+    `system_alert_retention_days`.
+
+    The Telegram-push decision below is unaffected -- it still uses this
+    call's own `severity`/`effective_dedup_key`, never the collapsed row's
+    post-update values, so push cadence/gating is unchanged; only row count
+    changes.
     """
-    alert = SystemAlert(
-        id=uuid.uuid4(),
-        workspace_id=workspace_id,
-        trading_session_id=trading_session_id,
-        severity=severity,
-        category=category,
-        message=message,
-        payload=payload if payload is not None else {},
-        created_at=_utcnow(),
+    now = _utcnow()
+    effective_dedup_key = dedup_key or f"{category}:{trading_session_id or workspace_id}"
+    collapse_window = timedelta(hours=get_settings().app.system_alert_collapse_window_hours)
+
+    existing = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == workspace_id,
+            SystemAlert.category == category,
+            SystemAlert.dedup_key == effective_dedup_key,
+            SystemAlert.is_resolved.is_(False),
+        )
+        .order_by(SystemAlert.created_at.desc())
+        .first()
     )
-    db.add(alert)
+    if existing is not None and (now - existing.last_seen_at) < collapse_window:
+        existing.occurrence_count += 1
+        existing.last_seen_at = now
+        existing.severity = _max_severity(existing.severity, severity)
+        existing.message = message
+        existing.payload = payload if payload is not None else {}
+        alert = existing
+    else:
+        alert = SystemAlert(
+            id=uuid.uuid4(),
+            workspace_id=workspace_id,
+            trading_session_id=trading_session_id,
+            severity=severity,
+            category=category,
+            message=message,
+            payload=payload if payload is not None else {},
+            created_at=now,
+            last_seen_at=now,
+            occurrence_count=1,
+            dedup_key=effective_dedup_key,
+        )
+        db.add(alert)
     db.flush()
 
-    effective_dedup_key = dedup_key or f"{category}:{trading_session_id or workspace_id}"
     if _should_push_to_telegram(
         category=category,
         severity=severity,

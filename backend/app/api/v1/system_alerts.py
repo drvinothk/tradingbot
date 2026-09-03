@@ -32,6 +32,8 @@ class SystemAlertOut(BaseModel):
     created_at: datetime
     resolved_at: datetime | None
     is_resolved: bool
+    occurrence_count: int
+    last_seen_at: datetime
 
     model_config = {"from_attributes": True}
 

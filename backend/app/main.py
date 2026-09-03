@@ -522,6 +522,9 @@ async def lifespan(app: FastAPI):
         from app.modules.reporting.export_scheduler import (
             ensure_trade_log_export_scheduler_running,
         )
+        from app.modules.scheduler.alert_housekeeping import (
+            ensure_alert_housekeeping_scheduler_running,
+        )
         from app.modules.scheduler.contract_sync_scheduler import (
             ensure_contract_sync_scheduler_running,
         )
@@ -533,6 +536,7 @@ async def lifespan(app: FastAPI):
 
         ensure_health_check_scheduler_running()
         ensure_reconciliation_lock_recovery_scheduler_running()
+        ensure_alert_housekeeping_scheduler_running()
         ensure_market_data_scheduler_running()
         ensure_trade_log_export_scheduler_running()
         ensure_contract_sync_scheduler_running()
@@ -556,6 +560,7 @@ async def lifespan(app: FastAPI):
         stop_scrip_master_refresh_scheduler,
     )
     from app.modules.reporting.export_scheduler import stop_trade_log_export_scheduler
+    from app.modules.scheduler.alert_housekeeping import stop_alert_housekeeping_scheduler
     from app.modules.scheduler.contract_sync_scheduler import stop_contract_sync_scheduler
     from app.modules.scheduler.health_check import stop_health_check_scheduler
     from app.modules.scheduler.reconciliation_lock_recovery import (
@@ -566,6 +571,7 @@ async def lifespan(app: FastAPI):
     stop_all_position_managers()
     stop_health_check_scheduler()
     stop_reconciliation_lock_recovery_scheduler()
+    stop_alert_housekeeping_scheduler()
     stop_market_data_scheduler()
     stop_scrip_master_refresh_scheduler()
     stop_trade_log_export_scheduler()

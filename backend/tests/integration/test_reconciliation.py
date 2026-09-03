@@ -302,6 +302,12 @@ def test_run_reconciliation_flags_an_injected_mismatch(
         SystemAlert.category == "reconciliation_mismatch",
     ).all()
     assert len(alerts) == 1
+    # 2026-09-03: the dedup_key must include which symbol mismatched, not
+    # just session+mode -- otherwise two genuinely different simultaneous
+    # mismatches on the same session/mode would collapse into one
+    # send_alert row under the new occurrence-count collapsing.
+    assert alerts[0].dedup_key is not None
+    assert option_contract.symbol in alerts[0].dedup_key
 
     sync_state = (
         db.query(BrokerSyncState)

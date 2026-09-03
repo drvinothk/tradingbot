@@ -294,7 +294,14 @@ def test_realerts_once_throttle_window_has_elapsed(
         session_factory=_same_session_factory(db),
     )
 
-    assert len(_alerts_for(db, trading_session)) == 2
+    # 2026-09-03: send_alert now collapses a recurring same-dedup_key alert
+    # into one row (occurrence_count++) instead of inserting a new row --
+    # this second call, made well within the 24h collapse window, lands on
+    # the same row rather than creating a second one. occurrence_count is
+    # the new observable that the second alert genuinely happened.
+    alerts = _alerts_for(db, trading_session)
+    assert len(alerts) == 1
+    assert alerts[0].occurrence_count == 2
 
 
 def test_separate_runs_are_throttled_independently(

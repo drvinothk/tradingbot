@@ -304,7 +304,7 @@ class AliceBlueSettings(BaseSettings):
        param -- Alice's docs show only `appcode`, presumably because the
        redirect URL is already tied to the App Code at registration time,
        same as this account's own registered
-       `https://68-233-110-76.sslip.io/aliceblue/callback`).
+       `https://144-24-137-112.sslip.io/aliceblue/callback`).
     2. User logs in with their own Alice Blue credentials on Alice's site
        (this backend never sees that password -- same reasoning
        ShoonyaSettings' own docstring gives for its OAuth flow).
@@ -493,6 +493,15 @@ class AppSettings(BaseSettings):
     # weekend_rest_idle_minutes after their last authenticated request.
     weekend_rest_enabled: bool = True
     weekend_rest_idle_minutes: int = 10
+    # System-alert dedup + retention (see app.modules.alerting.manager.send_alert
+    # and app.modules.scheduler.alert_housekeeping). A recurring alert with the
+    # same dedup_key collapses into one row (occurrence_count++) as long as it
+    # keeps recurring within this window; after that many hours of silence the
+    # housekeeping scheduler auto-resolves it. A resolved row is purged after
+    # this many days -- long enough to check history if the same issue
+    # resurfaces, short enough that stale noise doesn't accumulate forever.
+    system_alert_collapse_window_hours: int = 24
+    system_alert_retention_days: int = 30
 
 
 class PaperTradingSettings(BaseSettings):

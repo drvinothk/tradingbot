@@ -13,7 +13,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Numeric, String
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Numeric, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -41,10 +41,21 @@ class SystemAlert(Base, UUIDPkMixin):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_resolved: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 2026-09-03: dedup + retention (see alerting.manager.send_alert and
+    # scheduler.alert_housekeeping). `dedup_key` is the same
+    # effective_dedup_key send_alert already computed for Telegram-push
+    # throttling, now persisted so a recurring occurrence can collapse into
+    # this row instead of inserting a new one. `dedup_key` is nullable only
+    # for rows written before this column existed -- every row written after
+    # this always has one.
+    dedup_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index("ix_system_alerts_workspace_created", "workspace_id", "created_at"),
         Index("ix_system_alerts_trading_session", "trading_session_id"),
+        Index("ix_system_alerts_workspace_dedup", "workspace_id", "dedup_key"),
     )
 
 

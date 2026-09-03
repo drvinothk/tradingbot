@@ -20,6 +20,7 @@ import app.modules.alerting.manager as alerting_manager
 from app.config.settings import get_settings
 from app.core.clock import IST
 from app.domain.execution.models import OrderMode
+from app.domain.identity.models import Workspace
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.modules.alerting.manager import send_alert
 
@@ -659,3 +660,147 @@ def test_self_healing_grace_does_not_consume_a_dedup_slot(
         dedup_key="position-1",
     )
     assert alerting_manager._last_pushed_by_key.get("position-1") is None
+
+
+# 2026-09-03: row-collapse -- a recurring alert with the same dedup_key
+# updates one row (occurrence_count++) instead of inserting a new row every
+# time. See send_alert's own docstring for the full design and the real
+# incident (198 reconciliation_mismatch rows in one day) this closes.
+
+
+def test_send_alert_collapses_a_repeat_within_the_window(db: Session, workspace):
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="first occurrence",
+        dedup_key="same-issue",
+    )
+    second = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="second occurrence",
+        dedup_key="same-issue",
+    )
+
+    assert second.id == first.id
+    row = db.get(SystemAlert, first.id)
+    assert row is not None
+    assert row.occurrence_count == 2
+    assert row.message == "second occurrence"
+    assert (
+        db.query(SystemAlert).filter(SystemAlert.dedup_key == "same-issue").count() == 1
+    )
+
+
+def test_send_alert_collapse_keeps_the_higher_severity(db: Session, workspace):
+    """A later, lower-severity recurrence must never mask an earlier CRITICAL
+    occurrence on the same collapsed row (health_check_failed genuinely
+    varies WARNING/CRITICAL within one category -- see _max_severity)."""
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="test_category",
+        message="critical first",
+        dedup_key="same-issue",
+    )
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="warning second",
+        dedup_key="same-issue",
+    )
+
+    row = db.get(SystemAlert, first.id)
+    assert row is not None
+    assert row.severity == AlertSeverity.CRITICAL
+    assert row.occurrence_count == 2
+
+
+def test_send_alert_different_dedup_keys_do_not_collapse(db: Session, workspace):
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="issue-a",
+    )
+    second = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="issue-b",
+    )
+
+    assert first.id != second.id
+    first_row = db.get(SystemAlert, first.id)
+    second_row = db.get(SystemAlert, second.id)
+    assert first_row is not None
+    assert second_row is not None
+    assert first_row.occurrence_count == 1
+    assert second_row.occurrence_count == 1
+
+
+def test_send_alert_starts_a_fresh_row_once_the_existing_one_is_resolved(
+    db: Session, workspace
+):
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="same-issue",
+    )
+    row = db.get(SystemAlert, first.id)
+    assert row is not None
+    row.is_resolved = True
+    db.flush()
+
+    second = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="same-issue",
+    )
+
+    assert second.id != first.id
+    second_row = db.get(SystemAlert, second.id)
+    assert second_row is not None
+    assert second_row.occurrence_count == 1
+
+
+def test_send_alert_does_not_collapse_across_workspaces(db: Session, workspace):
+    other_workspace = Workspace(id=uuid.uuid4(), name=f"other-{uuid.uuid4().hex[:8]}")
+    db.add(other_workspace)
+    db.flush()
+
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="same-issue",
+    )
+    second = send_alert(
+        db,
+        workspace_id=other_workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test_category",
+        message="y",
+        dedup_key="same-issue",
+    )
+
+    assert first.id != second.id

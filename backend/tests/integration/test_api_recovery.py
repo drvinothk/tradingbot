@@ -93,6 +93,7 @@ def test_list_system_alerts_is_workspace_scoped(db: Session, workspace: Workspac
             category="test.mine",
             message="mine",
             created_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
         )
     )
     db.add(
@@ -103,6 +104,7 @@ def test_list_system_alerts_is_workspace_scoped(db: Session, workspace: Workspac
             category="test.not_mine",
             message="not mine",
             created_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
         )
     )
     db.flush()
@@ -125,6 +127,7 @@ def test_list_system_alerts_filters_by_resolved(db: Session, workspace: Workspac
             category="test.open",
             message="open",
             created_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
             is_resolved=False,
         )
     )
@@ -136,6 +139,7 @@ def test_list_system_alerts_filters_by_resolved(db: Session, workspace: Workspac
             category="test.resolved",
             message="resolved",
             created_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
             is_resolved=True,
         )
     )
