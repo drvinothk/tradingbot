@@ -46,6 +46,7 @@ from app.domain.execution.models import (
     PositionExitLegStatus,
     PositionStatus,
     StopPlan,
+    StopPlanStatus,
     TradeOutcome,
     TrailPlan,
     TrailPlanStatus,
@@ -53,7 +54,7 @@ from app.domain.execution.models import (
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
-from app.domain.strategy.exit_legs import allocate_leg_lots, deserialize_exit_legs
+from app.domain.strategy.exit_legs import allocate_leg_lots_floored, deserialize_exit_legs
 from app.domain.strategy.models import SignalSide, TradeIntent
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
@@ -190,8 +191,20 @@ def build_position_exit_legs(
     (caller keeps the legacy single-exit path). `None` cases:
 
     - no `trade_intent.exit_legs` spec at all — the common case, unchanged.
-    - the position is LIVE — collapse + alert (gated follow-up).
-    - the position is too small to give every leg >= 1 lot — collapse + alert.
+    - the position is only 1 lot — a staged exit is meaningless, collapse to a
+      single full-qty exit + a WARNING alert.
+    - a partial fill that isn't a whole lot multiple — collapse + alert.
+
+    A position with >= 2 lots but fewer lots than legs is **not** collapsed:
+    `allocate_leg_lots_floored` keeps the largest-fraction legs (1 lot each,
+    excess to the biggest) and drops the rest, with an `exit_legs_reduced`
+    alert naming the dropped legs.
+
+    LIVE positions build legs the same way as paper. The caller
+    (`_open_position_from_fill`) then creates the carrier `StopPlan` and, for
+    LIVE, places the single whole-position resting SL-LMT a hair below the
+    worst leg's stop (`is_live` is passed through only so the reduced/collapsed
+    alerts carry the right mode).
 
     Idempotent: if legs already exist for this position (a retried
     `_open_position_from_fill` via `_apply_resolved_pending_order`), returns
@@ -208,28 +221,7 @@ def build_position_exit_legs(
     if not specs or len(specs) < 2:
         return None
 
-    if is_live:
-        _alert_collapsed(
-            db,
-            trading_session,
-            position,
-            "multi-leg staged exit is not yet supported for LIVE positions",
-            is_live=True,
-        )
-        return None
-
     total_lots = filled_qty // lot_size if lot_size else 0
-    per_leg_lots = allocate_leg_lots(total_lots, [s.qty_fraction for s in specs])
-    if total_lots < len(specs) or any(lots < 1 for lots in per_leg_lots):
-        _alert_collapsed(
-            db,
-            trading_session,
-            position,
-            f"position has {total_lots} lot(s), too few to stage across "
-            f"{len(specs)} exit legs",
-            is_live=False,
-        )
-        return None
     if total_lots * lot_size != filled_qty:
         # A partial fill that isn't a clean lot multiple would leave the
         # legs' summed qty short of `position.qty`, so `position.qty` could
@@ -241,15 +233,47 @@ def build_position_exit_legs(
             trading_session,
             position,
             f"filled qty {filled_qty} is not a whole multiple of lot size {lot_size}",
+            is_live=is_live,
+        )
+        return None
+
+    kept_lots, dropped = allocate_leg_lots_floored(
+        total_lots, [s.qty_fraction for s in specs]
+    )
+    if not kept_lots:
+        # total_lots <= 1: a single-lot staged position is meaningless — fall
+        # back to the legacy single full-qty exit. Expected/benign regardless
+        # of mode, so WARNING not CRITICAL.
+        _alert_collapsed(
+            db,
+            trading_session,
+            position,
+            f"position has {total_lots} lot(s), collapsing to a single full-qty exit "
+            f"(config has {len(specs)} exit legs)",
             is_live=False,
         )
         return None
+
+    kept_specs = [s for i, s in enumerate(specs) if i not in set(dropped)]
+    if dropped:
+        dropped_kinds = ", ".join(specs[i].kind for i in dropped)
+        kept_desc = ", ".join(
+            f"{s.kind}={lots}L" for s, lots in zip(kept_specs, kept_lots, strict=True)
+        )
+        _alert_reduced(
+            db,
+            trading_session,
+            position,
+            f"position has {total_lots} lot(s); staged across {len(kept_specs)} of "
+            f"{len(specs)} legs ({kept_desc}), dropped: {dropped_kinds}",
+            is_live=is_live,
+        )
 
     now = _utcnow()
     entry_price = _dec(position.entry_price)
     base_target = _dec(trade_intent.target_price)
     legs: list[PositionExitLeg] = []
-    for idx, (spec, lots) in enumerate(zip(specs, per_leg_lots, strict=True)):
+    for idx, (spec, lots) in enumerate(zip(kept_specs, kept_lots, strict=True)):
         # Trail activation price: same shape as the legacy path
         # (_open_position_from_fill) — a fraction of the entry->target
         # distance, defaulting to the generic 0.5 when the leg doesn't
@@ -337,6 +361,153 @@ def _alert_collapsed(
         mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
         dedup_key=f"exit_legs_collapsed:{position.id}",
     )
+
+
+def _alert_reduced(
+    db: Session, trading_session: TradingSession, position: Position, why: str, *, is_live: bool
+) -> None:
+    """The staged exit *did* run, just with fewer legs than configured because
+    the position had fewer lots than legs (`allocate_leg_lots_floored` kept the
+    largest-fraction legs, dropped the rest). Always WARNING — an expected,
+    benign fallback, not a real-money-risk event like a full
+    `exit_legs_collapsed`. Deliberately *not* on `TELEGRAM_ALLOWED_CATEGORIES`,
+    so it stays a dashboard/DB record regardless of `mode`.
+    """
+    logger.info("exit_legs reduced for position %s: %s", position.id, why)
+    send_alert(
+        db,
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        severity=AlertSeverity.WARNING,
+        category="exit_legs_reduced",
+        message=(
+            f"Staged exit for position {position.id} ran with fewer legs than "
+            f"configured ({why})."
+        ),
+        mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
+        dedup_key=f"exit_legs_reduced:{position.id}",
+    )
+
+
+# --- carrier (whole-position) protective stop ------------------------------
+
+# How far below the worst (lowest) leg stop the single whole-position carrier
+# SL-LMT sits. Keeping it *below* every leg stop means the ~3s app poll always
+# closes a leg on its own stop first, so the carrier only ever fires when the
+# poll is dead (crash / broker disconnect) — it is a backstop, never a
+# concurrent second exit. 2% of the worst leg stop is comfortably more than a
+# poll cycle of option-premium drift, and small enough that a genuine
+# disconnect gives up little extra.
+_CARRIER_STOP_EXTRA_MARGIN_PCT = Decimal("0.02")
+
+
+def build_carrier_stop_plan(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    legs: list[PositionExitLeg],
+    option_contract: OptionContract,
+    broker: BrokerPort,
+    *,
+    is_live: bool,
+) -> StopPlan | None:
+    """The single whole-position resting stop for a legged position. Created in
+    BOTH modes so paper's data shape and the resize/cancel code path match
+    live; only LIVE places the real broker SL-LMT (`place_protective_stop`).
+
+    Trigger = worst (lowest) leg `stop_price` × (1 - `_CARRIER_STOP_EXTRA_MARGIN_PCT`).
+    Returns `None` if no leg carries a `stop_price` (nothing to anchor to — the
+    legs are then protected only by their own target/trail/structure/EOD
+    backstops, same as a runner leg already is).
+
+    A `StopPlan` on a position that ALSO has `position_exit_legs` is always a
+    carrier: it is never an exit-decision input (`evaluate_open_position`
+    branches to `evaluate_leg_position` before its own stop check), only a
+    holder for `resting_order_id` / `resting_order_price` and a resize anchor.
+    """
+    leg_stops = [_dec(lg.stop_price) for lg in legs if lg.stop_price is not None]
+    if not leg_stops:
+        return None
+    trigger = min(leg_stops) * (Decimal("1") - _CARRIER_STOP_EXTRA_MARGIN_PCT)
+    now = _utcnow()
+    carrier = StopPlan(
+        id=uuid.uuid4(),
+        position_id=position.id,
+        stop_price=float(trigger),
+        qty=position.qty,
+        structure_level=None,
+        status=StopPlanStatus.CONFIRMED,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(carrier)
+    db.flush()
+
+    if is_live:
+        from app.modules.execution_engine.paper.protective_stop import place_protective_stop
+
+        place_protective_stop(db, trading_session, position, carrier, option_contract, broker)
+    return carrier
+
+
+def _sync_carrier_stop_after_leg_close(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    order_mode: OrderMode,
+    broker: BrokerPort,
+    *,
+    position_now_flat: bool,
+) -> None:
+    """Keep the carrier stop in step as legs close. Flat position -> retire it
+    (LIVE: cancel the broker order). Legs remain -> re-anchor the trigger to
+    the worst *still-open* leg stop and shrink to the remaining qty (LIVE:
+    `resize_resting_protective_stop`). Paper just keeps the `StopPlan` row
+    honest. No-op when there is no carrier (no leg had a stop_price)."""
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    if carrier is None:
+        return
+
+    from app.modules.execution_engine.paper.protective_stop import (
+        cancel_resting_protective_stop,
+        resize_resting_protective_stop,
+    )
+
+    if position_now_flat:
+        if order_mode == OrderMode.LIVE and carrier.resting_order_id is not None:
+            cancel_resting_protective_stop(
+                db, trading_session, position, carrier, carrier.resting_order_id, broker
+            )
+        return
+
+    open_stops = [
+        _dec(lg.stop_price)
+        for lg in db.query(PositionExitLeg).filter(
+            PositionExitLeg.position_id == position.id,
+            PositionExitLeg.status == PositionExitLegStatus.OPEN,
+        )
+        if lg.stop_price is not None
+    ]
+    if not open_stops:
+        return
+    new_trigger = min(open_stops) * (Decimal("1") - _CARRIER_STOP_EXTRA_MARGIN_PCT)
+    if order_mode == OrderMode.LIVE and carrier.resting_order_id is not None:
+        resize_resting_protective_stop(
+            db,
+            trading_session,
+            position,
+            carrier,
+            carrier.resting_order_id,
+            new_trigger,
+            position.qty,
+            broker,
+        )
+    else:
+        carrier.stop_price = float(new_trigger)
+        carrier.qty = position.qty
+        carrier.updated_at = _utcnow()
+        db.add(carrier)
+        db.flush()
 
 
 # --- evaluation -------------------------------------------------------------
@@ -646,7 +817,10 @@ def _close_leg_locked(
     broker: BrokerPort,
     order_mode: OrderMode,
 ) -> TradeOutcome | None:
-    from app.modules.execution_engine.paper.service import _resolve_order_pricing
+    from app.modules.execution_engine.paper.service import (
+        _MAX_EXIT_ORDER_ATTEMPTS,
+        _resolve_order_pricing,
+    )
 
     option_contract = db.get(OptionContract, position.option_contract_id)
     if option_contract is None:
@@ -657,16 +831,64 @@ def _close_leg_locked(
 
     exit_side = _opposite(SignalSide(position.side))
     now = _utcnow()
-    idem = f"exit:{position.id}:{leg.leg_index}"
+    # Per-leg retry, mirroring close_position's single-exit fix (206b7a0,
+    # 2026-09-02): a LIVE leg exit order that comes back CANCELLED/REJECTED
+    # must place a *fresh* attempt with a new key, not re-find the dead order
+    # forever. Explicit key set (not a LIKE prefix) so `:0` can't be confused
+    # with `:0:retryN` matching logic and leg indices never collide.
+    base_key = f"exit:{position.id}:{leg.leg_index}"
+    attempt_keys = [base_key] + [
+        f"{base_key}:retry{n}" for n in range(1, _MAX_EXIT_ORDER_ATTEMPTS)
+    ]
+    exit_attempts = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.idempotency_key.in_(attempt_keys),
+        )
+        .order_by(Order.submitted_at.desc())
+        .all()
+    )
+    exit_order = exit_attempts[0] if exit_attempts else None
+    needs_new_attempt = exit_order is None or exit_order.status in (
+        OrderStatus.CANCELLED,
+        OrderStatus.REJECTED,
+    )
 
-    exit_order = db.query(Order).filter(Order.idempotency_key == idem).one_or_none()
-    if exit_order is None:
+    if needs_new_attempt:
+        if len(exit_attempts) >= _MAX_EXIT_ORDER_ATTEMPTS:
+            logger.error(
+                "position %s leg %s: %d exit order attempts all cancelled/rejected -- "
+                "giving up automatic retries, leaving leg OPEN for manual intervention",
+                position.id,
+                leg.leg_index,
+                len(exit_attempts),
+            )
+            send_alert(
+                db,
+                workspace_id=trading_session.workspace_id,
+                trading_session_id=trading_session.id,
+                severity=AlertSeverity.CRITICAL,
+                category="exit_order_attempts_exhausted",
+                message=(
+                    f"Position {position.id} leg {leg.leg_index}: {len(exit_attempts)} exit "
+                    f"order attempts all cancelled/rejected; automatic retries exhausted -- "
+                    f"needs manual square-off."
+                ),
+                mode=order_mode,
+                dedup_key=f"exit_order_attempts_exhausted:{position.id}:{leg.leg_index}",
+            )
+            return None
+
+        attempt_key = (
+            base_key if exit_order is None else f"{base_key}:retry{len(exit_attempts)}"
+        )
         limit_price, broker_order_type, domain_order_type = _resolve_order_pricing(
             order_mode, _dec(intended_price), exit_side, _dec(instrument.tick_size)
         )
         order_result = broker.place_order(
             OrderRequest(
-                idempotency_key=idem,
+                idempotency_key=attempt_key,
                 contract_symbol=option_contract.symbol,
                 side=_to_broker_side(exit_side),
                 order_type=broker_order_type,
@@ -684,15 +906,22 @@ def _close_leg_locked(
             side=_to_domain_side(exit_side),
             order_type=domain_order_type,
             qty=leg.qty,
-            idempotency_key=idem,
+            idempotency_key=attempt_key,
             now=now,
             position_id=position.id,
             intended_exit_reason=exit_reason,
         )
         db.add(exit_order)
         db.flush()
-        db.add(_new_order_event(exit_order.id, order_result, event_type="filled", now=now))
+        db.add(
+            _new_order_event(
+                exit_order.id, order_result, event_type="filled", now=now, include_raw_message=True
+            )
+        )
 
+    # Either found among prior attempts or just created in the needs_new_attempt
+    # block (the exhausted-retries case returned already).
+    assert exit_order is not None
     if exit_order.status != OrderStatus.FILLED or exit_order.avg_fill_price is None:
         # Same "leave it OPEN for retry" contract as close_position. Paper
         # always fills synchronously via the mock, so this is a safety net,
@@ -803,6 +1032,18 @@ def _finalize_leg_and_maybe_position(
         )
         .first()
     )
+
+    # Carrier whole-position resting stop upkeep — after `position.qty` has been
+    # decremented above, before finalising the position.
+    _sync_carrier_stop_after_leg_close(
+        db,
+        trading_session,
+        position,
+        order_mode,
+        broker,
+        position_now_flat=remaining_open is None,
+    )
+
     if remaining_open is None:
         _finalize_position_after_last_leg(
             db, trading_session, position, exit_order, order_mode

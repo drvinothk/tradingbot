@@ -105,6 +105,7 @@ from app.modules.broker_adapter.composition import (
 )
 from app.modules.broker_adapter.preflight import run_preflight_checks
 from app.modules.execution_engine.paper.exit_legs import (
+    build_carrier_stop_plan,
     build_position_exit_legs,
     close_all_open_legs,
     evaluate_leg_position,
@@ -520,13 +521,14 @@ def _open_position_from_fill(
     db.flush()
 
     # Multi-leg (staged) exit: if the TradeIntent carried a >=2-leg spec and
-    # this position is paper and large enough, create per-leg
-    # `position_exit_legs` and skip the single StopPlan/TrailPlan entirely —
-    # `evaluate_open_position`/`close_position` branch to the leg-aware path
-    # for any position that has legs. `build_position_exit_legs` returns
-    # `None` (keep the legacy path below, unchanged) for the common
-    # no-spec case, and for a LIVE/too-small position (with a one-time
-    # `exit_legs_collapsed` alert).
+    # this position is large enough, create per-leg `position_exit_legs` plus a
+    # single whole-position carrier StopPlan (the resting SL-LMT a hair below
+    # the worst leg stop, placed at the broker for LIVE) and skip the legacy
+    # single StopPlan/TrailPlan path — `evaluate_open_position`/`close_position`
+    # branch to the leg-aware path for any position that has legs.
+    # `build_position_exit_legs` returns `None` (keep the legacy path below,
+    # unchanged) for the common no-spec case and the 1-lot / bad-fill collapse
+    # cases.
     instrument = db.get(Instrument, option_contract.instrument_id)
     exit_legs = (
         build_position_exit_legs(
@@ -542,6 +544,15 @@ def _open_position_from_fill(
         else None
     )
     if exit_legs is not None:
+        build_carrier_stop_plan(
+            db,
+            trading_session,
+            position,
+            exit_legs,
+            option_contract,
+            broker,
+            is_live=(order.mode == OrderMode.LIVE),
+        )
         record_event(
             db,
             workspace_id=trading_session.workspace_id,

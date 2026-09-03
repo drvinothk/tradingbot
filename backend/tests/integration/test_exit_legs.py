@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.domain.execution.models import (
     ExitReason,
+    Order,
     OrderMode,
     Position,
     PositionExitLeg,
@@ -37,9 +38,15 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
-from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
-from app.modules.execution_engine.paper.exit_legs import build_position_exit_legs
+from app.modules.broker_adapter.base.contracts import BrokerOrderStatus
+from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
+from app.modules.execution_engine.paper.exit_legs import _close_leg, build_position_exit_legs
+from app.modules.execution_engine.paper.protective_stop import (
+    place_protective_stop,
+    resize_resting_protective_stop,
+)
 from app.modules.execution_engine.paper.service import (
+    _MAX_EXIT_ORDER_ATTEMPTS,
     close_position,
     dispatch_trade_intent,
     evaluate_open_position,
@@ -232,7 +239,7 @@ def _legs(db: Session, position_id: uuid.UUID) -> list[PositionExitLeg]:
 # --- leg creation ---------------------------------------------------------
 
 
-def test_dispatch_creates_legs_and_no_stop_plan(
+def test_dispatch_creates_legs_and_a_carrier_stop_plan(
     db, broker, trading_session, strategy_run, option_contract
 ):
     intent = _make_intent(
@@ -244,15 +251,24 @@ def test_dispatch_creates_legs_and_no_stop_plan(
     legs = _legs(db, position.id)
     assert [lg.qty for lg in legs] == [75, 75, 100]  # 3/3/4 lots * 25
     assert sum(lg.qty for lg in legs) == position.qty == order.filled_qty
-    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none() is None
     assert legs[2].target_price is None  # runner
 
+    # A legged position now carries a single whole-position carrier StopPlan:
+    # trigger a hair (2%) below the worst leg stop (72.0), full qty, and in
+    # paper no broker resting order.
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert float(carrier.stop_price) == pytest.approx(72.0 * 0.98)
+    assert carrier.qty == position.qty
+    assert carrier.resting_order_id is None
 
-def test_too_small_position_collapses_to_legacy_with_alert(
+
+def test_one_lot_position_collapses_to_legacy_with_alert(
     db, broker, trading_session, strategy_run, option_contract
 ):
+    # A 1-lot position can't stage anything — collapse to the single full-qty
+    # exit (StopPlan/TrailPlan), WARNING alert.
     intent = _make_intent(
-        db, trading_session, strategy_run, option_contract, qty_lots=2, exit_legs=_three_legs()
+        db, trading_session, strategy_run, option_contract, qty_lots=1, exit_legs=_three_legs()
     )
     dispatch_trade_intent(db, trading_session, intent, broker=broker)
 
@@ -265,22 +281,49 @@ def test_too_small_position_collapses_to_legacy_with_alert(
         .one_or_none()
     )
     assert alert is not None
-    # Paper-only collapse reason: harmless, expected fallback — stays
-    # WARNING (never Telegram-eligible), unchanged by the 2026-08-30 fix.
     assert alert.severity == AlertSeverity.WARNING
 
 
-def test_build_legs_returns_none_for_live_position(
+def test_few_lots_stage_across_fewer_legs_with_reduced_alert(
     db, broker, trading_session, strategy_run, option_contract
 ):
-    # A real paper position (real opening Order), then ask build_position_exit_legs
-    # to treat it as LIVE — it must decline and alert rather than half-support it.
+    # 2 lots / 3-leg [.3,.3,.4]: keep the two largest fractions (the .4 runner
+    # and the first .3), 1 lot each; drop the smaller .3 leg. Staged, not
+    # collapsed — WARNING `exit_legs_reduced`, no StopPlan.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=2, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    legs = _legs(db, position.id)
+    assert [lg.qty for lg in legs] == [25, 25]
+    assert [lg.kind for lg in legs] == ["fixed_sl", "runner"]
+    assert [lg.leg_index for lg in legs] == [0, 1]
+    assert sum(lg.qty for lg in legs) == position.qty
+    # Carrier StopPlan still created (kept legs both stop at 72.0).
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert float(carrier.stop_price) == pytest.approx(72.0 * 0.98)
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "exit_legs_reduced")
+        .one_or_none()
+    )
+    assert alert is not None
+    assert alert.severity == AlertSeverity.WARNING
+
+
+def test_build_legs_now_supported_for_live_position(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # The LIVE gate is open: build_position_exit_legs stages legs for a LIVE
+    # position exactly as for paper. The whole-position carrier resting stop is
+    # wired by _open_position_from_fill / build_carrier_stop_plan, not here.
     intent = _make_intent(
         db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
     )
     dispatch_trade_intent(db, trading_session, intent, broker=broker)
     position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
-    # Wipe the legs that paper dispatch created so build_* runs from scratch.
     for lg in _legs(db, position.id):
         db.delete(lg)
     db.flush()
@@ -288,14 +331,169 @@ def test_build_legs_returns_none_for_live_position(
     out = build_position_exit_legs(
         db, trading_session, position, intent, filled_qty=250, lot_size=25, is_live=True
     )
-    assert out is None
-    alert = (
-        db.query(SystemAlert).filter(SystemAlert.category == "exit_legs_collapsed").one()
+    assert out is not None and [lg.qty for lg in out] == [75, 75, 100]
+    assert (
+        db.query(SystemAlert).filter(SystemAlert.category == "exit_legs_collapsed").one_or_none()
+        is None
     )
-    # LIVE collapse reason: a real position's staged-exit risk config was
-    # silently ignored — CRITICAL + mode=LIVE so it's actually Telegram-
-    # eligible (2026-08-30 fix; previously always tagged mode=PAPER here,
-    # which made it permanently unpushable regardless of severity).
+
+
+def test_carrier_stop_shrinks_as_legs_close_and_retires_when_flat(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert carrier.qty == 250
+
+    # Close leg1 (tighter target 86) -> 175 lots of legs remain.
+    evaluate_open_position(db, trading_session, position, tick_price=86.0, broker=broker)
+    db.refresh(carrier)
+    db.refresh(position)
+    assert position.qty == 175
+    assert carrier.qty == 175
+    assert float(carrier.stop_price) == pytest.approx(72.0 * 0.98)  # both remaining legs stop at 72
+
+    # Close leg0 (target 92) -> 100 lots remain (the runner).
+    evaluate_open_position(db, trading_session, position, tick_price=92.0, broker=broker)
+    db.refresh(carrier)
+    db.refresh(position)
+    assert position.qty == 100
+    assert carrier.qty == 100
+
+    # Flatten the runner -> position CLOSED; carrier left in place (paper has no
+    # broker order to cancel).
+    close_position(db, trading_session, position, ExitReason.EOD_SQUARE_OFF, 90.0, broker=broker)
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+
+def test_resize_resting_protective_stop_shrinks_qty_and_reanchors(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # Give a legged position's carrier a real resting `stop:` order (as LIVE
+    # would), then simulate two legs closing and resize it down.
+    from decimal import Decimal
+
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+
+    oc = db.get(OptionContract, position.option_contract_id)
+    # A real resting SL-LMT does not fill synchronously (its trigger is on the
+    # wrong side of the current price); the mock fills everything by default, so
+    # queue an explicit PENDING outcome for the stop placement.
+    broker.queue_fill_scenario(oc.symbol, FillScenario(status=BrokerOrderStatus.PENDING))
+    place_protective_stop(db, trading_session, position, carrier, oc, broker)
+    db.refresh(carrier)
+    assert carrier.resting_order_id is not None
+    stop_order = db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one()
+    assert stop_order.qty == 250
+
+    position.qty = 100  # two legs closed
+    db.add(position)
+    db.flush()
+    resize_resting_protective_stop(
+        db,
+        trading_session,
+        position,
+        carrier,
+        carrier.resting_order_id,
+        Decimal("72.0") * Decimal("0.98"),
+        100,
+        broker,
+    )
+    db.refresh(carrier)
+    assert carrier.qty == 100
+    assert float(carrier.stop_price) == pytest.approx(72.0 * 0.98)
+    assert (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "protective_stop_resize_failed")
+        .one_or_none()
+        is None
+    )
+
+
+def test_carrier_stop_absent_when_no_leg_carries_a_stop_price(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    legs = [
+        ExitLegSpec(qty_fraction=0.5, kind="runner_a", stop_price=None, target_price=100.0),
+        ExitLegSpec(qty_fraction=0.5, kind="runner_b", stop_price=None, target_price=None),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=legs
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    assert len(_legs(db, position.id)) == 2
+    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none() is None
+
+
+def test_leg_exit_order_retries_with_fresh_key_then_exhausts(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # A leg exit order that keeps coming back CANCELLED must place a *fresh*
+    # attempt (`:retryN`) each cycle, not re-find the dead order forever, and
+    # stop after `_MAX_EXIT_ORDER_ATTEMPTS` with a CRITICAL alert. Mirrors
+    # close_position's single-exit fix (206b7a0) for the per-leg path.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    leg0 = _legs(db, position.id)[0]
+
+    for _ in range(_MAX_EXIT_ORDER_ATTEMPTS + 2):
+        broker.queue_fill_scenario(
+            option_contract.symbol, FillScenario(status=BrokerOrderStatus.CANCELLED)
+        )
+
+    for _ in range(_MAX_EXIT_ORDER_ATTEMPTS):
+        out = _close_leg(db, trading_session, position, leg0, ExitReason.STOP, 72.0, broker)
+        assert out is None
+        db.refresh(leg0)
+        assert leg0.status == PositionExitLegStatus.OPEN
+
+    attempts = (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.idempotency_key.like(f"exit:{position.id}:{leg0.leg_index}%"),
+        )
+        .all()
+    )
+    assert len(attempts) == _MAX_EXIT_ORDER_ATTEMPTS
+    keys = {a.idempotency_key for a in attempts}
+    assert f"exit:{position.id}:{leg0.leg_index}" in keys
+    assert f"exit:{position.id}:{leg0.leg_index}:retry{_MAX_EXIT_ORDER_ATTEMPTS - 1}" in keys
+
+    # One more cycle -> give up, CRITICAL alert, no further order.
+    assert _close_leg(db, trading_session, position, leg0, ExitReason.STOP, 72.0, broker) is None
+    assert (
+        db.query(Order)
+        .filter(
+            Order.position_id == position.id,
+            Order.idempotency_key.like(f"exit:{position.id}:{leg0.leg_index}%"),
+        )
+        .count()
+        == _MAX_EXIT_ORDER_ATTEMPTS
+    )
+    alert = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.category == "exit_order_attempts_exhausted",
+            SystemAlert.dedup_key
+            == f"exit_order_attempts_exhausted:{position.id}:{leg0.leg_index}",
+        )
+        .one()
+    )
     assert alert.severity == AlertSeverity.CRITICAL
 
 

@@ -431,3 +431,88 @@ def sync_resting_protective_stop(
     stop_plan.updated_at = _utcnow()
     db.add(stop_plan)
     db.flush()
+
+
+def resize_resting_protective_stop(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    stop_plan: StopPlan,
+    resting_order_id: str,
+    desired_trigger_price: Decimal,
+    new_qty: int,
+    broker: BrokerPort | None,
+) -> None:
+    """Shrink a legged position's whole-position carrier SL-LMT to `new_qty`
+    (and re-anchor its trigger to the new worst remaining leg stop) after a
+    leg closes, via one `ModifyOrder`. `new_qty` is passed explicitly because
+    `position.qty` may or may not have been decremented yet at the call site.
+
+    Never raises. On a modify failure this leaves the *larger* order armed
+    (a too-big stop is strictly safer than none) and raises a WARNING, not a
+    CRITICAL: the carrier trigger is a hair below every leg stop, so it can
+    only ever fire when the app poll is dead — at which point closing the
+    whole remaining position is the correct outcome regardless of the exact
+    qty. The stale size only matters on a triple-compound failure (resize
+    fails, then the app disconnects, then price reaches the trigger), which
+    reconciliation would then catch and lock on.
+    """
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        return
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    if instrument is None:
+        return
+
+    exit_side = _opposite(SignalSide(position.side))
+    tick_size = _dec(instrument.tick_size)
+    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
+    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+    limit_price = _round_to_tick(
+        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    )
+
+    from app.modules.execution_engine.paper.service import resolve_broker_for_position
+
+    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
+    try:
+        resolved_broker.modify_order(
+            resting_order_id,
+            contract_symbol=option_contract.symbol,
+            trigger_price=float(trigger_price),
+            limit_price=float(limit_price),
+            qty=new_qty,
+        )
+    except Exception:  # noqa: BLE001 - see place_protective_stop's identical reasoning
+        logger.warning(
+            "carrier stop resize failed for position %s (resting order %s) -- leaving it "
+            "armed at the previous (larger) qty %s / price %s; it only fires on a dead "
+            "poll anyway",
+            position.id,
+            resting_order_id,
+            stop_plan.qty,
+            stop_plan.resting_order_price,
+            exc_info=True,
+        )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.WARNING,
+            category="protective_stop_resize_failed",
+            message=(
+                f"Carrier stop resize failed for position {position.id}; still armed at "
+                f"qty {stop_plan.qty} / {stop_plan.resting_order_price}."
+            ),
+            mode=OrderMode.LIVE,
+            dedup_key=f"protective_stop_resize_failed:{position.id}",
+        )
+        db.flush()
+        return
+
+    stop_plan.qty = new_qty
+    stop_plan.stop_price = float(desired_trigger_price)
+    stop_plan.resting_order_price = float(trigger_price)
+    stop_plan.updated_at = _utcnow()
+    db.add(stop_plan)
+    db.flush()

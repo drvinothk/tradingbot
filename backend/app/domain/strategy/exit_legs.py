@@ -259,3 +259,60 @@ def allocate_leg_lots(total_lots: int, fractions: list[float]) -> list[int]:
     for idx in order[: max(0, remainder)]:
         floors[idx] += 1
     return floors
+
+
+def allocate_leg_lots_floored(
+    total_lots: int, fractions: list[float]
+) -> tuple[list[int], list[int]]:
+    """Allocate `total_lots` whole lots across `fractions`, guaranteeing every
+    *surviving* leg gets >= 1 lot and dropping the smallest-fraction legs when
+    there are fewer lots than legs.
+
+    Returns `(kept_lots, dropped_indices)`:
+      - `kept_lots` — lot counts for the surviving legs, in original leg order;
+        length `min(len(fractions), total_lots)`.
+      - `dropped_indices` — original positions of legs that got no lots,
+        ascending. `kept_lots[j]` lines up with the j-th leg whose index is
+        *not* in `dropped_indices`.
+
+    `total_lots <= 1` -> `([], list(range(len(fractions))))`: the caller must
+    collapse to a single full-qty exit (a 1-lot staged position is
+    meaningless).
+
+    Otherwise `sum(kept_lots) == total_lots`, every entry is >= 1, and excess
+    lots (beyond the 1-per-leg floor) are handed out by largest-remainder on
+    the survivors' renormalised fractions, ties toward *later* legs — the same
+    rule as `allocate_leg_lots`, kept deliberately consistent.
+
+    This does NOT replace `allocate_leg_lots` (which still backs the historical
+    behaviour and its pinned tests); it is the "keep as many legs as the lots
+    allow, never under-fill" variant used by `build_position_exit_legs`.
+    """
+    n = len(fractions)
+    if n == 0:
+        return [], []
+    if total_lots <= 1:
+        return [], list(range(n))
+
+    k = min(n, total_lots)
+    ranked = sorted(range(n), key=lambda i: (-fractions[i], i))
+    kept_set = set(ranked[:k])
+    kept_idx = [i for i in range(n) if i in kept_set]  # original order
+    dropped = [i for i in range(n) if i not in kept_set]
+
+    kept_fracs = [fractions[i] for i in kept_idx]
+    total_frac = sum(kept_fracs) or 1.0
+    norm = [f / total_frac for f in kept_fracs]
+
+    lots = [1] * k
+    rem = total_lots - k
+    if rem > 0:
+        raw = [rem * f for f in norm]
+        floors = [int(x) for x in raw]
+        for j, fl in enumerate(floors):
+            lots[j] += fl
+        leftover = rem - sum(floors)
+        order = sorted(range(k), key=lambda j: (raw[j] - floors[j], j), reverse=True)
+        for j in order[: max(0, leftover)]:
+            lots[j] += 1
+    return lots, dropped
