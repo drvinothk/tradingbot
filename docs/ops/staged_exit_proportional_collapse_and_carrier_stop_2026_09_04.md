@@ -1,9 +1,11 @@
 # Staged-exit: proportional leg collapse + whole-position carrier stop + LIVE gate — session record (2026-09-04)
 
-**Status: Parts 2, 3a, 3b, 3c implemented + self-verified (1580 backend tests
-pass, ruff + mypy clean). Committed + pushed + deployed to OCI this session.
-Part 3d (reconciliation leg-awareness) and Part 1 (the 3 new staged configs)
-are PENDING — see "What is pending" below.**
+**Status: Parts 2, 3a, 3b, 3c implemented (commit `eab6613`, pushed +
+deployed to OCI), then QC'd the same day — one real idempotency gap found
+and fixed (commit `4b20054`, local only as of this edit, not yet
+pushed/deployed — see "QC pass findings" below). 1581 backend tests pass,
+ruff + mypy clean. Part 3d (reconciliation leg-awareness) and Part 1 (the 3
+new staged configs) are PENDING — see "What is pending" below.**
 
 Full plan (with the Phase-2 QC / blast-radius audit that preceded the code):
 `~/.claude/plans/fizzy-weaving-hopcroft.md` on this machine (not in the repo).
@@ -148,6 +150,59 @@ Wired into `_open_position_from_fill` (`service.py`) — the legs branch now cal
   (was `..._and_no_stop_plan`), `test_build_legs_now_supported_for_live_position`
   (was `..._returns_none_for_live_position`).
 - No schema change / migration in any part.
+
+---
+
+## QC pass findings (2026-09-04, same day)
+
+Holistic QC pass over Parts 2/3a/3b/3c before Part 3d/Part 1 proceed, per
+the standing "always QC, real-money system" discipline. One real gap found
+and fixed, two doc-staleness nits fixed alongside it — commit `4b20054`.
+
+**Found + fixed: `build_carrier_stop_plan` was not idempotent.**
+`build_position_exit_legs` has always guarded against being called twice for
+the same position (`position_has_exit_legs` → return the existing legs
+unchanged) — its own docstring names the exact scenario: "a retried
+`_open_position_from_fill` via `_apply_resolved_pending_order`" (i.e.
+`reconcile_pending_live_orders` re-resolving the same LIVE entry order a
+second time). `build_carrier_stop_plan`, added by this same session right
+after `build_position_exit_legs` in the same call site
+(`_open_position_from_fill`), had no equivalent check — it unconditionally
+inserted a fresh `StopPlan` row. `stop_plans.position_id` is DB-unique, so a
+retry would raise `IntegrityError` instead of no-op'ing like the rest of the
+flow. **Confirmed via a direct repro**, not just static reading: wrote a
+throwaway test that called `build_position_exit_legs` then
+`build_carrier_stop_plan` twice for the same position (mirroring what a
+retried `_open_position_from_fill` does) — second call raised
+`sqlalchemy.exc.IntegrityError: duplicate key value violates unique
+constraint "stop_plans_position_id_key"`. Fixed with an existing-row check
+at the top of `build_carrier_stop_plan`, mirroring `build_position_exit_legs`
+exactly; kept as a permanent regression test
+(`test_carrier_stop_creation_is_idempotent`), confirmed failing before the
+fix (`git stash` the fix, rerun, red) and passing after.
+
+Currently dormant in production — the same "inert until a staged config
+goes live" reasoning as Part 3b itself, since every enabled `exit_legs`
+config is `runtime_mode=force_paper` and this retry path only ever runs for
+`Order.mode == OrderMode.LIVE` orders. But it is a distinct gap from Part 3d
+(which is about the *exit*-order reconciliation path,
+`_apply_resolved_pending_exit_order`) — this one is on the *entry*-fill
+path, `_apply_resolved_pending_order`. **Must be closed before any live
+staged-exit test, same as Part 3d** — it now is, but worth tracking as a
+separate item since it wasn't previously named as a Part-3d blocker.
+
+**Also fixed, doc-only, no behavior change**: `evaluate_open_position`'s
+comment claiming a legged position "has no StopPlan" (it does, since Part
+3c — just never read as an exit-decision input there, the branch to
+`evaluate_leg_position` happens first); `_alert_collapsed`'s docstring,
+which still described both paper-mode collapse reasons as unconditionally
+paper-tagged after this session's own refactor made the "fill not a lot
+multiple" reason carry the position's real `is_live` (intentional and
+correct — a genuinely anomalous LIVE fill deserves CRITICAL/LIVE, unlike
+routine 1-lot collapse — the docstring just hadn't caught up).
+
+1581 backend tests pass (up from 1580), ruff + mypy clean. No schema change,
+not yet pushed/deployed — see repo `git log` for current state.
 
 ---
 
