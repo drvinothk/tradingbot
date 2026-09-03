@@ -332,24 +332,41 @@ these rows don't need one either way.
 
 ## What is pending
 
-- **`EMA_Micro_Conviction` `qty_lots` for the eventual live test — DECIDED: 3,
-  not 2.** Its 3-leg spec (fractions ~0.4/0.3/0.3) needs `qty_lots >= 3` for
-  `allocate_leg_lots_floored` (Part 2) to keep all 3 legs; 2 lots drops the
-  smallest-fraction leg (`[1,1]`, only 2 of 3 survive), 3 keeps all of them
-  uniformly (`[1,1,1]`). Same "don't silently drop a configured leg when the
-  lot count can instead just cover all of them" principle as Part 2 itself,
-  applied consistently rather than left as a per-config inconsistency —
-  **use 3 specifically if/when EMA_Micro_Conviction is the config chosen for
-  the minimum-size live staged-exit test below.** Deliberately **not**
-  applied to the live config now: an explicit `params.qty_lots` is
+- **Minimum uniform `qty_lots` for the eventual live test — DECIDED for all
+  three staged conviction configs, none applied yet.** Checked live against
+  the OCI DB (2026-09-04) rather than assumed — an initial pass only decided
+  this for `EMA_Micro_Conviction`, which turned out to be an arbitrary
+  scoping mistake: `OI_Volume_Conviction` has the identical 3-leg 0.4/0.3/0.3
+  shape, and `ORB_Conviction` (4 legs) has the *same class* of exposure, worse
+  in degree. `allocate_leg_lots_floored` (Part 2) needs `qty_lots >= leg
+  count` to keep every leg; below that it silently drops the smallest-
+  fraction leg(s) first.
+
+  | Config | Live `exit_legs` (fractions) | `qty_lots` at deploy time | Drops a leg below | Uniform minimum |
+  |---|---|---|---|---|
+  | `EMA_Micro_Conviction` | core 0.4 / runner 0.3 / tight 0.3 | `10` (explicit) | 3 | **3** |
+  | `OI_Volume_Conviction` | core 0.4 / runner 0.3 / wide 0.3 | unset (mode default) | 3 | **3** |
+  | `ORB_Conviction` | core 0.3 / runner 0.3 / tightlock 0.2 / target 0.2 | unset (mode default) | 4 | **4** |
+
+  Use the config's own uniform minimum specifically for whichever one is
+  chosen for the minimum-size live staged-exit test below — never a single
+  generic small number (e.g. "`qty_lots: 2`" as a one-size template, which
+  this table shows would silently degrade every one of the three). Same
+  "don't silently drop a configured leg when the lot count can instead just
+  cover all of them" principle as Part 2 itself, applied uniformly across
+  all three staged configs, not just one. Deliberately **not** applied to
+  any of the three live configs now: an explicit `params.qty_lots` is
   mode-unaware (wins in both paper and live, a documented 2026-09-01
-  gotcha), so setting it today would immediately shrink this
-  still-`force_paper`, still-iterating config's *current* paper position
-  size from its 10-lot default — a real, unrequested side effect, not just
-  a same-day config tweak.
+  gotcha), so setting it today would immediately shrink `EMA_Micro_
+  Conviction`'s *current* paper position size from its 10-lot default (and
+  would newly *introduce* an override — unset today — for `OI_Volume_
+  Conviction`/`ORB_Conviction`, changing their paper sizing too) — a real,
+  unrequested side effect on three still-`force_paper`, still-iterating
+  configs, not just a same-day config tweak.
 - The A/B comparison metric (structure-break-affected trades only: net PnL, max
   adverse excursion, winner→loser flips) — prefer the validated reconstruction
   harness on one live config over trusting parallel-config PnL (risk-engine
   slot competition biases it).
-- A real minimum-size live staged-exit test (one config, `qty_lots: 2`, one
-  trading day) — Part 3d is done, so this is now unblocked, just not yet run.
+- A real minimum-size live staged-exit test (one config, sized to its own
+  uniform minimum from the table above, one trading day) — Part 3d is done,
+  so this is now unblocked, just not yet run.
