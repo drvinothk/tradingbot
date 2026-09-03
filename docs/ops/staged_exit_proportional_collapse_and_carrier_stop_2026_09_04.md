@@ -322,9 +322,21 @@ applied (`auto_spawner` reads `is_enabled` per run; `_build_strategy` reads
 - **Apply Part 1's script to the live OCI DB** — `--dry-run` first, read the
   printed params, then apply for real. Needs live DB/SSH access this session
   doesn't have.
-- Decide `EMA_Micro_Conviction` `qty_lots` (2 → `[1,1]` drops a leg; 3 →
-  `[1,1,1]`) — a separate, already-live conviction config, unrelated to the
-  3 new configs above.
+- **`EMA_Micro_Conviction` `qty_lots` for the eventual live test — DECIDED: 3,
+  not 2.** Its 3-leg spec (fractions ~0.4/0.3/0.3) needs `qty_lots >= 3` for
+  `allocate_leg_lots_floored` (Part 2) to keep all 3 legs; 2 lots drops the
+  smallest-fraction leg (`[1,1]`, only 2 of 3 survive), 3 keeps all of them
+  uniformly (`[1,1,1]`). Same "don't silently drop a configured leg when the
+  lot count can instead just cover all of them" principle as Part 2 itself,
+  applied consistently rather than left as a per-config inconsistency —
+  **use 3 specifically if/when EMA_Micro_Conviction is the config chosen for
+  the minimum-size live staged-exit test below.** Deliberately **not**
+  applied to the live config now: an explicit `params.qty_lots` is
+  mode-unaware (wins in both paper and live, a documented 2026-09-01
+  gotcha), so setting it today would immediately shrink this
+  still-`force_paper`, still-iterating config's *current* paper position
+  size from its 10-lot default — a real, unrequested side effect, not just
+  a same-day config tweak.
 - The A/B comparison metric (structure-break-affected trades only: net PnL, max
   adverse excursion, winner→loser flips) — prefer the validated reconstruction
   harness on one live config over trusting parallel-config PnL (risk-engine

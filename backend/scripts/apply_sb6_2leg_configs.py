@@ -18,6 +18,15 @@ Idempotent: skips (does not overwrite) any name that already exists. Always
 run with --dry-run first and read the printed params before applying for
 real.
 
+Does NOT touch `EMA_Micro_Conviction`'s own `qty_lots` -- see the plan doc's
+"What is pending" for that decision (3, for the eventual minimum-size live
+staged-exit test specifically) and why it's deliberately not applied here:
+an explicit `params.qty_lots` is NOT mode-aware (wins in both paper and
+live, a documented 2026-09-01 gotcha), so setting it now would immediately
+shrink this config's *today*, still-`force_paper`, still-iterating paper
+position size from its current 10-lot default -- an unrequested side effect
+outside this script's actual job.
+
 Usage (run from `backend/`, against whatever DB `DATABASE_URL`/the app's own
 settings resolve to -- point this at the live OCI DB deliberately, the same
 way any other one-off apply script in this directory does):
