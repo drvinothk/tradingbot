@@ -118,3 +118,28 @@ def make_broker_call_limiter() -> TokenBucket:
     escalation plan if this recurs again.
     """
     return TokenBucket(capacity=50, refill_rate_per_second=6.0)
+
+
+def make_option_chain_quote_limiter() -> TokenBucket:
+    """A second, dedicated bucket for `ShoonyaBrokerAdapter.get_option_chain`'s
+    own per-strike `GetQuotes` loop — deliberately separate from
+    `make_broker_call_limiter`'s general-purpose bucket above, not a
+    replacement for it.
+
+    **2026-09-03 incident**: the original, unthrottled burst (~41 calls) was
+    live-measured completing in under a second, calls landing only 18-25ms
+    apart — pure network RTT, no pacing at all. Narrowing the loop's strike
+    count (see `adapter.py`'s `_CHAIN_QUOTE_STRIKE_RADIUS`) alone cuts that
+    to ~28 calls, but at the same RTT-only cadence that's still ~2.8x
+    Shoonya's documented 10 GetQuotes/sec ceiling — narrowing the count
+    doesn't by itself guarantee staying under the real ceiling, real pacing
+    does. This bucket is checked *in addition to* the general bucket (a
+    second, tighter gate in series) specifically around that loop, so every
+    other broker call (order placement, position polling) keeps the general
+    bucket's existing capacity=50/refill=6 headroom untouched.
+
+    capacity=8, refill=8/sec stays comfortably under Shoonya's 10/sec ceiling
+    even with other concurrent `GetQuotes` traffic (e.g. `PositionManager`
+    polling) sharing the general bucket at the same time.
+    """
+    return TokenBucket(capacity=8, refill_rate_per_second=8.0)

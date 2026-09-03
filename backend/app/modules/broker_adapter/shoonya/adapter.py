@@ -50,6 +50,7 @@ from websockets.sync.client import connect as _ws_connect
 
 from app.config.settings import ShoonyaSettings
 from app.core.db.base import utcnow as _utcnow
+from app.core.rate_limiter import TokenBucket, make_option_chain_quote_limiter
 from app.modules.broker_adapter.base.broker_port import BrokerPort, DepthCallback, TickCallback
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
@@ -219,6 +220,32 @@ _UNDERLYING_INDEX_SEARCH_TEXT: dict[str, str] = {
     "INDIA VIX": "VIX",
 }
 
+# 2026-09-03 incident: get_option_chain used to fetch Shoonya's default
+# count=10 (40 structural rows: 10 strikes each side x 2 option types x 2
+# sides), then fired one GetQuotes REST call per row -- a ~41-call burst
+# completing in under a second, ~4x Shoonya's documented 10/sec GetQuotes
+# ceiling, causing some calls to get 400 Bad Request and others a 200 OK
+# carrying corrupted data (a leaked underlying spot price landed on an
+# option premium field). No strategy ever ranks/trades beyond ATM +/- 3
+# (`strategy_engine.strike_ranking.engine.StrikeRankingConfig.atm_range`,
+# including every DTE-aware window variant there, whose combined reach
+# tops out at 4 strike-indices from ATM) -- deliberately not imported here
+# to compute this, since strategy_engine already depends on broker_adapter
+# and importing the other way would risk a circular import; this constant
+# is a plain literal instead, cross-referenced in the comment above so the
+# two stay easy to keep in sync by eye. 4 (real max reach) + 3 buffer
+# (absorbs spot drift between the ~60s refresh cycles without needing a
+# same-cycle re-fetch when ATM shifts by a strike or two) = 7. Also matches
+# -- with no strategy currently confirmed to need it -- two older,
+# unreconciled "ATM+/-7" comments elsewhere (`rest_client.py`'s own
+# `get_option_chain` docstring, `mock_universe.build_mock_universe`'s), both
+# predating this constant and neither tied to any `atm_range`/window value
+# actually set by any of the 7 real strategy files today (checked); kept
+# this at 7 rather than 6 specifically so if either stale comment turns out
+# to reference something real and not-yet-migrated, this doesn't silently
+# truncate it the same way the original bug did.
+_CHAIN_QUOTE_STRIKE_RADIUS = 7
+
 # Re-exported for callers that only import from adapter.py — the actual
 # class lives in rest_client.py now (session-expiry classification happens
 # right where the raw Not_Ok response is parsed, not one layer up).
@@ -232,6 +259,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
         auth_result: AuthResult,
         *,
         rest_client: ShoonyaRestClient | None = None,
+        chain_quote_limiter: TokenBucket | None = None,
     ) -> None:
         self._settings = settings
         self._auth_result = auth_result
@@ -241,6 +269,12 @@ class ShoonyaBrokerAdapter(BrokerPort):
         self._rest = rest_client or ShoonyaRestClient(
             settings.api_host, auth_result.session_token
         )
+        # Dedicated, tighter pacer for get_option_chain's own per-strike
+        # GetQuotes loop -- see make_option_chain_quote_limiter's own
+        # docstring. Same constructor-injection shape ShoonyaRestClient
+        # itself already uses for its own limiter, so tests can inject a
+        # fast/no-op bucket instead of a real one.
+        self._chain_quote_limiter = chain_quote_limiter or make_option_chain_quote_limiter()
 
         # contract_symbol -> (exchange, broker_token) — populated as
         # get_instrument_master/get_option_chain results come in, since
@@ -440,7 +474,11 @@ class ShoonyaBrokerAdapter(BrokerPort):
         underlying_quote = self._rest.get_quotes(self._uid, underlying_exchange, underlying_token)
         strike_price = float(underlying_quote.get("lp", 0.0))
         rows = self._rest.get_option_chain(
-            self._uid, exchange, anchor_tsym, strike_price=strike_price
+            self._uid,
+            exchange,
+            anchor_tsym,
+            strike_price=strike_price,
+            count=_CHAIN_QUOTE_STRIKE_RADIUS,
         )
 
         # Live-confirmed via diagnostic logging: a GetOptionChain row is
@@ -460,14 +498,26 @@ class ShoonyaBrokerAdapter(BrokerPort):
             self._remember_token(symbol, exchange, token)
             quote: dict = {}
             if token:
-                try:
-                    quote = self._rest.get_quotes(self._uid, exchange, token)
-                except ShoonyaApiError:
+                # Second, tighter gate in series with ShoonyaRestClient's own
+                # general-purpose bucket inside _request() -- see
+                # make_option_chain_quote_limiter's own docstring for why
+                # narrowing the row count above isn't sufficient on its own.
+                if not self._chain_quote_limiter.acquire_blocking(timeout=10.0):
                     logger.warning(
-                        "Failed to fetch live quote for %s (token=%s); using zeros",
+                        "Chain-quote limiter timed out waiting to fetch %s (token=%s); "
+                        "using zeros",
                         symbol,
                         token,
                     )
+                else:
+                    try:
+                        quote = self._rest.get_quotes(self._uid, exchange, token)
+                    except ShoonyaApiError:
+                        logger.warning(
+                            "Failed to fetch live quote for %s (token=%s); using zeros",
+                            symbol,
+                            token,
+                        )
             entries.append(normalizer.parse_option_chain_entry(row, symbol, quote))
 
         logger.info(

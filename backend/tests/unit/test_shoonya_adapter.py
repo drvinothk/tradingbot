@@ -7,6 +7,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.config.settings import ShoonyaSettings
+from app.core.rate_limiter import TokenBucket
 from app.modules.broker_adapter.base.contracts import (
     AuthResult,
     BrokerOrderStatus,
@@ -17,7 +18,10 @@ from app.modules.broker_adapter.base.contracts import (
     OrderType,
 )
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
-from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+from app.modules.broker_adapter.shoonya.adapter import (
+    _CHAIN_QUOTE_STRIKE_RADIUS,
+    ShoonyaBrokerAdapter,
+)
 from app.modules.broker_adapter.shoonya.rest_client import ShoonyaApiError
 
 SETTINGS = ShoonyaSettings(
@@ -91,7 +95,7 @@ class _FakeRestClient:
         return self.get_quotes_response
 
     def get_option_chain(self, uid, exchange, tradingsymbol, strike_price, count=10):
-        self._record("get_option_chain", uid, exchange, tradingsymbol, strike_price)
+        self._record("get_option_chain", uid, exchange, tradingsymbol, strike_price, count=count)
         return self.get_option_chain_response
 
     def get_time_price_series(
@@ -142,9 +146,16 @@ class _FakeRestClient:
 
 def _adapter(
     rest_client: _FakeRestClient | None = None,
+    *,
+    chain_quote_limiter=None,
 ) -> tuple[ShoonyaBrokerAdapter, _FakeRestClient]:
     rest = rest_client or _FakeRestClient()
-    adapter = ShoonyaBrokerAdapter(SETTINGS, AUTH_RESULT, rest_client=rest)  # type: ignore[arg-type]
+    adapter = ShoonyaBrokerAdapter(
+        SETTINGS,
+        AUTH_RESULT,
+        rest_client=rest,  # type: ignore[arg-type]
+        chain_quote_limiter=chain_quote_limiter,
+    )
     return adapter, rest
 
 
@@ -1142,6 +1153,105 @@ def test_get_option_chain_zero_fills_entry_when_live_quote_fetch_fails():
     assert len(snapshot.entries) == 1
     assert snapshot.entries[0].ltp == 0.0
     assert snapshot.entries[0].oi == 0
+
+
+def test_get_option_chain_requests_a_narrowed_strike_count():
+    """2026-09-03 rate-limit incident: GetOptionChain used to fetch Shoonya's
+    default count=10 (~40 structural rows), then fired one GetQuotes REST
+    call per row -- a burst ~4x Shoonya's documented 10/sec ceiling. No
+    strategy ever ranks/trades beyond ATM+/-3 (plus a small DTE-aware
+    margin), so the chain fetch itself is now narrowed at the source via
+    Shoonya's own `count` (strikes-each-side-of-anchor) parameter.
+    """
+    rest = _FakeRestClient()
+    adapter, rest = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    chain_calls = [call for call in rest.calls if call[0] == "get_option_chain"]
+    assert chain_calls[0][2]["count"] == _CHAIN_QUOTE_STRIKE_RADIUS
+
+
+def test_get_option_chain_paces_per_strike_quotes_through_dedicated_limiter():
+    """Same incident as above: narrowing the row count alone (previous test)
+    isn't sufficient -- even ~24 calls completing in under a second is still
+    ~2.4x Shoonya's ceiling, since nothing paces them beyond raw network RTT.
+    A dedicated, tighter TokenBucket (separate from ShoonyaRestClient's own
+    general-purpose one) gates every per-strike GetQuotes call in this loop.
+    """
+    rest = _FakeRestClient()
+    rest.get_option_chain_response = [
+        {
+            "tsym": "NIFTY30JUL26C24000",
+            "token": "111",
+            "strprc": "24000.00",
+            "optt": "CE",
+            "instname": "OPTIDX",
+        },
+        {
+            "tsym": "NIFTY30JUL26P24000",
+            "token": "112",
+            "strprc": "24000.00",
+            "optt": "PE",
+            "instname": "OPTIDX",
+        },
+    ]
+
+    class _CountingBucket(TokenBucket):
+        def __init__(self):
+            super().__init__(capacity=100, refill_rate_per_second=100.0)
+            self.acquire_calls = 0
+
+        def acquire_blocking(self, cost=1.0, timeout=None):
+            self.acquire_calls += 1
+            return super().acquire_blocking(cost, timeout)
+
+    limiter = _CountingBucket()
+    adapter, rest = _adapter(rest, chain_quote_limiter=limiter)
+    _configure_search_scrip_for_option_chain(rest)
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert limiter.acquire_calls == 2
+
+
+def test_get_option_chain_zero_fills_entry_when_chain_quote_limiter_times_out():
+    """A stuck/exhausted dedicated limiter must degrade the same way a
+    per-strike GetQuotes failure already does -- zero-filled entry, not a
+    crash or a discarded snapshot."""
+    rest = _FakeRestClient()
+    rest.get_option_chain_response = [
+        {
+            "tsym": "NIFTY30JUL26C24000",
+            "token": "111",
+            "strprc": "24000.00",
+            "optt": "CE",
+            "instname": "OPTIDX",
+        },
+    ]
+
+    class _NeverAvailableBucket(TokenBucket):
+        def __init__(self):
+            super().__init__(capacity=1, refill_rate_per_second=1.0)
+
+        def acquire_blocking(self, cost=1.0, timeout=None):
+            return False
+
+    adapter, rest = _adapter(rest, chain_quote_limiter=_NeverAvailableBucket())
+    _configure_search_scrip_for_option_chain(rest)
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert len(snapshot.entries) == 1
+    assert snapshot.entries[0].ltp == 0.0
+    # Only the underlying's own strike-price quote (NSE) fires -- the
+    # per-strike NFO GetQuotes call is never attempted once the dedicated
+    # limiter refuses to grant it.
+    nfo_quote_calls = [
+        call for call in rest.calls if call[0] == "get_quotes" and call[1][1] == "NFO"
+    ]
+    assert nfo_quote_calls == []
 
 
 def test_get_price_history_resolves_underlying_and_calls_tpseries():

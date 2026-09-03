@@ -15,6 +15,22 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.domain.execution.models import (
+    Order,
+    OrderMode,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    PositionStatus,
+)
+from app.domain.identity.models import (
+    BrokerAccount,
+    BrokerAccountStatus,
+    BrokerType,
+    User,
+    Workspace,
+)
 from app.domain.market.mock_universe import build_mock_universe
 from app.domain.market.models import (
     DepthSnapshot,
@@ -24,6 +40,17 @@ from app.domain.market.models import (
     OptionContract,
     PriceBar,
     QuoteTick,
+)
+from app.domain.session.models import FundingMode, SafeMode, TradingSession
+from app.domain.strategy.models import (
+    ExecutionMode,
+    Signal,
+    SignalSide,
+    StrategyConfig,
+    StrategyRun,
+    StrategyRunStatus,
+    TradeIntent,
+    TradeIntentStatus,
 )
 from app.modules.broker_adapter.base.contracts import PriceCandle, Tick
 from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
@@ -1156,6 +1183,388 @@ def test_record_option_chain_snapshot_drops_an_implausible_entry(
     # minus the 1 corrupted one, dropped rather than persisted.
     assert len(row.chain_data) == 41
     assert all(e["ltp"] < 5000 for e in row.chain_data)
+
+
+@pytest.fixture
+def open_position_factory(test_session_factory):
+    """Yields a callable that commits a minimal but real Workspace -> User ->
+    BrokerAccount -> TradingSession -> StrategyConfig -> StrategyRun ->
+    Signal -> TradeIntent -> Order -> Position chain via
+    `test_session_factory` (not the `db` fixture) -- `record_option_chain_
+    snapshot` reads through its own, separate `session_factory`-scoped
+    session, which (same reasoning as `seeded_universe`'s own docstring)
+    cannot see the `db` fixture's uncommitted per-test transaction.
+
+    Explicit FK-ordered teardown, same discipline as `seeded_universe`'s own
+    cleanup and this codebase's established "clean up using explicit IDs
+    captured at creation time" convention (see CLAUDE.md's Phase 1/QC
+    notes) -- `seeded_universe`'s own teardown deletes `OptionContract`/
+    `Instrument` unconditionally, which would FK-violate against any
+    `Position`/`Order`/`TradeIntent`/`Signal` row this fixture leaves
+    behind, silently poisoning every later test's `seeded_universe` seed
+    with leftover NIFTY/NFO rows -- confirmed live while writing this test.
+    """
+    created_workspace_ids: list[uuid.UUID] = []
+
+    def _create(option_contract_id: uuid.UUID) -> None:
+        _seed_open_position_on_contract(
+            test_session_factory, option_contract_id, created_workspace_ids
+        )
+
+    yield _create
+
+    with test_session_factory() as cleanup_db:
+        for workspace_id in created_workspace_ids:
+            trading_session_ids = [
+                row.id
+                for row in cleanup_db.query(TradingSession.id).filter(
+                    TradingSession.workspace_id == workspace_id
+                )
+            ]
+            cleanup_db.query(Position).filter(
+                Position.trading_session_id.in_(trading_session_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(Order).filter(
+                Order.trading_session_id.in_(trading_session_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(TradeIntent).filter(
+                TradeIntent.trading_session_id.in_(trading_session_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(Signal).filter(
+                Signal.trading_session_id.in_(trading_session_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(StrategyRun).filter(
+                StrategyRun.trading_session_id.in_(trading_session_ids)
+            ).delete(synchronize_session=False)
+            cleanup_db.query(StrategyConfig).filter(
+                StrategyConfig.workspace_id == workspace_id
+            ).delete(synchronize_session=False)
+            cleanup_db.query(TradingSession).filter(
+                TradingSession.workspace_id == workspace_id
+            ).delete(synchronize_session=False)
+            cleanup_db.query(BrokerAccount).filter(
+                BrokerAccount.workspace_id == workspace_id
+            ).delete(synchronize_session=False)
+            cleanup_db.query(User).filter(User.workspace_id == workspace_id).delete(
+                synchronize_session=False
+            )
+            cleanup_db.query(Workspace).filter(Workspace.id == workspace_id).delete(
+                synchronize_session=False
+            )
+
+
+def _seed_open_position_on_contract(
+    test_session_factory, option_contract_id: uuid.UUID, created_workspace_ids: list[uuid.UUID]
+) -> None:
+    """Field values are otherwise arbitrary; only FK validity and
+    `Position.status == OPEN` are exercised by the behavior under test.
+    """
+    from app.core.security.passwords import hash_password
+
+    with test_session_factory() as db:
+        workspace = Workspace(id=uuid.uuid4(), name=f"test-{uuid.uuid4().hex[:8]}")
+        db.add(workspace)
+        db.flush()
+        created_workspace_ids.append(workspace.id)
+        user = User(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            email=f"{uuid.uuid4().hex[:8]}@example.com",
+            password_hash=hash_password("correct horse battery staple"),
+            display_name="Test User",
+            is_active=True,
+        )
+        db.add(user)
+        db.flush()
+        broker_account = BrokerAccount(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            broker_type=BrokerType.SHOONYA,
+            label="preservation-test-account",
+            credentials_ref="config/credentials/shoonya.env",
+            status=BrokerAccountStatus.ACTIVE,
+        )
+        db.add(broker_account)
+        db.flush()
+        trading_session = TradingSession(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            broker_account_id=broker_account.id,
+            started_by_user_id=user.id,
+            mode=SafeMode.PAPER_ONLY,
+            started_at=datetime.now(UTC),
+            budget_amount=100_000,
+            daily_target_profit=5_000,
+            daily_loss_cap=5_000,
+            funding_mode=FundingMode.CASH,
+        )
+        db.add(trading_session)
+        db.flush()
+        config = StrategyConfig(
+            id=uuid.uuid4(), workspace_id=workspace.id, name=f"cfg-{uuid.uuid4().hex[:6]}"
+        )
+        db.add(config)
+        db.flush()
+        run = StrategyRun(
+            id=uuid.uuid4(),
+            strategy_config_id=config.id,
+            trading_session_id=trading_session.id,
+            execution_mode=ExecutionMode.AUTO,
+            status=StrategyRunStatus.SCANNING,
+            started_at=trading_session.started_at,
+            started_by_user_id=user.id,
+        )
+        db.add(run)
+        db.flush()
+        signal = Signal(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            strategy_config_id=config.id,
+            strategy_run_id=run.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract_id,
+            side=SignalSide.BUY,
+            entry_price=80.0,
+            stop_price=60.0,
+            target_price=120.0,
+            qty_lots=1,
+            generated_at=trading_session.started_at,
+        )
+        db.add(signal)
+        db.flush()
+        intent = TradeIntent(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            signal_id=signal.id,
+            strategy_run_id=run.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract_id,
+            idempotency_key=f"intent-{uuid.uuid4()}",
+            side=SignalSide.BUY,
+            qty_lots=1,
+            entry_price=80.0,
+            stop_price=60.0,
+            target_price=120.0,
+            status=TradeIntentStatus.DISPATCHED,
+            created_at=trading_session.started_at,
+            dispatched_at=trading_session.started_at,
+        )
+        db.add(intent)
+        db.flush()
+        opening_order = Order(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract_id,
+            trade_intent_id=intent.id,
+            idempotency_key=f"open-{uuid.uuid4()}",
+            mode=OrderMode.PAPER,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=25,
+            status=OrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=80.0,
+            submitted_at=trading_session.started_at,
+            updated_at=trading_session.started_at,
+        )
+        db.add(opening_order)
+        db.flush()
+        position = Position(
+            id=uuid.uuid4(),
+            workspace_id=workspace.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract_id,
+            trade_intent_id=intent.id,
+            opening_order_id=opening_order.id,
+            side=OrderSide.BUY,
+            qty=25,
+            entry_price=80.0,
+            status=PositionStatus.OPEN,
+            opened_at=trading_session.started_at,
+        )
+        db.add(position)
+        db.flush()
+
+
+def test_record_option_chain_snapshot_preserves_an_open_positions_contract_outside_the_window(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """2026-09-03: narrowing `get_option_chain`'s REST-priced window (fixing
+    the GetQuotes rate-limit incident) must not silently stop pricing an
+    already-open position whose strike has drifted outside that window --
+    `current_contract_price`'s only reliable fallback for an open position's
+    option contract is this exact REST snapshot (per-contract WS ticks don't
+    deliver in this deployment, see `execution_engine.paper.position_manager`'s
+    own module docstring); its last-resort fallback beyond that,
+    `broker.get_quote()`, would price a paper position from the mock's own
+    synthetic, strategy-independent seed instead of the real market.
+    """
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=11)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    real_chain = real_broker.get_option_chain("NIFTY", EXPIRY)
+    assert len(real_chain.entries) > 1
+    missing_entry = real_chain.entries[0]
+    missing_contract = (
+        db.query(OptionContract)
+        .filter(OptionContract.symbol == missing_entry.contract_symbol)
+        .one()
+    )
+    open_position_factory(missing_contract.id)
+
+    class _NarrowedWindowBroker:
+        """Simulates the real, narrowed ShoonyaBrokerAdapter.get_option_chain
+        window by dropping the one entry an open position is on -- exactly
+        the scenario `_preserve_open_position_pricing` exists to cover."""
+
+        def get_option_chain(self, *args, **kwargs):
+            from dataclasses import replace
+
+            # MockBrokerAdapter builds a fresh OptionChainEntry per call, so
+            # an `is`/identity filter against `missing_entry` (captured from
+            # an earlier, separate call) would never actually match anything
+            # here -- filter by the stable contract_symbol instead.
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            return replace(
+                chain,
+                entries=tuple(
+                    e
+                    for e in chain.entries
+                    if e.contract_symbol != missing_entry.contract_symbol
+                ),
+            )
+
+        def get_quote(self, contract_symbol):
+            assert contract_symbol == missing_entry.contract_symbol
+            return Tick(
+                contract_symbol=contract_symbol,
+                ltp=missing_entry.ltp,
+                bid=missing_entry.bid,
+                ask=missing_entry.ask,
+                volume=missing_entry.volume,
+                oi=missing_entry.oi,
+                ts=datetime.now(UTC),
+            )
+
+    row = record_option_chain_snapshot(
+        nifty.id,
+        _NarrowedWindowBroker(),  # type: ignore[arg-type]
+        "NIFTY",
+        EXPIRY,
+        session_factory=test_session_factory,
+    )
+
+    symbols = {e["contract_symbol"] for e in row.chain_data}
+    assert missing_entry.contract_symbol in symbols
+    preserved = next(
+        e for e in row.chain_data if e["contract_symbol"] == missing_entry.contract_symbol
+    )
+    assert preserved["ltp"] == missing_entry.ltp
+
+
+def test_record_option_chain_snapshot_does_not_requery_a_position_already_in_the_window(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """No-op case: an open position whose contract is already present in
+    `get_option_chain`'s own result must not trigger a redundant
+    `get_quote` call -- the preservation step only fills real gaps."""
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=12)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    real_chain = real_broker.get_option_chain("NIFTY", EXPIRY)
+    present_entry = real_chain.entries[0]
+    present_contract = (
+        db.query(OptionContract)
+        .filter(OptionContract.symbol == present_entry.contract_symbol)
+        .one()
+    )
+    open_position_factory(present_contract.id)
+
+    class _SpyBroker:
+        def get_option_chain(self, *args, **kwargs):
+            return real_broker.get_option_chain(*args, **kwargs)
+
+        def get_quote(self, contract_symbol):
+            raise AssertionError(
+                f"get_quote should not be called for {contract_symbol!r} -- "
+                "it's already in the chain"
+            )
+
+    row = record_option_chain_snapshot(
+        nifty.id,
+        _SpyBroker(),  # type: ignore[arg-type]
+        "NIFTY",
+        EXPIRY,
+        session_factory=test_session_factory,
+    )
+
+    assert len(row.chain_data) == len(real_chain.entries)
+
+
+def test_record_option_chain_snapshot_deduplicates_multiple_positions_on_the_same_contract(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """Real, live-observed pattern: more than one open Position can share
+    the identical OptionContract (multiple strategies trading the same
+    strike concurrently). The JOIN inside `_preserve_open_position_pricing`
+    produces one raw SQL row per matching Position (confirmed: 2 positions
+    on 1 contract here yield 2 rows), which its explicit `.distinct()`
+    collapses back to one -- pinning that behavior rather than relying on
+    the legacy `Query.all()` API's own incidental per-primary-key collapsing
+    (which already happens to do the same thing, verified separately, but
+    isn't something to depend on implicitly)."""
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=13)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    real_chain = real_broker.get_option_chain("NIFTY", EXPIRY)
+    missing_entry = real_chain.entries[0]
+    missing_contract = (
+        db.query(OptionContract)
+        .filter(OptionContract.symbol == missing_entry.contract_symbol)
+        .one()
+    )
+    # Two independent open positions (separate workspace/session/strategy
+    # chains) on the exact same contract.
+    open_position_factory(missing_contract.id)
+    open_position_factory(missing_contract.id)
+
+    get_quote_calls = []
+
+    class _NarrowedWindowBroker:
+        def get_option_chain(self, *args, **kwargs):
+            from dataclasses import replace
+
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            return replace(
+                chain,
+                entries=tuple(
+                    e
+                    for e in chain.entries
+                    if e.contract_symbol != missing_entry.contract_symbol
+                ),
+            )
+
+        def get_quote(self, contract_symbol):
+            get_quote_calls.append(contract_symbol)
+            return Tick(
+                contract_symbol=contract_symbol,
+                ltp=missing_entry.ltp,
+                bid=missing_entry.bid,
+                ask=missing_entry.ask,
+                volume=missing_entry.volume,
+                oi=missing_entry.oi,
+                ts=datetime.now(UTC),
+            )
+
+    row = record_option_chain_snapshot(
+        nifty.id,
+        _NarrowedWindowBroker(),  # type: ignore[arg-type]
+        "NIFTY",
+        EXPIRY,
+        session_factory=test_session_factory,
+    )
+
+    matching = [e for e in row.chain_data if e["contract_symbol"] == missing_entry.contract_symbol]
+    assert len(matching) == 1
+    assert get_quote_calls == [missing_entry.contract_symbol]
 
 
 def test_on_tick_rejects_an_implausible_price_for_an_option_contract(

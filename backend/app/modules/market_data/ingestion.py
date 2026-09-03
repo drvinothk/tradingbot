@@ -17,6 +17,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.db.session import SessionFactory, session_scope
+from app.domain.execution.models import Position, PositionStatus
 from app.domain.market.models import DepthSnapshot as DepthSnapshotRow
 from app.domain.market.models import IndicatorSnapshot as IndicatorSnapshotRow
 from app.domain.market.models import Instrument, OptionContract
@@ -24,8 +25,16 @@ from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotR
 from app.domain.market.models import PriceBar as PriceBarRow
 from app.domain.market.models import QuoteTick as QuoteTickRow
 from app.modules.broker_adapter.base.broker_port import BrokerPort
-from app.modules.broker_adapter.base.contracts import DepthSnapshot, PriceCandle, Tick
-from app.modules.broker_adapter.base.errors import BrokerRateLimitedError
+from app.modules.broker_adapter.base.contracts import (
+    DepthSnapshot,
+    OptionChainEntry,
+    PriceCandle,
+    Tick,
+)
+from app.modules.broker_adapter.base.contracts import (
+    OptionType as BrokerOptionType,
+)
+from app.modules.broker_adapter.base.errors import BrokerError, BrokerRateLimitedError
 from app.modules.market_data.indicators.bar_aggregator import Bar
 from app.modules.market_data.indicators.engine import IndicatorEngine
 from app.modules.market_data.providers.base import BaseMarketDataProvider
@@ -885,6 +894,94 @@ class MarketDataIngestionService:
             )
 
 
+def _preserve_open_position_pricing(
+    db: Session,
+    broker: BrokerPort,
+    instrument_id: uuid.UUID,
+    expiry: date,
+    plausible_entries: list[OptionChainEntry],
+) -> None:
+    """Mutates `plausible_entries` in place, appending one entry per
+    genuinely open `Position` on this instrument+expiry whose contract
+    symbol didn't already come back in `broker.get_option_chain`'s own
+    (now ATM-window-narrowed) result — see `record_option_chain_snapshot`'s
+    own docstring for why this matters. A `get_quote` failure for one
+    position degrades that one entry (skipped, not persisted) rather than
+    the whole snapshot, same discipline as the main per-strike loop this
+    mirrors.
+    """
+    already_present = {e.contract_symbol for e in plausible_entries}
+    # Explicit .distinct(), even though this system routinely has more than
+    # one open Position on the identical OptionContract (multiple strategies
+    # sharing a strike is normal, confirmed live via this exact repo's own
+    # trading_sessions today) and the raw JOIN below does produce one SQL row
+    # per matching Position. Verified empirically: the legacy `Query.all()`
+    # API already collapses those into a single ORM object by primary-key
+    # identity even without this call (confirmed via `db.execute(query
+    # .statement).fetchall()` returning 2 raw rows while `query.all()`
+    # returned 1) -- so this isn't fixing an active bug, but making that
+    # collapsing explicit and not dependent on an ORM-API-specific behavior
+    # this codebase doesn't rely on anywhere else being asserted.
+    query = (
+        db.query(OptionContract)
+        .join(Position, Position.option_contract_id == OptionContract.id)
+        .filter(
+            Position.status == PositionStatus.OPEN,
+            OptionContract.instrument_id == instrument_id,
+            OptionContract.expiry_date == expiry,
+        )
+        .distinct()
+    )
+    if already_present:
+        query = query.filter(OptionContract.symbol.notin_(already_present))
+    open_contracts = query.all()
+    for contract in open_contracts:
+        try:
+            tick = broker.get_quote(contract.symbol)
+        except BrokerError:
+            logger.warning(
+                "Failed to fetch a preservation quote for open position's contract %s "
+                "(instrument=%s, expiry=%s); its chain entry stays absent this refresh",
+                contract.symbol,
+                instrument_id,
+                expiry,
+            )
+            continue
+        if not is_plausible_option_tick(tick.ltp, tick.bid, tick.ask, tick.volume):
+            logger.error(
+                "REJECTED implausible preservation quote for open position's contract %r "
+                "(instrument=%s, expiry=%s): ltp=%.4f bid=%.4f ask=%.4f volume=%d",
+                contract.symbol,
+                instrument_id,
+                expiry,
+                tick.ltp,
+                tick.bid,
+                tick.ask,
+                tick.volume,
+            )
+            continue
+        plausible_entries.append(
+            OptionChainEntry(
+                contract_symbol=contract.symbol,
+                strike=float(contract.strike),
+                # OptionContract.option_type is declared Mapped[OptionType]
+                # (app.domain.market.models's own StrEnum) but the underlying
+                # column is a plain String(2) with no SQLAlchemy Enum type
+                # decorator -- at runtime this attribute is always a bare str
+                # ("CE"/"PE"), never an actual enum instance with a `.value`
+                # to read. OptionChainEntry needs this module's own OptionType
+                # (a separate StrEnum class, same CE/PE values), constructed
+                # directly from that string.
+                option_type=BrokerOptionType(contract.option_type),
+                ltp=tick.ltp,
+                bid=tick.bid,
+                ask=tick.ask,
+                volume=tick.volume,
+                oi=tick.oi or 0,
+            )
+        )
+
+
 def record_option_chain_snapshot(
     db_underlying_instrument_id: uuid.UUID,
     broker: BrokerPort,
@@ -908,6 +1005,23 @@ def record_option_chain_snapshot(
     deduped per-symbol like the WS path's warning — chain snapshots refresh
     on a ~25s+ cadence per instrument/expiry, not per tick, so log volume is
     naturally bounded without needing the same cap.
+
+    **2026-09-03**: `broker.get_option_chain` now only REST-prices an
+    ATM-centered window (`ShoonyaBrokerAdapter._CHAIN_QUOTE_STRIKE_RADIUS`,
+    fixing a real GetQuotes-per-second rate-limit violation — see
+    `core.rate_limiter.make_option_chain_quote_limiter`'s own docstring),
+    not the wider chain this function used to receive. `current_contract_price`'s
+    REST-snapshot fallback (`latest_snapshot_tick`) is the *only* reliable
+    price source for an open position's option contract today — per-contract
+    WS ticks don't deliver in this deployment (see
+    `execution_engine.paper.position_manager`'s own module docstring) — so a
+    position whose strike drifts outside the narrower window must still end
+    up in this snapshot, or its stop/target/trail pricing would silently
+    fall through to `broker.get_quote()` as an absolute last resort, which
+    for a paper-routed position prices from the mock's own synthetic,
+    strategy-independent seed instead of the real market. Bounded and safe:
+    at most one extra `get_quote` call per genuinely open position on this
+    exact instrument+expiry, never proportional to chain width.
     """
     chain = broker.get_option_chain(underlying_symbol, expiry)
     plausible_entries = []
@@ -929,6 +1043,23 @@ def record_option_chain_snapshot(
                 e.volume,
             )
     with session_factory() as db:
+        # Only when the broker actually returned *some* real chain data --
+        # never for a genuinely empty/dead chain (a broker with no
+        # instruments configured, a real outage). An empty chain already
+        # correctly classifies as DEAD (`_snapshot_has_live_prices`), which
+        # sends every caller straight to `broker.get_quote()` on every
+        # cycle -- exactly right for "we have no market data right now."
+        # Manufacturing one preserved entry would instead make that chain
+        # look LIVE, freezing it at whatever price happened to be fetched
+        # this one time until the next 60s refresh -- confirmed live via a
+        # real test regression: MockBrokerAdapter-backed tests that
+        # intentionally mutate `broker._prices` *after* dispatch, relying on
+        # the empty-chain-forces-DEAD-forces-fresh-get_quote path, started
+        # reading a stale cached price instead.
+        if plausible_entries:
+            _preserve_open_position_pricing(
+                db, broker, db_underlying_instrument_id, expiry, plausible_entries
+            )
         row = OptionChainSnapshotRow(
             id=uuid.uuid4(),
             instrument_id=db_underlying_instrument_id,
