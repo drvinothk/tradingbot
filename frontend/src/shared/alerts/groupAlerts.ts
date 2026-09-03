@@ -33,9 +33,17 @@ export interface AlertIncident {
   message: string
   count: number
   lastSeen: string
+  firstSeen: string
   occurrences: SystemAlertOut[]
 }
 
+// 2026-09-03: `firstSeen` tracks the earliest `created_at` across every raw
+// occurrence merged into this incident -- mirrors `lastSeen`'s own tracking
+// exactly, just min instead of max. Added for ControlRoomPage.tsx's
+// self-healing grace window (an incident must have been open for a few
+// seconds before it's worth surfacing as "needs your attention" -- see that
+// file's own SELF_HEALING_GRACE_CATEGORIES) -- purely additive, every other
+// consumer of AlertIncident is unaffected.
 export function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertIncident[] {
   const byKey = new Map<string, AlertIncident>()
   for (const alert of alerts) {
@@ -49,6 +57,7 @@ export function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertInciden
         message: alert.message,
         count: 1,
         lastSeen: alert.created_at,
+        firstSeen: alert.created_at,
         occurrences: [alert],
       })
       continue
@@ -58,6 +67,9 @@ export function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertInciden
     if (new Date(alert.created_at) > new Date(existing.lastSeen)) {
       existing.lastSeen = alert.created_at
       existing.message = alert.message
+    }
+    if (new Date(alert.created_at) < new Date(existing.firstSeen)) {
+      existing.firstSeen = alert.created_at
     }
     if (severityRank(alert.severity) > severityRank(existing.severity)) {
       existing.severity = alert.severity

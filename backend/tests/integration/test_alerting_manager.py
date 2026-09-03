@@ -33,16 +33,18 @@ _OUTSIDE_WINDOW = datetime(2026, 1, 5, 17, 0, tzinfo=IST)  # 17:00 IST
 
 @pytest.fixture(autouse=True)
 def _reset_module_state():
-    """`_warned_missing_config` and `_last_pushed_by_key` are module-level
-    globals -- reset around each test so one test's trigger can't leak into
-    another's assertion, matching this file's own pre-existing isolation
-    discipline for the config-warning flag.
+    """`_warned_missing_config`, `_last_pushed_by_key`, and
+    `_first_seen_by_key` are module-level globals -- reset around each test
+    so one test's trigger can't leak into another's assertion, matching this
+    file's own pre-existing isolation discipline for the config-warning flag.
     """
     alerting_manager._warned_missing_config = False
     alerting_manager._last_pushed_by_key.clear()
+    alerting_manager._first_seen_by_key.clear()
     yield
     alerting_manager._warned_missing_config = False
     alerting_manager._last_pushed_by_key.clear()
+    alerting_manager._first_seen_by_key.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -505,3 +507,155 @@ def test_telegram_blocked_for_exit_legs_collapsed_on_a_paper_position(
     )
 
     assert _configured == []
+
+
+# 2026-09-03: self-healing grace window -- protective_stop_cancel_unresolved,
+# exit_order_unfilled, and reconciliation_mismatch are raised on an ambiguous
+# intermediate state that PositionManager's own 3s retry cycle resolves
+# within ~1s the overwhelming majority of the time. See manager.py's own
+# docstring ("2026-09-03: self-healing grace window") for the full reasoning.
+_SELF_HEALING_START = datetime(2026, 1, 5, 10, 0, tzinfo=alerting_manager.UTC)
+
+
+@pytest.fixture
+def _grace_clock(monkeypatch):
+    """Controls `_utcnow()` (the grace-window clock) independently of
+    `now_ist()` (the alert-window clock) -- returns a mutable holder so a
+    test can advance time mid-test without re-patching."""
+    current = {"v": _SELF_HEALING_START}
+    monkeypatch.setattr(alerting_manager, "_utcnow", lambda: current["v"])
+    return current
+
+
+@pytest.mark.parametrize(
+    "category",
+    ["protective_stop_cancel_unresolved", "exit_order_unfilled", "reconciliation_mismatch"],
+)
+def test_telegram_blocked_on_first_sighting_of_a_self_healing_category(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock, category
+):
+    """The very first occurrence must never push immediately -- it only
+    records the sighting and starts the grace clock."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=category,
+        message="y",
+        dedup_key="position-1",
+    )
+
+    assert _configured == []
+
+
+def test_telegram_still_blocked_before_the_grace_window_elapses(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock
+):
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="y",
+        dedup_key="position-1",
+    )
+    _grace_clock["v"] = _SELF_HEALING_START + timedelta(
+        seconds=alerting_manager._SELF_HEALING_GRACE_SECONDS - 1
+    )
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="y",
+        dedup_key="position-1",
+    )
+
+    assert _configured == []
+
+
+def test_telegram_pushes_once_the_grace_window_elapses_and_the_issue_recurs(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock
+):
+    """A genuinely stuck case (still recurring after the grace window) must
+    still reach Telegram -- this gate only delays, never permanently
+    suppresses."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="y",
+        dedup_key="position-1",
+    )
+    _grace_clock["v"] = _SELF_HEALING_START + timedelta(
+        seconds=alerting_manager._SELF_HEALING_GRACE_SECONDS
+    )
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="y",
+        dedup_key="position-1",
+    )
+
+    assert len(_configured) == 1
+
+
+def test_self_healing_grace_never_fires_if_the_issue_never_recurs(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock
+):
+    """The whole point: a position that self-heals within one call never
+    triggers a second send_alert, so Telegram is never reached at all --
+    not even after the grace window would have elapsed."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="protective_stop_cancel_unresolved",
+        message="y",
+        dedup_key="position-1",
+    )
+
+    assert _configured == []
+    # Confirmed the grace clock genuinely would have allowed a push by now --
+    # this really is "never called again", not "called too soon to tell".
+    _grace_clock["v"] = _SELF_HEALING_START + timedelta(hours=1)
+    assert _configured == []
+
+
+def test_self_healing_grace_does_not_apply_to_other_categories(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock
+):
+    """A category outside the self-healing set (e.g. the terminal
+    exit_order_attempts_exhausted signal) must push on its very first
+    occurrence, unaffected by this gate."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category=_ALLOWED_CATEGORY,
+        message="y",
+        dedup_key="position-1",
+    )
+
+    assert len(_configured) == 1
+
+
+def test_self_healing_grace_does_not_consume_a_dedup_slot(
+    db: Session, workspace, _configured, _within_alert_window, _grace_clock
+):
+    """A candidate held back by the grace window must not start/extend the
+    15-minute dedup cooldown -- once it does push (grace elapsed), a later
+    genuinely-new recurrence should not be silently swallowed by a dedup
+    window that was never really started."""
+    send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="y",
+        dedup_key="position-1",
+    )
+    assert alerting_manager._last_pushed_by_key.get("position-1") is None

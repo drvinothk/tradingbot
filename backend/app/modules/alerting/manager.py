@@ -61,6 +61,49 @@ hold, checked in `_should_push_to_telegram`:
 The SystemAlert DB write always happens regardless of any of the above —
 this section can only suppress the Telegram push, never the durable record.
 
+**2026-09-03: self-healing grace window, added after a real "is this just
+FYI or does it need me" complaint.** `protective_stop_cancel_unresolved`,
+`exit_order_unfilled`, and `reconciliation_mismatch` are raised on an
+*ambiguous* intermediate state (Shoonya's real Cancel/Place acks are often
+status-less; a reconciliation pass sampling mid-fill) — not a confirmed,
+durable failure. `PositionManager`'s own 3-second poll cycle (plus each
+broker adapter's own follow-up status check) resolves the large majority of
+these within about a second, with zero human action ever involved. Live
+evidence from 2026-09-03: two real live positions each hit this pair of
+alerts once and closed correctly about a second later — the alert fired
+before the system had even had one full retry cycle to resolve itself.
+
+`_SELF_HEALING_GRACE_CATEGORIES` (checked in `_should_push_to_telegram`,
+same ordering discipline as condition 4 — before dedup, so a suppressed
+candidate never consumes a dedup slot) holds a push until the *same*
+`dedup_key` has been continuously observed for `_SELF_HEALING_GRACE_SECONDS`
+(10s, ~3 poll cycles — enough margin over the ~1s typical resolution time
+without being so long it delays a genuinely stuck case). Tracked via its own
+small in-memory dict (`_first_seen_by_key`), deliberately independent of the
+`SystemAlert` row/its own dedup_key lookup — no schema dependency, and the
+grace timer survives regardless of whether/how the row itself is written.
+Same reset-on-restart acceptance as condition 5's dedup dict.
+
+Deliberately excludes `protective_stop_cancel_failed`/
+`protective_stop_placement_failed` (a real exception, not an ambiguous
+ack — never observed to self-heal) and `exit_order_attempts_exhausted` (the
+actual "retries exhausted, needs you now" terminal signal, which must never
+be delayed). The mode-machine's own reaction to a genuine live-book
+`reconciliation_mismatch` (`transition_mode` to `RECONCILIATION_LOCK`) is
+unaffected by this — that call happens in `reconciliation/service.py`
+independently of whether this alert ever reaches Telegram, and is
+separately audited via `audit_events` regardless.
+
+This only ever holds back the *Telegram push and the Control Room Attention
+card* (`ControlRoomPage.tsx`'s `AttentionCard` applies the identical
+grace window client-side, computed from each alert's own `created_at` — kept
+in sync with this list by comment, same as the existing
+`TELEGRAM_ALLOWED_CATEGORIES`/`ATTENTION_ALERT_CATEGORIES` pair already are).
+The `SystemAlert` row is unaffected — written immediately regardless, and
+remains fully visible without any grace delay on the Advanced page's "System
+errors" card (`GET /system-alerts?is_resolved=false`, no category or age
+filter) the whole time.
+
 **Suggested-action tips**: per explicit user decision, these are static,
 hand-written one-liners per category (`TELEGRAM_SUGGESTED_ACTIONS`), not an
 LLM-generated suggestion — this execution core is deliberately non-AI/
@@ -216,6 +259,24 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
 _dedup_lock = threading.Lock()
 _last_pushed_by_key: dict[str, datetime] = {}
 
+# See this module's own docstring ("2026-09-03: self-healing grace window")
+# for the full reasoning. Deliberately excludes protective_stop_cancel_failed/
+# protective_stop_placement_failed (a real exception, not an ambiguous ack)
+# and exit_order_attempts_exhausted (the terminal "give up" signal, must
+# never be delayed). Keep in sync with ControlRoomPage.tsx's
+# SELF_HEALING_GRACE_CATEGORIES if this changes.
+_SELF_HEALING_GRACE_CATEGORIES = frozenset(
+    {"protective_stop_cancel_unresolved", "exit_order_unfilled", "reconciliation_mismatch"}
+)
+_SELF_HEALING_GRACE_SECONDS = 10.0
+
+_first_seen_lock = threading.Lock()
+_first_seen_by_key: dict[str, datetime] = {}
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
 
 def _within_alert_window(now: datetime) -> bool:
     return _ALERT_WINDOW_START <= now.time() <= _ALERT_WINDOW_END
@@ -231,6 +292,23 @@ def _dedup_allows_push(dedup_key: str, now: datetime) -> bool:
             return False
         _last_pushed_by_key[dedup_key] = now
         return True
+
+
+def _self_healing_grace_elapsed(dedup_key: str, now: datetime) -> bool:
+    """Records the first time `dedup_key` is seen; returns `True` once it has
+    been continuously observed for at least `_SELF_HEALING_GRACE_SECONDS`.
+    In-memory only, independent of the `SystemAlert` row itself — see this
+    module's own docstring. Never removes an entry once resolved (matching
+    `_last_pushed_by_key`'s own unbounded-growth acceptance — a `dedup_key`
+    here is normally scoped to one position/session, so this only grows by
+    real trading volume, not per-cycle re-checks of the same issue).
+    """
+    with _first_seen_lock:
+        first_seen = _first_seen_by_key.get(dedup_key)
+        if first_seen is None:
+            _first_seen_by_key[dedup_key] = now
+            return False
+        return (now - first_seen).total_seconds() >= _SELF_HEALING_GRACE_SECONDS
 
 
 def _should_push_to_telegram(
@@ -253,6 +331,13 @@ def _should_push_to_telegram(
     # same ordering rationale as the time-window check. The SystemAlert DB
     # row is still written unconditionally by send_alert. No-op Mon-Fri.
     if weekend_rest.is_dormant():
+        return False
+    # Self-healing grace window -- checked before the dedup step below for
+    # the same reason: a candidate held back here must never start/extend
+    # that issue's dedup cooldown, since it was never actually pushed.
+    if category in _SELF_HEALING_GRACE_CATEGORIES and not _self_healing_grace_elapsed(
+        dedup_key, _utcnow()
+    ):
         return False
     now = now_ist()
     if not _within_alert_window(now):
@@ -342,7 +427,7 @@ def send_alert(
         category=category,
         message=message,
         payload=payload if payload is not None else {},
-        created_at=datetime.now(UTC),
+        created_at=_utcnow(),
     )
     db.add(alert)
     db.flush()

@@ -834,6 +834,26 @@ interface AttentionItem {
 // quiet for 30 minutes is treated as resolved and drops off.
 const ATTENTION_STALE_AFTER_MS = 30 * 60 * 1000
 
+// 2026-09-03: self-healing grace window -- mirrors backend
+// alerting/manager.py's _SELF_HEALING_GRACE_CATEGORIES/
+// _SELF_HEALING_GRACE_SECONDS exactly (same categories, same 10s value; see
+// that module's own docstring, "2026-09-03: self-healing grace window", for
+// the full reasoning). These three categories are raised on an ambiguous
+// intermediate broker/reconciliation state that PositionManager's own 3s
+// retry cycle resolves within ~1s the overwhelming majority of the time --
+// surfacing them here the instant they're detected, before the system has
+// even had one retry cycle to resolve itself, trained a "just FYI, ignore
+// it" reflex rather than a "this needs you" one. Held back from this card
+// only -- the SystemAlert row is written immediately regardless and stays
+// visible without any delay on the Advanced page's "System errors" card.
+// Keep this set/value in sync with the backend's if either changes.
+const SELF_HEALING_GRACE_CATEGORIES = new Set([
+  'protective_stop_cancel_unresolved',
+  'exit_order_unfilled',
+  'reconciliation_mismatch',
+])
+const SELF_HEALING_GRACE_MS = 10_000
+
 function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
   const alertsQuery = useSystemAlerts()
   const [expanded, setExpanded] = useState(false)
@@ -848,7 +868,9 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
     (inc) =>
       inc.severity === 'critical' &&
       ATTENTION_ALERT_CATEGORIES.has(inc.category) &&
-      Date.now() - new Date(inc.lastSeen).getTime() <= ATTENTION_STALE_AFTER_MS,
+      Date.now() - new Date(inc.lastSeen).getTime() <= ATTENTION_STALE_AFTER_MS &&
+      (!SELF_HEALING_GRACE_CATEGORIES.has(inc.category) ||
+        Date.now() - new Date(inc.firstSeen).getTime() >= SELF_HEALING_GRACE_MS),
   )
 
   const approvalItems: AttentionItem[] = runs.flatMap((run) =>
