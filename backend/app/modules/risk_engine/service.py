@@ -44,7 +44,7 @@ from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
 from app.core.pnl import signed_pnl
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, Position, PositionStatus, TradeOutcome
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
@@ -95,6 +95,7 @@ _ALERT_WORTHY_REASON_PREFIXES = (
     "mode_blocks_new_entries",
     "entries_paused",
     "same_strike_locked",
+    "reentry_cooldown_locked",
     "max_concurrent_positions_reached",
     "max_trades_per_day_reached",
     "consecutive_loss_pause_active",
@@ -406,6 +407,59 @@ def _same_strike_locked(
     return locked is not None
 
 
+_REENTRY_COOLDOWN = timedelta(minutes=5)
+
+
+def _reentry_cooldown_locked(
+    db: Session,
+    trading_session_id: uuid.UUID,
+    strategy_config_id: uuid.UUID,
+    option_contract_id: uuid.UUID,
+    new_entry_price: Decimal,
+) -> bool:
+    """True if this strategy closed a position on this exact contract
+    within the last 5 minutes at an exit price <= new_entry_price (i.e. the
+    new entry is not strictly cheaper than the prior exit) -- blocks
+    chasing a move that already reversed (see the 2026-08-27/28 trade
+    streak analysis: same-strike/same-direction re-entries at a higher
+    premium than the prior exit, shortly after it, were the dominant real
+    loss pattern). A strictly better-priced re-entry is never blocked.
+
+    Orders by TradeOutcome.closed_at (per-row, per-leg), not
+    Position.closed_at -- a multi-leg staged exit
+    (execution_engine/paper/exit_legs.py) writes one TradeOutcome per leg,
+    all sharing the same Position.closed_at (set only once, on the final
+    leg). Ordering on the position-level timestamp would make `.first()`
+    pick an arbitrary leg's exit_price among ties; ordering on the
+    row-level TradeOutcome.closed_at deterministically picks the
+    most-recently-closed leg -- the actual "last exit" moment, and the
+    correct single-leg behavior when there's no multi-leg exit at all.
+    `Position.status == CLOSED` still excludes an in-progress multi-leg
+    position (only the final leg flips it), which is correct -- a partial
+    leg exit while other legs remain open isn't "the prior exit" yet.
+    """
+    cutoff = _utcnow() - _REENTRY_COOLDOWN
+    row = (
+        db.query(TradeOutcome.exit_price)
+        .join(Position, Position.id == TradeOutcome.position_id)
+        .join(TradeIntent, TradeIntent.id == Position.trade_intent_id)
+        .join(StrategyRun, StrategyRun.id == TradeIntent.strategy_run_id)
+        .filter(
+            Position.trading_session_id == trading_session_id,
+            Position.option_contract_id == option_contract_id,
+            StrategyRun.strategy_config_id == strategy_config_id,
+            Position.status == PositionStatus.CLOSED,
+            TradeOutcome.closed_at >= cutoff,
+        )
+        .order_by(TradeOutcome.closed_at.desc())
+        .first()
+    )
+    if row is None:
+        return False
+    (exit_price,) = row
+    return new_entry_price >= _dec(exit_price)
+
+
 def _is_alert_worthy(reasons: list[str]) -> bool:
     return any(
         reason.startswith(prefix)
@@ -517,6 +571,15 @@ def evaluate_trade_intent(
             db, trading_session.id, strategy_run.strategy_config_id, trade_intent.option_contract_id
         ):
             reasons.append("same_strike_locked")
+
+        if _reentry_cooldown_locked(
+            db,
+            trading_session.id,
+            strategy_run.strategy_config_id,
+            trade_intent.option_contract_id,
+            _dec(trade_intent.entry_price),
+        ):
+            reasons.append("reentry_cooldown_locked")
 
         # 2026-08-19: gated on is_strategy_routed_live, same reasoning as
         # max_trades_per_day/budget_exceeded below -- max_concurrent_

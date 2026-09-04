@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.api.v1.strategies import _get_pending_approval_or_404
 from app.domain.audit.models import AuditEvent
-from app.domain.execution.models import Order, OrderMode
+from app.domain.execution.models import ExitReason, Order, OrderMode, Position, TradeOutcome
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.identity.models import Workspace as WorkspaceRow
 from app.domain.market.models import Instrument, OptionContract, OptionType, QuoteTick
@@ -36,7 +36,7 @@ from app.domain.strategy.models import (
 from app.modules.audit_service.service import verify_chain
 from app.modules.broker_adapter.base.contracts import MarginInfo
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
-from app.modules.execution_engine.paper.service import dispatch_trade_intent
+from app.modules.execution_engine.paper.service import close_position, dispatch_trade_intent
 from app.modules.risk_engine.service import (
     compute_pre_trade_analytics,
     create_new_risk_limit_config_version,
@@ -420,6 +420,163 @@ def test_same_strike_lock_does_not_cross_strategies(
     decision = evaluate_trade_intent(db, second, trading_session, other_run)
 
     assert "same_strike_locked" not in decision.reasons
+
+
+# -- reentry cooldown (5 min, same strategy + contract, no-worse-premium) --
+
+
+def test_reentry_cooldown_blocks_equal_or_higher_premium(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    first_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+    assert outcome is not None
+    exit_price = float(outcome.exit_price)
+
+    second = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=exit_price
+    )
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "reentry_cooldown_locked" in decision.reasons
+
+
+def test_reentry_cooldown_allows_strictly_cheaper_reentry(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    first_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+    assert outcome is not None
+    exit_price = float(outcome.exit_price)
+
+    second = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=exit_price - 1.0
+    )
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert "reentry_cooldown_locked" not in decision.reasons
+
+
+def test_reentry_cooldown_expires_after_window(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    first_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+    assert outcome is not None
+    exit_price = float(outcome.exit_price)
+
+    # Directly age the outcome past the 5-min window -- same pattern this
+    # codebase already uses elsewhere for time-gated tests (e.g. setting
+    # TradingSession.cutoff_time explicitly) rather than sleeping for real.
+    outcome.closed_at = datetime.now(UTC) - timedelta(minutes=6)
+    db.add(outcome)
+    db.flush()
+
+    second = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=exit_price
+    )
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert "reentry_cooldown_locked" not in decision.reasons
+
+
+def test_reentry_cooldown_does_not_cross_strategies(
+    db: Session, broker, workspace, user, trading_session, strategy_run, option_contract,
+):
+    first_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=72.0, broker=broker
+    )
+    assert outcome is not None
+    exit_price = float(outcome.exit_price)
+
+    other_config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="other-strategy")
+    db.add(other_config)
+    db.flush()
+    other_run = StrategyRun(
+        id=uuid.uuid4(), strategy_config_id=other_config.id,
+        trading_session_id=trading_session.id, execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING, started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(other_run)
+    db.flush()
+
+    second = _make_trade_intent(
+        db, trading_session, other_run, option_contract, entry_price=exit_price
+    )
+    decision = evaluate_trade_intent(db, second, trading_session, other_run)
+
+    assert "reentry_cooldown_locked" not in decision.reasons
+
+
+def test_reentry_cooldown_uses_last_leg_exit_for_multileg_position(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """Regression test for a real bug found during design review: a
+    multi-leg staged exit (execution_engine/paper/exit_legs.py) writes one
+    TradeOutcome per leg, all sharing one position_id. Simulated here by
+    adding a second TradeOutcome row directly rather than exercising the
+    full staged-exit engine -- `position_exit_leg_id=None` on both rows is
+    fine for this purpose since Postgres doesn't treat two NULLs as equal
+    under `uq_trade_outcome_position_leg` (see CLAUDE.md's own note on that
+    constraint), so this doesn't collide.
+
+    Constructed so an arbitrary-row pick and a last-closed-by-time pick
+    disagree: the real (later-closed) leg exits at 60.0, an earlier
+    synthetic leg exits at 100.0. A new entry at 70.0 must be blocked
+    (>= the real last exit, 60.0) -- if the query instead picked the
+    earlier 100.0 leg, 70.0 < 100.0 would wrongly be allowed.
+    """
+    first_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    last_leg_outcome = close_position(
+        db, trading_session, position, ExitReason.TARGET, intended_price=60.0, broker=broker
+    )
+    assert last_leg_outcome is not None
+    assert float(last_leg_outcome.exit_price) == pytest.approx(60.0)
+
+    earlier_leg_outcome = TradeOutcome(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        position_id=position.id,
+        position_exit_leg_id=None,
+        trade_intent_id=first_intent.id,
+        entry_price=last_leg_outcome.entry_price,
+        exit_price=100.0,
+        qty=25,
+        realized_pnl=0.0,
+        slippage=0.0,
+        exit_reason=ExitReason.TARGET,
+        closed_at=datetime.now(UTC) - timedelta(minutes=2),
+    )
+    db.add(earlier_leg_outcome)
+    db.flush()
+
+    second = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract, entry_price=70.0
+    )
+    decision = evaluate_trade_intent(db, second, trading_session, strategy_run)
+
+    assert decision.decision == "rejected"
+    assert "reentry_cooldown_locked" in decision.reasons
 
 
 def test_same_strike_locked_blocks_a_pending_approval_duplicate(
