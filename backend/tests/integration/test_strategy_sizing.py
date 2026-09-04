@@ -13,7 +13,6 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-import pytest
 from sqlalchemy.orm import Session
 
 from app.domain.identity.models import (
@@ -118,11 +117,33 @@ def test_force_paper_strategy_in_a_live_session_gets_the_paper_default(db, works
     assert resolve_qty_lots(config, ts, run) == DEFAULT_QTY_LOTS_PAPER
 
 
-@pytest.mark.parametrize("mode", [SafeMode.PAPER_ONLY, SafeMode.LIVE_ENABLED])
-def test_explicit_param_always_wins(db, workspace, user, mode):
-    ts = _session(db, workspace, user, mode)
+def test_explicit_param_wins_when_routed_live(db, workspace, user):
+    ts = _session(db, workspace, user, SafeMode.LIVE_ENABLED)
     config, run = _config_and_run(db, workspace, user, ts, params={"qty_lots": 4})
     assert resolve_qty_lots(config, ts, run) == 4
+
+
+def test_explicit_param_is_ignored_for_paper(db, workspace, user):
+    # 2026-09-04: paper always gets the paper default, independent of
+    # whatever live-sized override is configured -- see sizing.py's own
+    # docstring for why (a live qty_lots was silently shrinking paper's
+    # sizing too).
+    ts = _session(db, workspace, user, SafeMode.PAPER_ONLY)
+    config, run = _config_and_run(db, workspace, user, ts, params={"qty_lots": 4})
+    assert resolve_qty_lots(config, ts, run) == DEFAULT_QTY_LOTS_PAPER
+
+
+def test_explicit_param_is_ignored_for_force_paper_in_a_live_session(db, workspace, user):
+    ts = _session(db, workspace, user, SafeMode.LIVE_ENABLED)
+    config, run = _config_and_run(
+        db,
+        workspace,
+        user,
+        ts,
+        params={"qty_lots": 4},
+        runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
+    )
+    assert resolve_qty_lots(config, ts, run) == DEFAULT_QTY_LOTS_PAPER
 
 
 def test_no_session_falls_back_to_paper_default(db, workspace, user):

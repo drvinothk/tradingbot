@@ -105,6 +105,13 @@ class OrderOut(BaseModel):
     expiry_date: date | None = None
     option_type: str | None = None
     strategy_type: str | None = None
+    # 2026-09-04: the *config's* own name (e.g. "OI_Volume_Conviction"), not
+    # just its strategy_type -- two configs of the same type (e.g. "Test"
+    # and "Test 4", both oi_volume_confirmed) were otherwise visually
+    # indistinguishable in the trade table, both rendering the exact same
+    # friendlyTradeLabel. Same join, same None-for-exit-order caveat as
+    # strategy_type above.
+    strategy_name: str | None = None
     # Order.intended_exit_reason -- picked up automatically by
     # model_validate(order) below since the column name matches, same as
     # mode/side/order_type/status above; declared here only for the response
@@ -153,6 +160,9 @@ class PositionOut(BaseModel):
     expiry_date: date | None = None
     option_type: str | None = None
     strategy_type: str | None = None
+    # 2026-09-04: see OrderOut.strategy_name's own comment -- identical
+    # reasoning, same ambiguity fixed on the position side.
+    strategy_name: str | None = None
     target_price: float | None = None
     stop_price: float | None = None
     # The trailed stop level once a trail has activated (StopPlan.stop_price
@@ -210,6 +220,7 @@ def _order_out(
     order: Order,
     contract: OptionContract | None,
     strategy_type: str | None,
+    strategy_name: str | None,
 ) -> OrderOut:
     out = OrderOut.model_validate(order)
     if contract is not None:
@@ -218,6 +229,7 @@ def _order_out(
         out.expiry_date = contract.expiry_date
         out.option_type = str(contract.option_type)
     out.strategy_type = strategy_type
+    out.strategy_name = strategy_name
     return out
 
 
@@ -229,7 +241,7 @@ def list_orders(
 ) -> list[OrderOut]:
     trading_session = _get_session_or_404(db, user, trading_session_id)
     rows = (
-        db.query(Order, OptionContract, StrategyConfig.strategy_type)
+        db.query(Order, OptionContract, StrategyConfig.strategy_type, StrategyConfig.name)
         .outerjoin(OptionContract, Order.option_contract_id == OptionContract.id)
         .outerjoin(TradeIntent, Order.trade_intent_id == TradeIntent.id)
         .outerjoin(StrategyRun, TradeIntent.strategy_run_id == StrategyRun.id)
@@ -238,7 +250,10 @@ def list_orders(
         .order_by(Order.submitted_at.desc())
         .all()
     )
-    return [_order_out(order, contract, strategy_type) for order, contract, strategy_type in rows]
+    return [
+        _order_out(order, contract, strategy_type, strategy_name)
+        for order, contract, strategy_type, strategy_name in rows
+    ]
 
 
 @router.get("/positions", response_model=list[PositionOut])
@@ -253,6 +268,7 @@ def list_positions(
             Position,
             OptionContract,
             StrategyConfig.strategy_type,
+            StrategyConfig.name,
             TradeIntent,
             StopPlan,
             TrailPlan,
@@ -311,6 +327,7 @@ def list_positions(
         position,
         contract,
         strategy_type,
+        strategy_name,
         trade_intent,
         stop_plan,
         trail_plan,
@@ -322,6 +339,7 @@ def list_positions(
         out.expiry_date = contract.expiry_date
         out.option_type = str(contract.option_type)
         out.strategy_type = strategy_type
+        out.strategy_name = strategy_name
         out.mode = str(opening_order_mode) if opening_order_mode is not None else None
         if trade_intent is not None:
             out.target_price = float(trade_intent.target_price)

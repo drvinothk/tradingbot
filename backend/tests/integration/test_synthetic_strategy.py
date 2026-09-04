@@ -416,6 +416,82 @@ def test_run_cycle_fires_nothing_outside_the_trade_window(
     assert db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
 
 
+def test_run_cycle_suppresses_live_entries_during_midday_window(
+    monkeypatch,
+    db: Session,
+    instrument,
+    option_contract,
+    strategy_run,
+    trading_session,
+    strategy_config,
+):
+    """2026-09-04: the same market data that fires a dispatch inside the
+    trade window (test_run_cycle_dispatches_and_closes_and_audits_full_loop)
+    must yield no signal for a LIVE-routed run at 12:00 IST -- evaluate()
+    must not even be called (same "don't burn a fire-once strategy's state
+    for nothing" reasoning as the outside-trade-window test above). The
+    signal panel's last_signal_status must reflect the real reason instead
+    of going stale.
+    """
+    from app.domain.session.models import SafeMode
+
+    monkeypatch.setattr(runner_module, "now_ist", lambda: datetime(2026, 1, 1, 12, 0, tzinfo=IST))
+    _seed_market_data(db, instrument, option_contract)
+
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
+
+    assert decision is None
+    assert db.query(TradeIntent).filter(TradeIntent.strategy_run_id == strategy_run.id).count() == 0
+    # getattr, not a direct attribute access -- SyntheticStrategy has no
+    # declared last_signal_status (see interface.SignalStatus's own
+    # docstring); run_cycle sets it dynamically via setattr.
+    signal_status = getattr(strategy, "last_signal_status", None)
+    assert signal_status is not None
+    assert signal_status.reason_code == "live_entry_suppressed"
+
+
+def test_run_cycle_does_not_suppress_paper_entries_during_midday_window(
+    monkeypatch,
+    db: Session,
+    instrument,
+    option_contract,
+    strategy_run,
+    trading_session,
+    strategy_config,
+):
+    """The exact counterpart to the LIVE test above -- a PAPER_ONLY session
+    (or a FORCE_PAPER strategy inside a live session, covered by
+    is_strategy_routed_live's own tests) must dispatch normally through the
+    11:30-13:00 IST band; only real-money entries are suppressed."""
+    monkeypatch.setattr(runner_module, "now_ist", lambda: datetime(2026, 1, 1, 12, 0, tzinfo=IST))
+    _seed_market_data(db, instrument, option_contract)
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    decision = run_cycle(
+        db,
+        strategy,
+        strategy_run,
+        trading_session,
+        strategy_config,
+        alert_session_factory=_same_session_factory(db),
+    )
+
+    assert decision is not None
+    assert decision.decision == "approved"
+
+
 def test_repeated_cycles_hit_max_trades_per_day_and_alert_fires(
     db: Session,
     workspace,

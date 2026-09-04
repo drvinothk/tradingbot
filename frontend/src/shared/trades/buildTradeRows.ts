@@ -21,6 +21,10 @@ export interface TradeRow {
   status: TradeRowStatus
   label: string
   strategyType: string | null
+  // The config's own name -- see friendlyTradeLabel's own comment for why
+  // this exists alongside strategyType. `null` in the same cases
+  // strategyType is (an exit order's missing trade_intent_id join, etc).
+  strategyName: string | null
   strike: number | null
   expiryDate: string | null
   optionType: string | null
@@ -87,14 +91,18 @@ export interface TradeRow {
   legs: PositionLegOut[]
 }
 
+// 2026-09-04: cancelled/rejected pushed to the very end (both dead-end
+// statuses, deliberately after closed) -- explicit user request to stop
+// dead orders from cluttering the top of the table ahead of real closed
+// trades.
 const STATUS_ORDER: Record<TradeRowStatus, number> = {
   pending_approval: 0,
   order_sent: 1,
   position_open: 2,
   closing: 3,
-  rejected: 4,
-  cancelled: 5,
-  closed: 6,
+  closed: 4,
+  rejected: 5,
+  cancelled: 6,
 }
 
 // Both statuses mean "this order never became/stayed a fill" -- used for
@@ -189,8 +197,9 @@ export function buildTradeRows(
       rows.push({
         key: `approval-${approval.approval_id}`,
         status: 'pending_approval',
-        label: friendlyTradeLabel(run.strategy_type, null, approval.expires_at),
+        label: friendlyTradeLabel(run.strategy_type, null, approval.expires_at, run.strategy_name),
         strategyType: run.strategy_type,
+        strategyName: run.strategy_name,
         strike: null,
         expiryDate: null,
         optionType: null,
@@ -274,7 +283,12 @@ export function buildTradeRows(
         : order.intended_exit_reason
       const exitKind = orderExitReason ? exitReasonLabel(orderExitReason) : null
       const label = order.strategy_type
-        ? friendlyTradeLabel(order.strategy_type, order.contract_symbol, order.submitted_at)
+        ? friendlyTradeLabel(
+            order.strategy_type,
+            order.contract_symbol,
+            order.submitted_at,
+            order.strategy_name,
+          )
         : exitKind
           ? `${exitKind} exit · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
           : `Exit order · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
@@ -283,6 +297,7 @@ export function buildTradeRows(
         status: 'closing',
         label,
         strategyType: order.strategy_type,
+        strategyName: order.strategy_name,
         strike: order.strike,
         expiryDate: order.expiry_date,
         optionType: order.option_type,
@@ -314,7 +329,12 @@ export function buildTradeRows(
     // structure-break) is a distinct, non-alarming outcome from a broker
     // rejection and must not share its status or label.
     const label = order.strategy_type
-      ? friendlyTradeLabel(order.strategy_type, order.contract_symbol, order.submitted_at)
+      ? friendlyTradeLabel(
+          order.strategy_type,
+          order.contract_symbol,
+          order.submitted_at,
+          order.strategy_name,
+        )
       : `${isExitOrder ? 'Exit order' : 'Order'} · ${order.side} · ${new Date(order.submitted_at).toLocaleTimeString()}`
     const orderLotSize = resolveLotSize(order.contract_symbol, instruments)
     rows.push({
@@ -322,6 +342,7 @@ export function buildTradeRows(
       status: order.status === 'cancelled' ? 'cancelled' : order.status === 'rejected' ? 'rejected' : 'order_sent',
       label,
       strategyType: order.strategy_type,
+      strategyName: order.strategy_name,
       strike: order.strike,
       expiryDate: order.expiry_date,
       optionType: order.option_type,
@@ -349,8 +370,9 @@ export function buildTradeRows(
   for (const position of positions) {
     const run = runByPositionId.get(position.id)
     const strategyType = run?.strategy_type ?? position.strategy_type
+    const strategyName = run?.strategy_name ?? position.strategy_name
     const label = strategyType
-      ? friendlyTradeLabel(strategyType, position.contract_symbol, position.opened_at)
+      ? friendlyTradeLabel(strategyType, position.contract_symbol, position.opened_at, strategyName)
       : `Position · ${position.side} · ${new Date(position.opened_at).toLocaleTimeString()}`
     const isOpen = position.status === 'open'
     const positionLotSize = resolveLotSize(position.contract_symbol, instruments)
@@ -368,6 +390,7 @@ export function buildTradeRows(
       status: isOpen ? 'position_open' : 'closed',
       label,
       strategyType,
+      strategyName,
       strike: position.strike,
       expiryDate: position.expiry_date,
       optionType: position.option_type,

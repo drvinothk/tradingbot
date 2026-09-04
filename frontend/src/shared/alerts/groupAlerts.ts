@@ -48,6 +48,13 @@ export interface AlertIncident {
   lastSeen: string
   firstSeen: string
   occurrences: SystemAlertOut[]
+  // 2026-09-04: SystemAlert.mode ('paper' | 'live' | null) -- tracks the
+  // *latest* occurrence's value, same update timing as `message`/`lastSeen`
+  // below, mirroring how the backend's own send_alert refreshes `mode` on a
+  // collapsed row rather than freezing it at first sight. ControlRoomPage's
+  // Attention card filters on this to match Telegram's own mode!=PAPER
+  // suppression rule.
+  mode: string | null
 }
 
 // 2026-09-03: `firstSeen` tracks the earliest `created_at` across every raw
@@ -74,6 +81,7 @@ export function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertInciden
         lastSeen: rowLastSeen,
         firstSeen: alert.created_at,
         occurrences: [alert],
+        mode: alert.mode,
       })
       continue
     }
@@ -82,6 +90,7 @@ export function groupAlertsIntoIncidents(alerts: SystemAlertOut[]): AlertInciden
     if (new Date(rowLastSeen) > new Date(existing.lastSeen)) {
       existing.lastSeen = rowLastSeen
       existing.message = alert.message
+      existing.mode = alert.mode
     }
     if (new Date(alert.created_at) < new Date(existing.firstSeen)) {
       existing.firstSeen = alert.created_at

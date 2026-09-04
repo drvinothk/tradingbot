@@ -94,6 +94,53 @@ def test_send_alert_writes_a_system_alert_row(db: Session, workspace):
     assert row.trading_session_id is None
 
 
+def test_send_alert_persists_mode_on_a_new_row(db: Session, workspace):
+    # 2026-09-04: mode used to be used only in-memory for the Telegram
+    # push decision and then discarded -- Control Room's Attention card
+    # now needs it persisted too.
+    alert = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="order_rejected",
+        message="rejected",
+        mode=OrderMode.LIVE,
+        dedup_key="order_rejected:mode-persist-test",
+    )
+    db.flush()
+    row = db.get(SystemAlert, alert.id)
+    assert row is not None
+    assert row.mode == OrderMode.LIVE
+
+
+def test_send_alert_refreshes_mode_on_a_collapsed_row(db: Session, workspace):
+    first = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="first",
+        mode=OrderMode.PAPER,
+        dedup_key="exit_order_unfilled:collapse-mode-test",
+    )
+    db.flush()
+    second = send_alert(
+        db,
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_unfilled",
+        message="second",
+        mode=OrderMode.LIVE,
+        dedup_key="exit_order_unfilled:collapse-mode-test",
+    )
+    db.flush()
+
+    assert second.id == first.id  # collapsed into the same row
+    collapsed_row = db.get(SystemAlert, first.id)
+    assert collapsed_row is not None
+    assert collapsed_row.mode == OrderMode.LIVE
+
+
 def test_send_alert_skips_telegram_when_unconfigured(
     db: Session, workspace, monkeypatch, _within_alert_window
 ):

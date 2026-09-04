@@ -23,7 +23,12 @@ from datetime import UTC, date, datetime
 
 from sqlalchemy.orm import Session
 
-from app.core.clock import is_past_eod_scanning_stop, is_within_global_trading_window, now_ist
+from app.core.clock import (
+    is_past_eod_scanning_stop,
+    is_within_global_trading_window,
+    is_within_live_entry_suppression_window,
+    now_ist,
+)
 from app.core.db.session import SessionFactory, reuse_session, session_scope
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
@@ -35,7 +40,7 @@ from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
-from app.modules.broker_adapter.composition import get_broker
+from app.modules.broker_adapter.composition import get_broker, is_strategy_routed_live
 from app.modules.market_data.freshness import (
     FreshnessState,
     FreshnessThresholds,
@@ -289,6 +294,19 @@ def run_cycle(
     still always runs so an already-open position's status stays
     ground-truth.
 
+    2026-09-04: also skipped entirely (never calls `evaluate()`) while
+    `is_within_live_entry_suppression_window()` (11:30-13:00 IST) is true
+    *and* this run is currently routed live (`is_strategy_routed_live`) —
+    explicit user request to avoid new LIVE entries in that historically
+    choppy midday band without affecting paper at all. Skips `evaluate()`
+    itself, not just `submit_signal()`, deliberately — see
+    `core.clock.is_within_live_entry_suppression_window`'s own docstring for
+    why merely discarding a resolved proposal would still burn a strategy's
+    one-shot-per-direction tracking. `strategy.last_signal_status` (the
+    Market Terminal signal panel's data source) is stamped directly with a
+    synthetic `"live_entry_suppressed"` reason in this case instead, so the
+    panel doesn't just go stale showing whatever the 11:29 cycle last saw.
+
     The window gate keys off the latest completed bar's own `bucket_start`,
     not wall-clock `now()` — fetched once, here, and threaded through to
     `evaluate()` so a bar-consuming strategy doesn't re-query the identical
@@ -345,7 +363,30 @@ def run_cycle(
         latest_bar = None
         window_ts = now_ist()
 
-    if is_within_global_trading_window(window_ts) and is_market_data_ready():
+    live_entry_suppressed = is_within_live_entry_suppression_window(
+        window_ts
+    ) and is_strategy_routed_live(trading_session, strategy_run)
+    if live_entry_suppressed:
+        # Direct assignment + a narrow mypy ignore, not setattr (ruff B010
+        # flags setattr-with-a-constant-name as no safer than direct
+        # assignment, and it's right) -- `last_signal_status` is
+        # deliberately not part of the `Strategy` base class's declared
+        # contract (see interface.SignalStatus's own docstring: only
+        # `ConfirmationFilterStrategy` instances carry it,
+        # `SyntheticStrategy` has none at all), so mypy has nothing to check
+        # this assignment against on the `Strategy`-typed `strategy` param
+        # here -- same duck-typed contract `StrategyRunner.last_signal_
+        # status`'s own `getattr(self._strategy, "last_signal_status", None)`
+        # already relies on for reading it.
+        strategy.last_signal_status = SignalStatus(  # type: ignore[attr-defined]
+            reason_code="live_entry_suppressed", evaluated_at=now_ist()
+        )
+
+    if (
+        not live_entry_suppressed
+        and is_within_global_trading_window(window_ts)
+        and is_market_data_ready()
+    ):
         freshness = ensure_fresh_option_chain(
             db,
             get_broker(),

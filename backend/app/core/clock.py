@@ -59,6 +59,36 @@ def is_within_global_trading_window(ts_utc: datetime) -> bool:
     return TRADE_WINDOW_START <= to_ist(ts_utc).time() < TRADE_WINDOW_END
 
 
+# 2026-09-04: explicit user request -- new LIVE entries only (real
+# money, real slippage in a historically choppy/low-liquidity band),
+# suppressed nowhere for paper, which keeps proving entry logic through
+# the window uninterrupted. Deliberately independent of TRADE_WINDOW_START/
+# END and of each strategy's own morning/afternoon chop-avoidance windows
+# (`oi_morning_window`/`ema_morning_window`/`sweep_morning_window`, which
+# apply identically in both modes) -- this is a live-only overlay checked
+# by `strategy_engine.runner.run_cycle` in addition to, not instead of,
+# those. `run_cycle` is expected to skip `evaluate()` entirely while this
+# is true (not just skip dispatch) -- several strategies track a
+# per-direction one-shot "already fired" flag the moment `evaluate()`
+# returns a proposal, independent of whether that proposal is ever
+# actually dispatched (the same way a risk-rejected signal already burns
+# that shot today), so calling `evaluate()` here and merely discarding the
+# result would permanently forfeit a real entry the moment the window
+# closes -- exactly the opposite of "delay it to 13:00."
+LIVE_ENTRY_SUPPRESSION_START = time(11, 30)
+LIVE_ENTRY_SUPPRESSION_END = time(13, 0)
+
+
+def is_within_live_entry_suppression_window(ts_utc: datetime) -> bool:
+    """Same data-timestamp convention as `is_within_global_trading_window`
+    (bar `bucket_start`, falling back to wall-clock via the same caller
+    pattern) -- kept consistent so both gates agree on "now" for the same
+    cycle.
+    """
+    t = to_ist(ts_utc).time()
+    return LIVE_ENTRY_SUPPRESSION_START <= t < LIVE_ENTRY_SUPPRESSION_END
+
+
 # One minute past TRADE_WINDOW_END: a strategy run still SCANNING (zero open
 # positions) this late has nothing left to protect, since no new entry can
 # fire past TRADE_WINDOW_END anyway — see strategy_engine.runner's

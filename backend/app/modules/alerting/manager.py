@@ -410,9 +410,11 @@ def send_alert(
     concerns, if any. `OrderMode.PAPER` blocks the Telegram push (see
     module docstring) unless `override_paper_mode_suppression=True`; `None`
     is for alerts with no specific paper/live position behind them (health
-    checks, instrument-master sync) and is never paper-suppressed. Ignored
-    entirely for the `SystemAlert` row itself — that's written the same
-    regardless.
+    checks, instrument-master sync) and is never paper-suppressed.
+    2026-09-04: also persisted on the `SystemAlert` row itself
+    (`SystemAlert.mode`) so Control Room's "Attention Required" card can
+    apply this exact same mode!=PAPER rule — previously used only in-memory
+    here and then discarded.
 
     `override_paper_mode_suppression`: when `True`, a `mode=OrderMode.PAPER`
     alert is still eligible for Telegram (all other gates — allowlist,
@@ -473,6 +475,7 @@ def send_alert(
         existing.severity = _max_severity(existing.severity, severity)
         existing.message = message
         existing.payload = payload if payload is not None else {}
+        existing.mode = mode
         alert = existing
     else:
         alert = SystemAlert(
@@ -487,6 +490,7 @@ def send_alert(
             last_seen_at=now,
             occurrence_count=1,
             dedup_key=effective_dedup_key,
+            mode=mode,
         )
         db.add(alert)
     db.flush()

@@ -115,6 +115,21 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     # instrument_id), never persisted at the config level, since nothing
     # needed to auto-start a run without a human picking an instrument first.
     underlying_symbol: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    # 2026-09-04: "I'm done with this config" -- distinct from is_enabled,
+    # which stays the quick/temporary pause (no precondition, always was and
+    # still is instant). Archiving is the more permanent "put it away"
+    # action: `api.v1.strategies.archive_strategy` blocks it (409) while
+    # anything is running against it -- an active StrategyRun, or an open
+    # Position from one that's since been stopped (see that function's own
+    # docstring) -- but does NOT require is_enabled to already be false;
+    # archiving itself forces is_enabled=false unconditionally as part of
+    # the same call, no separate "disable it first" step. Un-archiving just
+    # clears this column -- it deliberately does NOT re-enable is_enabled,
+    # so the operator flips that back on deliberately. Name stays unique
+    # across archived+active rows (uq_strategy_config_name below is
+    # untouched) so a still-archived name can't be silently reused by a new
+    # config.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (UniqueConstraint("workspace_id", "name", name="uq_strategy_config_name"),)
 

@@ -825,6 +825,10 @@ tbody tr:hover {
   width: 55px;
 }
 
+.strategy-name-input {
+  width: 140px;
+}
+
 /* Reconciliation & Recovery gets the width (its own tables need it);
    Backend restart sits beside it, narrower -- not a 50/50 split. Wraps to
    a single column once there's no room for both side by side. */

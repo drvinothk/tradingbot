@@ -304,15 +304,23 @@ function StrategyControlCard() {
   const runs = runningQuery.data ?? []
   const instruments = instrumentsQuery.data ?? []
 
-  // Exactly one StrategyConfig per type is the common case this app runs
-  // today (per the plan: "these are the user's real current StrategyConfigs
-  // ... name to be dropped from UI"). If more than one config shares a
+  // Exactly one StrategyConfig per type used to be the common case this app
+  // ran (per the plan's original "name to be dropped from UI" decision) --
+  // no longer true once real day-to-day iteration meant several configs of
+  // the same type at once (the 2026-09 conviction/stub configs), which is
+  // exactly why the Name column + rename below exist now: distinguishing
+  // "Test" from "Test 4" (both oi_volume_confirmed) was previously
+  // impossible from this table alone. If more than one config shares a
   // type, every one of them renders as its own sub-row under that type's
-  // header instead of only the first — "sub-rows appear only once a 2nd
-  // concurrent instrument run starts" from the plan, generalized to "more
-  // than one config of this type" so nothing is silently hidden.
+  // header instead of only the first.
+  //
+  // 2026-09-04: archived configs (StrategyConfig.archived_at set) are
+  // excluded from these by-type groups entirely -- they live in
+  // ArchivedStrategiesSection at the bottom of this panel instead.
+  const activeStrategies = strategies.filter((s) => s.archived_at === null)
+  const archivedStrategies = strategies.filter((s) => s.archived_at !== null)
   const byType = new Map<string, StrategyConfigOut[]>()
-  for (const s of strategies) {
+  for (const s of activeStrategies) {
     const list = byType.get(s.strategy_type) ?? []
     list.push(s)
     byType.set(s.strategy_type, list)
@@ -345,7 +353,85 @@ function StrategyControlCard() {
       </div>
 
       <CreateStrategyDefinitionRow onCreated={invalidate} />
+
+      <ArchivedStrategiesSection configs={archivedStrategies} onChanged={invalidate} />
     </div>
+  )
+}
+
+function ArchivedStrategiesSection({
+  configs,
+  onChanged,
+}: {
+  configs: StrategyConfigOut[]
+  onChanged: () => void
+}) {
+  const [expanded, setExpanded] = useState(false)
+  if (configs.length === 0) return null
+
+  return (
+    <div className="section-title" style={{ marginTop: '1.5rem' }}>
+      <div className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+        <span>Archived Strategies ({configs.length})</span>
+        <span className={`chevron ${expanded ? 'open' : ''}`}>▶</span>
+      </div>
+      {expanded && (
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Type</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {configs.map((config) => (
+              <ArchivedStrategyRow key={config.id} config={config} onChanged={onChanged} />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function ArchivedStrategyRow({
+  config,
+  onChanged,
+}: {
+  config: StrategyConfigOut
+  onChanged: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [error, setError] = useState<string | null>(null)
+
+  const unarchiveMutation = useMutation({
+    mutationFn: () => api.post<StrategyConfigOut>(`/strategies/${config.id}/unarchive`),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<StrategyConfigOut[]>(['strategies'], (prev) =>
+        prev ? prev.map((s) => (s.id === updated.id ? updated : s)) : prev,
+      )
+      setError(null)
+      onChanged()
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Un-archive failed'),
+  })
+
+  return (
+    <tr>
+      <td>{config.name}</td>
+      <td className="muted">{strategyTypeLabel(config.strategy_type)}</td>
+      <td>
+        <button
+          className="btn-ghost"
+          disabled={unarchiveMutation.isPending}
+          onClick={() => unarchiveMutation.mutate()}
+        >
+          Un-archive
+        </button>
+        {error && <span className="error" style={{ marginLeft: '0.5rem' }}>{error}</span>}
+      </td>
+    </tr>
   )
 }
 
@@ -389,6 +475,7 @@ function StrategyTypeGroup({
             <table>
               <thead>
                 <tr>
+                  <th>Name</th>
                   <th>Power</th>
                   <th>Mode</th>
                   <th>Instrument</th>
@@ -445,6 +532,12 @@ function StrategyConfigRow({
   // `null` = not yet touched, falls back to the server value -- same
   // pattern as GlobalDailyLimitsCard's budget/target/loss-cap fields.
   const [lotsInput, setLotsInput] = useState<string | null>(null)
+  const [nameInput, setNameInput] = useState<string | null>(null)
+  // Ref, not state -- see the rename input's onBlur comment for why Escape
+  // needs synchronous, race-free signaling into the blur handler it triggers.
+  const cancelRenameRef = useRef(false)
+  const [patchError, setPatchError] = useState<string | null>(null)
+  const [archiveError, setArchiveError] = useState<string | null>(null)
 
   // Both mutations below write the real server response straight into the
   // `['strategies']` list cache via setQueryData, same pattern
@@ -460,8 +553,26 @@ function StrategyConfigRow({
       queryClient.setQueryData<StrategyConfigOut[]>(['strategies'], (prev) =>
         prev ? prev.map((s) => (s.id === updated.id ? updated : s)) : prev,
       )
+      setPatchError(null)
       onChanged()
     },
+    // 2026-09-04: previously unhandled -- a rename collision (409) failed
+    // silently, leaving the input showing the rejected value with no
+    // explanation. Other PATCH fields (runtime_mode/underlying_symbol/
+    // qty_lots) share this same error surface now too, not just rename.
+    onError: (err) => setPatchError(err instanceof ApiError ? err.message : 'Update failed'),
+  })
+
+  const archiveMutation = useMutation({
+    mutationFn: () => api.post<StrategyConfigOut>(`/strategies/${config.id}/archive`),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<StrategyConfigOut[]>(['strategies'], (prev) =>
+        prev ? prev.map((s) => (s.id === updated.id ? updated : s)) : prev,
+      )
+      setArchiveError(null)
+      onChanged()
+    },
+    onError: (err) => setArchiveError(err instanceof ApiError ? err.message : 'Archive failed'),
   })
 
   const powerMutation = useMutation({
@@ -549,6 +660,42 @@ function StrategyConfigRow({
   return (
     <>
       <tr>
+        <td>
+          <input
+            type="text"
+            className="strategy-name-input"
+            value={nameInput ?? config.name}
+            disabled={patchMutation.isPending}
+            onChange={(e) => setNameInput(e.target.value)}
+            onBlur={() => {
+              // 2026-09-04 QC fix: Escape used to call setNameInput(null)
+              // immediately before .blur() -- but .blur() fires this same
+              // onBlur handler synchronously, before React re-renders, so
+              // the closure here still saw the *old* (edited) nameInput,
+              // not the just-set null. Escape was silently committing the
+              // edit instead of cancelling it. cancelRenameRef (a ref, not
+              // state) is set synchronously with no such race.
+              if (cancelRenameRef.current) {
+                cancelRenameRef.current = false
+                setNameInput(null)
+                return
+              }
+              if (nameInput === null) return
+              const trimmed = nameInput.trim()
+              if (trimmed !== '' && trimmed !== config.name) {
+                patchMutation.mutate({ name: trimmed })
+              }
+              setNameInput(null)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+              if (e.key === 'Escape') {
+                cancelRenameRef.current = true
+                ;(e.target as HTMLInputElement).blur()
+              }
+            }}
+          />
+        </td>
         <td>
           <label className="row-actions" style={{ gap: '0.4rem' }}>
             <input
@@ -644,13 +791,21 @@ function StrategyConfigRow({
                 </button>
               </>
             )}
+            <button
+              className="btn-ghost"
+              disabled={archiveMutation.isPending}
+              title="Archive: hides this config below, in Archived Strategies. Requires no active run or open position."
+              onClick={() => archiveMutation.mutate()}
+            >
+              Archive
+            </button>
           </div>
         </td>
       </tr>
-      {(powerDetail || startError) && (
+      {(powerDetail || startError || archiveError || patchError) && (
         <tr>
           <td colSpan={7} className="muted" style={{ fontSize: '0.8rem' }}>
-            {startError ?? powerDetail}
+            {startError ?? archiveError ?? patchError ?? powerDetail}
           </td>
         </tr>
       )}

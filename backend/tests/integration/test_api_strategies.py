@@ -25,7 +25,15 @@ import app.modules.strategy_engine.auto_spawner as auto_spawner_module
 from app.core.clock import IST
 from app.core.db.session import get_db
 from app.core.security.passwords import hash_password
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import (
+    Order,
+    OrderMode,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    PositionStatus,
+)
 from app.domain.identity.models import (
     BrokerAccount,
     BrokerAccountStatus,
@@ -1079,6 +1087,334 @@ def test_patch_rejects_unknown_underlying_symbol(api_client: TestClient, seeded_
     )
 
     assert response.status_code == 400
+
+
+# -- 2026-09-04: PATCH /strategies/{id} name (rename) -----------------------
+
+
+def test_patch_renames_strategy(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-rename-before"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"name": "orb-patch-rename-after"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "orb-patch-rename-after"
+
+    refetched = api_client.get("/api/v1/strategies").json()
+    updated = next(row for row in refetched if row["id"] == strategy_id)
+    assert updated["name"] == "orb-patch-rename-after"
+
+
+def test_patch_rename_rejects_collision_with_another_config(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    api_client.post("/api/v1/strategies", json={"name": "orb-patch-rename-taken"})
+    other_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-rename-other"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{other_id}", json={"name": "orb-patch-rename-taken"}
+    )
+
+    assert response.status_code == 409
+
+
+def test_patch_rename_to_its_own_current_name_is_a_no_op(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-patch-rename-noop"}
+    ).json()["id"]
+
+    response = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"name": "orb-patch-rename-noop"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "orb-patch-rename-noop"
+
+
+# -- 2026-09-04: POST /strategies/{id}/archive + /unarchive ------------------
+
+
+def test_archive_disables_and_sets_archived_at(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-archive-basic"}
+    ).json()["id"]
+
+    response = api_client.post(f"/api/v1/strategies/{strategy_id}/archive")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["archived_at"] is not None
+    assert body["is_enabled"] is False
+
+
+def test_archive_is_idempotent(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-archive-idempotent"}
+    ).json()["id"]
+
+    first = api_client.post(f"/api/v1/strategies/{strategy_id}/archive").json()
+    second = api_client.post(f"/api/v1/strategies/{strategy_id}/archive").json()
+
+    assert first["archived_at"] == second["archived_at"]
+
+
+def test_archive_blocks_with_an_active_run(api_client: TestClient, seeded_admin, engine):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-archive-blocked"}
+    ).json()["id"]
+
+    from app.domain.session.models import FundingMode, SafeMode, TradingSession
+    from app.domain.strategy.models import ExecutionMode, StrategyRun, StrategyRunStatus
+
+    # engine, not session_scope() -- session_scope() is the app's
+    # production DB session factory, a different database entirely from
+    # this test's own isolated `engine` fixture (the exact trap this
+    # codebase's own CLAUDE.md flags repeatedly: PositionManager's
+    # live-subscribe bug, run_daily_bootstrap's default session_factory).
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        trading_session = TradingSession(
+            id=uuid.uuid4(),
+            workspace_id=seeded_admin["workspace_id"],
+            broker_account_id=seeded_admin["broker_account_id"],
+            started_by_user_id=seeded_admin["user_id"],
+            mode=SafeMode.PAPER_ONLY,
+            started_at=datetime.now(UTC),
+            budget_amount=100_000,
+            daily_target_profit=5_000,
+            daily_loss_cap=5_000,
+            funding_mode=FundingMode.CASH,
+        )
+        db.add(trading_session)
+        db.flush()
+        run = StrategyRun(
+            id=uuid.uuid4(),
+            strategy_config_id=uuid.UUID(strategy_id),
+            trading_session_id=trading_session.id,
+            execution_mode=ExecutionMode.AUTO,
+            status=StrategyRunStatus.SCANNING,
+            started_at=datetime.now(UTC),
+            started_by_user_id=seeded_admin["user_id"],
+        )
+        db.add(run)
+        db.commit()
+        run_id = run.id
+        trading_session_id = trading_session.id
+
+    try:
+        response = api_client.post(f"/api/v1/strategies/{strategy_id}/archive")
+        assert response.status_code == 409
+    finally:
+        with session_factory() as db:
+            db.query(StrategyRun).filter(StrategyRun.id == run_id).delete()
+            db.query(TradingSession).filter(TradingSession.id == trading_session_id).delete()
+            db.commit()
+
+
+def test_archive_blocks_with_an_open_position_on_a_stopped_run(
+    api_client: TestClient, seeded_admin, engine
+):
+    """2026-09-04 QC finding: `_stop_active_run` (Stop button / Power off)
+    only ever marks the StrategyRun STOPPED -- it never touches an open
+    Position, which PositionManager keeps managing independently. So a run
+    can be STOPPED (passing the "active run" check alone) while still
+    holding a real open position. Archive must catch this case too, not
+    just a still-running StrategyRun.
+    """
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-archive-open-position"}
+    ).json()["id"]
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        trading_session = TradingSession(
+            id=uuid.uuid4(),
+            workspace_id=seeded_admin["workspace_id"],
+            broker_account_id=seeded_admin["broker_account_id"],
+            started_by_user_id=seeded_admin["user_id"],
+            mode=SafeMode.PAPER_ONLY,
+            started_at=datetime.now(UTC),
+            budget_amount=100_000,
+            daily_target_profit=5_000,
+            daily_loss_cap=5_000,
+            funding_mode=FundingMode.CASH,
+        )
+        db.add(trading_session)
+        db.flush()
+        # STOPPED, not SCANNING/IN_POSITION -- the whole point of this test
+        # is that _has_active_run's own check would pass (wrongly) here.
+        run = StrategyRun(
+            id=uuid.uuid4(),
+            strategy_config_id=uuid.UUID(strategy_id),
+            trading_session_id=trading_session.id,
+            execution_mode=ExecutionMode.AUTO,
+            status=StrategyRunStatus.STOPPED,
+            started_at=datetime.now(UTC),
+            stopped_at=datetime.now(UTC),
+            started_by_user_id=seeded_admin["user_id"],
+        )
+        db.add(run)
+        db.flush()
+
+        instrument = Instrument(
+            id=uuid.uuid4(), symbol="NIFTY-ARCHTEST", exchange="NFO", lot_size=25, tick_size=0.05
+        )
+        db.add(instrument)
+        db.flush()
+        option_contract = OptionContract(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            expiry_date=date(2026, 12, 31),
+            strike=24000,
+            option_type=OptionType.CE,
+            symbol="NIFTY-ARCHTEST-C24000",
+        )
+        db.add(option_contract)
+        db.flush()
+
+        now = datetime.now(UTC)
+        signal = Signal(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            strategy_config_id=run.strategy_config_id,
+            strategy_run_id=run.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract.id,
+            side=SignalSide.BUY,
+            entry_price=80.0,
+            stop_price=72.0,
+            target_price=92.0,
+            qty_lots=1,
+            generated_at=now,
+        )
+        db.add(signal)
+        db.flush()
+        intent = TradeIntent(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            signal_id=signal.id,
+            strategy_run_id=run.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract.id,
+            idempotency_key=f"test:{uuid.uuid4()}",
+            side=SignalSide.BUY,
+            qty_lots=1,
+            entry_price=80.0,
+            stop_price=72.0,
+            target_price=92.0,
+            status=TradeIntentStatus.DISPATCHED,
+            created_at=now,
+            dispatched_at=now,
+        )
+        db.add(intent)
+        db.flush()
+        order = Order(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract.id,
+            trade_intent_id=intent.id,
+            idempotency_key=intent.idempotency_key,
+            mode=OrderMode.PAPER,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=25,
+            status=OrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=80.0,
+            submitted_at=now,
+            updated_at=now,
+        )
+        db.add(order)
+        db.flush()
+        position = Position(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            option_contract_id=option_contract.id,
+            trade_intent_id=intent.id,
+            opening_order_id=order.id,
+            side=OrderSide.BUY,
+            qty=25,
+            entry_price=80.0,
+            status=PositionStatus.OPEN,
+            opened_at=now,
+            closed_at=None,
+        )
+        db.add(position)
+        db.commit()
+        cleanup_ids = {
+            "trading_session_id": trading_session.id,
+            "run_id": run.id,
+            "instrument_id": instrument.id,
+            "option_contract_id": option_contract.id,
+            "signal_id": signal.id,
+            "intent_id": intent.id,
+            "order_id": order.id,
+            "position_id": position.id,
+        }
+
+    try:
+        response = api_client.post(f"/api/v1/strategies/{strategy_id}/archive")
+        assert response.status_code == 409
+    finally:
+        with session_factory() as db:
+            db.query(Position).filter(Position.id == cleanup_ids["position_id"]).delete()
+            db.query(Order).filter(Order.id == cleanup_ids["order_id"]).delete()
+            db.query(TradeIntent).filter(TradeIntent.id == cleanup_ids["intent_id"]).delete()
+            db.query(Signal).filter(Signal.id == cleanup_ids["signal_id"]).delete()
+            db.query(StrategyRun).filter(StrategyRun.id == cleanup_ids["run_id"]).delete()
+            db.query(TradingSession).filter(
+                TradingSession.id == cleanup_ids["trading_session_id"]
+            ).delete()
+            db.query(OptionContract).filter(
+                OptionContract.id == cleanup_ids["option_contract_id"]
+            ).delete()
+            db.query(Instrument).filter(Instrument.id == cleanup_ids["instrument_id"]).delete()
+            db.commit()
+
+
+def test_unarchive_clears_archived_at_but_leaves_disabled(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-unarchive-basic"}
+    ).json()["id"]
+    api_client.post(f"/api/v1/strategies/{strategy_id}/archive")
+
+    response = api_client.post(f"/api/v1/strategies/{strategy_id}/unarchive")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["archived_at"] is None
+    assert body["is_enabled"] is False  # left disabled deliberately, not re-enabled
+
+
+def test_unarchive_is_idempotent(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    strategy_id = api_client.post(
+        "/api/v1/strategies", json={"name": "orb-unarchive-idempotent"}
+    ).json()["id"]
+
+    first = api_client.post(f"/api/v1/strategies/{strategy_id}/unarchive")
+    assert first.status_code == 200
+    assert first.json()["archived_at"] is None
+
+
+def test_archive_unknown_id_is_404(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    response = api_client.post(f"/api/v1/strategies/{uuid.uuid4()}/archive")
+    assert response.status_code == 404
 
 
 # -- POST /strategies/{id}/power (Dual-Trigger Model, 2026-08-17) ---------

@@ -63,6 +63,9 @@ export interface StrategyConfigOut {
   is_enabled: boolean
   runtime_mode: string | null
   underlying_symbol: string | null
+  // null = active. Non-null = archived ("done with this one" -- distinct
+  // from is_enabled, which stays the quick/temporary pause).
+  archived_at: string | null
 }
 
 export interface SetStrategyPowerOut {
@@ -216,6 +219,11 @@ export interface OrderOut {
   expiry_date: string | null
   option_type: string | null
   strategy_type: string | null
+  // The config's own name (e.g. "OI_Volume_Conviction") -- distinguishes
+  // two configs of the same strategy_type, which otherwise render an
+  // identical friendlyTradeLabel. Same null-when-no-join caveat as
+  // strategy_type above.
+  strategy_name: string | null
   // Order.intended_exit_reason -- what the caller (close_position) recorded
   // as *why* it placed this exit order, at the moment it placed it -- not
   // yet a confirmed outcome. `null` for an entry order, a row from before
@@ -258,6 +266,8 @@ export interface PositionOut {
   expiry_date: string | null
   option_type: string | null
   strategy_type: string | null
+  // See OrderOut.strategy_name's own comment -- same fix, position side.
+  strategy_name: string | null
   target_price: number | null
   stop_price: number | null
   trail_stop_price: number | null
@@ -399,6 +409,9 @@ export interface SystemAlertOut {
   is_resolved: boolean
   occurrence_count: number
   last_seen_at: string
+  // 'paper' | 'live' | null. null = not tied to a specific paper/live
+  // position (health checks etc.) -- never paper-suppressed.
+  mode: string | null
 }
 
 export interface ReconciliationRunOut {

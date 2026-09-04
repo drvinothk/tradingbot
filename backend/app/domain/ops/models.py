@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
+from app.domain.execution.models import OrderMode
 
 
 class AlertSeverity(enum.StrEnum):
@@ -51,6 +52,16 @@ class SystemAlert(Base, UUIDPkMixin):
     dedup_key: Mapped[str | None] = mapped_column(String(300), nullable=True)
     occurrence_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # 2026-09-04: persists alerting.manager.send_alert's own `mode` param,
+    # previously used only in-memory to decide the Telegram push and then
+    # discarded -- Control Room's "Attention Required" card needs it to
+    # apply the same mode!=PAPER suppression Telegram already has (see that
+    # card's own ATTENTION_ALERT_CATEGORIES comment). Same meaning as
+    # send_alert's own `mode` docstring: `None` is for alerts with no
+    # specific paper/live position behind them (health checks, market-data
+    # staleness) and is never paper-suppressed anywhere. Nullable for rows
+    # written before this column existed.
+    mode: Mapped[OrderMode | None] = mapped_column(String(10), nullable=True)
 
     __table_args__ = (
         Index("ix_system_alerts_workspace_created", "workspace_id", "created_at"),

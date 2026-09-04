@@ -32,12 +32,25 @@ export function strategyTypeLabel(strategyType: string): string {
   return STRATEGY_TYPE_LABELS[strategyType] ?? strategyType
 }
 
+// 2026-09-04: `strategyName` (the config's own name, e.g.
+// "OI_Volume_Conviction") is now the primary identifier when available --
+// two configs of the same strategyType (e.g. "Test" and "Test 4", both
+// oi_volume_confirmed) were otherwise indistinguishable, both rendering the
+// exact same label. `strategyType`'s friendly label is kept as a
+// parenthetical qualifier, not dropped -- a name like "Test 4" alone
+// doesn't tell you what the strategy actually does. Falls back to the type
+// label alone when no name resolved (an exit order with no trade_intent_id
+// join, or a pre-2026-09-04 data-integrity gap), same as before this change.
 export function friendlyTradeLabel(
   strategyType: string,
   instrumentSymbol: string | null | undefined,
   timestamp: string | Date,
+  strategyName?: string | null,
 ): string {
-  const parts: (string | null)[] = [strategyTypeLabel(strategyType), instrumentSymbol ?? null]
+  const typeLabel = strategyTypeLabel(strategyType)
+  const primaryLabel =
+    strategyName && strategyName !== strategyType ? `${strategyName} (${typeLabel})` : typeLabel
+  const parts: (string | null)[] = [primaryLabel, instrumentSymbol ?? null]
   // The trade table has its own dedicated Entry/Exit time column, so once a
   // real contract is known (order/position rows) a trailing timestamp here
   // is just a duplicate of that column. Only the pending-approval fallback
@@ -98,6 +111,7 @@ const SIGNAL_REASON_LABELS: Record<string, string> = {
   skip_weekday: 'Skipped weekday',
   ce_only: 'CE-only filter',
   min_bars_since_open: 'Waiting for more bars since open',
+  live_entry_suppressed: 'Live entries paused (11:30–13:00 IST)',
   min_ema_spread_atr_ratio: 'EMA9/EMA20 spread too tight',
   oi_price_misaligned: 'OI/price not aligned',
   breakout_too_weak: 'Breakout too weak',

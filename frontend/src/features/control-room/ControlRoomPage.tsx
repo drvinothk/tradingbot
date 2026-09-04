@@ -403,7 +403,20 @@ function ControlRoomHeader({
 interface ScopeMetrics {
   sessionId: string | null
   report: DailyReportOut | undefined
-  totalPnl: number
+  // 2026-09-04: renamed from `totalPnl` to make the cost-netting explicit
+  // at the call site -- (realizedPnl + unrealizedPnl) - report.total_cost.
+  // The one metric on this page that has cost baked in; every other P&L
+  // figure here is gross. Cost only ever reflects *closed* trades
+  // (report.total_cost is TradeOutcome-scoped -- see reporting/service.py)
+  // -- an open position's eventual cost isn't estimated, by explicit
+  // decision, so this slightly understates cost while positions are open.
+  // Defaults the cost term to 0 before the report loads / with no session,
+  // same "don't block on the report" immediacy realizedPnl/unrealizedPnl
+  // already have (unlike the Total Cost/Win Rate boxes, which show '…').
+  actualPnl: number
+  // 2026-09-04: now divides actualPnl (net of cost), not the old gross
+  // totalPnl -- the more decision-useful "what did each lot actually make"
+  // figure, since this sits right next to Actual P&L in the UI.
   perLotPnl: number | null
   totalLots: number
   realTradeCount: number
@@ -435,7 +448,7 @@ function useScopeMetrics(
   rows: TradeRow[],
   runs: RunningStrategyOut[],
 ): ScopeMetrics {
-  // mode keeps this scope's Total Trades/Win Rate/Max Drawdown/Largest Loss
+  // mode keeps this scope's Closed Trades/Win Rate/Max Drawdown/Largest Loss
   // scoped to the same population as its already-per-trade-scoped P&L below
   // -- without it, a live_enabled session holding both live-routed and
   // force_paper strategies together (normal since 2026-08-28) blends the
@@ -449,7 +462,12 @@ function useScopeMetrics(
   })
 
   const realTradeRows = rows.filter((r) => REAL_TRADE_STATUSES.has(r.status))
-  const totalPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  const grossPnl = realTradeRows.reduce((sum, r) => sum + (r.pnl ?? 0), 0)
+  // Cost defaults to 0 before the report loads / with no session -- same
+  // "don't block the headline number on the report" immediacy every other
+  // figure in this box already has (unlike Total Cost/Win Rate, which show
+  // '…' while loading). See ScopeMetrics.actualPnl's own comment.
+  const actualPnl = grossPnl - (dailyReportQuery.data?.total_cost ?? 0)
   // Lots only, not realTradeRows -- a 'closing' row is a still-resting exit
   // order (most commonly the LIVE protective SL-LMT placed at entry, see
   // buildTradeRows' own STATUS_LABELS comment: "just not yet triggered/
@@ -460,7 +478,7 @@ function useScopeMetrics(
   // its own resting-stop 'closing' row carrying the same qty.
   const lotsRows = rows.filter((r) => r.status === 'position_open' || r.status === 'closed')
   const totalLots = lotsRows.reduce((sum, r) => sum + (r.lots ?? 0), 0)
-  const perLotPnl = totalLots > 0 ? totalPnl / totalLots : null
+  const perLotPnl = totalLots > 0 ? actualPnl / totalLots : null
   const openTrades = rows.filter((r) => r.status === 'position_open').length
   const closedRows = rows.filter((r) => r.status === 'closed')
   const openRows = rows.filter((r) => r.status === 'position_open')
@@ -494,7 +512,7 @@ function useScopeMetrics(
   return {
     sessionId,
     report: dailyReportQuery.data,
-    totalPnl,
+    actualPnl,
     perLotPnl,
     totalLots,
     realTradeCount: realTradeRows.length,
@@ -596,17 +614,21 @@ function TodaysActivityCard({
   )
 }
 
-// Left-aligned under the Realized Profit / Unrealized P&L columns, Total
-// P&L and Per Lot side by side on one line -- Per Lot (perLotPnl) was
-// computed all along but never actually rendered anywhere.
-function TotalPnlRow({ metrics }: { metrics: ScopeMetrics }) {
+// 2026-09-04: renamed from TotalPnlRow -- was the muted summary line under
+// the two prominent boxes, showing Total P&L (now Actual P&L, promoted to
+// the prominent box below) + Per Lot. Swapped per explicit user request:
+// this row now shows Realized P&L (renamed from "Realized Profit", which
+// used to be one of the two prominent boxes) instead. Per Lot now divides
+// actualPnl (net of cost), not this row's own realizedPnl -- see
+// ScopeMetrics.perLotPnl's own comment for why.
+function RealizedPnlRow({ metrics }: { metrics: ScopeMetrics }) {
   if (metrics.sessionId === null) return null
   return (
     <div className="total-pnl-row muted">
-      Total P&amp;L{' '}
-      <span className={metrics.totalPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-        {metrics.totalPnl >= 0 ? '+' : ''}
-        {fmtAmt(metrics.totalPnl)}
+      Realized P&amp;L{' '}
+      <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+        {metrics.realizedPnl >= 0 ? '+' : ''}
+        {fmtAmt(metrics.realizedPnl)}
       </span>
       {metrics.perLotPnl !== null && (
         <>
@@ -649,19 +671,23 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
 
   return (
     <>
-      {/* Realized Profit (left) / Unrealized P&L (middle) / Cost+Win Rate
-          (right, stacked -- same overall box height as the two main
+      {/* 2026-09-04: Actual P&L (left) / Unrealized P&L (middle) / Cost+Win
+          Rate (right, stacked -- same overall box height as the two main
           columns, smaller font to fit two label+value pairs in that
-          space). */}
+          space). Actual P&L (swapped in from the muted row, renamed from
+          "Total P&L") is the one figure on this page with cost netted in --
+          see ScopeMetrics.actualPnl's own comment. Realized P&L (renamed
+          from "Realized Profit") moved down to the muted row below,
+          alongside Per Lot -- see RealizedPnlRow. */}
       <div className="metric-box metric-box-split metric-box-wide">
         <div className="metric-box-pnl-group">
           <div className="metric-box-pnl-values">
             <div className="metric-box-main">
-              <div className="metric-label">Realized Profit</div>
+              <div className="metric-label">Actual P&amp;L</div>
               <div className="metric-value">
-                <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-                  {metrics.realizedPnl >= 0 ? '+' : ''}
-                  {fmtAmt(metrics.realizedPnl)}
+                <span className={metrics.actualPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                  {metrics.actualPnl >= 0 ? '+' : ''}
+                  {fmtAmt(metrics.actualPnl)}
                 </span>
               </div>
             </div>
@@ -675,7 +701,7 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
               </div>
             </div>
           </div>
-          <TotalPnlRow metrics={metrics} />
+          <RealizedPnlRow metrics={metrics} />
         </div>
         <div className="metric-box-stacked">
           <div className="metric-box-stacked-item">
@@ -691,7 +717,7 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
 
       <div className="metric-box metric-box-split">
         <div className="metric-box-main">
-          <div className="metric-label">Total Trades</div>
+          <div className="metric-label">Closed Trades</div>
           <div className="metric-value">{totalTradesDisplay}</div>
           <div className="metric-subvalue muted">
             {metrics.totalLots} lot{metrics.totalLots === 1 ? '' : 's'}
@@ -799,7 +825,9 @@ function StrategyStatusCard({ runs }: { runs: RunningStrategyOut[] }) {
           <tbody>
             {runs.map((run) => (
               <tr key={run.strategy_run_id}>
-                <td>{strategyTypeLabel(run.strategy_type)}</td>
+                <td>
+                  {run.strategy_name} <span className="muted">({strategyTypeLabel(run.strategy_type)})</span>
+                </td>
                 <td>
                   <span className={isStrategyHealthy(run) ? 'badge' : 'badge badge-live'}>
                     {RUN_STATUS_LABELS[run.status] ?? run.status}
@@ -898,6 +926,12 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
     (inc) =>
       inc.severity === 'critical' &&
       ATTENTION_ALERT_CATEGORIES.has(inc.category) &&
+      // 2026-09-04: mirrors Telegram's own mode!=PAPER suppression gate
+      // (alerting.manager._should_push_to_telegram) -- a paper-mode alert
+      // needs no urgent real-attention here either. mode === null (health
+      // checks, market-data staleness -- not tied to a specific position)
+      // is never suppressed, same as the backend's own rule.
+      inc.mode !== 'paper' &&
       Date.now() - new Date(inc.lastSeen).getTime() <= ATTENTION_STALE_AFTER_MS &&
       (!SELF_HEALING_GRACE_CATEGORIES.has(inc.category) ||
         Date.now() - new Date(inc.firstSeen).getTime() >= SELF_HEALING_GRACE_MS),
@@ -908,7 +942,7 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
       key: `approval:${approval.approval_id}`,
       kind: 'approval' as const,
       badgeLabel: 'Approval',
-      message: `${strategyTypeLabel(run.strategy_type)} ${approval.side} ${approval.qty_lots} lot${approval.qty_lots === 1 ? '' : 's'} @ ${fmtAmt(approval.entry_price)}`,
+      message: `${run.strategy_name} (${strategyTypeLabel(run.strategy_type)}) ${approval.side} ${approval.qty_lots} lot${approval.qty_lots === 1 ? '' : 's'} @ ${fmtAmt(approval.entry_price)}`,
       whenLabel: `expires ${new Date(approval.expires_at).toLocaleTimeString()}`,
       sortValue: new Date(approval.expires_at).getTime(),
     })),

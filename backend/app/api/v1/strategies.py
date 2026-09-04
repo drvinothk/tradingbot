@@ -11,7 +11,7 @@ check for trading_sessions.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -24,7 +24,7 @@ from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.security.rbac import require_permission
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Order, Position, StopPlan
+from app.domain.execution.models import Order, Position, PositionStatus, StopPlan
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.session.models import TradingSession, TradingSessionStatus
@@ -486,6 +486,11 @@ class StrategyConfigOut(BaseModel):
     is_enabled: bool
     runtime_mode: str | None
     underlying_symbol: str | None
+    # 2026-09-04: null = active. Non-null = archived ("done with this one" --
+    # see StrategyConfig.archived_at's own docstring for how this differs
+    # from is_enabled). The Advanced page filters on this client-side, same
+    # is_enabled/disabled split pattern it already uses.
+    archived_at: datetime | None
 
     model_config = {"from_attributes": True}
 
@@ -620,6 +625,12 @@ def _get_strategy_config_or_404(db: Session, user: User, strategy_id: uuid.UUID)
 
 
 class UpdateStrategyRequest(BaseModel):
+    # 2026-09-04: rename. Unlike runtime_mode/underlying_symbol/qty_lots
+    # below, `name` has no "clear" case -- a config must always have some
+    # name -- so `None` here just means "not provided," the same plain
+    # is-not-None convention `is_enabled` already uses, not the
+    # in-`model_fields_set`-vs-omitted distinction those three need.
+    name: str | None = None
     is_enabled: bool | None = None
     runtime_mode: StrategyRuntimeMode | None = None
     underlying_symbol: str | None = None
@@ -643,7 +654,10 @@ def update_strategy(
     """Ops-Hardening Phase 1 (`is_enabled`/`runtime_mode`) + Phase 6
     (`underlying_symbol`) + 2026-08-30 (`qty_lots`, the one field that does
     touch `params`, narrowly -- everything else in `params` is still
-    untouched here, deliberately not folded into one catch-all PATCH).
+    untouched here, deliberately not folded into one catch-all PATCH) +
+    2026-09-04 (`name`, rejecting a rename that collides with another
+    config's name in the same workspace with a 409, same check
+    `create_strategy` already does at creation time).
 
     `runtime_mode: null`/`underlying_symbol: null`/`qty_lots: null`
     explicitly clear the field, distinct from omitting it entirely (which
@@ -667,6 +681,23 @@ def update_strategy(
         _validate_underlying_symbol_or_404(db, body.underlying_symbol)
 
     changes: dict[str, object] = {}
+    if body.name is not None and body.name != config.name:
+        conflict = (
+            db.query(StrategyConfig)
+            .filter(
+                StrategyConfig.workspace_id == user.workspace_id,
+                StrategyConfig.name == body.name,
+                StrategyConfig.id != config.id,
+            )
+            .one_or_none()
+        )
+        if conflict is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "A strategy with this name already exists"
+            )
+        changes["name"] = body.name
+        config.name = body.name
+
     if body.is_enabled is not None and body.is_enabled != config.is_enabled:
         changes["is_enabled"] = body.is_enabled
         config.is_enabled = body.is_enabled
@@ -1068,6 +1099,130 @@ def set_strategy_power(
         run_id=run_id,
         detail=detail,
     )
+
+
+def _has_active_run(db: Session, strategy_config_id: uuid.UUID) -> bool:
+    return (
+        db.query(StrategyRun)
+        .filter(
+            StrategyRun.strategy_config_id == strategy_config_id,
+            StrategyRun.status != StrategyRunStatus.STOPPED,
+        )
+        .first()
+        is not None
+    )
+
+
+def _has_open_position(db: Session, strategy_config_id: uuid.UUID) -> bool:
+    """2026-09-04 QC finding: `_has_active_run` alone isn't enough to guard
+    archiving -- `stop_strategy`/`set_strategy_power`'s "Power off" path
+    (`_stop_active_run`) only ever marks the `StrategyRun` STOPPED, it never
+    touches any open `Position`; `PositionManager` keeps managing that
+    position independently of the run's own status (same "run status !=
+    position lifecycle" split `_maybe_stop_for_eod`'s own docstring already
+    documents). So a run can be STOPPED (passing `_has_active_run`'s check)
+    while still holding a real open paper/live position -- this closes that
+    gap via the same Position -> TradeIntent -> StrategyRun join
+    `list_orders`/`list_positions` already use for `strategy_type`.
+    """
+    return (
+        db.query(Position)
+        .join(TradeIntent, Position.trade_intent_id == TradeIntent.id)
+        .join(StrategyRun, TradeIntent.strategy_run_id == StrategyRun.id)
+        .filter(
+            StrategyRun.strategy_config_id == strategy_config_id,
+            Position.status == PositionStatus.OPEN,
+        )
+        .first()
+        is not None
+    )
+
+
+@router.post("/strategies/{strategy_id}/archive", response_model=StrategyConfigOut)
+def archive_strategy(
+    strategy_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.edit")),
+) -> StrategyConfig:
+    """2026-09-04: "I'm done with this config, put it away" -- distinct from
+    `is_enabled` (see StrategyConfig.archived_at's own docstring). Per
+    explicit user decision: auto-disables (`is_enabled=False`) as part of
+    archiving -- no separate "disable it first" step -- but blocks outright
+    (409) with a still-active `StrategyRun` (any status other than STOPPED)
+    OR a still-open `Position` (possible even with every run STOPPED --
+    see `_has_open_position`'s own docstring) rather than silently stopping
+    or ignoring either, since that's real paper/live capital potentially
+    still at risk. The operator must stop the run and/or square off the
+    position first, then retry. Idempotent: archiving an already-archived
+    config is a no-op, returned as-is.
+    """
+    config = _get_strategy_config_or_404(db, user, strategy_id)
+    if config.archived_at is not None:
+        return config
+
+    if _has_active_run(db, config.id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot archive: this strategy has an active run. Stop it first.",
+        )
+    if _has_open_position(db, config.id):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot archive: this strategy has an open position. Square it off first.",
+        )
+
+    config.archived_at = datetime.now(UTC)
+    config.is_enabled = False
+    db.flush()
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.STRATEGY_STATE_CHANGE,
+        event_type="strategy_config.archived",
+        entity_type="strategy_config",
+        entity_id=config.id,
+        strategy_config_id=config.id,
+        payload={"archived_at": config.archived_at.isoformat()},
+    )
+    db.commit()
+    db.refresh(config)
+    return config
+
+
+@router.post("/strategies/{strategy_id}/unarchive", response_model=StrategyConfigOut)
+def unarchive_strategy(
+    strategy_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("strategy.edit")),
+) -> StrategyConfig:
+    """Clears `archived_at` only -- deliberately leaves `is_enabled=False`
+    alone (it was forced false on archive) so an un-archived config doesn't
+    immediately resume auto-spawning; the operator flips Power back on
+    deliberately, same as any other newly-created/disabled config. Idempotent.
+    """
+    config = _get_strategy_config_or_404(db, user, strategy_id)
+    if config.archived_at is None:
+        return config
+
+    config.archived_at = None
+    db.flush()
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.STRATEGY_STATE_CHANGE,
+        event_type="strategy_config.unarchived",
+        entity_type="strategy_config",
+        entity_id=config.id,
+        strategy_config_id=config.id,
+        payload={},
+    )
+    db.commit()
+    db.refresh(config)
+    return config
 
 
 class RunningPositionOut(BaseModel):

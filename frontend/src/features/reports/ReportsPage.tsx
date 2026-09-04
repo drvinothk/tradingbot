@@ -113,7 +113,7 @@ export function ReportsPage() {
           <option value="">Select a strategy...</option>
           {strategies.map((s) => (
             <option key={s.id} value={s.id}>
-              {strategyTypeLabel(s.strategy_type)}
+              {s.name} ({strategyTypeLabel(s.strategy_type)})
             </option>
           ))}
         </select>

@@ -114,9 +114,9 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         ema_expansion_lookback: int = 3,
         min_body_ratio: float = 0.40,
         ema_morning_window_start: str = "09:31",
-        ema_morning_window_end: str = "15:00",
+        ema_morning_window_end: str = "15:05",
         ema_afternoon_window_start: str = "13:00",
-        ema_afternoon_window_end: str = "15:00",
+        ema_afternoon_window_end: str = "15:05",
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ) -> None:

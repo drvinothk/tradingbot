@@ -34,6 +34,9 @@ class SystemAlertOut(BaseModel):
     is_resolved: bool
     occurrence_count: int
     last_seen_at: datetime
+    # 2026-09-04: 'paper' | 'live' | None. See SystemAlert.mode's own
+    # docstring -- Control Room's "Attention Required" card filters on this.
+    mode: str | None
 
     model_config = {"from_attributes": True}
 
