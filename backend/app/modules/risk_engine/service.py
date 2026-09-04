@@ -44,7 +44,14 @@ from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
 from app.core.modes.state_machine import enter_kill_switch
 from app.core.pnl import signed_pnl
 from app.domain.audit.models import ActorType, EventCategory
-from app.domain.execution.models import Order, OrderMode, Position, PositionStatus, TradeOutcome
+from app.domain.execution.models import (
+    ExitReason,
+    Order,
+    OrderMode,
+    Position,
+    PositionStatus,
+    TradeOutcome,
+)
 from app.domain.identity.models import User
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
@@ -63,6 +70,7 @@ from app.domain.strategy.models import (
     SignalSide,
     StrategyConfig,
     StrategyRun,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -98,7 +106,6 @@ _ALERT_WORTHY_REASON_PREFIXES = (
     "reentry_cooldown_locked",
     "max_concurrent_positions_reached",
     "max_trades_per_day_reached",
-    "consecutive_loss_pause_active",
     "budget_exceeded",
     "per_trade_lot_cap_exceeded",
     "margin_check_failed",
@@ -645,19 +652,22 @@ def evaluate_trade_intent(
             if dispatched_today >= risk_config.max_trades_per_day:
                 reasons.append("max_trades_per_day_reached")
 
-        # 2026-08-19: gated on is_strategy_routed_live -- consecutive_losses
-        # is now only ever incremented by genuinely-live closes (see
-        # record_trade_outcome_effects's own fix), so this stays 0 on a
-        # pure-paper day regardless; the explicit gate matters on a *mixed*
-        # day, where a live-side losing streak must not stop a paper
-        # strategy from continuing to test.
-        if is_live and (
-            trading_session.consecutive_losses >= risk_config.consecutive_loss_pause_threshold
-        ):
-            reasons.append("consecutive_loss_pause_active")
+        # 2026-09-04: the session-wide `consecutive_loss_pause_active` check
+        # that used to live here was retired (Issue 5, reliability_fixes_
+        # plan_2026_09_04.md) -- it was a structural deadlock (blocked new
+        # entries with no path to the win that would reset it) and applied
+        # session-wide, so one strategy's losses could pause every other
+        # strategy too. Replaced by a per-strategy, time-bounded auto
+        # live<->paper breaker (`record_trade_outcome_effects` ->
+        # `_apply_strategy_circuit_breaker`) that flips a tripped strategy's
+        # own `runtime_mode` to FORCE_PAPER rather than rejecting its
+        # TradeIntents here -- a tripped strategy's new entries are simply
+        # routed to the mock broker by the *existing* `is_strategy_routed_
+        # live`/`get_execution_broker` machinery, same as any other
+        # FORCE_PAPER strategy, needing no new rejection reason at all.
 
         # 2026-08-26: gated on is_strategy_routed_live, same as
-        # max_trades_per_day/consecutive_loss_pause_active above -- was
+        # max_trades_per_day above -- was
         # unconditional, which meant every FORCE_PAPER strategy's new
         # mode-aware default of 10 lots (`strategy_engine.sizing
         # .DEFAULT_QTY_LOTS_PAPER`, added 2026-08-24 specifically so paper
@@ -907,31 +917,47 @@ def record_trade_outcome_effects(
     realized_pnl: float,
     *,
     is_live: bool,
+    position: Position,
+    exit_reason: ExitReason,
 ) -> None:
     """Called by `execution_engine.paper.service.close_position` right after
     it writes a real `TradeOutcome` row — this function owns only the
     session-level *effects* of that P&L (running totals + the two triggers
-    below), not the outcome row itself, since that now belongs to the
-    execution domain. Replaces Phase 2's `record_synthetic_outcome`
-    (formerly also responsible for creating the Phase-2-only
-    `SyntheticTradeOutcome` row) with the same triggers described in the
-    build plan's "Daily trading plan" section: a loss-cap breach escalates
-    straight to kill_switch (no soft step-down), a target-profit hit sets
-    `entries_paused_reason` without touching the safety-mode state machine.
+    below) plus, since 2026-09-04, the per-strategy circuit breaker below,
+    not the outcome row itself, since that now belongs to the execution
+    domain. Replaces Phase 2's `record_synthetic_outcome` (formerly also
+    responsible for creating the Phase-2-only `SyntheticTradeOutcome` row)
+    with the same triggers described in the build plan's "Daily trading
+    plan" section: a loss-cap breach escalates straight to kill_switch (no
+    soft step-down), a target-profit hit sets `entries_paused_reason`
+    without touching the safety-mode state machine.
 
     **`is_live` required, 2026-08-19**: this used to run unconditionally
     for every closed position, paper or live, with no distinction — the
-    most severe bug found in that day's audit. `cumulative_realized_pnl`/
-    `consecutive_losses` drive a *real* `kill_switch` and `entries_paused_
-    reason`; a losing streak of pure paper trades could trip both, halting
-    the entire session (paper and live) over a "loss" that never touched
-    real money, and paper profit accumulating toward `daily_target_profit`
-    could pause live entries the same way. `is_live=False` now returns
-    immediately, before the lock and before any write — paper P&L is
-    already fully captured per-trade in `TradeOutcome` (symbol, strategy,
-    entry/exit, realized_pnl, timestamps), which is what every "evaluate
-    the strategies" query in this project has always actually used; no
-    separate paper-side running total was needed.
+    most severe bug found in that day's audit. `cumulative_realized_pnl`
+    drives a *real* `kill_switch`; a losing streak of pure paper trades
+    could trip it, halting the entire session (paper and live) over a
+    "loss" that never touched real money, and paper profit accumulating
+    toward `daily_target_profit` could pause live entries the same way.
+    `is_live=False` now returns immediately, before the lock and before any
+    write — paper P&L is already fully captured per-trade in `TradeOutcome`
+    (symbol, strategy, entry/exit, realized_pnl, timestamps), which is what
+    every "evaluate the strategies" query in this project has always
+    actually used; no separate paper-side running total was needed. This
+    same early-return is also what makes the circuit breaker below
+    inherently live-only with no extra guard needed — a strategy already on
+    paper (manual or auto) never reaches it, by construction.
+
+    **2026-09-04 (Issue 5, reliability_fixes_plan_2026_09_04.md)**: the
+    session-wide, win-gated `trading_session.consecutive_losses` counter is
+    retired here — it was a structural deadlock (new entries blocked while
+    paused, so there was no path to the win that would reset it) and it
+    applied session-wide, so one strategy's losses could pause every other
+    strategy too. Replaced by a per-strategy, time-bounded auto live<->paper
+    breaker (`_apply_strategy_circuit_breaker`, below) — `trading_sessions.
+    consecutive_losses`/`risk_limit_configs.consecutive_loss_pause_
+    threshold` are deliberately left in place but unused (not dropped this
+    pass) rather than migrated away entirely.
 
     Runs under `LOCK_RISK_EVALUATION_QUEUE` (not `LOCK_EXECUTION_SINGLETON`,
     which the caller already holds) — deliberately a *different* lock than
@@ -945,9 +971,6 @@ def record_trade_outcome_effects(
     with advisory_lock(db, LOCK_RISK_EVALUATION_QUEUE):
         new_cumulative = _dec(trading_session.cumulative_realized_pnl) + _dec(realized_pnl)
         trading_session.cumulative_realized_pnl = float(new_cumulative)
-        trading_session.consecutive_losses = (
-            trading_session.consecutive_losses + 1 if realized_pnl < 0 else 0
-        )
         db.add(trading_session)
         db.flush()
 
@@ -961,7 +984,6 @@ def record_trade_outcome_effects(
             payload={
                 "realized_pnl": float(realized_pnl),
                 "cumulative_realized_pnl": float(new_cumulative),
-                "consecutive_losses": trading_session.consecutive_losses,
             },
         )
 
@@ -1023,3 +1045,189 @@ def record_trade_outcome_effects(
             )
 
         db.flush()
+
+    _apply_strategy_circuit_breaker(db, trading_session, position, exit_reason, realized_pnl)
+
+
+# Only these three exit reasons check directly against the position's own
+# *original* stop_price during a live evaluation cycle (evaluate_open_
+# position's stop/target/trail checks) -- every other reason (structure
+# break, spread blowout, momentum plateau, EOD/margin-forced, manual,
+# reconciled, a late-discovered fill, ...) exits for a reason unrelated to
+# that stop distance, so there is no "clean" risk_amount to compare against.
+# Per explicit design decision: fail toward more protection for all of
+# those, not less -- always treat as severe rather than guess.
+_STOP_DISTANCE_BASED_EXIT_REASONS = frozenset(
+    {ExitReason.STOP, ExitReason.TARGET, ExitReason.TRAIL}
+)
+# A losing trade counts toward the breaker only once it burns at least this
+# fraction of the *original* designed risk (entry-to-stop distance) -- a
+# marginal loss (e.g. a trail giveback after being briefly in profit) is
+# normal variance, not evidence the strategy's edge has broken.
+_SEVERE_LOSS_FRACTION_OF_RISK = 0.5
+
+
+def _is_severe_loss(
+    db: Session, position: Position, exit_reason: ExitReason, realized_pnl: float
+) -> bool:
+    """Classifies one live losing trade as *severe* (counts toward the
+    per-strategy circuit breaker) or *marginal* (invisible to it -- no
+    increment, no reset). Never called for a winning trade — that's handled
+    separately in `_apply_strategy_circuit_breaker` (a win always resets the
+    breaker outright, severity is moot).
+
+    `position.qty` is already the absolute contract quantity (lots x
+    lot_size, resolved server-side at dispatch per this codebase's own
+    qty_lots convention — see CLAUDE.md), the same quantity `signed_pnl`
+    already used to compute `realized_pnl` itself. That means the "designed
+    risk" in the same units is just `signed_pnl` evaluated at the position's
+    *original* stop instead of its actual exit — no separate lot_size
+    lookup/multiplication needed.
+    """
+    if exit_reason not in _STOP_DISTANCE_BASED_EXIT_REASONS:
+        return True
+
+    trade_intent = db.get(TradeIntent, position.trade_intent_id)
+    if trade_intent is None or trade_intent.stop_price is None:
+        # No original stop to compare against -- can't classify cleanly,
+        # fail toward protection rather than silently treating it as
+        # marginal.
+        return True
+
+    entry_side = SignalSide(position.side)
+    # signed_pnl returns Decimal (see its own docstring / CLAUDE.md's
+    # Decimal-vs-float rule) -- convert once, here, rather than mixing
+    # Decimal and float arithmetic below.
+    risk_amount = abs(
+        float(
+            signed_pnl(
+                float(position.entry_price),
+                float(trade_intent.stop_price),
+                position.qty,
+                entry_side,
+            )
+        )
+    )
+    if risk_amount <= 0:
+        # A degenerate/zero designed risk (e.g. stop == entry) can't
+        # meaningfully classify severity by fraction -- fail toward
+        # protection.
+        return True
+
+    return abs(realized_pnl) >= _SEVERE_LOSS_FRACTION_OF_RISK * risk_amount
+
+
+def _apply_strategy_circuit_breaker(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    exit_reason: ExitReason,
+    realized_pnl: float,
+) -> None:
+    """The per-strategy graduated live<->paper breaker itself (Issue 5).
+    Ladder: Tier 0 (normal) -> 3 consecutive severe live losses -> Tier 1
+    (auto-flip to paper, 60min) -> auto-resume to live -> one more severe
+    loss -> Tier 2 (paper, 90min) -> auto-resume -> one more severe loss ->
+    Tier 3 (paper for the rest of the trading day, no further auto-resume
+    attempted today). A win at any point fully resets to Tier 0. Auto-resume
+    itself lives in `strategy_engine.runner.StrategyRunner.run_cycle`, not
+    here — this function only ever moves a strategy *toward* paper, never
+    back to live; that direction is entirely the runner's own per-cycle
+    timer check (see that function's own docstring for why).
+
+    Locked per-`strategy_config_id` (not the fixed `LOCK_RISK_EVALUATION_
+    QUEUE`/`LOCK_EXECUTION_SINGLETON` names) so this can never race the
+    runner's own auto-resume check for the *same* strategy — both mutate
+    `StrategyRun.cooldown_tier`/`cooldown_until` and `StrategyConfig.
+    runtime_mode` for that one strategy from two different background
+    threads. A different strategy's trip/resume uses a different lock key
+    entirely, so this never serializes unrelated strategies against each
+    other.
+    """
+    trade_intent = db.get(TradeIntent, position.trade_intent_id)
+    if trade_intent is None:
+        return
+    strategy_run = db.get(StrategyRun, trade_intent.strategy_run_id)
+    if strategy_run is None:
+        return
+    strategy_config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+    if strategy_config is None:
+        return
+
+    with advisory_lock(db, f"strategy_cooldown:{strategy_config.id}"):
+        if realized_pnl >= 0:
+            if strategy_run.cooldown_tier != 0 or strategy_run.consecutive_severe_losses != 0:
+                strategy_run.consecutive_severe_losses = 0
+                strategy_run.cooldown_tier = 0
+                strategy_run.cooldown_until = None
+                db.add(strategy_run)
+                db.flush()
+            return
+
+        if not _is_severe_loss(db, position, exit_reason, realized_pnl):
+            return  # marginal loss -- invisible to the breaker, no change
+
+        now = _utcnow()
+        if strategy_run.cooldown_tier == 0:
+            strategy_run.consecutive_severe_losses += 1
+            if strategy_run.consecutive_severe_losses < 3:
+                db.add(strategy_run)
+                db.flush()
+                return
+            new_tier = 1
+            strategy_run.consecutive_severe_losses = 0
+            strategy_run.cooldown_until = now + timedelta(minutes=60)
+        elif strategy_run.cooldown_tier == 1:
+            new_tier = 2
+            strategy_run.cooldown_until = now + timedelta(minutes=90)
+        else:
+            # Already tier 2 (or already 3, a defensive no-op -- can't
+            # reach tier 3 without passing through 2 first, and once here
+            # runtime_mode is already FORCE_PAPER so is_live can never be
+            # True again for this strategy today anyway).
+            new_tier = 3
+            strategy_run.cooldown_until = None
+
+        strategy_run.cooldown_tier = new_tier
+        db.add(strategy_run)
+
+        strategy_config.runtime_mode = StrategyRuntimeMode.FORCE_PAPER
+        strategy_config.runtime_mode_source = "circuit_breaker"
+        db.add(strategy_config)
+        db.flush()
+
+        record_event(
+            db,
+            workspace_id=trading_session.workspace_id,
+            actor_type=ActorType.SYSTEM,
+            event_category=EventCategory.RISK_DECISION,
+            event_type="strategy_circuit_breaker.tripped",
+            entity_type="strategy_run",
+            entity_id=strategy_run.id,
+            strategy_config_id=strategy_config.id,
+            trading_session_id=trading_session.id,
+            payload={
+                "cooldown_tier": new_tier,
+                "cooldown_until": strategy_run.cooldown_until.isoformat()
+                if strategy_run.cooldown_until
+                else None,
+            },
+        )
+        tier_description = (
+            f"paper for {60 if new_tier == 1 else 90} minutes"
+            if new_tier in (1, 2)
+            else "paper for the rest of today"
+        )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.WARNING,
+            category="strategy_circuit_breaker_tripped",
+            message=(
+                f"{strategy_config.name}: severe live loss streak (tier {new_tier}) -- "
+                f"auto-parked to {tier_description}."
+            ),
+            mode=OrderMode.LIVE,
+            dedup_key=f"strategy_circuit_breaker_tripped:{strategy_run.id}:{new_tier}",
+        )

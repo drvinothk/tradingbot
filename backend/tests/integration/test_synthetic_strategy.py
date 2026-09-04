@@ -30,6 +30,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -237,6 +238,72 @@ def test_run_cycle_reresolves_qty_lots_when_session_mode_flips(
     run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
               alert_session_factory=_same_session_factory(db))
     assert strategy.qty_lots == DEFAULT_QTY_LOTS_LIVE
+
+
+def test_run_cycle_auto_resumes_a_strategy_once_its_cooldown_expires(
+    db: Session, instrument: Instrument, strategy_run, trading_session, strategy_config
+):
+    """2026-09-04 (Issue 5): the other half of risk_engine.service.
+    _apply_strategy_circuit_breaker -- once a circuit-breaker-tripped
+    strategy's timed cooldown window has passed, the *next* run_cycle must
+    auto-flip it back to live and clear the cooldown state, tagged the same
+    'circuit_breaker' source.
+    """
+    from datetime import timedelta
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    strategy_config.runtime_mode = StrategyRuntimeMode.FORCE_PAPER
+    strategy_config.runtime_mode_source = "circuit_breaker"
+    db.add(strategy_config)
+    strategy_run.cooldown_tier = 1
+    strategy_run.consecutive_severe_losses = 0
+    strategy_run.cooldown_until = datetime.now(UTC) - timedelta(seconds=1)
+    db.add(strategy_run)
+    db.flush()
+
+    run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
+              alert_session_factory=_same_session_factory(db))
+
+    assert strategy_config.runtime_mode is None
+    assert strategy_config.runtime_mode_source == "circuit_breaker"
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.cooldown_until is None
+
+    event = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "strategy_circuit_breaker.auto_resumed")
+        .filter(AuditEvent.entity_id == strategy_run.id)
+        .one()
+    )
+    assert event.strategy_config_id == strategy_config.id
+    assert event.payload["resumed_from_tier"] == 1
+
+
+def test_run_cycle_does_not_auto_resume_a_manually_set_force_paper_strategy(
+    db: Session, instrument: Instrument, strategy_run, trading_session, strategy_config
+):
+    """A human's own deliberate `force_paper` (runtime_mode_source == 'manual'
+    or unset) must never be auto-resumed, even if cooldown_tier/cooldown_until
+    happen to carry stale values (e.g. left over from an earlier trip that
+    the human then overrode) -- the `runtime_mode_source` gate is what
+    prevents the breaker from clobbering a deliberate manual decision.
+    """
+    from datetime import timedelta
+
+    strategy = SyntheticStrategy(instrument_id=instrument.id, expiry_date=EXPIRY)
+    strategy_config.runtime_mode = StrategyRuntimeMode.FORCE_PAPER
+    strategy_config.runtime_mode_source = "manual"
+    db.add(strategy_config)
+    strategy_run.cooldown_tier = 1
+    strategy_run.cooldown_until = datetime.now(UTC) - timedelta(seconds=1)
+    db.add(strategy_run)
+    db.flush()
+
+    run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
+              alert_session_factory=_same_session_factory(db))
+
+    assert strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER
+    assert strategy_config.runtime_mode_source == "manual"
 
 
 def test_run_cycle_skips_evaluate_when_option_chain_refresh_fails(

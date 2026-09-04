@@ -65,6 +65,7 @@ from app.domain.execution.models import (
     Order,
     OrderEvent,
     OrderMode,
+    OrderSide,
     OrderStatus,
     OrderType,
     Position,
@@ -76,7 +77,7 @@ from app.domain.execution.models import (
     TrailPlanStatus,
 )
 from app.domain.market.models import Instrument, OptionContract, OptionType
-from app.domain.ops.models import AlertSeverity
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import (
     SignalSide,
@@ -140,7 +141,7 @@ from app.modules.market_data.freshness import (
 )
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.tick_plausibility import is_plausible_option_tick
-from app.modules.reconciliation.service import run_reconciliation
+from app.modules.reconciliation.service import _attempt_auto_repair, run_reconciliation
 from app.modules.risk_engine.service import record_trade_outcome_effects
 from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
@@ -171,6 +172,17 @@ TRAIL_LOCK_FRACTION = Decimal("0.5")
 # alerts distinctly and stops trying, rather than placing a new live
 # broker order every PositionManager cycle forever.
 _MAX_EXIT_ORDER_ATTEMPTS = 5
+
+# 2026-09-04: every SystemAlert category that is scoped to one specific
+# position via `dedup_key == f"{category}:{position.id}"` (see each one's
+# own call site) -- `_finalize_position_close` auto-resolves any standing
+# alert in this list for a position the moment it genuinely closes, instead
+# of leaving it for AlertHousekeepingScheduler's 24h silence timer.
+_POSITION_SCOPED_ALERT_CATEGORIES = (
+    "exit_order_unfilled",
+    "exit_order_attempts_exhausted",
+    "protective_stop_cancel_unresolved",
+)
 
 # Phase 4: generic spread-blowout exit — the same threshold for every
 # strategy regardless of structure_level (unlike the trail, this isn't
@@ -1026,10 +1038,50 @@ def close_position(
             if len(exit_attempts) >= _MAX_EXIT_ORDER_ATTEMPTS:
                 logger.error(
                     "position %s: %d exit order attempts all cancelled/rejected -- giving up "
-                    "automatic retries, leaving OPEN for manual intervention",
+                    "automatic retries, attempting auto-repair before alerting",
                     position.id,
                     len(exit_attempts),
                 )
+                # 2026-09-04: before falling all the way through to a
+                # "needs manual square-off" alert, try the exact same
+                # broker-fill recovery `run_reconciliation`'s own
+                # auto-repair path already uses for a "local OPEN, broker
+                # flat" mismatch (`_attempt_auto_repair`, built 2026-09-02
+                # for precisely this incident shape) -- reused here, not
+                # duplicated, so a real broker-side fill this system missed
+                # (a manual square-off in the broker's own app, or a
+                # cancelled resting order that Shoonya actually filled
+                # moments later) gets picked up immediately instead of
+                # waiting for the next periodic reconciliation pass, and so
+                # "needs manual square-off" only ever fires when there is
+                # genuinely nothing left to recover automatically.
+                # LIVE-only by `_attempt_auto_repair`'s own deliberate scope
+                # (see its docstring) -- a PAPER exhaustion has no broker
+                # fill to recover from and falls straight through to the
+                # alert, same as before.
+                signed_qty = position.qty if position.side == OrderSide.BUY else -position.qty
+                try:
+                    repaired = _attempt_auto_repair(
+                        db, broker, trading_session, option_contract.symbol, signed_qty, order_mode
+                    )
+                except Exception:  # noqa: BLE001 - an auto-repair attempt failing must
+                    # never crash the exhaustion path itself; fall through to the
+                    # existing alert exactly as if auto-repair had declined.
+                    logger.exception(
+                        "auto-repair attempt raised for position %s -- falling through "
+                        "to the exit_order_attempts_exhausted alert",
+                        position.id,
+                    )
+                    repaired = False
+                if repaired:
+                    # Mirrors close_position's own established contract for
+                    # "closed via a path other than this function's normal
+                    # logic" (see close_position_from_external_fill's own
+                    # "lost a race" case) -- the position is genuinely
+                    # closed now, callers must read position.status from the
+                    # DB rather than trust a TradeOutcome from this return.
+                    return None
+
                 send_alert(
                     db,
                     workspace_id=trading_session.workspace_id,
@@ -1038,8 +1090,9 @@ def close_position(
                     category="exit_order_attempts_exhausted",
                     message=(
                         f"Position {position.id}: {len(exit_attempts)} exit order attempts all "
-                        f"cancelled/rejected; automatic retries exhausted -- needs manual "
-                        f"square-off."
+                        f"cancelled/rejected; automatic retries exhausted and no matching "
+                        f"broker fill was found to auto-repair from -- needs manual "
+                        f"reconcile (POST /positions/{{id}}/manual-reconcile)."
                     ),
                     mode=order_mode,
                     dedup_key=f"exit_order_attempts_exhausted:{position.id}",
@@ -1297,8 +1350,40 @@ def _finalize_position_close(
     )
 
     record_trade_outcome_effects(
-        db, trading_session, float(realized_pnl), is_live=(order_mode == OrderMode.LIVE)
+        db,
+        trading_session,
+        float(realized_pnl),
+        is_live=(order_mode == OrderMode.LIVE),
+        position=position,
+        exit_reason=exit_reason,
     )
+
+    # 2026-09-04: a position reaching this function is proof it just
+    # genuinely closed -- resolve any standing alert that was specifically
+    # about *this position* being stuck, rather than leaving it to sit
+    # `is_resolved=False` (re-pushing to Telegram every 15 minutes) until
+    # `AlertHousekeepingScheduler`'s 24h silence timer eventually closes it.
+    # Every one of these three categories' own `dedup_key` is exactly
+    # `f"{category}:{position.id}"` (see their own call sites) -- an exact
+    # IN-list match, not a broad LIKE, so this can never touch an alert
+    # about a different position or a session-wide category.
+    resolved_count = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == trading_session.workspace_id,
+            SystemAlert.dedup_key.in_(
+                f"{category}:{position.id}" for category in _POSITION_SCOPED_ALERT_CATEGORIES
+            ),
+            SystemAlert.is_resolved.is_(False),
+        )
+        .update({"is_resolved": True, "resolved_at": now}, synchronize_session=False)
+    )
+    if resolved_count:
+        logger.info(
+            "position %s closed -- auto-resolved %d standing position-scoped alert(s)",
+            position.id,
+            resolved_count,
+        )
 
     return outcome
 

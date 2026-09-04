@@ -42,6 +42,7 @@ from app.domain.strategy.models import (
     TradeIntent,
     TradeIntentStatus,
 )
+from app.modules.broker_adapter import composition
 from app.modules.broker_adapter.base.errors import BrokerAuthError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.position_manager import PositionManager
@@ -655,10 +656,26 @@ def test_run_once_survives_margin_broker_resolution_failure(
     `PositionManager` (unlike every other test in this file) so this
     exercises the real `get_execution_broker` resolution path instead of
     short-circuiting past it via `self._broker_override`.
+
+    2026-09-04: `broker` is now also monkeypatched in as the module-level
+    execution-mock singleton. This position is dispatched via `broker=broker`
+    directly (a `MockBrokerAdapter`), so its opening order correctly records
+    `mode=PAPER` -- and since the Issue-1 fix (`get_execution_broker` pinning
+    a paper-opened position to the mock broker regardless of the strategy's
+    *current* routing, composition.py's own step 1c/1d), its per-position
+    resolution now genuinely succeeds instead of also raising the same
+    `ConfigurationError` the margin-breach check above hits. Before that fix,
+    this position's own per-cycle evaluation was silently skipped by the
+    *same* exception this test exists to prove is survived -- it never
+    actually exercised the seeded $80 price. Registering `broker` as the
+    real execution-mock singleton makes it exercise that path for real: the
+    margin check still fails and is survived (unchanged), and the position's
+    own stop/target check now genuinely runs against the seeded price.
     """
     from app.config.settings import get_settings
 
     monkeypatch.setattr(get_settings().app, "allow_real_money_dispatch", True)
+    monkeypatch.setattr(composition, "_execution_mock", broker)
     position = _dispatch_position(
         db, trading_session, strategy_run, option_contract, broker,
         stop_price=72.0, target_price=92.0,

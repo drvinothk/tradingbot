@@ -126,6 +126,8 @@ VWAP_PULLBACK_PARAM_KEYS = {
     "pullback_tolerance_frac",
     "stop_pct",
     "target_pct",
+    "stop_points",
+    "target_points",
     "trail_activation_fraction",
     "trail_lock_fraction",
     "trend_lookback_bars",
@@ -705,6 +707,31 @@ def update_strategy(
     if "runtime_mode" in fields_set and body.runtime_mode != config.runtime_mode:
         changes["runtime_mode"] = body.runtime_mode.value if body.runtime_mode is not None else None
         config.runtime_mode = body.runtime_mode
+        # 2026-09-04 (Issue 5): a human deliberately editing runtime_mode
+        # always wins over the circuit breaker -- stamp the source so the
+        # breaker's own auto-resume check (StrategyRunner.run_cycle) knows
+        # this wasn't its own doing, and clear any pending cooldown on the
+        # currently active run so a stale auto-timer can never later
+        # override this decision (e.g. a human clears force_paper mid-
+        # cooldown; without this, the run's own leftover cooldown_tier/
+        # cooldown_until would just sit there inert, but a *future* trip
+        # reusing the same run row could otherwise misread it).
+        config.runtime_mode_source = "manual"
+        active_run = (
+            db.query(StrategyRun)
+            .filter(
+                StrategyRun.strategy_config_id == config.id,
+                StrategyRun.status != StrategyRunStatus.STOPPED,
+            )
+            .one_or_none()
+        )
+        if active_run is not None and (
+            active_run.cooldown_tier != 0 or active_run.cooldown_until is not None
+        ):
+            active_run.cooldown_tier = 0
+            active_run.cooldown_until = None
+            active_run.consecutive_severe_losses = 0
+            db.add(active_run)
 
     if "underlying_symbol" in fields_set and body.underlying_symbol != config.underlying_symbol:
         changes["underlying_symbol"] = body.underlying_symbol
@@ -772,6 +799,25 @@ def bulk_set_runtime_mode(
     changed = [config for config in configs if config.runtime_mode != body.mode]
     for config in changed:
         config.runtime_mode = body.mode
+        # 2026-09-04 (Issue 5): same treatment as update_strategy's own
+        # single-strategy edit -- a bulk manual edit wins over the circuit
+        # breaker too, for every config it touches.
+        config.runtime_mode_source = "manual"
+        active_run = (
+            db.query(StrategyRun)
+            .filter(
+                StrategyRun.strategy_config_id == config.id,
+                StrategyRun.status != StrategyRunStatus.STOPPED,
+            )
+            .one_or_none()
+        )
+        if active_run is not None and (
+            active_run.cooldown_tier != 0 or active_run.cooldown_until is not None
+        ):
+            active_run.cooldown_tier = 0
+            active_run.cooldown_until = None
+            active_run.consecutive_severe_losses = 0
+            db.add(active_run)
 
     if changed:
         db.flush()

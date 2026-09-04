@@ -424,6 +424,29 @@ def get_execution_broker(
        `place_protective_stop` resting order) for as long as the crash
        loop continued. Live-confirmed 2026-08-25 on a real Test 1
        (ema_micro_pullback) live-mode entry.
+    1c. `position` given and it was **not** opened live (i.e. opened
+       PAPER) → always resolves the mock broker, regardless of
+       `trading_session.mode` or the strategy's *current* `runtime_mode`.
+       Symmetric counterpart to step 1: a position's mode is fixed at
+       dispatch time in both directions, not just the live one. Fixes a
+       real, live-confirmed incident (2026-09-04): a position opened while
+       `runtime_mode=FORCE_PAPER` was active kept `Order.mode=PAPER`
+       correctly at entry, but once `force_paper` was later cleared
+       mid-position, its next protective-stop dispatch fell through to
+       step 3 below and re-evaluated *current* routing — resolving the
+       real Shoonya broker for a position Shoonya never had, firing 5 real
+       SELL orders that all rejected, exhausting retries and stranding the
+       position. `resolve_broker_for_position`'s own 2026-08-19 fix made
+       broker resolution per-position instead of shared-per-cycle, but
+       never added this half — this step is the missing symmetric case.
+    1d. `order` given (no `position` yet) and it was dispatched with
+       `mode == PAPER` → same mock resolution as 1c, same reasoning.
+       Currently unreachable via any existing caller (`reconcile_pending_
+       live_orders`, the only `order`-only call site, already filters to
+       `Order.mode == LIVE` orders before this function is ever called) —
+       kept for structural completeness so a future caller can't
+       reintroduce the 1c/1d gap by passing an `order` instead of a
+       `position`.
     2. `mode != live_enabled` (paper_only / degraded_mode / kill_switch /
        reconciliation_lock) → mock, unconditionally, regardless of
        `strategy_run`.
@@ -462,6 +485,30 @@ def get_execution_broker(
 
     if order is not None and order.mode == OrderMode.LIVE:
         return _real_broker_or_raise(f"order {order.id} was dispatched live")
+
+    if position is not None and not _position_opened_live(position):
+        if strategy_run is not None and is_strategy_routed_live(trading_session, strategy_run):
+            # The position was opened paper but this strategy is *currently*
+            # live-routed -- correct to keep it pinned to mock (nothing here
+            # should ever misroute a paper position to a real order), but
+            # this specific combination is worth a visible trail: it either
+            # means a force_paper hold was lifted mid-position (expected,
+            # harmless) or, if it recurs unexpectedly often for a strategy
+            # that was never force_paper, could indicate some other bug put
+            # a position in paper when it should have been live. WARNING
+            # only, never an alert -- there is no real-money risk here, the
+            # position is correctly protected either way.
+            logger.warning(
+                "position %s opened paper but strategy_run %s is currently "
+                "live-routed -- keeping this position on the mock broker "
+                "(paper stays pinned to paper, per its own opening order)",
+                position.id,
+                strategy_run.id,
+            )
+        return get_execution_mock()
+
+    if order is not None and order.mode == OrderMode.PAPER:
+        return get_execution_mock()
 
     if not is_strategy_routed_live(trading_session, strategy_run):
         return get_execution_mock()

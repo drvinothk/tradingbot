@@ -297,19 +297,32 @@ def option_contract(db: Session, instrument: Instrument) -> OptionContract:
 
 
 def _position(
-    db: Session, *, workspace, trading_session, option_contract, user, order_mode: OrderMode
+    db: Session,
+    *,
+    workspace,
+    trading_session,
+    option_contract,
+    user,
+    order_mode: OrderMode,
+    run: StrategyRun | None = None,
 ) -> Position:
     """A minimal Signal -> TradeIntent -> Order(open) -> Position chain --
     only `opening_order.mode` is semantically exercised by these tests, but
     `orders.ck_order_exactly_one_of_intent_or_position` requires a real
     `trade_intent_id` on the opening order regardless.
+
+    `run` lets a caller pass an already-built `StrategyRun` (e.g. one with a
+    specific `runtime_mode`) instead of always getting a fresh plain one --
+    needed to exercise the interaction between a position's own frozen
+    opening-order mode and its strategy's *current* routing state.
     """
-    run = _strategy_run(
-        db,
-        workspace=workspace,
-        trading_session=trading_session,
-        user=user,
-    )
+    if run is None:
+        run = _strategy_run(
+            db,
+            workspace=workspace,
+            trading_session=trading_session,
+            user=user,
+        )
     signal = Signal(
         id=uuid.uuid4(),
         workspace_id=workspace.id,
@@ -582,3 +595,86 @@ def test_live_opened_position_without_flag_raises_not_silently_mocked(
 
     with pytest.raises(ConfigurationError):
         composition.get_execution_broker(trading_session, position=position)
+
+
+# -- 2026-09-04: paper positions must stay pinned to mock, symmetric to the
+# live-pin tests above (`_position_opened_live`'s own counterpart) --------
+
+
+def test_paper_opened_position_stays_mock_when_strategy_now_live_routed(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    """Direct reproduction of the 2026-09-04 live incident: a position
+    opened while `runtime_mode=FORCE_PAPER` was active correctly filled
+    paper (`Order.mode=PAPER`), but by the time its exit was dispatched the
+    strategy's `force_paper` hold had been lifted -- session is
+    `live_enabled` and the strategy is *currently* plain live-routed. Before
+    the fix, this fell through step 3 and resolved the real broker for a
+    position that broker never had. The fix must keep it pinned to mock
+    regardless of the strategy's current routing.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    run = _strategy_run(
+        db, workspace=workspace, trading_session=trading_session, user=user, runtime_mode=None
+    )
+    position = _position(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.PAPER,
+        run=run,
+    )
+
+    broker = composition.get_execution_broker(trading_session, run, position=position)
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
+def test_paper_opened_position_stays_mock_with_no_strategy_run_passed(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    """Same reproduction, but via the no-`strategy_run` call shape some
+    call sites use (e.g. reconciliation/EOD square-off) -- must not depend
+    on `strategy_run` being supplied to resolve mock for a paper position.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    position = _position(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.PAPER,
+    )
+
+    broker = composition.get_execution_broker(trading_session, position=position)
+
+    assert isinstance(broker, MockBrokerAdapter)
+
+
+def test_live_enabled_session_returns_mock_for_a_paper_dispatched_order_with_no_position_yet(
+    db: Session, workspace, trading_session, option_contract, user, monkeypatch
+):
+    """Symmetric `order`-only case (1d) -- currently unreachable via any
+    real caller (see `get_execution_broker`'s own docstring), but the
+    branch itself must still resolve correctly if something ever does pass
+    a PAPER order with no position.
+    """
+    _allow_real_money(monkeypatch, True)
+    composition.set_broker(_FakeRealBroker())
+    order = _pending_order(
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        option_contract=option_contract,
+        user=user,
+        order_mode=OrderMode.PAPER,
+    )
+
+    broker = composition.get_execution_broker(trading_session, order=order)
+
+    assert isinstance(broker, MockBrokerAdapter)

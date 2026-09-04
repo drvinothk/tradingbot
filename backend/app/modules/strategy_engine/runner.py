@@ -29,7 +29,9 @@ from app.core.clock import (
     is_within_live_entry_suppression_window,
     now_ist,
 )
+from app.core.db.base import utcnow as _utcnow
 from app.core.db.session import SessionFactory, reuse_session, session_scope
+from app.core.locking import advisory_lock
 from app.core.sleep_inhibitor import get_sleep_inhibitor
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode
@@ -346,6 +348,77 @@ def run_cycle(
     # own default of opening a second, independently-committing connection
     # — keeps the refresh atomic with the rest of this cycle.
     same_session = reuse_session(db)
+
+    # 2026-09-04 (Issue 5, reliability_fixes_plan_2026_09_04.md): per-strategy
+    # circuit-breaker auto-resume -- the *only* place that ever moves a
+    # tripped strategy back to live. risk_engine.service.
+    # _apply_strategy_circuit_breaker (PositionManager's thread, at position
+    # close) only ever moves a strategy toward paper; this cycle-level check
+    # is what reverses that once its timed window passes. Tier 3 has no
+    # timer (`cooldown_until is None`) -- stays paper for the rest of the
+    # trading day by design, nothing to auto-resume until tomorrow's fresh
+    # StrategyRun starts at tier 0. `runtime_mode_source == "circuit_
+    # breaker"` gates this so a human's own deliberate `force_paper` (set
+    # via the manual-edit endpoint, which stamps `runtime_mode_source=
+    # "manual"` and clears cooldown_tier/cooldown_until on write) is never
+    # touched here.
+    if (
+        strategy_run.cooldown_tier in (1, 2)
+        and strategy_run.cooldown_until is not None
+        and strategy_config.runtime_mode_source == "circuit_breaker"
+        and _utcnow() >= strategy_run.cooldown_until
+    ):
+        # Locked per-strategy-config so this can never race risk_engine.
+        # service._apply_strategy_circuit_breaker's own trip check for the
+        # same strategy, running concurrently on PositionManager's thread.
+        with advisory_lock(db, f"strategy_cooldown:{strategy_config.id}"):
+            db.refresh(strategy_run)
+            db.refresh(strategy_config)
+            # Re-check after acquiring the lock -- a trip could have landed
+            # (e.g. tier 1 -> 2) between the unlocked read above and here.
+            if (
+                strategy_run.cooldown_tier in (1, 2)
+                and strategy_run.cooldown_until is not None
+                and strategy_config.runtime_mode_source == "circuit_breaker"
+                and _utcnow() >= strategy_run.cooldown_until
+            ):
+                resumed_from_tier = strategy_run.cooldown_tier
+                strategy_run.cooldown_tier = 0
+                strategy_run.cooldown_until = None
+                strategy_run.consecutive_severe_losses = 0
+                db.add(strategy_run)
+                strategy_config.runtime_mode = None
+                strategy_config.runtime_mode_source = "circuit_breaker"
+                db.add(strategy_config)
+                db.flush()
+
+                record_event(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    actor_type=ActorType.SYSTEM,
+                    event_category=EventCategory.RISK_DECISION,
+                    event_type="strategy_circuit_breaker.auto_resumed",
+                    entity_type="strategy_run",
+                    entity_id=strategy_run.id,
+                    strategy_config_id=strategy_config.id,
+                    trading_session_id=trading_session.id,
+                    payload={"resumed_from_tier": resumed_from_tier},
+                )
+                send_alert(
+                    db,
+                    workspace_id=trading_session.workspace_id,
+                    trading_session_id=trading_session.id,
+                    severity=AlertSeverity.INFO,
+                    category="strategy_circuit_breaker_resumed",
+                    message=(
+                        f"{strategy_config.name}: cooldown (tier {resumed_from_tier}) "
+                        "expired -- auto-resumed to live."
+                    ),
+                    mode=OrderMode.LIVE,
+                    dedup_key=(
+                        f"strategy_circuit_breaker_resumed:{strategy_run.id}:{resumed_from_tier}"
+                    ),
+                )
 
     # Re-resolve qty_lots from the *current* session/run routing every cycle,
     # so a mid-session Paper<->Live master-switch flip (or a force_paper

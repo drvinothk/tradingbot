@@ -882,6 +882,10 @@ interface AttentionItem {
   message: string
   whenLabel: string
   sortValue: number
+  // 'alert' items only -- every raw SystemAlert id this grouped incident
+  // represents (usually one, post-2026-09-03 row-collapse; can be more for
+  // an older, pre-collapse incident). Resolve clears all of them together.
+  alertIds?: string[]
 }
 
 // A category re-firing every scheduler cycle (market_data_stale,
@@ -915,6 +919,20 @@ const SELF_HEALING_GRACE_MS = 10_000
 function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
   const alertsQuery = useSystemAlerts()
   const [expanded, setExpanded] = useState(false)
+  const queryClient = useQueryClient()
+  const [resolvingKey, setResolvingKey] = useState<string | null>(null)
+
+  // 2026-09-04: the general manual-resolve safety valve
+  // (`POST /system-alerts/{id}/resolve`) -- a grouped incident can
+  // represent more than one raw alert id (pre-2026-09-03 row-collapse
+  // history), so resolve every one of them together; the mutation itself
+  // is idempotent per-id, so resolving an already-resolved one is a no-op.
+  const resolveAlertMutation = useMutation({
+    mutationFn: (alertIds: string[]) =>
+      Promise.all(alertIds.map((id) => api.post(`/system-alerts/${id}/resolve`))),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['system-alerts'] }),
+    onSettled: () => setResolvingKey(null),
+  })
 
   // Same category+message grouping AdvancedPage.tsx's System Errors card
   // uses (see shared/alerts/groupAlerts.ts) -- keeps a repeating alert to
@@ -954,6 +972,7 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
     message: incident.count > 1 ? `${incident.message} (×${incident.count})` : incident.message,
     whenLabel: new Date(incident.lastSeen).toLocaleTimeString(),
     sortValue: new Date(incident.lastSeen).getTime(),
+    alertIds: incident.occurrences.map((o) => o.id),
   }))
 
   // Pending approvals first (soonest-expiring first -- most urgent to
@@ -977,13 +996,29 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
       ) : !expanded ? (
         <div className="attention-preview">
           {items.slice(0, 2).map((item) => (
-            <AttentionPreviewRow key={item.key} item={item} />
+            <AttentionPreviewRow
+              key={item.key}
+              item={item}
+              onResolve={(alertIds) => {
+                setResolvingKey(item.key)
+                resolveAlertMutation.mutate(alertIds)
+              }}
+              isResolving={resolvingKey === item.key}
+            />
           ))}
         </div>
       ) : (
         <div className="attention-scroll">
           {items.map((item) => (
-            <AttentionPreviewRow key={item.key} item={item} />
+            <AttentionPreviewRow
+              key={item.key}
+              item={item}
+              onResolve={(alertIds) => {
+                setResolvingKey(item.key)
+                resolveAlertMutation.mutate(alertIds)
+              }}
+              isResolving={resolvingKey === item.key}
+            />
           ))}
         </div>
       )}
@@ -991,7 +1026,15 @@ function AttentionCard({ runs }: { runs: RunningStrategyOut[] }) {
   )
 }
 
-function AttentionPreviewRow({ item }: { item: AttentionItem }) {
+function AttentionPreviewRow({
+  item,
+  onResolve,
+  isResolving,
+}: {
+  item: AttentionItem
+  onResolve: (alertIds: string[]) => void
+  isResolving: boolean
+}) {
   return (
     <div className="attention-row">
       <span className={`attention-dot ${item.kind === 'approval' ? 'warning' : 'danger'}`} />
@@ -1000,6 +1043,18 @@ function AttentionPreviewRow({ item }: { item: AttentionItem }) {
       </span>
       <span className="attention-message">{item.message}</span>
       <span className="muted attention-when">{item.whenLabel}</span>
+      {item.kind === 'alert' && item.alertIds && item.alertIds.length > 0 && (
+        <button
+          className="btn-ghost"
+          disabled={isResolving}
+          onClick={(e) => {
+            e.stopPropagation()
+            onResolve(item.alertIds!)
+          }}
+        >
+          {isResolving ? 'Resolving…' : 'Resolve'}
+        </button>
+      )}
     </div>
   )
 }

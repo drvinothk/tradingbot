@@ -325,6 +325,60 @@ def test_run_reconciliation_flags_an_injected_mismatch(
     assert trading_session.mode == SafeMode.PAPER_ONLY
 
 
+def test_run_reconciliation_auto_resolves_a_stale_alert_on_the_next_clean_pass(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-04: once a real mismatch clears (verified by an actual clean
+    reconciliation pass, not a blind timer), the `reconciliation_mismatch`
+    alert it raised must resolve itself within that same cycle instead of
+    sitting `is_resolved=False` for up to `system_alert_collapse_window_
+    hours` (24h default) and re-pushing to Telegram every 15 minutes the
+    whole time.
+    """
+    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)
+
+    broker.place_order(
+        OrderRequest(
+            idempotency_key=f"manual-injection-{uuid.uuid4()}",
+            contract_symbol=option_contract.symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=25,
+        )
+    )
+
+    dirty_run = run_reconciliation(db, broker, trading_session, ReconciliationTrigger.EVENT)
+    assert dirty_run.mismatches_found == 1
+    alert = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "reconciliation_mismatch",
+        )
+        .one()
+    )
+    assert alert.is_resolved is False
+
+    # Offset the injected extra qty directly on the broker's own book, back
+    # to matching local -- a genuinely clean pass, not a mocked-out check.
+    broker.place_order(
+        OrderRequest(
+            idempotency_key=f"manual-offset-{uuid.uuid4()}",
+            contract_symbol=option_contract.symbol,
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            qty=25,
+        )
+    )
+
+    clean_run = run_reconciliation(db, broker, trading_session, ReconciliationTrigger.POLL)
+    assert clean_run.mismatches_found == 0
+
+    db.refresh(alert)
+    assert alert.is_resolved is True
+    assert alert.resolved_at is not None
+
+
 def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live_on_live_mismatch(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

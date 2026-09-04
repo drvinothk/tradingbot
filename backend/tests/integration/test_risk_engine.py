@@ -1017,49 +1017,26 @@ def test_daily_trade_cap_ignores_a_strategys_earlier_paper_era_dispatches(
     assert "max_trades_per_day_reached" not in decision.reasons
 
 
-def test_evaluate_trade_intent_consecutive_loss_pause(
+def test_evaluate_trade_intent_never_rejects_for_the_retired_session_wide_check(
     db: Session, broker, workspace, authorized_user, trading_session, strategy_run,
     strategy_config, option_contract, monkeypatch,
 ):
-    """2026-08-19: gated on is_strategy_routed_live -- see this check's own
-    comment in evaluate_trade_intent. Needs a genuinely live-routed
-    strategy, same setup as the other rescoped checks in this file.
+    """2026-09-04 (Issue 5): the session-wide, win-gated `consecutive_loss_
+    pause_active` check is retired -- `trading_session.consecutive_losses`
+    hitting the old threshold must never reject a TradeIntent anymore
+    (replaced by the per-strategy auto live<->paper breaker, tested near
+    `record_trade_outcome_effects` below, which routes a tripped strategy's
+    entries to paper via `runtime_mode` instead of rejecting them here).
     """
     trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
-    trading_session.consecutive_losses = 2  # RiskDefaults threshold is 2
+    trading_session.consecutive_losses = 99  # the old, now-inert field
     db.add(strategy_config)
     db.add(trading_session)
     db.flush()
     monkeypatch.setattr(
         "app.modules.risk_engine.service.get_execution_broker",
         lambda trading_session, strategy_run=None: broker,
-    )
-
-    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
-    decision = evaluate_trade_intent(db, trade_intent, trading_session, strategy_run)
-
-    assert decision.decision == "rejected"
-    assert "consecutive_loss_pause_active" in decision.reasons
-
-
-def test_consecutive_loss_pause_does_not_block_a_paper_routed_strategy(
-    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
-    option_contract, monkeypatch,
-):
-    """The symmetric case: the live side having hit its consecutive-loss
-    threshold must not stop a force_paper strategy from continuing.
-    """
-    trading_session.mode = SafeMode.LIVE_ENABLED
-    db.add(trading_session)
-    strategy_config.runtime_mode = "force_paper"
-    trading_session.consecutive_losses = 2
-    db.add(strategy_config)
-    db.add(trading_session)
-    db.flush()
-    monkeypatch.setattr(
-        "app.modules.risk_engine.service.get_execution_broker",
-        lambda trading_session, strategy_run=None: MockBrokerAdapter(),
     )
 
     trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
@@ -1670,30 +1647,48 @@ def test_expire_stale_pending_approvals_leaves_fresh_ones_alone(
 # Phase 3 replaces record_synthetic_outcome with record_trade_outcome_effects
 # (see risk_engine.service's module docstring) — it no longer creates its own
 # outcome row (execution_engine.paper.service.close_position writes the real
-# TradeOutcome now) or takes a TradeIntent at all, just the trading_session
-# and a realized_pnl, so these tests no longer need a dispatched position as
-# setup. Coverage of the full dispatch -> close -> effects chain lives in
+# TradeOutcome now). 2026-09-04 (Issue 5): now requires a real `position` +
+# `exit_reason` too — the per-strategy circuit breaker it also drives needs
+# the position's own trade_intent -> strategy_run -> strategy_config chain,
+# so these tests once again need a dispatched position as setup (`_dispatch`,
+# above). `exit_reason=ExitReason.MANUAL` throughout this block -- none of
+# these tests are about severity classification (that's covered in its own
+# section below), and MANUAL always classifies as severe with no stop_price
+# lookup needed (see `_is_severe_loss`), keeping this setup minimal. Full
+# dispatch -> close -> effects coverage lives in
 # tests/integration/test_execution_paper_service.py.
 
 
-def test_record_trade_outcome_effects_updates_running_totals(db: Session, trading_session):
-    record_trade_outcome_effects(db, trading_session, realized_pnl=150.0, is_live=True)
+def _outcome_effects_position(
+    db: Session, trading_session, strategy_run, option_contract, broker
+) -> Position:
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    return db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+
+def test_record_trade_outcome_effects_updates_running_totals(
+    db: Session, trading_session, strategy_run, option_contract, broker
+):
+    position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
+
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=150.0, is_live=True,
+        position=position, exit_reason=ExitReason.MANUAL,
+    )
 
     assert float(trading_session.cumulative_realized_pnl) == pytest.approx(150.0)
-    assert trading_session.consecutive_losses == 0
-
-
-def test_record_trade_outcome_effects_increments_consecutive_losses(db: Session, trading_session):
-    record_trade_outcome_effects(db, trading_session, realized_pnl=-50.0, is_live=True)
-
-    assert trading_session.consecutive_losses == 1
 
 
 def test_record_trade_outcome_effects_breaching_loss_cap_triggers_kill_switch(
-    db: Session, trading_session
+    db: Session, trading_session, strategy_run, option_contract, broker
 ):
+    position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
+
     # daily_loss_cap is 1000 on the fixture session.
-    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0, is_live=True)
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=-1500.0, is_live=True,
+        position=position, exit_reason=ExitReason.MANUAL,
+    )
 
     assert trading_session.mode == SafeMode.KILL_SWITCH
     alerts = db.query(SystemAlert).filter(
@@ -1704,17 +1699,24 @@ def test_record_trade_outcome_effects_breaching_loss_cap_triggers_kill_switch(
 
 
 def test_record_trade_outcome_effects_hitting_target_sets_entries_paused(
-    db: Session, trading_session
+    db: Session, trading_session, strategy_run, option_contract, broker
 ):
+    position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
+
     # daily_target_profit is 2000 on the fixture session.
-    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0, is_live=True)
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=2500.0, is_live=True,
+        position=position, exit_reason=ExitReason.MANUAL,
+    )
 
     assert trading_session.entries_paused_reason == "daily_target_reached"
     # Not a mode transition — reaching a target is a goal, not a fault.
     assert trading_session.mode == SafeMode.PAPER_ONLY
 
 
-def test_record_trade_outcome_effects_is_a_noop_for_paper(db: Session, trading_session):
+def test_record_trade_outcome_effects_is_a_noop_for_paper(
+    db: Session, trading_session, strategy_run, option_contract, broker
+):
     """2026-08-19 regression: the most severe gap from that day's audit —
     this function used to run unconditionally for every closed position,
     paper or live. A losing streak of pure paper trades could trip a real
@@ -1723,10 +1725,14 @@ def test_record_trade_outcome_effects_is_a_noop_for_paper(db: Session, trading_s
     return before touching anything, not just before the loss-cap/target
     triggers -- proven here with a paper loss well past daily_loss_cap.
     """
-    record_trade_outcome_effects(db, trading_session, realized_pnl=-1500.0, is_live=False)
+    position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
+
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=-1500.0, is_live=False,
+        position=position, exit_reason=ExitReason.MANUAL,
+    )
 
     assert float(trading_session.cumulative_realized_pnl) == 0.0
-    assert trading_session.consecutive_losses == 0
     assert trading_session.mode == SafeMode.PAPER_ONLY
     assert trading_session.entries_paused_reason is None
 
@@ -1749,8 +1755,12 @@ def test_entries_paused_blocks_further_trade_intents(
         "app.modules.risk_engine.service.get_execution_broker",
         lambda trading_session, strategy_run=None: broker,
     )
+    position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
 
-    record_trade_outcome_effects(db, trading_session, realized_pnl=2500.0, is_live=True)
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=2500.0, is_live=True,
+        position=position, exit_reason=ExitReason.MANUAL,
+    )
     assert trading_session.entries_paused_reason == "daily_target_reached"
 
     other_contract = OptionContract(
@@ -1765,6 +1775,232 @@ def test_entries_paused_blocks_further_trade_intents(
 
     assert decision.decision == "rejected"
     assert any(r.startswith("entries_paused") for r in decision.reasons)
+
+
+# -- Issue 5: per-strategy graduated live<->paper circuit breaker -----------
+# (docs/ops/reliability_fixes_plan_2026_09_04.md). record_trade_outcome_
+# effects drives the "trip toward paper" half; StrategyRunner.run_cycle's own
+# auto-resume (tested in test_synthetic_strategy.py) drives the other half.
+
+
+def test_severe_loss_at_stop_counts_marginal_loss_does_not(
+    db: Session, trading_session, strategy_run, option_contract, broker
+):
+    """entry=80, stop=72 -> risk_amount = qty * 8. A loss burning >= 50% of
+    that (severe) must increment the streak; a loss burning less (marginal)
+    must leave it untouched -- neither increment nor reset.
+    """
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    risk_amount = position.qty * 8.0
+
+    # Marginal: 20% of risk.
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=-0.2 * risk_amount, is_live=True,
+        position=position, exit_reason=ExitReason.STOP,
+    )
+    db.refresh(strategy_run)
+    assert strategy_run.consecutive_severe_losses == 0
+
+    # Severe: 60% of risk.
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=-0.6 * risk_amount, is_live=True,
+        position=position, exit_reason=ExitReason.STOP,
+    )
+    db.refresh(strategy_run)
+    assert strategy_run.consecutive_severe_losses == 1
+
+
+def test_no_clean_stop_reference_exit_reason_always_counts_as_severe(
+    db: Session, trading_session, strategy_run, option_contract, broker
+):
+    """structure_break has no designed stop-distance to compare against --
+    per explicit design decision, always classify as severe (fail toward
+    more protection) regardless of how small the realized loss was.
+    """
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=-1.0, is_live=True,  # tiny loss
+        position=position, exit_reason=ExitReason.STRUCTURE_BREAK,
+    )
+
+    db.refresh(strategy_run)
+    assert strategy_run.consecutive_severe_losses == 1
+
+
+def test_full_circuit_breaker_ladder(
+    db: Session, trading_session, strategy_run, strategy_config, option_contract, broker
+):
+    """3 severe losses -> tier 1 (60min, auto-parked to paper); one more
+    severe loss -> tier 2 (90min); one more -> tier 3 (paper for the rest of
+    the day, no timer). Each trip flips strategy_config.runtime_mode to
+    FORCE_PAPER, tagged 'circuit_breaker'.
+    """
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    severe_loss = -position.qty * 8.0  # full stop-out, well past the 50% bar
+
+    def _severe_close():
+        record_trade_outcome_effects(
+            db, trading_session, realized_pnl=severe_loss, is_live=True,
+            position=position, exit_reason=ExitReason.STOP,
+        )
+        db.refresh(strategy_run)
+        db.refresh(strategy_config)
+
+    _severe_close()
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.consecutive_severe_losses == 1
+    _severe_close()
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.consecutive_severe_losses == 2
+
+    _severe_close()  # 3rd -- trips tier 1
+    assert strategy_run.cooldown_tier == 1
+    assert strategy_run.consecutive_severe_losses == 0
+    assert strategy_run.cooldown_until is not None
+    minutes_until = (strategy_run.cooldown_until - datetime.now(UTC)).total_seconds() / 60
+    assert 58 <= minutes_until <= 60
+    assert strategy_config.runtime_mode == "force_paper"
+    assert strategy_config.runtime_mode_source == "circuit_breaker"
+    tripped_events = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "strategy_circuit_breaker.tripped")
+        .filter(AuditEvent.entity_id == strategy_run.id)
+        .all()
+    )
+    assert len(tripped_events) == 1
+    assert tripped_events[0].payload["cooldown_tier"] == 1
+
+    _severe_close()  # single loss post-trip -- escalates straight to tier 2
+    assert strategy_run.cooldown_tier == 2
+    minutes_until = (strategy_run.cooldown_until - datetime.now(UTC)).total_seconds() / 60
+    assert 88 <= minutes_until <= 90
+
+    _severe_close()  # single loss -- escalates to tier 3, terminal for today
+    assert strategy_run.cooldown_tier == 3
+    assert strategy_run.cooldown_until is None
+    assert strategy_config.runtime_mode == "force_paper"
+
+
+def test_a_win_fully_resets_the_circuit_breaker(
+    db: Session, trading_session, strategy_run, option_contract, broker
+):
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    severe_loss = -position.qty * 8.0
+
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=severe_loss, is_live=True,
+        position=position, exit_reason=ExitReason.STOP,
+    )
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=severe_loss, is_live=True,
+        position=position, exit_reason=ExitReason.STOP,
+    )
+    db.refresh(strategy_run)
+    assert strategy_run.consecutive_severe_losses == 2
+
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=500.0, is_live=True,  # a win
+        position=position, exit_reason=ExitReason.TARGET,
+    )
+    db.refresh(strategy_run)
+    assert strategy_run.consecutive_severe_losses == 0
+    assert strategy_run.cooldown_tier == 0
+
+    # A 3rd severe loss right after the win must not trip anything -- the
+    # streak genuinely restarted from zero.
+    record_trade_outcome_effects(
+        db, trading_session, realized_pnl=severe_loss, is_live=True,
+        position=position, exit_reason=ExitReason.STOP,
+    )
+    db.refresh(strategy_run)
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.consecutive_severe_losses == 1
+
+
+def test_circuit_breaker_trip_never_affects_a_sibling_strategy(
+    db: Session, workspace, authorized_user, trading_session, option_contract, broker,
+):
+    """Two independent strategy_runs in the same session -- tripping one
+    must never touch the other's cooldown state.
+    """
+    def _new_strategy_run() -> StrategyRun:
+        config = StrategyConfig(
+            id=uuid.uuid4(), workspace_id=workspace.id, name=f"sibling-{uuid.uuid4().hex[:6]}",
+        )
+        db.add(config)
+        db.flush()
+        run = StrategyRun(
+            id=uuid.uuid4(), strategy_config_id=config.id, trading_session_id=trading_session.id,
+            execution_mode=ExecutionMode.AUTO, status=StrategyRunStatus.SCANNING,
+            started_at=trading_session.started_at, started_by_user_id=authorized_user.id,
+        )
+        db.add(run)
+        db.flush()
+        return run
+
+    run_a = _new_strategy_run()
+    run_b = _new_strategy_run()
+
+    intent_a = _dispatch(db, trading_session, run_a, option_contract, broker)
+    position_a = db.query(Position).filter(Position.trade_intent_id == intent_a.id).one()
+    severe_loss = -position_a.qty * 8.0
+
+    for _ in range(3):
+        record_trade_outcome_effects(
+            db, trading_session, realized_pnl=severe_loss, is_live=True,
+            position=position_a, exit_reason=ExitReason.STOP,
+        )
+    db.refresh(run_a)
+    db.refresh(run_b)
+
+    assert run_a.cooldown_tier == 1
+    assert run_b.cooldown_tier == 0
+    assert run_b.consecutive_severe_losses == 0
+
+
+def test_manual_runtime_mode_edit_cancels_a_pending_cooldown(
+    db: Session, workspace, authorized_user, trading_session, strategy_run, strategy_config,
+    option_contract, broker,
+):
+    """2026-09-04 (Issue 5): a human editing runtime_mode via the API always
+    wins over the circuit breaker -- must clear any pending cooldown_tier/
+    cooldown_until on the active run and stamp runtime_mode_source='manual',
+    so a stale auto-timer can never later override this decision.
+    """
+    from app.api.v1.strategies import UpdateStrategyRequest, update_strategy
+
+    trade_intent = _dispatch(db, trading_session, strategy_run, option_contract, broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    severe_loss = -position.qty * 8.0
+    for _ in range(3):
+        record_trade_outcome_effects(
+            db, trading_session, realized_pnl=severe_loss, is_live=True,
+            position=position, exit_reason=ExitReason.STOP,
+        )
+    db.refresh(strategy_run)
+    db.refresh(strategy_config)
+    assert strategy_run.cooldown_tier == 1
+    assert strategy_config.runtime_mode_source == "circuit_breaker"
+
+    update_strategy(
+        strategy_id=strategy_config.id,
+        body=UpdateStrategyRequest(runtime_mode=None),
+        db=db,
+        user=authorized_user,
+    )
+
+    db.refresh(strategy_run)
+    db.refresh(strategy_config)
+    assert strategy_config.runtime_mode is None
+    assert strategy_config.runtime_mode_source == "manual"
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.cooldown_until is None
+    assert strategy_run.consecutive_severe_losses == 0
 
 
 def test_daily_target_entries_paused_does_not_block_a_paper_routed_strategy(

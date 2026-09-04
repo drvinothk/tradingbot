@@ -130,6 +130,16 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     # untouched) so a still-archived name can't be silently reused by a new
     # config.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 2026-09-04 (Issue 5): 'manual' | 'circuit_breaker' | NULL -- which
+    # actor last set `runtime_mode`. Lets the circuit breaker's auto-resume
+    # (StrategyRunner.run_cycle) tell "I flipped this to paper, my own timer
+    # should flip it back" apart from "a human deliberately parked this on
+    # paper for their own reasons, leave it alone" -- and lets the manual
+    # PATCH /strategies/{id} endpoint know it must clear any pending
+    # cooldown_tier/cooldown_until on write, so a stale auto-timer can never
+    # later override a deliberate manual decision. NULL for any row that
+    # predates this column or has never had runtime_mode touched.
+    runtime_mode_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     __table_args__ = (UniqueConstraint("workspace_id", "name", name="uq_strategy_config_name"),)
 
@@ -162,6 +172,28 @@ class StrategyRun(Base, UUIDPkMixin):
     )
     expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     interval_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 2026-09-04 (Issue 5, reliability_fixes_plan_2026_09_04.md): per-strategy
+    # graduated live<->paper circuit breaker state. Lives on the *run*, not
+    # the config, so it resets naturally with each new trading day's run
+    # (matching how the session-wide consecutive_losses counter it replaces
+    # used to reset via a fresh TradingSession row) rather than needing an
+    # explicit daily-reset step. Survives a backend restart -- the existing
+    # StrategyRunner resume path reuses this same row, never creates a new
+    # one mid-day.
+    # consecutive_severe_losses: only meaningful while cooldown_tier == 0 --
+    # counts toward the initial trip-3 threshold. Reset to 0 on any live win
+    # or once a trip fires (the next tier counts single losses, not a fresh
+    # streak of 3).
+    consecutive_severe_losses: Mapped[int] = mapped_column(Integer, default=0)
+    # cooldown_tier: 0=normal, 1=after the first trip (60min auto-paper),
+    # 2=after a second severe loss post-resume (90min), 3=after a third --
+    # paper for the rest of today, no further auto-resume attempted.
+    cooldown_tier: Mapped[int] = mapped_column(Integer, default=0)
+    # cooldown_until: wall-clock end of the current timed auto-paper window
+    # (tiers 1/2 only -- tier 3 has no timer, so this is NULL there too).
+    # StrategyRunner.run_cycle checks this each cycle to auto-flip back to
+    # live once it passes.
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("ix_strategy_runs_session", "trading_session_id"),

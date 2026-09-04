@@ -846,6 +846,60 @@ def test_reconcile_pending_live_orders_continues_after_one_orders_broker_error(
 # -- close_position -----------------------------------------------------------
 
 
+def test_close_position_auto_resolves_standing_position_scoped_alerts(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-04: a position genuinely closing is proof any alert that was
+    specifically about *this position* being stuck is now stale -- must
+    resolve automatically rather than sit unresolved (re-pushing to
+    Telegram every 15 minutes) until the 24h housekeeping timer.
+    """
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    stuck_alert = SystemAlert(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_attempts_exhausted",
+        message=f"Position {position.id}: exit order attempts exhausted.",
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+        is_resolved=False,
+        dedup_key=f"exit_order_attempts_exhausted:{position.id}",
+    )
+    # A CRITICAL alert about some *other*, unrelated position -- must
+    # never be touched by this position's own close.
+    other_alert = SystemAlert(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_attempts_exhausted",
+        message="Position <other>: exit order attempts exhausted.",
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+        is_resolved=False,
+        dedup_key=f"exit_order_attempts_exhausted:{uuid.uuid4()}",
+    )
+    db.add(stuck_alert)
+    db.add(other_alert)
+    db.flush()
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0, broker=broker
+    )
+
+    assert outcome is not None
+    db.refresh(stuck_alert)
+    assert stuck_alert.is_resolved is True
+    assert stuck_alert.resolved_at is not None
+    db.refresh(other_alert)
+    assert other_alert.is_resolved is False
+
+
 def test_close_position_computes_pnl_and_slippage_on_stop(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -1159,6 +1213,186 @@ def test_close_position_gives_up_after_max_exit_order_attempts(
     assert str(position.id) in alert.message
 
 
+class _FakeLiveDelegatingBroker:
+    """Reads as live (`not isinstance(_, MockBrokerAdapter)`) while
+    delegating real behavior to an inner mock -- same trick this file's own
+    `_FakeLiveBroker` local classes use, factored out here since these two
+    new tests need to override `get_recent_trades` specifically (mirrors
+    `test_reconciliation.py`'s identically-named/-shaped helper).
+    """
+
+    def __init__(self, inner: MockBrokerAdapter) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_close_position_auto_repairs_from_a_real_broker_fill_after_max_attempts(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-09-04: a genuinely LIVE position whose exit orders keep getting
+    rejected must try the same broker-fill recovery `run_reconciliation`'s
+    own auto-repair path already uses (`_attempt_auto_repair`) *before*
+    giving up -- if the broker's own order history shows a real matching
+    fill (e.g. a human squared it off directly in the broker's app while
+    this system's own retries were failing), the position must close from
+    that fill automatically, with no `exit_order_attempts_exhausted` alert.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+
+    inner = MockBrokerAdapter()
+    live_broker = _FakeLiveDelegatingBroker(inner)
+    # A LIVE entry fill also places a real protective SL-LMT immediately
+    # after -- the mock always fills synchronously by default, which would
+    # otherwise finalize the position as STOP right here before this test
+    # ever gets to its own exhaustion loop. Queue the entry's own fill
+    # explicitly, then a PENDING ack for the stop placement, matching
+    # test_reconciliation.py's identical setup for the same reason.
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0)
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    assert position.status == PositionStatus.OPEN
+    assert position.opening_order_id is not None
+    opening_order = db.get(Order, position.opening_order_id)
+    assert opening_order is not None and opening_order.mode == OrderMode.LIVE
+
+    for _ in range(5):
+        inner.queue_fill_scenario(
+            option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+        )
+        outcome = close_position(
+            db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
+            broker=live_broker,  # type: ignore[arg-type]
+        )
+        assert outcome is None
+    # 1 protective-stop order (placed at entry, LIVE-only) + 5 exit attempts
+    # both carry `position_id` -- filter to just the exit-attempt lineage
+    # (`exit:{position_id}%`), matching exactly what the internal
+    # `_MAX_EXIT_ORDER_ATTEMPTS` count itself filters on.
+    exit_attempt_filter = Order.idempotency_key.like(f"exit:{position.id}%")
+    exit_attempt_count = (
+        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
+    )
+    assert exit_attempt_count == 5
+
+    real_fill = TradeFill(
+        broker_order_id="SHOONYA-MANUAL-1",
+        contract_symbol=option_contract.symbol,
+        side=ContractOrderSide.SELL,
+        qty=position.qty,
+        avg_price=95.0,
+        ts=datetime.now(UTC),
+    )
+
+    class _RepairBroker(_FakeLiveDelegatingBroker):
+        def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
+            return [real_fill] if contract_symbol == option_contract.symbol else []
+
+    # 6th call: attempts are exhausted -- must auto-repair from the real
+    # fill instead of alerting.
+    outcome = close_position(
+        db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
+        broker=_RepairBroker(inner),  # type: ignore[arg-type]
+    )
+    assert outcome is None  # mirrors close_position's own "closed via another path" contract
+    # Still 5 -- no 6th exit-attempt order placed (repaired via the recovered
+    # fill instead).
+    exit_attempt_count = (
+        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
+    )
+    assert exit_attempt_count == 5
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+
+    trade_outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert float(trade_outcome.exit_price) == pytest.approx(95.0)
+
+    assert (
+        db.query(SystemAlert)
+        .filter(SystemAlert.trading_session_id == trading_session.id)
+        .filter(SystemAlert.category == "exit_order_attempts_exhausted")
+        .count()
+        == 0
+    )
+
+
+def test_close_position_still_alerts_when_auto_repair_finds_no_matching_fill(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """Symmetric case: a genuinely LIVE, genuinely un-exitable position
+    (the broker has no matching fill either) must still fall through to the
+    existing `exit_order_attempts_exhausted` alert -- auto-repair is a
+    best-effort addition, not a replacement for the alert when there is
+    truly nothing to recover.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+
+    inner = MockBrokerAdapter()
+    live_broker = _FakeLiveDelegatingBroker(inner)
+    # Same protective-stop-fills-synchronously gotcha as the previous test.
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0)
+    )
+    inner.queue_fill_scenario(
+        option_contract.symbol, FillScenario(status=BrokerOrderStatus.PENDING)
+    )
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    assert position.status == PositionStatus.OPEN
+
+    for _ in range(6):
+        inner.queue_fill_scenario(
+            option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
+        )
+        outcome = close_position(
+            db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
+            broker=live_broker,  # type: ignore[arg-type]
+        )
+        assert outcome is None
+
+    # 1 protective-stop order (LIVE-only, placed at entry) + 5 exit attempts
+    # both carry `position_id` -- filter to just the exit-attempt lineage.
+    exit_attempt_filter = Order.idempotency_key.like(f"exit:{position.id}%")
+    exit_attempt_count = (
+        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
+    )
+    assert exit_attempt_count == 5
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.trading_session_id == trading_session.id)
+        .filter(SystemAlert.category == "exit_order_attempts_exhausted")
+        .one()
+    )
+    assert "manual-reconcile" in alert.message
+
+
 def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     db: Session, broker, workspace, strategy_run, strategy_config, trading_session,
     option_contract, monkeypatch,
@@ -1222,7 +1456,6 @@ def test_close_position_updates_session_pnl_and_can_trigger_kill_switch(
     # record_synthetic_outcome, now fed by an actual fill instead of a
     # random P&L.
     assert float(trading_session.cumulative_realized_pnl) == pytest.approx(outcome.realized_pnl)
-    assert trading_session.consecutive_losses == 1
     assert trading_session.mode == SafeMode.KILL_SWITCH
 
     # 2026-08-19: the exit order for a genuinely live close must also be a

@@ -12,10 +12,12 @@ import uuid
 from datetime import UTC, datetime
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.api.v1.sessions import list_reconciliation_runs
-from app.api.v1.system_alerts import list_system_alerts
+from app.api.v1.system_alerts import list_system_alerts, resolve_system_alert
+from app.domain.audit.models import AuditEvent
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.identity.models import Workspace as WorkspaceRow
@@ -150,6 +152,90 @@ def test_list_system_alerts_filters_by_resolved(db: Session, workspace: Workspac
     )
 
     assert {a.category for a in unresolved} == {"test.open"}
+
+
+def test_resolve_system_alert_marks_it_resolved_and_audits(
+    db: Session, workspace: WorkspaceRow, user: User
+):
+    alert = SystemAlert(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="exit_order_attempts_exhausted",
+        message="needs manual attention",
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+        is_resolved=False,
+    )
+    db.add(alert)
+    db.flush()
+
+    result = resolve_system_alert(alert_id=alert.id, db=db, user=user)
+
+    assert result.is_resolved is True
+    assert result.resolved_at is not None
+    db.refresh(alert)
+    assert alert.is_resolved is True
+
+    event = (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "system_alert.manual_resolve")
+        .filter(AuditEvent.entity_id == alert.id)
+        .one()
+    )
+    assert event.actor_id == user.id
+
+
+def test_resolve_system_alert_is_idempotent(db: Session, workspace: WorkspaceRow, user: User):
+    already_resolved_at = datetime(2026, 1, 1, tzinfo=UTC)
+    alert = SystemAlert(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        severity=AlertSeverity.WARNING,
+        category="test.already_resolved",
+        message="already resolved",
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+        is_resolved=True,
+        resolved_at=already_resolved_at,
+    )
+    db.add(alert)
+    db.flush()
+
+    result = resolve_system_alert(alert_id=alert.id, db=db, user=user)
+
+    assert result.is_resolved is True
+    # Unchanged -- a no-op, not a fresh resolution, and no second audit event.
+    assert result.resolved_at == already_resolved_at
+    assert (
+        db.query(AuditEvent)
+        .filter(AuditEvent.event_type == "system_alert.manual_resolve")
+        .filter(AuditEvent.entity_id == alert.id)
+        .count()
+        == 0
+    )
+
+
+def test_resolve_system_alert_is_workspace_scoped(db: Session, workspace: WorkspaceRow, user: User):
+    other_workspace = WorkspaceRow(id=uuid.uuid4(), name=f"other-{uuid.uuid4().hex[:8]}")
+    db.add(other_workspace)
+    db.flush()
+    alert = SystemAlert(
+        id=uuid.uuid4(),
+        workspace_id=other_workspace.id,
+        severity=AlertSeverity.CRITICAL,
+        category="test.not_mine",
+        message="not mine",
+        created_at=datetime.now(UTC),
+        last_seen_at=datetime.now(UTC),
+        is_resolved=False,
+    )
+    db.add(alert)
+    db.flush()
+
+    with pytest.raises(HTTPException) as exc_info:
+        resolve_system_alert(alert_id=alert.id, db=db, user=user)
+    assert exc_info.value.status_code == 404
 
 
 def test_list_reconciliation_runs_returns_history_and_current_mismatches(

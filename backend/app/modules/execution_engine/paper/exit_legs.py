@@ -1116,8 +1116,20 @@ def _finalize_position_after_last_leg(
     )
 
     # Once per position, on the NET P&L across all legs (QC findings 1, 9).
+    # exit_reason=MANUAL: multi-leg staged exits don't have one single exit
+    # reason (each leg can close for a different one) and are paper-only in
+    # code today (get_execution_broker mocks a FORCE_PAPER/paper-opened
+    # position unconditionally -- see composition.py), so is_live is always
+    # False here and this value is never actually read by the circuit
+    # breaker in practice -- picked as the least-wrong placeholder rather
+    # than inventing a new ExitReason for an unreachable path.
     record_trade_outcome_effects(
-        db, trading_session, total_realized, is_live=(order_mode == OrderMode.LIVE)
+        db,
+        trading_session,
+        total_realized,
+        is_live=(order_mode == OrderMode.LIVE),
+        position=position,
+        exit_reason=ExitReason.MANUAL,
     )
 
 

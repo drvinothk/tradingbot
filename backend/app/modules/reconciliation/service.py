@@ -64,7 +64,7 @@ from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
 from app.domain.execution.models import Order, OrderMode, OrderSide, Position, PositionStatus
 from app.domain.market.models import OptionContract
-from app.domain.ops.models import AlertSeverity
+from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import SafeMode, TradingSession, TransitionTriggerType
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
@@ -447,6 +447,40 @@ def run_reconciliation(
             trading_session_id=trading_session.id,
             payload={"mismatches": mismatches, "action_taken": action_taken},
         )
+    else:
+        # 2026-09-04: a clean pass (zero mismatches, this session, this
+        # book) is real, verified evidence that any standing
+        # `reconciliation_mismatch` alert for this session is stale --
+        # auto-resolve it here instead of leaving it to the housekeeping
+        # scheduler's blind `system_alert_collapse_window_hours` timer
+        # (default 24h), which only means "hasn't recurred," never
+        # "verified fixed" (see alerting.manager.send_alert's own
+        # docstring). A manually-reconciled or auto-repaired mismatch now
+        # clears within one reconciliation cycle instead of continuing to
+        # re-push to Telegram every 15 minutes for the rest of the day.
+        # Scoped to this session + category only -- never touches another
+        # session's or another category's alerts. `synchronize_session=
+        # False` matches `alert_housekeeping.py`'s own established bulk-
+        # update pattern; this function's own `db` session holds no other
+        # in-memory references to these rows.
+        resolved_count = (
+            db.query(SystemAlert)
+            .filter(
+                SystemAlert.workspace_id == trading_session.workspace_id,
+                SystemAlert.trading_session_id == trading_session.id,
+                SystemAlert.category == "reconciliation_mismatch",
+                SystemAlert.is_resolved.is_(False),
+            )
+            .update({"is_resolved": True, "resolved_at": finished_at}, synchronize_session=False)
+        )
+        if resolved_count:
+            logger.info(
+                "reconciliation: auto-resolved %d stale reconciliation_mismatch alert(s) "
+                "for session %s (%s pass came back clean)",
+                resolved_count,
+                trading_session.id,
+                order_mode.value,
+            )
 
     run = ReconciliationRun(
         id=uuid.uuid4(),
