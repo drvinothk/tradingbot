@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from decimal import Decimal
 
+from sqlalchemy import func as sa_func
 from sqlalchemy import or_ as sa_or
 from sqlalchemy.orm import Session
 
@@ -82,6 +83,7 @@ from app.modules.market_data.freshness import (
     PRICE_DRIFT_TOLERANCE_PCT,
     check_price_drift,
     fresh_reference_premium,
+    latest_ticks_by_contract,
 )
 from app.modules.strategy_engine.sizing import resolve_qty_lots
 
@@ -109,6 +111,7 @@ _ALERT_WORTHY_REASON_PREFIXES = (
     "budget_exceeded",
     "per_trade_lot_cap_exceeded",
     "margin_check_failed",
+    "same_direction_trouble_locked",
 )
 
 
@@ -179,6 +182,7 @@ def get_active_risk_limit_config(db: Session, workspace_id: uuid.UUID) -> RiskLi
         daily_loss_cap=defaults.daily_loss_cap,
         daily_target_profit=defaults.daily_target_profit,
         per_trade_lot_cap=defaults.per_trade_lot_cap,
+        cross_strategy_guard_enabled=defaults.cross_strategy_guard_enabled,
     )
     db.add(config)
     db.flush()
@@ -191,7 +195,7 @@ def create_new_risk_limit_config_version(
     *,
     actor_user: User,
     reason: str = "",
-    **overrides: int | float,
+    **overrides: int | float | bool,
 ) -> RiskLimitConfig:
     """Deactivates the current version and creates version+1 with any
     overridden fields, carrying the rest forward unchanged. Not wired to a
@@ -213,13 +217,14 @@ def create_new_risk_limit_config_version(
     db.add(current)
     db.flush()
 
-    fields: dict[str, int | float] = {
+    fields: dict[str, int | float | bool] = {
         "max_concurrent_positions": current.max_concurrent_positions,
         "max_trades_per_day": current.max_trades_per_day,
         "consecutive_loss_pause_threshold": current.consecutive_loss_pause_threshold,
         "daily_loss_cap": float(current.daily_loss_cap),
         "daily_target_profit": float(current.daily_target_profit),
         "per_trade_lot_cap": current.per_trade_lot_cap,
+        "cross_strategy_guard_enabled": current.cross_strategy_guard_enabled,
     }
     fields.update(overrides)
 
@@ -467,6 +472,173 @@ def _reentry_cooldown_locked(
     return new_entry_price >= _dec(exit_price)
 
 
+# Guard 1 -- validated via a chronological counterfactual simulation against
+# real OCI Postgres trade data across 7 real trading days (net +Rs14,696.50,
+# 10 real losers avoided vs 4 winners collaterally blocked). Deliberately
+# hardcoded, not RiskLimitConfig columns -- same precedent as
+# _REENTRY_COOLDOWN above; retune by editing these constants + redeploying,
+# not a config version bump.
+_CROSS_STRATEGY_TROUBLE_WINDOW = timedelta(minutes=10)
+_CROSS_STRATEGY_TROUBLE_THRESHOLD_PER_LOT = Decimal("-300")
+_CROSS_STRATEGY_TROUBLE_COUNT = 2
+
+# Guard 1 is opt-in per strategy_type, not apply-to-all-by-default. Only
+# strategies that re-evaluate fresh every cycle and can legitimately retry
+# the same setup belong here -- a rejection for them really is just a delay.
+# `orb`/`orb_conviction`/`atr_breakout`/`oi_volume_confirmed(+conviction)`/
+# `liquidity_sweep_reversal(+conviction)` each set an in-memory
+# `_fired_directions` latch the moment they DECIDE to propose a trade,
+# before risk evaluation ever runs -- for them, a Guard 1 rejection of any
+# duration permanently cancels that direction for the rest of the trading
+# day, not just delays it, so they stay out. `synthetic` has no such latch
+# but is a legacy Phase 2 stub, not part of either live family, so it also
+# stays out (no real trading uses it).
+#
+# When adding a new strategy_type, add it to exactly one of these two sets
+# based on its actual behavior (does it latch a fired-direction, or does it
+# fire only ~1-3 times/day per direction? -> exclude. Does it continuously
+# re-check and legitimately retry? -> include) -- never leave it
+# uncategorized.
+# test_cross_strategy_guard_allowlist_covers_all_known_strategy_types
+# enforces this against api.v1.strategies.KNOWN_STRATEGY_TYPES.
+_CROSS_STRATEGY_GUARD_APPLIES_TO = {
+    "ema_micro_pullback",
+    "ema_micro_pullback_conviction",
+    "vwap_pullback",
+    "vwap_pullback_conviction",
+}
+_CROSS_STRATEGY_GUARD_EXCLUDED = {
+    "synthetic",
+    "orb",
+    "orb_conviction",
+    "atr_breakout",
+    "oi_volume_confirmed",
+    "oi_volume_confirmed_conviction",
+    "liquidity_sweep_reversal",
+    "liquidity_sweep_reversal_conviction",
+}
+
+
+def _same_direction_trouble_locked(
+    db: Session,
+    trading_session_id: uuid.UUID,
+    instrument_id: uuid.UUID,
+    option_type: OptionType,
+    order_mode: OrderMode,
+) -> bool:
+    """Guard 1: True if >= _CROSS_STRATEGY_TROUBLE_COUNT OTHER positions on
+    the same underlying + option_type (CE/PE), same trading_session_id, same
+    actual order mode (paper vs live) as the trade being evaluated are
+    currently "in trouble" -- <= _CROSS_STRATEGY_TROUBLE_THRESHOLD_PER_LOT
+    P&L per lot, either an OPEN position (live unrealized P&L right now) or
+    a CLOSED position whose last leg closed within
+    _CROSS_STRATEGY_TROUBLE_WINDOW (realized P&L).
+
+    The caller (evaluate_trade_intent) only invokes this for a strategy_type
+    in _CROSS_STRATEGY_GUARD_APPLIES_TO -- this function itself doesn't know
+    or care which strategy is asking, since the trouble it looks for is
+    always cross-strategy by design (see below).
+
+    Deliberately crosses strategies and strikes -- counts by *position*
+    ("trade"), not by strategy_config_id -- the opposite scoping from
+    _same_strike_locked/_reentry_cooldown_locked just above, which are both
+    per-strategy on purpose (see their own docstrings for why). Here, two
+    losing positions from the *same* strategy count exactly the same as one
+    each from two different strategies, because the risk being guarded
+    against is directional (the whole book leaning the same way and
+    losing), not "did one strategy misbehave."
+
+    OPEN leg: `position.qty` is already the correct REMAINING open quantity
+    -- multi-leg staged exits decrement it per closed leg
+    (execution_engine/paper/exit_legs.py), so no position_exit_legs sum is
+    needed here. lots_remaining = position.qty / lot_size (lot_size always
+    resolved server-side from Instrument, never trusted from a caller, same
+    as compute_pre_trade_analytics above). A position with no fresh tick or
+    qty <= 0 is simply skipped -- absence means no data, not "safe."
+
+    CLOSED leg: sums ALL of a position's TradeOutcome.realized_pnl rows (one
+    per staged-exit leg) so a multi-leg position still counts as one
+    "trade", divided by the position's *original* TradeIntent.qty_lots (not
+    TradeOutcome.qty, which is only the final leg's own slice) -- matches
+    how the real-data validation above was computed. The window cutoff uses
+    MAX(TradeOutcome.closed_at) across the position's legs, not
+    Position.closed_at -- same row-level-vs-position-level reasoning
+    _reentry_cooldown_locked's own docstring gives for why multi-leg needs
+    the row-level timestamp.
+
+    Short-circuits as soon as the count threshold is reached in either leg.
+    """
+    trouble_count = 0
+
+    open_positions = (
+        db.query(Position)
+        .join(OptionContract, OptionContract.id == Position.option_contract_id)
+        .join(Order, Order.id == Position.opening_order_id)
+        .filter(
+            Position.trading_session_id == trading_session_id,
+            Position.status == PositionStatus.OPEN,
+            OptionContract.instrument_id == instrument_id,
+            OptionContract.option_type == option_type.value,
+            Order.mode == order_mode,
+        )
+        .all()
+    )
+
+    if open_positions:
+        instrument = db.get(Instrument, instrument_id)
+        lot_size = instrument.lot_size if instrument is not None else None
+        if lot_size:
+            contract_ids = {p.option_contract_id for p in open_positions}
+            ticks = latest_ticks_by_contract(db, contract_ids)
+            for position in open_positions:
+                if position.qty <= 0:
+                    continue
+                tick = ticks.get(position.option_contract_id)
+                if tick is None:
+                    continue
+                ltp, _ts = tick
+                unrealized = signed_pnl(position.entry_price, ltp, position.qty, position.side)
+                per_lot = _dec(unrealized) / (Decimal(position.qty) / Decimal(lot_size))
+                if per_lot <= _CROSS_STRATEGY_TROUBLE_THRESHOLD_PER_LOT:
+                    trouble_count += 1
+                    if trouble_count >= _CROSS_STRATEGY_TROUBLE_COUNT:
+                        return True
+
+    closed_cutoff = _utcnow() - _CROSS_STRATEGY_TROUBLE_WINDOW
+    closed_rows = (
+        db.query(
+            TradeIntent.qty_lots,
+            sa_func.sum(TradeOutcome.realized_pnl),
+            sa_func.max(TradeOutcome.closed_at),
+        )
+        .select_from(Position)
+        .join(TradeOutcome, TradeOutcome.position_id == Position.id)
+        .join(TradeIntent, TradeIntent.id == Position.trade_intent_id)
+        .join(OptionContract, OptionContract.id == Position.option_contract_id)
+        .join(Order, Order.id == Position.opening_order_id)
+        .filter(
+            Position.trading_session_id == trading_session_id,
+            Position.status == PositionStatus.CLOSED,
+            OptionContract.instrument_id == instrument_id,
+            OptionContract.option_type == option_type.value,
+            Order.mode == order_mode,
+        )
+        .group_by(Position.id, TradeIntent.qty_lots)
+        .having(sa_func.max(TradeOutcome.closed_at) >= closed_cutoff)
+        .all()
+    )
+    for qty_lots, total_realized, _last_closed_at in closed_rows:
+        if not qty_lots:
+            continue
+        per_lot = _dec(total_realized) / Decimal(qty_lots)
+        if per_lot <= _CROSS_STRATEGY_TROUBLE_THRESHOLD_PER_LOT:
+            trouble_count += 1
+            if trouble_count >= _CROSS_STRATEGY_TROUBLE_COUNT:
+                return True
+
+    return False
+
+
 def _is_alert_worthy(reasons: list[str]) -> bool:
     return any(
         reason.startswith(prefix)
@@ -587,6 +759,27 @@ def evaluate_trade_intent(
             _dec(trade_intent.entry_price),
         ):
             reasons.append("reentry_cooldown_locked")
+
+        # Guard 1: runs for both paper and live (not gated on is_live the way
+        # the capacity checks below are) -- is_live only selects which mode's
+        # positions the check counts against. Opt-in per strategy_type (see
+        # _CROSS_STRATEGY_GUARD_APPLIES_TO's own comment) -- a strategy not
+        # on that list (e.g. any one-shot-per-direction strategy) is never
+        # subject to this guard, regardless of how much trouble other
+        # strategies are in.
+        if (
+            risk_config.cross_strategy_guard_enabled
+            and strategy_config is not None
+            and strategy_config.strategy_type in _CROSS_STRATEGY_GUARD_APPLIES_TO
+            and _same_direction_trouble_locked(
+                db,
+                trading_session.id,
+                option_contract.instrument_id,
+                OptionType(option_contract.option_type),
+                OrderMode.LIVE if is_live else OrderMode.PAPER,
+            )
+        ):
+            reasons.append("same_direction_trouble_locked")
 
         # 2026-08-19: gated on is_strategy_routed_live, same reasoning as
         # max_trades_per_day/budget_exceeded below -- max_concurrent_

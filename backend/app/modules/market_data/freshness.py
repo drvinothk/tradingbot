@@ -15,6 +15,7 @@ import enum
 import logging
 import threading
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
@@ -564,3 +565,39 @@ def fresh_reference_premium(
         return snapshot_tick.ltp
 
     return None
+
+
+def latest_ticks_by_contract(
+    db: Session, option_contract_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, tuple[float, datetime]]:
+    """Most recent `(ltp, ts)` already persisted per contract by market-data
+    ingestion -- a plain DB read, never a fresh broker call. Relocated here
+    (originally `api.v1.execution._latest_ticks`) so `risk_engine.service`'s
+    Guard 1 check (cross-strategy same-direction trouble lock) can reuse the
+    identical batched lookup for pricing OTHER strategies' open positions,
+    without the service layer importing from the api layer -- this module
+    is already imported by `risk_engine.service` for `check_price_drift`/
+    `fresh_reference_premium`, so this adds no new cross-layer dependency.
+    `api.v1.execution` keeps a bare re-export alias for its own call site and
+    for the one test that imports the old private name directly.
+
+    Batched into one `DISTINCT ON` round-trip over every requested contract's
+    `option_contract_id` at once, reusing `ix_quote_ticks_option_contract_ts`.
+    Contracts with no tick at all (e.g. right after a restart, before
+    ingestion resubscribes) are simply absent from the returned dict -- not
+    an error, and not treated as "safe" by any caller; see each caller's own
+    handling of a missing entry.
+    """
+    from app.domain.market.models import QuoteTick
+
+    ids = list(option_contract_ids)
+    if not ids:
+        return {}
+    rows = (
+        db.query(QuoteTick.option_contract_id, QuoteTick.ltp, QuoteTick.ts)
+        .filter(QuoteTick.option_contract_id.in_(ids))
+        .order_by(QuoteTick.option_contract_id, QuoteTick.ts.desc())
+        .distinct(QuoteTick.option_contract_id)
+        .all()
+    )
+    return {row.option_contract_id: (float(row.ltp), row.ts) for row in rows}

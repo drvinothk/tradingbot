@@ -7,7 +7,6 @@ workspace-scoping discipline every other lookup in this codebase follows).
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterable
 from datetime import date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -33,14 +32,19 @@ from app.domain.execution.models import (
     TrailPlan,
 )
 from app.domain.identity.models import User
-from app.domain.market.models import OptionContract, QuoteTick
+from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
 from app.domain.strategy.models import StrategyConfig, StrategyRun, TradeIntent
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.contracts import OrderSide as _ContractOrderSide
 from app.modules.broker_adapter.base.contracts import TradeFill
 from app.modules.execution_engine.paper.service import close_position_from_external_fill
-from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
+from app.modules.market_data.freshness import (
+    TICK_THRESHOLDS,
+    FreshnessState,
+    classify_age,
+    latest_ticks_by_contract,
+)
 from app.modules.scheduler.eod_square_off import (
     UnresolvableOptionContractError,
     run_single_position_square_off,
@@ -49,34 +53,12 @@ from app.modules.scheduler.eod_square_off import (
 router = APIRouter(tags=["execution"])
 
 
-def _latest_ticks(
-    db: Session, option_contract_ids: Iterable[uuid.UUID]
-) -> dict[uuid.UUID, tuple[float, datetime]]:
-    """Most recent `(ltp, ts)` already persisted per contract by market-data
-    ingestion -- a plain DB read, never a fresh broker call, so polling
-    `GET /positions` every few seconds from the frontend can never itself
-    trigger broker traffic (a real rate-limit concern in this codebase's own
-    history -- see CLAUDE.md's "rate-limiter capacity fix" entry).
-
-    Batched into one `DISTINCT ON` round-trip over every open position's
-    `option_contract_id` at once, reusing `ix_quote_ticks_option_contract_ts`
-    -- replaces a previous per-position query that ran once per open
-    position on every `GET /positions` poll (an N+1 that scaled with open
-    position count, not a fixed cost). Contracts with no tick at all (e.g.
-    right after a restart, before ingestion resubscribes) are simply absent
-    from the returned dict.
-    """
-    ids = list(option_contract_ids)
-    if not ids:
-        return {}
-    rows = (
-        db.query(QuoteTick.option_contract_id, QuoteTick.ltp, QuoteTick.ts)
-        .filter(QuoteTick.option_contract_id.in_(ids))
-        .order_by(QuoteTick.option_contract_id, QuoteTick.ts.desc())
-        .distinct(QuoteTick.option_contract_id)
-        .all()
-    )
-    return {row.option_contract_id: (float(row.ltp), row.ts) for row in rows}
+# Relocated to app.modules.market_data.freshness.latest_ticks_by_contract
+# (2026-09-05, so risk_engine.service's Guard 1 check can reuse the same
+# batched lookup without the service layer importing from this api layer).
+# Kept as a bare re-export: this module's own call site below and
+# test_api_execution_and_reports.py both still reference the old name.
+_latest_ticks = latest_ticks_by_contract
 
 
 class OrderOut(BaseModel):

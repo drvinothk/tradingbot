@@ -13,7 +13,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.api.v1.strategies import _get_pending_approval_or_404
+from app.api.v1.strategies import KNOWN_STRATEGY_TYPES, _get_pending_approval_or_404
 from app.domain.audit.models import AuditEvent
 from app.domain.execution.models import ExitReason, Order, OrderMode, Position, TradeOutcome
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
@@ -38,6 +38,8 @@ from app.modules.broker_adapter.base.contracts import MarginInfo
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
 from app.modules.execution_engine.paper.service import close_position, dispatch_trade_intent
 from app.modules.risk_engine.service import (
+    _CROSS_STRATEGY_GUARD_APPLIES_TO,
+    _CROSS_STRATEGY_GUARD_EXCLUDED,
     compute_pre_trade_analytics,
     create_new_risk_limit_config_version,
     evaluate_trade_intent,
@@ -625,6 +627,497 @@ def test_same_strike_locked_blocks_a_pending_approval_duplicate(
 
     assert decision.decision == "rejected"
     assert "same_strike_locked" in decision.reasons
+
+
+
+# -- Guard 1: cross-strategy same-direction "trouble" lock -------------------
+# (Rs300/lot threshold, count-of-2, 10-min closed-position window -- all
+# hardcoded module constants in risk_engine.service, validated via a
+# chronological counterfactual simulation against real trade data. Deliberately
+# independent of same_strike_locked/reentry_cooldown_locked above: this one
+# counts by *position*, crosses strategies and strikes on purpose.)
+
+
+def _make_strategy_run(
+    db: Session,
+    workspace,
+    user: User,
+    trading_session: TradingSession,
+    name: str,
+    *,
+    strategy_type: str = "synthetic",
+) -> StrategyRun:
+    config = StrategyConfig(
+        id=uuid.uuid4(), workspace_id=workspace.id, name=name, strategy_type=strategy_type
+    )
+    db.add(config)
+    db.flush()
+    run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(run)
+    db.flush()
+    return run
+
+
+def _make_contract(
+    db: Session, instrument: Instrument, strike: float, option_type: OptionType = OptionType.CE
+) -> OptionContract:
+    contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 7, 30),
+        strike=strike,
+        option_type=option_type,
+        symbol=f"NIFTY26JUL{int(strike)}{option_type.value}",
+    )
+    db.add(contract)
+    db.flush()
+    return contract
+
+
+def _open_trouble_position(
+    db: Session,
+    trading_session: TradingSession,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+    broker: MockBrokerAdapter,
+    *,
+    entry_price: float = 80.0,
+    trouble_ltp: float = 60.0,
+) -> TradeIntent:
+    """Dispatches a fresh position, then plants a QuoteTick pricing it at a
+    per-lot unrealized loss well past Guard 1's -Rs300/lot threshold (default
+    (60-80)*25 = -500/lot at qty_lots=1). Returns the TradeIntent (matching
+    `_dispatch`'s own return shape) -- resolve Position via
+    `Position.trade_intent_id` where a test needs it directly.
+    """
+    trade_intent = _dispatch(
+        db, trading_session, strategy_run, option_contract, broker, entry_price=entry_price
+    )
+    tick = QuoteTick(
+        id=uuid.uuid4(),
+        option_contract_id=option_contract.id,
+        ltp=trouble_ltp,
+        bid=trouble_ltp,
+        ask=trouble_ltp,
+        volume=100,
+        ts=datetime.now(UTC),
+    )
+    db.add(tick)
+    db.flush()
+    return trade_intent
+
+
+def _close_trouble_position(
+    db: Session,
+    trading_session: TradingSession,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+    broker: MockBrokerAdapter,
+    *,
+    entry_price: float = 80.0,
+    exit_price: float = 60.0,
+    closed_minutes_ago: float = 2.0,
+) -> TradeOutcome:
+    """Dispatches then closes a position at a per-lot realized loss well past
+    Guard 1's threshold (default (60-80)*25 = -500/lot at qty_lots=1), aged
+    to `closed_minutes_ago`."""
+    trade_intent = _dispatch(
+        db, trading_session, strategy_run, option_contract, broker, entry_price=entry_price
+    )
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    outcome = close_position(
+        db, trading_session, position, ExitReason.STOP, intended_price=exit_price, broker=broker
+    )
+    assert outcome is not None
+    outcome.closed_at = datetime.now(UTC) - timedelta(minutes=closed_minutes_ago)
+    db.add(outcome)
+    db.flush()
+    return outcome
+
+
+def test_cross_strategy_guard_blocks_when_two_open_losers_same_direction(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert decision.decision == "rejected"
+    assert "same_direction_trouble_locked" in decision.reasons
+
+
+def test_cross_strategy_guard_blocks_with_one_open_and_one_closed_loser(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    _close_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert decision.decision == "rejected"
+    assert "same_direction_trouble_locked" in decision.reasons
+
+
+def test_cross_strategy_guard_allows_only_one_trouble_source(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-b", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+
+    second = _make_trade_intent(db, trading_session, run_b, contract_b)
+    decision = evaluate_trade_intent(db, second, trading_session, run_b)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_ignores_opposite_option_type(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    """Two trouble PE positions must never block a CE entry on the same
+    underlying -- direction (option_type), not just underlying, defines
+    Guard 1's scope."""
+    pe_a = _make_contract(db, instrument, 22000, OptionType.PE)
+    pe_b = _make_contract(db, instrument, 22050, OptionType.PE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, pe_a, broker)
+    _open_trouble_position(db, trading_session, run_b, pe_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, option_contract)  # CE
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_does_not_cross_trading_sessions(
+    db: Session, broker, workspace, user, broker_account, trading_session, option_contract,
+    instrument,
+):
+    other_session = TradingSession(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        broker_account_id=broker_account.id,
+        started_by_user_id=user.id,
+        mode=SafeMode.PAPER_ONLY,
+        started_at=datetime.now(UTC),
+        budget_amount=100_000,
+        daily_target_profit=2_000,
+        daily_loss_cap=1_000,
+        funding_mode=FundingMode.CASH,
+    )
+    db.add(other_session)
+    db.flush()
+
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, other_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, other_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, other_session, run_a, option_contract, broker)
+    _open_trouble_position(db, other_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_does_not_cross_order_modes(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    """Two trouble positions marked LIVE must not block a same-direction
+    PAPER entry -- Guard 1 scopes by actual order mode, not just session/
+    strategy. (The reverse direction shares the identical `Order.mode ==
+    order_mode` filter, so isn't separately tested here.)
+    """
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    intent_a = _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    intent_b = _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+    _mark_last_order_live(db, intent_a)
+    _mark_last_order_live(db, intent_b)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_closed_loser_expires_after_window(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    # Closed 11 minutes ago -- outside the 10-min window, must not count.
+    _close_trouble_position(
+        db, trading_session, run_a, option_contract, broker, closed_minutes_ago=11.0
+    )
+    # Still open and in trouble -- if the closed one above still counted,
+    # total would be 2 and this test would (wrongly) see a block.
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_aggregates_multileg_position_correctly(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    """Regression test mirroring
+    test_reentry_cooldown_uses_last_leg_exit_for_multileg_position's
+    construction technique (a second TradeOutcome row inserted directly,
+    position_exit_leg_id=None on both -- doesn't collide with
+    uq_trade_outcome_position_leg since Postgres doesn't treat two NULLs as
+    equal). The real (later) leg exits at +250 on its own (a WIN) -- only
+    once combined with an earlier, older synthetic leg at -800 does the
+    position's true aggregate net to -550/lot, past the -300 threshold.
+    Proves both: (a) TradeOutcome.realized_pnl is SUMMED across a position's
+    legs, not just the last one, and (b) the window cutoff uses
+    MAX(TradeOutcome.closed_at) -- the earlier leg is 20 min old (outside the
+    window on its own), but the real leg is 2 min old, so the position must
+    still count.
+    """
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    first_intent = _dispatch(db, trading_session, run_a, option_contract, broker, entry_price=80.0)
+    position = db.query(Position).filter(Position.trade_intent_id == first_intent.id).one()
+
+    last_leg_outcome = close_position(
+        db, trading_session, position, ExitReason.TARGET, intended_price=90.0, broker=broker
+    )
+    assert last_leg_outcome is not None
+    assert float(last_leg_outcome.realized_pnl) == pytest.approx(250.0)
+    last_leg_outcome.closed_at = datetime.now(UTC) - timedelta(minutes=2)
+    db.add(last_leg_outcome)
+
+    earlier_leg_outcome = TradeOutcome(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        trading_session_id=trading_session.id,
+        position_id=position.id,
+        position_exit_leg_id=None,
+        trade_intent_id=first_intent.id,
+        entry_price=last_leg_outcome.entry_price,
+        exit_price=48.0,
+        qty=25,
+        realized_pnl=-800.0,
+        slippage=0.0,
+        exit_reason=ExitReason.STOP,
+        closed_at=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    db.add(earlier_leg_outcome)
+    db.flush()
+
+    # One more open trouble position, in the same direction, to reach the
+    # count-2 threshold together with the aggregated position above.
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert decision.decision == "rejected"
+    assert "same_direction_trouble_locked" in decision.reasons
+
+
+def test_cross_strategy_guard_disabled_by_kill_switch(
+    db: Session, broker, workspace, user, authorized_user, trading_session, option_contract,
+    instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    create_new_risk_limit_config_version(
+        db, workspace.id, actor_user=authorized_user, reason="disable for test",
+        cross_strategy_guard_enabled=False,
+    )
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_live_rejection_writes_system_alert_with_live_mode(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument, monkeypatch,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    intent_a = _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    intent_b = _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+    _mark_last_order_live(db, intent_a)
+    _mark_last_order_live(db, intent_b)
+
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+    monkeypatch.setattr(
+        "app.modules.risk_engine.service.get_execution_broker",
+        lambda trading_session, strategy_run=None: broker,
+    )
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+    assert "same_direction_trouble_locked" in decision.reasons
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == workspace.id,
+            SystemAlert.category == "risk_limit_breach",
+        )
+        .order_by(SystemAlert.created_at.desc())
+        .first()
+    )
+    assert alert is not None
+    assert alert.mode == OrderMode.LIVE
+
+
+def test_cross_strategy_guard_paper_rejection_writes_system_alert_with_paper_mode(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="ema_micro_pullback"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+    assert "same_direction_trouble_locked" in decision.reasons
+
+    alert = (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.workspace_id == workspace.id,
+            SystemAlert.category == "risk_limit_breach",
+        )
+        .order_by(SystemAlert.created_at.desc())
+        .first()
+    )
+    assert alert is not None
+    assert alert.mode == OrderMode.PAPER
+
+
+def test_cross_strategy_guard_does_not_apply_to_one_shot_strategy(
+    db: Session, broker, workspace, user, trading_session, option_contract, instrument,
+):
+    """A one-shot-per-direction strategy (see _CROSS_STRATEGY_GUARD_EXCLUDED's
+    own comment — sets `_fired_directions` before risk evaluation ever runs,
+    so any rejection here would permanently cancel that direction for the
+    rest of the trading day) must never be blocked by Guard 1, no matter how
+    much trouble other strategies are in. Same 2-open-loser setup as
+    test_cross_strategy_guard_blocks_when_two_open_losers_same_direction —
+    only the evaluated run's strategy_type differs.
+    """
+    contract_b = _make_contract(db, instrument, 22050, OptionType.CE)
+    contract_c = _make_contract(db, instrument, 22100, OptionType.CE)
+    run_a = _make_strategy_run(db, workspace, user, trading_session, "guard1-a")
+    run_b = _make_strategy_run(db, workspace, user, trading_session, "guard1-b")
+    run_c = _make_strategy_run(
+        db, workspace, user, trading_session, "guard1-c", strategy_type="orb"
+    )
+
+    _open_trouble_position(db, trading_session, run_a, option_contract, broker)
+    _open_trouble_position(db, trading_session, run_b, contract_b, broker)
+
+    third = _make_trade_intent(db, trading_session, run_c, contract_c)
+    decision = evaluate_trade_intent(db, third, trading_session, run_c)
+
+    assert "same_direction_trouble_locked" not in decision.reasons
+
+
+def test_cross_strategy_guard_allowlist_covers_all_known_strategy_types() -> None:
+    """Guardrail against a silently-uncategorized strategy_type: every value
+    in api.v1.strategies.KNOWN_STRATEGY_TYPES must appear in exactly one of
+    _CROSS_STRATEGY_GUARD_APPLIES_TO / _CROSS_STRATEGY_GUARD_EXCLUDED. A
+    brand-new or renamed strategy_type that lands in neither would silently
+    fall out of the guard (opt-in default), which may be correct — but it
+    must be a deliberate decision, not an oversight. See
+    feedback_one_shot_guard_isolation memory for the classification
+    criterion (does it latch a fired-direction / fire only ~1-3x/day per
+    direction -> exclude; does it re-evaluate continuously and legitimately
+    retry -> include).
+    """
+    assert _CROSS_STRATEGY_GUARD_APPLIES_TO & _CROSS_STRATEGY_GUARD_EXCLUDED == set()
+    assert _CROSS_STRATEGY_GUARD_APPLIES_TO | _CROSS_STRATEGY_GUARD_EXCLUDED == KNOWN_STRATEGY_TYPES
 
 
 def test_evaluate_trade_intent_max_concurrent_positions(

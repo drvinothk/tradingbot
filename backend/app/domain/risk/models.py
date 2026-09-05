@@ -39,6 +39,7 @@ class RiskLimitConfig(Base, UUIDPkMixin, TimestampMixin):
     daily_loss_cap: Mapped[float] = mapped_column(Numeric(14, 2))
     daily_target_profit: Mapped[float] = mapped_column(Numeric(14, 2))
     per_trade_lot_cap: Mapped[int] = mapped_column(Integer)
+    cross_strategy_guard_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
     __table_args__ = (
         Index("ix_risk_limit_configs_workspace_active", "workspace_id", "is_active"),

@@ -949,6 +949,15 @@ def _seed_backtest_entities(
             daily_loss_cap=Decimal("10000000"),
             daily_target_profit=Decimal("10000000"),
             per_trade_lot_cap=10,
+            # Guard 1 (cross-strategy same-direction trouble lock) is a
+            # directional-clustering guard evaluated against real multi-
+            # strategy concurrent activity -- this backtest runner exercises
+            # one config at a time against evaluate_trade_intent with every
+            # other risk knob already set permissively high specifically so
+            # unrelated risk checks don't interfere with backtest results.
+            # Guard 1 is the same kind of noise here; disabled for the same
+            # reason.
+            cross_strategy_guard_enabled=False,
         )
         db.add(risk_config)
         db.flush()

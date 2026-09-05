@@ -456,6 +456,7 @@ class RiskDefaults(BaseSettings):
     daily_loss_cap: float = 5000.0
     daily_target_profit: float = 5000.0
     per_trade_lot_cap: int = 1
+    cross_strategy_guard_enabled: bool = True
     default_budget: float = 50000.0
 
 
