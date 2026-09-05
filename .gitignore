@@ -65,3 +65,7 @@ backend/data/
 
 # Backtest engine bundle (424M archive + pinned app snapshot; movable to A1)
 backtest_engine/
+
+# Isolated Shoonya auto-login engine — deployed to A1 only, never to GitHub
+# (its own systemd timer, zero import from app/). See backend/autologin/README.md.
+backend/autologin/
