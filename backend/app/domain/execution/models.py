@@ -319,6 +319,15 @@ class StopPlan(Base, UUIDPkMixin):
     # keep disagreeing) rather than only on the next real tightening event.
     # `None` whenever `resting_order_id` is `None` (cleared together).
     resting_order_price: Mapped[float | None] = mapped_column(Numeric(12, 4), nullable=True)
+    # Fire-now-exit state (migration 0037, 2026-09-07). `exit_fired_at` is
+    # set the moment a fire-now `ModifyOrder` on `resting_order_id` is
+    # confirmed by `exit_via_resting_stop` -- the idempotency signal so the
+    # ~3s poll doesn't re-modify every cycle while the async fill is pending.
+    # `exit_fire_attempts` counts *failed* fire-now modifies; a position with
+    # a resting order never creates `exit:{id}` order rows, so this is what
+    # drives `_MAX_EXIT_ORDER_ATTEMPTS` -> exhaustion for that path.
+    exit_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit_fire_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

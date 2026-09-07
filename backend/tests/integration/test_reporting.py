@@ -30,7 +30,11 @@ from app.domain.strategy.models import (
 )
 from app.modules.broker_adapter.base.contracts import BrokerOrderStatus, OrderRequest, OrderResult
 from app.modules.broker_adapter.mock.adapter import MockBrokerAdapter
-from app.modules.execution_engine.paper.service import close_position, dispatch_trade_intent
+from app.modules.execution_engine.paper.service import (
+    close_position,
+    dispatch_trade_intent,
+    reconcile_pending_live_exit_orders,
+)
 from app.modules.reporting.service import build_daily_report, build_scorecard
 
 EXPIRY = date(2026, 7, 30)
@@ -317,6 +321,34 @@ class _FakeLiveBroker:
                 return cancelled
         raise KeyError(f"Unknown fake order: {broker_order_id}")
 
+    def modify_order(self, broker_order_id: str, **changes: object) -> OrderResult:
+        # 2026-09-07: a LIVE exit now drives the resting SL-LMT to fire via
+        # ModifyOrder (`exit_via_resting_stop`). Accepting the modify is
+        # enough -- `reconcile_pending_live_exit_orders` polls the fill.
+        return OrderResult(
+            idempotency_key=broker_order_id,
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.OPEN,
+            filled_qty=0,
+            avg_fill_price=None,
+        )
+
+    def get_order_status(self, broker_order_id: str) -> OrderResult:
+        assert self.fill_price is not None
+        return OrderResult(
+            idempotency_key=broker_order_id,
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=self.fill_price,
+        )
+
+    def peek_cached_order_update(self, broker_order_id: str) -> OrderResult | None:
+        return None
+
+    def get_recent_trades(self, contract_symbol: str) -> list:
+        return []
+
     def get_positions(self) -> list:
         return []
 
@@ -385,10 +417,16 @@ def test_build_daily_report_mode_filter_separates_live_from_paper_trades(
     assert live_position.status == PositionStatus.OPEN  # not the "stop fired at placement" path
 
     live_broker.fill_price = 92.0
-    live_outcome = close_position(
+    # LIVE exit fires the resting SL-LMT via ModifyOrder and returns None
+    # (FIRED_PENDING); the fill is picked up asynchronously.
+    close_position(
         db, trading_session, live_position, ExitReason.STOP, 92.0, broker=live_broker  # type: ignore[arg-type]
     )
-    assert live_outcome is not None
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=live_broker  # type: ignore[arg-type]
+    )
+    db.refresh(live_position)
+    assert live_position.status == PositionStatus.CLOSED
 
     unfiltered = build_daily_report(db, trading_session)
     assert unfiltered.trade_count == 2

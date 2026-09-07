@@ -149,6 +149,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "protective_stop_cancel_failed",
         "protective_stop_cancel_unresolved",
         "exit_order_unfilled",
+        "exit_order_attempts_exhausted",
         "margin_breach_square_off",
         "daily_loss_cap_breached",
         "reconciliation_mismatch",
@@ -202,6 +203,10 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "exit_order_unfilled": (
         "Confirm the exit in the broker's order book -- the position may still be "
         "open longer than expected."
+    ),
+    "exit_order_attempts_exhausted": (
+        "Automatic exit retries are exhausted -- square off this position directly "
+        "in the broker app now, then Manual Reconcile it in the Control Room."
     ),
     "margin_breach_square_off": (
         "Review margin usage and confirm the emergency square-off actually closed "

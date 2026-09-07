@@ -840,8 +840,13 @@ def _close_leg_locked(
     broker: BrokerPort,
     order_mode: OrderMode,
 ) -> TradeOutcome | None:
+    from app.modules.execution_engine.paper.protective_stop import (
+        ExitViaStopOutcome,
+        exit_via_resting_stop,
+    )
     from app.modules.execution_engine.paper.service import (
         _MAX_EXIT_ORDER_ATTEMPTS,
+        _handle_exit_attempts_exhausted,
         _resolve_order_pricing,
     )
 
@@ -851,6 +856,49 @@ def _close_leg_locked(
     instrument = db.get(Instrument, option_contract.instrument_id)
     if instrument is None:
         raise ValueError(f"unknown instrument for option_contract {option_contract.id}")
+
+    # 2026-09-07: a LIVE legged position exits through its ONE whole-position
+    # carrier SL-LMT (`build_carrier_stop_plan`), driven to fire now via one
+    # `ModifyOrder` -- never a fresh per-leg `LIMIT` sell, which Shoonya RMS
+    # margin-rejects as a naked short on a thin account (the incident). One
+    # broker order can only fire once, so any leg's exit trigger flattens
+    # the whole remaining position: `reconcile_pending_live_exit_orders`
+    # routes the carrier fill to `finalize_all_open_legs_from_one_fill`,
+    # which still writes one `TradeOutcome` per leg. Staggered per-leg live
+    # exits would need one resting SL-LMT *per leg* -- deferred (see the
+    # 2026-09-07 exit-path redesign notes).
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
+    if (
+        order_mode == OrderMode.LIVE
+        and carrier is not None
+        and carrier.resting_order_id is not None
+    ):
+        fire_outcome = exit_via_resting_stop(
+            db,
+            trading_session,
+            position,
+            carrier,
+            exit_reason,
+            float(intended_price),
+            position.qty,
+            broker,
+        )
+        if fire_outcome is ExitViaStopOutcome.FIRED_PENDING:
+            return None
+        if fire_outcome is ExitViaStopOutcome.MODIFY_FAILED:
+            if carrier.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
+                _handle_exit_attempts_exhausted(
+                    db,
+                    broker,
+                    trading_session,
+                    position,
+                    option_contract,
+                    order_mode,
+                    attempts=carrier.exit_fire_attempts,
+                )
+            return None
+        # ExitViaStopOutcome.NO_RESTING_ORDER -- fall through to the per-leg
+        # fresh-`LIMIT` path (degraded: entry-time carrier placement failed).
 
     exit_side = _opposite(SignalSide(position.side))
     now = _utcnow()

@@ -309,6 +309,93 @@ def cancel_resting_protective_stop(
     return CancelOutcome.FAILED
 
 
+def _modify_resting_order(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    resting_order_id: str,
+    desired_trigger_price: Decimal,
+    new_qty: int,
+    broker: BrokerPort | None,
+    *,
+    context: str,
+    fail_alert_category: str,
+    extra_modify_kwargs: dict[str, object] | None = None,
+) -> Decimal | None:
+    """Shared body of every resting-SL-LMT `ModifyOrder` in this module
+    (`sync_resting_protective_stop` TSL tightening, `resize_resting_protective_
+    stop` carrier shrink, `exit_via_resting_stop` fire-now). Resolves the
+    contract/instrument/broker, tick-rounds the trigger plus a buffered limit,
+    issues exactly one `broker.modify_order`, and on any failure logs a WARNING
+    + raises a WARNING `SystemAlert` in `fail_alert_category` — never raises to
+    the caller (same "never leave the position worse off, never crash the
+    caller" contract every helper in this file makes).
+
+    Returns the tick-rounded trigger `Decimal` on success (the caller persists
+    its own `stop_plan` fields from it) or `None` on any failure / unresolvable
+    contract. `extra_modify_kwargs` is merged into the `modify_order` call
+    verbatim (e.g. `{"order_type": ...}` for the fire-now conversion); Shoonya
+    requires `qty` on every `ModifyOrder` regardless of what is changing, so it
+    is always sent.
+    """
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    if option_contract is None:
+        return None
+    instrument = db.get(Instrument, option_contract.instrument_id)
+    if instrument is None:
+        return None
+
+    exit_side = _opposite(SignalSide(position.side))
+    tick_size = _dec(instrument.tick_size)
+    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
+    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
+    limit_price = _round_to_tick(
+        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    )
+
+    from app.modules.execution_engine.paper.service import resolve_broker_for_position
+
+    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
+
+    modify_kwargs: dict[str, object] = {
+        "contract_symbol": option_contract.symbol,
+        "trigger_price": float(trigger_price),
+        "limit_price": float(limit_price),
+        "qty": new_qty,
+    }
+    if extra_modify_kwargs:
+        modify_kwargs.update(extra_modify_kwargs)
+
+    try:
+        resolved_broker.modify_order(resting_order_id, **modify_kwargs)
+    except Exception:  # noqa: BLE001 - see place_protective_stop's identical reasoning
+        logger.warning(
+            "%s failed for position %s (resting order %s) -- resting stop left armed at "
+            "its last confirmed level; will retry next cycle",
+            context,
+            position.id,
+            resting_order_id,
+            exc_info=True,
+        )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.WARNING,
+            category=fail_alert_category,
+            message=(
+                f"{context} failed for position {position.id}; resting stop still armed "
+                f"at its last confirmed level, not yet {float(trigger_price)}."
+            ),
+            mode=OrderMode.LIVE,
+            dedup_key=f"{fail_alert_category}:{position.id}",
+        )
+        db.flush()
+        return None
+
+    return trigger_price
+
+
 def sync_resting_protective_stop(
     db: Session,
     trading_session: TradingSession,
@@ -345,89 +432,38 @@ def sync_resting_protective_stop(
     that: the position is not left unprotected, just running on its last
     confirmed level.
     """
+    # Skip a redundant ModifyOrder when the tick-rounded trigger wouldn't
+    # actually change at the broker -- `desired_trigger_price` creeps by
+    # sub-tick amounts most cycles.
     option_contract = db.get(OptionContract, position.option_contract_id)
     if option_contract is None:
         return
     instrument = db.get(Instrument, option_contract.instrument_id)
     if instrument is None:
         return
-
     exit_side = _opposite(SignalSide(position.side))
-    tick_size = _dec(instrument.tick_size)
-    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
-
-    # Compare tick-*rounded* values, not the raw Decimal the trail
-    # arithmetic produced -- `desired_trigger_price` creeps by sub-tick
-    # amounts most cycles, which would otherwise trigger a redundant
-    # ModifyOrder call even when the actual price at the broker wouldn't
-    # change at all once rounded.
+    rounded = _round_to_tick(desired_trigger_price, _dec(instrument.tick_size), exit_side)
     current_price = (
         _dec(stop_plan.resting_order_price) if stop_plan.resting_order_price is not None else None
     )
-    if current_price is not None and current_price == trigger_price:
+    if current_price is not None and current_price == rounded:
         return
 
-    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-    limit_price = _round_to_tick(
-        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    confirmed_trigger = _modify_resting_order(
+        db,
+        trading_session,
+        position,
+        resting_order_id,
+        desired_trigger_price,
+        position.qty,
+        broker,
+        context="TSL sync",
+        fail_alert_category="protective_stop_modify_failed",
     )
-
-    from app.modules.execution_engine.paper.service import resolve_broker_for_position
-
-    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
-
-    try:
-        resolved_broker.modify_order(
-            resting_order_id,
-            contract_symbol=option_contract.symbol,
-            trigger_price=float(trigger_price),
-            limit_price=float(limit_price),
-            # 2026-09-01: Shoonya's real ModifyOrder rejects with "ORA: no
-            # qty field in modify" if qty is omitted -- live-confirmed the
-            # same day (order 26090100261986, NIFTY01SEP26P24100) cascading
-            # into a cancel/re-exit that also fumbled its own synchronous
-            # fill detection (exit_order_unfilled). qty is unchanged by a
-            # TSL price sync, but Shoonya requires it on every ModifyOrder
-            # call regardless of which fields are actually changing.
-            qty=position.qty,
-        )
-    except Exception:  # noqa: BLE001 - see place_protective_stop's identical reasoning
-        # Broader than `BrokerError` deliberately -- `evaluate_open_
-        # position` has nothing wrapping this specific call, so an uncaught
-        # exception here would abort the rest of *this* position's own
-        # evaluation this cycle (stop/target/trail checks after the TSL
-        # sync). PositionManager's own per-position loop (its caller) has
-        # had its own try/except since 2026-08-25, so it would still catch
-        # this and move on to the next position rather than aborting the
-        # whole cycle -- but this function shouldn't rely on that outer
-        # safety net to avoid leaving its own TSL-sync step half-done.
-        logger.warning(
-            "TSL sync failed for position %s (resting order %s) -- resting stop stays "
-            "armed at its last confirmed price %s, not the newly tightened %s; will "
-            "retry next cycle",
-            position.id,
-            resting_order_id,
-            stop_plan.resting_order_price,
-            float(trigger_price),
-            exc_info=True,
-        )
-        send_alert(
-            db,
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            severity=AlertSeverity.WARNING,
-            category="protective_stop_modify_failed",
-            message=(
-                f"TSL modify failed for position {position.id}; resting stop still "
-                f"armed at {stop_plan.resting_order_price}, not yet {float(trigger_price)}."
-            ),
-            mode=OrderMode.LIVE,
-            dedup_key=f"protective_stop_modify_failed:{position.id}",
-        )
-        db.flush()
+    if confirmed_trigger is None:
         return
 
-    stop_plan.resting_order_price = float(trigger_price)
+    stop_plan.resting_order_price = float(confirmed_trigger)
     stop_plan.updated_at = _utcnow()
     db.add(stop_plan)
     db.flush()
@@ -457,62 +493,140 @@ def resize_resting_protective_stop(
     fails, then the app disconnects, then price reaches the trigger), which
     reconciliation would then catch and lock on.
     """
-    option_contract = db.get(OptionContract, position.option_contract_id)
-    if option_contract is None:
-        return
-    instrument = db.get(Instrument, option_contract.instrument_id)
-    if instrument is None:
-        return
-
-    exit_side = _opposite(SignalSide(position.side))
-    tick_size = _dec(instrument.tick_size)
-    trigger_price = _round_to_tick(desired_trigger_price, tick_size, exit_side)
-    buffer_pct = _dec(get_settings().app.live_limit_order_buffer_pct)
-    limit_price = _round_to_tick(
-        _apply_slippage(trigger_price, exit_side, buffer_pct), tick_size, exit_side
+    confirmed_trigger = _modify_resting_order(
+        db,
+        trading_session,
+        position,
+        resting_order_id,
+        desired_trigger_price,
+        new_qty,
+        broker,
+        context="carrier stop resize",
+        fail_alert_category="protective_stop_resize_failed",
     )
-
-    from app.modules.execution_engine.paper.service import resolve_broker_for_position
-
-    resolved_broker = broker or resolve_broker_for_position(db, trading_session, position)
-    try:
-        resolved_broker.modify_order(
-            resting_order_id,
-            contract_symbol=option_contract.symbol,
-            trigger_price=float(trigger_price),
-            limit_price=float(limit_price),
-            qty=new_qty,
-        )
-    except Exception:  # noqa: BLE001 - see place_protective_stop's identical reasoning
-        logger.warning(
-            "carrier stop resize failed for position %s (resting order %s) -- leaving it "
-            "armed at the previous (larger) qty %s / price %s; it only fires on a dead "
-            "poll anyway",
-            position.id,
-            resting_order_id,
-            stop_plan.qty,
-            stop_plan.resting_order_price,
-            exc_info=True,
-        )
-        send_alert(
-            db,
-            workspace_id=trading_session.workspace_id,
-            trading_session_id=trading_session.id,
-            severity=AlertSeverity.WARNING,
-            category="protective_stop_resize_failed",
-            message=(
-                f"Carrier stop resize failed for position {position.id}; still armed at "
-                f"qty {stop_plan.qty} / {stop_plan.resting_order_price}."
-            ),
-            mode=OrderMode.LIVE,
-            dedup_key=f"protective_stop_resize_failed:{position.id}",
-        )
-        db.flush()
+    if confirmed_trigger is None:
         return
 
     stop_plan.qty = new_qty
     stop_plan.stop_price = float(desired_trigger_price)
-    stop_plan.resting_order_price = float(trigger_price)
+    stop_plan.resting_order_price = float(confirmed_trigger)
     stop_plan.updated_at = _utcnow()
     db.add(stop_plan)
     db.flush()
+
+
+class ExitViaStopOutcome(enum.Enum):
+    """Result of `exit_via_resting_stop` — plumbing for `close_position` /
+    the legged exit path, not a domain concept."""
+
+    FIRED_PENDING = "fired_pending"
+    MODIFY_FAILED = "modify_failed"
+    NO_RESTING_ORDER = "no_resting_order"
+
+
+def exit_via_resting_stop(
+    db: Session,
+    trading_session: TradingSession,
+    position: Position,
+    stop_plan: StopPlan,
+    exit_reason: ExitReason,
+    ltp: float,
+    qty: int,
+    broker: BrokerPort | None,
+) -> ExitViaStopOutcome:
+    """LIVE exit for a position that already has a resting broker SL-LMT:
+    drive that order to fire *now* via one `ModifyOrder` instead of
+    cancelling it and placing a fresh `LIMIT` sell.
+
+    Why: a fresh plain-`LIMIT` sell of a long option is margin-checked by
+    Shoonya's RMS as a *new naked short* (full SPAN) and rejected on a thin
+    account -- the 2026-09-07 live incident, twice. Modifying the
+    already-accepted SL-LMT to a fire-now trigger (`ltp - 1 tick`, the
+    max-below-LTP a sell stop allows) with a marketable buffered limit is
+    the same order, same type, same direction of trigger movement as
+    `sync_resting_protective_stop`'s trail-tighten -- the RMS-lightest exit.
+
+    Never raises (delegates to `_modify_resting_order`, which owns the
+    WARNING-alert-and-return-`None` contract). Returns:
+
+    - `NO_RESTING_ORDER` -- `stop_plan.resting_order_id` (or its `Order`
+      row) is absent; the caller falls back to the fresh-`LIMIT` path
+      (only reachable when entry-time SL placement already failed + alerted).
+    - `FIRED_PENDING` -- the modify is confirmed (or was already fired on a
+      prior cycle: `stop_plan.exit_fired_at` set). The async
+      `reconcile_pending_live_exit_orders` owns finalization from here,
+      using `Order.intended_exit_reason` (persisted below) so a
+      late-discovered fill reports the real reason, not generic STOP.
+    - `MODIFY_FAILED` -- this attempt's modify failed;
+      `stop_plan.exit_fire_attempts` is bumped, the caller retries next
+      cycle, and `_MAX_EXIT_ORDER_ATTEMPTS` bumps escalate to the
+      exhaustion path (a resting-order position never creates `exit:{id}`
+      rows, so the `Order`-count exhaustion check can't see it).
+    """
+    from app.modules.execution_engine.paper.service import _MAX_EXIT_ORDER_ATTEMPTS
+
+    resting_order_id = stop_plan.resting_order_id
+    if resting_order_id is None:
+        return ExitViaStopOutcome.NO_RESTING_ORDER
+
+    # Idempotency: already fired -- do not re-`ModifyOrder` every ~3s poll
+    # while the async fill is pending.
+    if stop_plan.exit_fired_at is not None:
+        return ExitViaStopOutcome.FIRED_PENDING
+
+    # Retries exhausted -- stop bumping the counter / re-hitting the broker;
+    # the caller's `>= _MAX_EXIT_ORDER_ATTEMPTS` check routes to
+    # `_handle_exit_attempts_exhausted` (which keeps retrying auto-repair).
+    if stop_plan.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
+        return ExitViaStopOutcome.MODIFY_FAILED
+
+    stop_order = (
+        db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one_or_none()
+    )
+    if stop_order is None:
+        return ExitViaStopOutcome.NO_RESTING_ORDER
+
+    option_contract = db.get(OptionContract, position.option_contract_id)
+    instrument = (
+        db.get(Instrument, option_contract.instrument_id) if option_contract is not None else None
+    )
+    if option_contract is None or instrument is None:
+        return ExitViaStopOutcome.MODIFY_FAILED
+
+    now = _utcnow()
+    # Persist intent BEFORE the modify -- a crash after the broker acts must
+    # still let reconciliation report the real reason and the right qty.
+    stop_order.intended_exit_reason = exit_reason
+    stop_order.qty = qty
+    db.add(stop_order)
+    db.flush()
+
+    tick_size = _dec(instrument.tick_size)
+    fire_trigger = _dec(ltp) - tick_size
+    if fire_trigger <= 0:
+        fire_trigger = tick_size
+
+    confirmed_trigger = _modify_resting_order(
+        db,
+        trading_session,
+        position,
+        resting_order_id,
+        fire_trigger,
+        qty,
+        broker,
+        context="fire-now exit",
+        fail_alert_category="protective_stop_exit_modify_failed",
+    )
+    if confirmed_trigger is None:
+        stop_plan.exit_fire_attempts += 1
+        stop_plan.updated_at = now
+        db.add(stop_plan)
+        db.flush()
+        return ExitViaStopOutcome.MODIFY_FAILED
+
+    stop_plan.exit_fired_at = now
+    stop_plan.resting_order_price = float(confirmed_trigger)
+    stop_plan.updated_at = now
+    db.add(stop_plan)
+    db.flush()
+    return ExitViaStopOutcome.FIRED_PENDING

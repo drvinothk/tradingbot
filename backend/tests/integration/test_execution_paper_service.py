@@ -61,6 +61,7 @@ from app.modules.broker_adapter.base.contracts import OrderSide as ContractOrder
 from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
 from app.modules.execution_engine.paper.service import (
+    _MAX_EXIT_ORDER_ATTEMPTS,
     close_position,
     close_position_from_external_fill,
     dispatch_trade_intent,
@@ -1250,13 +1251,20 @@ def test_close_position_auto_repairs_from_a_real_broker_fill_after_max_attempts(
     )
 
     inner = MockBrokerAdapter()
-    live_broker = _FakeLiveDelegatingBroker(inner)
-    # A LIVE entry fill also places a real protective SL-LMT immediately
-    # after -- the mock always fills synchronously by default, which would
-    # otherwise finalize the position as STOP right here before this test
-    # ever gets to its own exhaustion loop. Queue the entry's own fill
-    # explicitly, then a PENDING ack for the stop placement, matching
-    # test_reconciliation.py's identical setup for the same reason.
+
+    class _RaisingModifyBroker(_FakeLiveDelegatingBroker):
+        """2026-09-07 incident shape: a LIVE position has an accepted resting
+        SL-LMT, so `close_position` drives it to fire via `ModifyOrder`
+        (never a fresh `exit:{id}` LIMIT) -- and Shoonya RMS rejects that
+        modify (margin shortfall)."""
+
+        def modify_order(self, *args: object, **kwargs: object) -> object:
+            raise BrokerError("RED:Margin Shortfall")
+
+    live_broker = _RaisingModifyBroker(inner)
+    # LIVE entry fill, then a PENDING ack for the protective SL-LMT placement
+    # (the mock fills synchronously by default, which would otherwise
+    # finalize the position as STOP before this test's own loop).
     inner.queue_fill_scenario(
         option_contract.symbol, FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0)
     )
@@ -1267,28 +1275,26 @@ def test_close_position_auto_repairs_from_a_real_broker_fill_after_max_attempts(
     dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
     position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
     assert position.status == PositionStatus.OPEN
-    assert position.opening_order_id is not None
-    opening_order = db.get(Order, position.opening_order_id)
-    assert opening_order is not None and opening_order.mode == OrderMode.LIVE
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.resting_order_id is not None  # LIVE entry armed a resting SL-LMT
 
-    for _ in range(5):
-        inner.queue_fill_scenario(
-            option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
-        )
+    # Each attempt drives `exit_via_resting_stop`, whose `ModifyOrder` is
+    # rejected -> `exit_fire_attempts` bumps. No `exit:{id}` LIMIT orders are
+    # ever placed on the resting-order path.
+    for _ in range(_MAX_EXIT_ORDER_ATTEMPTS - 1):
         outcome = close_position(
             db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
             broker=live_broker,  # type: ignore[arg-type]
         )
         assert outcome is None
-    # 1 protective-stop order (placed at entry, LIVE-only) + 5 exit attempts
-    # both carry `position_id` -- filter to just the exit-attempt lineage
-    # (`exit:{position_id}%`), matching exactly what the internal
-    # `_MAX_EXIT_ORDER_ATTEMPTS` count itself filters on.
-    exit_attempt_filter = Order.idempotency_key.like(f"exit:{position.id}%")
-    exit_attempt_count = (
-        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
+    db.refresh(stop_plan)
+    assert stop_plan.exit_fire_attempts == _MAX_EXIT_ORDER_ATTEMPTS - 1
+    assert (
+        db.query(Order)
+        .filter(Order.idempotency_key.like(f"exit:{position.id}%"))
+        .count()
+        == 0
     )
-    assert exit_attempt_count == 5
 
     real_fill = TradeFill(
         broker_order_id="SHOONYA-MANUAL-1",
@@ -1299,23 +1305,18 @@ def test_close_position_auto_repairs_from_a_real_broker_fill_after_max_attempts(
         ts=datetime.now(UTC),
     )
 
-    class _RepairBroker(_FakeLiveDelegatingBroker):
+    class _RepairBroker(_RaisingModifyBroker):
         def get_recent_trades(self, contract_symbol: str) -> list[TradeFill]:
             return [real_fill] if contract_symbol == option_contract.symbol else []
 
-    # 6th call: attempts are exhausted -- must auto-repair from the real
-    # fill instead of alerting.
+    # This attempt tips `exit_fire_attempts` to the cap -> the exhaustion
+    # handler -> auto-repair from the real broker fill -> CLOSED, no
+    # `exit_order_attempts_exhausted` alert.
     outcome = close_position(
         db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
         broker=_RepairBroker(inner),  # type: ignore[arg-type]
     )
-    assert outcome is None  # mirrors close_position's own "closed via another path" contract
-    # Still 5 -- no 6th exit-attempt order placed (repaired via the recovered
-    # fill instead).
-    exit_attempt_count = (
-        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
-    )
-    assert exit_attempt_count == 5
+    assert outcome is None
     db.refresh(position)
     assert position.status == PositionStatus.CLOSED
 
@@ -1351,7 +1352,12 @@ def test_close_position_still_alerts_when_auto_repair_finds_no_matching_fill(
     )
 
     inner = MockBrokerAdapter()
-    live_broker = _FakeLiveDelegatingBroker(inner)
+
+    class _RaisingModifyBroker(_FakeLiveDelegatingBroker):
+        def modify_order(self, *args: object, **kwargs: object) -> object:
+            raise BrokerError("RED:Margin Shortfall")
+
+    live_broker = _RaisingModifyBroker(inner)
     # Same protective-stop-fills-synchronously gotcha as the previous test.
     inner.queue_fill_scenario(
         option_contract.symbol, FillScenario(status=BrokerOrderStatus.FILLED, avg_fill_price=80.0)
@@ -1363,24 +1369,22 @@ def test_close_position_still_alerts_when_auto_repair_finds_no_matching_fill(
     dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
     position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
     assert position.status == PositionStatus.OPEN
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.resting_order_id is not None
 
-    for _ in range(6):
-        inner.queue_fill_scenario(
-            option_contract.symbol, FillScenario(status=BrokerOrderStatus.REJECTED)
-        )
+    for _ in range(_MAX_EXIT_ORDER_ATTEMPTS):
         outcome = close_position(
             db, trading_session, position, ExitReason.MANUAL, intended_price=80.0,
             broker=live_broker,  # type: ignore[arg-type]
         )
         assert outcome is None
 
-    # 1 protective-stop order (LIVE-only, placed at entry) + 5 exit attempts
-    # both carry `position_id` -- filter to just the exit-attempt lineage.
-    exit_attempt_filter = Order.idempotency_key.like(f"exit:{position.id}%")
-    exit_attempt_count = (
-        db.query(Order).filter(Order.position_id == position.id, exit_attempt_filter).count()
+    assert (
+        db.query(Order)
+        .filter(Order.idempotency_key.like(f"exit:{position.id}%"))
+        .count()
+        == 0
     )
-    assert exit_attempt_count == 5
     db.refresh(position)
     assert position.status == PositionStatus.OPEN
 
@@ -1856,41 +1860,47 @@ def test_reconcile_pending_live_exit_orders_uses_the_recorded_intended_reason(
     assert trail_plan.status == TrailPlanStatus.TRIGGERED
 
 
-def test_reconcile_pending_live_exit_orders_protective_stop_wins_over_intended_reason(
+def test_reconcile_pending_live_exit_orders_stop_reports_fire_now_reason(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
-    """Defensive: `is_protective_stop` (from the `stop:` idempotency-key
-    prefix) must take priority over `intended_exit_reason` even in this
-    contrived combination that shouldn't occur in practice (`_place_
-    protective_stop` never sets `intended_exit_reason`) — a resting
-    protective stop's own fill is always a genuine STOP exit by
-    construction, regardless of what any other field says.
+    """2026-09-07: `exit_via_resting_stop` fires the resting SL-LMT for a
+    deliberate non-STOP exit (trail/target/EOD/...) and records that reason
+    on the `stop:` order via `intended_exit_reason`. A `stop:` order whose
+    fill is discovered late by reconciliation must therefore report that
+    reason -- NOT generic STOP -- when `intended_exit_reason` is set. A
+    `stop:` order WITHOUT it (a genuine trigger-hit) still reports STOP.
     """
-    position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
-    exit_order = _make_pending_live_exit_order(
-        db,
-        trading_session,
-        position,
-        broker_order_id="STOP-1",
-        idempotency_key=f"stop:{position.id}",
-        intended_exit_reason=ExitReason.TARGET,
-    )
-    fake_broker = _FakeOrderStatusBroker(
-        cached_result=OrderResult(
-            idempotency_key=exit_order.idempotency_key,
-            broker_order_id=exit_order.broker_order_id,
-            status=BrokerOrderStatus.FILLED,
-            filled_qty=position.qty,
-            avg_fill_price=80.0,
+    for reason_set, expected in (
+        (ExitReason.TARGET, ExitReason.TARGET),  # fire-now exit
+        (None, ExitReason.STOP),  # genuine trigger hit
+    ):
+        position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+        exit_order = _make_pending_live_exit_order(
+            db,
+            trading_session,
+            position,
+            broker_order_id=f"STOP-{expected.value}",
+            idempotency_key=f"stop:{position.id}",
+            intended_exit_reason=reason_set,
         )
-    )
+        fake_broker = _FakeOrderStatusBroker(
+            cached_result=OrderResult(
+                idempotency_key=exit_order.idempotency_key,
+                broker_order_id=exit_order.broker_order_id,
+                status=BrokerOrderStatus.FILLED,
+                filled_qty=position.qty,
+                avg_fill_price=80.0,
+            )
+        )
 
-    reconcile_pending_live_exit_orders(
-        db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
-    )
+        reconcile_pending_live_exit_orders(
+            db, trading_session, allow_rest_fallback=False, broker=fake_broker  # type: ignore[arg-type]
+        )
 
-    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
-    assert outcome.exit_reason == ExitReason.STOP
+        outcome = (
+            db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+        )
+        assert outcome.exit_reason == expected
 
 
 def test_reconcile_pending_live_exit_orders_falls_back_to_rest_when_allowed(
@@ -2174,12 +2184,101 @@ class _FakeLiveBrokerWithModify:
     def cancel_order(self, broker_order_id: str) -> OrderResult:
         raise AssertionError("cancel_order should not be called in this test")
 
+    # 2026-09-07: a fire-now exit leaves the resting SL-LMT PENDING at the
+    # broker; `reconcile_pending_live_exit_orders` polls its fill. Scripted
+    # via `resting_fill_price` (None => still pending).
+    resting_fill_price: float | None = None
+
+    def peek_cached_order_update(self, broker_order_id: str) -> OrderResult | None:
+        return None
+
+    def get_order_status(self, broker_order_id: str) -> OrderResult:
+        if self.resting_fill_price is None:
+            return OrderResult(
+                idempotency_key=broker_order_id,
+                broker_order_id=broker_order_id,
+                status=BrokerOrderStatus.OPEN,
+                filled_qty=0,
+                avg_fill_price=None,
+            )
+        return OrderResult(
+            idempotency_key=broker_order_id,
+            broker_order_id=broker_order_id,
+            status=BrokerOrderStatus.FILLED,
+            filled_qty=25,
+            avg_fill_price=self.resting_fill_price,
+        )
+
+    def get_recent_trades(self, contract_symbol: str) -> list:
+        return []
+
     def get_positions(self) -> list:
         # dispatch_trade_intent/close_position both run an event-triggered
         # reconciliation pass after every real fill -- an empty book is a
         # harmless, real mismatch (local position exists, broker doesn't)
         # rather than a crash; not what these tests are exercising.
         return []
+
+
+def test_close_position_live_fires_resting_stop_and_reconciliation_finalizes_with_real_reason(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-09-07 happy path: a LIVE position with an accepted resting SL-LMT
+    exits by driving THAT order to fire (`ModifyOrder`), never a fresh
+    `exit:{id}` LIMIT. `close_position` returns `None` (FIRED_PENDING);
+    `reconcile_pending_live_exit_orders` picks up the fill and finalizes
+    with the caller's real reason (TRAIL), not generic STOP.
+    """
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=100.0, stop_price=90.0, target_price=140.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.resting_order_id is not None
+
+    outcome = close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker,  # type: ignore[arg-type]
+    )
+    assert outcome is None  # FIRED_PENDING -- async finalization
+    db.refresh(position)
+    db.refresh(stop_plan)
+    assert position.status == PositionStatus.OPEN
+    assert stop_plan.exit_fired_at is not None
+    stop_order = db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one()
+    assert stop_order.intended_exit_reason == ExitReason.TRAIL
+    # No fresh exit:{id} LIMIT was ever placed.
+    assert db.query(Order).filter(Order.idempotency_key.like(f"exit:{position.id}%")).count() == 0
+    # Idempotent: a second cycle must NOT issue a second ModifyOrder.
+    modify_count_after_fire = len(live_broker.modify_calls)
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=129.0,
+        broker=live_broker,  # type: ignore[arg-type]
+    )
+    assert len(live_broker.modify_calls) == modify_count_after_fire
+
+    # The resting order fills; reconciliation finalizes as TRAIL, not STOP.
+    live_broker.resting_fill_price = 128.0
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=live_broker  # type: ignore[arg-type]
+    )
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    to = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert to.exit_reason == ExitReason.TRAIL
+    assert float(to.exit_price) == pytest.approx(128.0)
 
 
 def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(

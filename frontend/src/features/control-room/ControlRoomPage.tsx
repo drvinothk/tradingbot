@@ -865,6 +865,7 @@ const ATTENTION_ALERT_CATEGORIES = new Set([
   'protective_stop_cancel_failed',
   'protective_stop_cancel_unresolved',
   'exit_order_unfilled',
+  'exit_order_attempts_exhausted',
   'margin_breach_square_off',
   'daily_loss_cap_breached',
   'reconciliation_mismatch',

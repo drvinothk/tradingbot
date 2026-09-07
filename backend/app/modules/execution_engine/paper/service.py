@@ -127,7 +127,9 @@ from app.modules.execution_engine.paper.order_helpers import (
 )
 from app.modules.execution_engine.paper.protective_stop import (
     CancelOutcome,
+    ExitViaStopOutcome,
     cancel_resting_protective_stop,
+    exit_via_resting_stop,
     place_protective_stop,
     sync_resting_protective_stop,
 )
@@ -904,6 +906,91 @@ def resolve_broker_for_position(
     return get_execution_broker(trading_session, strategy_run, position=position)
 
 
+def _handle_exit_attempts_exhausted(
+    db: Session,
+    broker: BrokerPort,
+    trading_session: TradingSession,
+    position: Position,
+    option_contract: OptionContract,
+    order_mode: OrderMode,
+    *,
+    attempts: int,
+) -> None:
+    """Shared terminal handling once a LIVE exit has failed
+    `_MAX_EXIT_ORDER_ATTEMPTS` times -- for both the fresh-`LIMIT` retry path
+    and the fire-now `ModifyOrder` path (`protective_stop.exit_via_resting_
+    stop`). Tries the same broker-fill auto-repair `run_reconciliation` uses
+    (a human squared it off in the broker's own app, or a resting order
+    Shoonya filled after we gave up -- `_attempt_auto_repair`, 2026-09-02)
+    before raising the CRITICAL `exit_order_attempts_exhausted` "needs
+    manual reconcile" alert.
+
+    Log-once (2026-09-07): auto-repair keeps retrying every stuck cycle, but
+    the ERROR log + a fresh alert only fire on the *first* detection (no
+    unresolved alert row yet) -- DEBUG after -- so a genuinely-stuck
+    position no longer spams journald every ~3s.
+
+    Always returns `None`: a successful auto-repair closes the position (the
+    caller reads `position.status` from the DB), a failed one leaves it OPEN
+    for the next cycle / a manual reconcile.
+    """
+    already_alerted = (
+        db.query(SystemAlert.id)
+        .filter(
+            SystemAlert.dedup_key == f"exit_order_attempts_exhausted:{position.id}",
+            SystemAlert.is_resolved.is_(False),
+        )
+        .first()
+        is not None
+    )
+    if already_alerted:
+        logger.debug(
+            "position %s: exit still exhausted (%d attempts) -- retrying auto-repair",
+            position.id,
+            attempts,
+        )
+    else:
+        logger.error(
+            "position %s: %d exit attempts all failed -- giving up automatic retries, "
+            "attempting auto-repair before alerting",
+            position.id,
+            attempts,
+        )
+
+    signed_qty = position.qty if position.side == OrderSide.BUY else -position.qty
+    try:
+        repaired = _attempt_auto_repair(
+            db, broker, trading_session, option_contract.symbol, signed_qty, order_mode
+        )
+    except Exception:  # noqa: BLE001 - an auto-repair attempt failing must never crash
+        # the exhaustion path itself; treat exactly as "not repaired".
+        logger.exception(
+            "auto-repair attempt raised for position %s -- treating as not repaired",
+            position.id,
+        )
+        repaired = False
+    if repaired:
+        return None
+
+    if not already_alerted:
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="exit_order_attempts_exhausted",
+            message=(
+                f"Position {position.id}: {attempts} exit attempts all failed; automatic "
+                f"retries exhausted and no matching broker fill was found -- square off in "
+                f"the broker app now, then Manual Reconcile "
+                f"(POST /positions/{{id}}/manual-reconcile)."
+            ),
+            mode=order_mode,
+            dedup_key=f"exit_order_attempts_exhausted:{position.id}",
+        )
+    return None
+
+
 def close_position(
     db: Session,
     trading_session: TradingSession,
@@ -966,11 +1053,51 @@ def close_position(
         # already skips itself while a resting order exists (see that
         # function's own comment), so `exit_reason` reaching here is never
         # STOP for a position with one -- every other exit reason must
-        # cancel the resting order first.
+        # deal with the resting order first.
         stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one_or_none()
-        if stop_plan is not None and stop_plan.resting_order_id is not None:
+        resting_order_id = stop_plan.resting_order_id if stop_plan is not None else None
+
+        # 2026-09-07 incident: a fresh plain-`LIMIT` sell of a long option is
+        # margin-rejected by Shoonya RMS as a *new naked short* (full SPAN)
+        # on a thin account. For a LIVE position that already has an
+        # accepted resting SL-LMT, drive *that* order to fire now via one
+        # `ModifyOrder` (RMS-light -- same order, same type, trigger moved
+        # the same direction as a trail-tighten) instead of cancel-then-
+        # fresh. The async `reconcile_pending_live_exit_orders` finalizes
+        # the fill, reporting `intended_exit_reason` (persisted by
+        # `exit_via_resting_stop`) rather than a generic STOP.
+        if order_mode == OrderMode.LIVE and stop_plan is not None and resting_order_id is not None:
+            fire_outcome = exit_via_resting_stop(
+                db,
+                trading_session,
+                position,
+                stop_plan,
+                exit_reason,
+                float(intended_price),
+                position.qty,
+                broker,
+            )
+            if fire_outcome is ExitViaStopOutcome.FIRED_PENDING:
+                return None
+            if fire_outcome is ExitViaStopOutcome.MODIFY_FAILED:
+                if stop_plan.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
+                    _handle_exit_attempts_exhausted(
+                        db,
+                        broker,
+                        trading_session,
+                        position,
+                        option_contract,
+                        order_mode,
+                        attempts=stop_plan.exit_fire_attempts,
+                    )
+                return None
+            # ExitViaStopOutcome.NO_RESTING_ORDER: `resting_order_id` was set
+            # but its local `stop:{id}` Order row is missing -- fall through
+            # to the cancel-the-orphan-then-fresh-`LIMIT` path below.
+
+        if stop_plan is not None and resting_order_id is not None:
             cancel_outcome = cancel_resting_protective_stop(
-                db, trading_session, position, stop_plan, stop_plan.resting_order_id, broker
+                db, trading_session, position, stop_plan, resting_order_id, broker
             )
             if cancel_outcome is CancelOutcome.ALREADY_FILLED:
                 # Reality beat us to it -- the resting stop fired before
@@ -1036,66 +1163,14 @@ def close_position(
 
         if needs_new_attempt:
             if len(exit_attempts) >= _MAX_EXIT_ORDER_ATTEMPTS:
-                logger.error(
-                    "position %s: %d exit order attempts all cancelled/rejected -- giving up "
-                    "automatic retries, attempting auto-repair before alerting",
-                    position.id,
-                    len(exit_attempts),
-                )
-                # 2026-09-04: before falling all the way through to a
-                # "needs manual square-off" alert, try the exact same
-                # broker-fill recovery `run_reconciliation`'s own
-                # auto-repair path already uses for a "local OPEN, broker
-                # flat" mismatch (`_attempt_auto_repair`, built 2026-09-02
-                # for precisely this incident shape) -- reused here, not
-                # duplicated, so a real broker-side fill this system missed
-                # (a manual square-off in the broker's own app, or a
-                # cancelled resting order that Shoonya actually filled
-                # moments later) gets picked up immediately instead of
-                # waiting for the next periodic reconciliation pass, and so
-                # "needs manual square-off" only ever fires when there is
-                # genuinely nothing left to recover automatically.
-                # LIVE-only by `_attempt_auto_repair`'s own deliberate scope
-                # (see its docstring) -- a PAPER exhaustion has no broker
-                # fill to recover from and falls straight through to the
-                # alert, same as before.
-                signed_qty = position.qty if position.side == OrderSide.BUY else -position.qty
-                try:
-                    repaired = _attempt_auto_repair(
-                        db, broker, trading_session, option_contract.symbol, signed_qty, order_mode
-                    )
-                except Exception:  # noqa: BLE001 - an auto-repair attempt failing must
-                    # never crash the exhaustion path itself; fall through to the
-                    # existing alert exactly as if auto-repair had declined.
-                    logger.exception(
-                        "auto-repair attempt raised for position %s -- falling through "
-                        "to the exit_order_attempts_exhausted alert",
-                        position.id,
-                    )
-                    repaired = False
-                if repaired:
-                    # Mirrors close_position's own established contract for
-                    # "closed via a path other than this function's normal
-                    # logic" (see close_position_from_external_fill's own
-                    # "lost a race" case) -- the position is genuinely
-                    # closed now, callers must read position.status from the
-                    # DB rather than trust a TradeOutcome from this return.
-                    return None
-
-                send_alert(
+                _handle_exit_attempts_exhausted(
                     db,
-                    workspace_id=trading_session.workspace_id,
-                    trading_session_id=trading_session.id,
-                    severity=AlertSeverity.CRITICAL,
-                    category="exit_order_attempts_exhausted",
-                    message=(
-                        f"Position {position.id}: {len(exit_attempts)} exit order attempts all "
-                        f"cancelled/rejected; automatic retries exhausted and no matching "
-                        f"broker fill was found to auto-repair from -- needs manual "
-                        f"reconcile (POST /positions/{{id}}/manual-reconcile)."
-                    ),
-                    mode=order_mode,
-                    dedup_key=f"exit_order_attempts_exhausted:{position.id}",
+                    broker,
+                    trading_session,
+                    position,
+                    option_contract,
+                    order_mode,
+                    attempts=len(exit_attempts),
                 )
                 return None
 
@@ -1655,15 +1730,16 @@ def _apply_resolved_pending_exit_order(
     )
 
     # `stop:` orders are this position's own resting protective SL-LMT
-    # (see `place_protective_stop`) -- distinct idempotency-key prefix
-    # from the `exit:` orders `close_position` places, so its own fill is
-    # always a genuine STOP exit regardless of anything else. Otherwise,
-    # `close_position` already recorded the caller's real reason on
-    # `intended_exit_reason` at placement time (2026-08-25) -- use it
-    # instead of defaulting to the generic `RECONCILED`, which is now only
-    # the honest answer for an order that genuinely never had one recorded
-    # (e.g. a row from before this field existed). See `ExitReason
-    # .RECONCILED`'s own docstring for the full incident this closes.
+    # (see `place_protective_stop`) -- distinct idempotency-key prefix from
+    # the `exit:` orders `close_position` places. Reason resolution
+    # (2026-08-25 mislabel fix, extended 2026-09-07 for fire-now exits):
+    #   - `intended_exit_reason` set -> use it. `exit_via_resting_stop`
+    #     records the caller's real reason (trail/target/EOD/manual/...) on
+    #     the `stop:` order before firing it, so a fire-now exit is NOT a
+    #     generic STOP; `close_position` does the same for a fresh `exit:`.
+    #   - no reason + `stop:` -> a genuine trigger-hit STOP.
+    #   - no reason + `exit:` -> `RECONCILED` (predates the field / never
+    #     had one). See `ExitReason.RECONCILED`'s own docstring.
     is_protective_stop = order.idempotency_key.startswith("stop:")
     # 2026-09-04, Part 3d: a legged position's exit orders never reach
     # `close_position` (it early-returns to `close_all_open_legs` for any
@@ -1680,10 +1756,10 @@ def _apply_resolved_pending_exit_order(
     resolved_exit_reason: ExitReason | None = None
 
     if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
-        if is_protective_stop:
-            exit_reason = ExitReason.STOP
-        elif order.intended_exit_reason is not None:
+        if order.intended_exit_reason is not None:
             exit_reason = ExitReason(order.intended_exit_reason)
+        elif is_protective_stop:
+            exit_reason = ExitReason.STOP
         else:
             exit_reason = ExitReason.RECONCILED
         resolved_exit_reason = exit_reason
@@ -2048,7 +2124,13 @@ def evaluate_open_position(
             # the same cycle `hit_trail` fires above (position is closing
             # anyway, `close_position`'s own Path B cancels the resting
             # order right after this returns).
-            if stop_plan.resting_order_id is not None:
+            #
+            # Also skipped once `exit_via_resting_stop` has driven this same
+            # resting order to fire (`exit_fired_at` set, position still
+            # OPEN pending the async fill): re-syncing its trigger back up
+            # to the trail level would *un-fire* a pending fire-now exit
+            # that wasn't trail-triggered (TARGET / structure / EOD).
+            if stop_plan.resting_order_id is not None and stop_plan.exit_fired_at is None:
                 sync_resting_protective_stop(
                     db,
                     trading_session,

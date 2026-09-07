@@ -52,6 +52,7 @@ from app.modules.execution_engine.paper.exit_legs import (
     _close_leg,
     build_carrier_stop_plan,
     build_position_exit_legs,
+    close_all_open_legs,
 )
 from app.modules.execution_engine.paper.protective_stop import (
     place_protective_stop,
@@ -696,6 +697,59 @@ def test_late_resolved_per_leg_exit_order_closes_only_that_leg(
         db.query(TradeOutcome).filter(TradeOutcome.position_exit_leg_id == leg0.id).one()
     )
     assert float(outcome.exit_price) == pytest.approx(91.5)
+
+
+def test_live_legged_exit_fires_the_carrier_not_per_leg_orders(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-07: a LIVE legged position exits by driving its ONE carrier
+    SL-LMT to fire (`ModifyOrder`), never a fresh per-leg `exit:{id}:{n}`
+    LIMIT. `close_all_open_legs` returns `None` (FIRED_PENDING); the async
+    carrier fill then closes every leg with the caller's real reason.
+    """
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=10, exit_legs=_three_legs()
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    carrier = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    carrier.resting_order_id = "CARRIER-STOP-1"
+    carrier.resting_order_price = 70.56
+    db.add(carrier)
+    _make_pending_live_leg_order(
+        db, trading_session, position,
+        idempotency_key=f"stop:{position.id}", qty=position.qty, broker_order_id="CARRIER-STOP-1",
+    )
+    db.flush()
+
+    fake_broker = _FakeExitStatusBroker(
+        OrderResult(
+            idempotency_key=f"stop:{position.id}", broker_order_id="CARRIER-STOP-1",
+            status=BrokerOrderStatus.FILLED, filled_qty=position.qty, avg_fill_price=70.0,
+        )
+    )
+
+    outcome = close_all_open_legs(
+        db, trading_session, position, ExitReason.TRAIL, 71.0, fake_broker  # type: ignore[arg-type]
+    )
+    assert outcome is None  # FIRED_PENDING
+    db.refresh(carrier)
+    assert carrier.exit_fired_at is not None
+    assert len(fake_broker.modify_calls) == 1  # exactly one ModifyOrder for the whole position
+    stop_order = db.query(Order).filter(Order.idempotency_key == f"stop:{position.id}").one()
+    assert stop_order.intended_exit_reason == ExitReason.TRAIL
+    assert (
+        db.query(Order).filter(Order.idempotency_key.like(f"exit:{position.id}:%")).count() == 0
+    )
+
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=fake_broker  # type: ignore[arg-type]
+    )
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    legs = _legs(db, position.id)
+    assert all(lg.status == PositionExitLegStatus.CLOSED for lg in legs)
+    assert all(lg.exit_reason == ExitReason.TRAIL for lg in legs)
 
 
 def test_late_resolved_carrier_stop_closes_all_remaining_legs(

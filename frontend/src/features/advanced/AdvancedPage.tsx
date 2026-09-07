@@ -31,6 +31,12 @@ import type {
 } from '../../shared/api/types'
 
 const UNDERLYING_SYMBOLS: UnderlyingSymbol[] = ['NIFTY', 'BANKNIFTY']
+
+// Rough per-lot free-margin a live NIFTY option position needs during market
+// hours -- from 2026-09-07's live `RED:Margin Shortfall` evidence (~₹160-176k
+// per lot for the exit-side SPAN). Informational only (the confirm dialog on
+// raising live lots), never a hard block.
+const LIVE_MARGIN_PER_LOT_ESTIMATE = 175_000
 // "Main data provider" selector. Values must match backend
 // RECOGNIZED_OVERRIDE_PROVIDERS (app/api/v1/market_data.py) -- "" clears the
 // override (automatic health-based failover), "shoonya"/"alice_blue" pin the
@@ -192,10 +198,11 @@ function GlobalDailyLimitsCard() {
       <h3>Daily settings</h3>
       <p className="muted">
         Default budget / target profit / loss cap for a newly-created session's{' '}
-        <strong>Daily plan</strong> (Reconciliation &amp; Recovery, below) — that Daily Plan is what
-        Risk Service actually enforces live. Editing this changes what the <em>next</em> new session
-        starts with; today's already-active session stays independently editable and untouched. Max
-        trades / strategy applies immediately, across every strategy. Max lots / trade is a
+        <strong>Daily plan</strong>. Editing this changes what the <em>next</em> new session
+        starts with — it does <strong>not</strong> touch today's active session. To change the
+        loss cap / target that Risk Service is enforcing <em>right now</em>, use the per-session{' '}
+        <strong>Daily plan</strong> editor in <strong>Reconciliation &amp; Recovery</strong> below.
+        Max trades / strategy applies immediately, across every strategy. Max lots / trade is a
         standing ceiling (not daily-resetting) on every live order's size — a strategy's own
         configured Lots (Strategy Control, below) can never exceed it.
       </p>
@@ -734,34 +741,87 @@ function StrategyConfigRow({
           </select>
         </td>
         <td>
-          <input
-            type="number"
-            min={1}
-            className="lots-input"
-            placeholder={isPaperMode ? '10' : '1'}
-            value={lotsInput ?? (typeof config.params.qty_lots === 'number' ? String(config.params.qty_lots) : '')}
-            disabled={patchMutation.isPending}
-            onChange={(e) => setLotsInput(e.target.value)}
-            onBlur={() => {
+          {(() => {
+            // 2026-09-07: position size is a real-money field -- it no longer
+            // commits on blur. Type -> Save (checkmark) commits; Esc / Cancel
+            // reverts. When a live session is active and the value is being
+            // raised, confirm first with an approximate margin-readiness note.
+            const serverValue =
+              typeof config.params.qty_lots === 'number' ? config.params.qty_lots : null
+            const serverStr = serverValue !== null ? String(serverValue) : ''
+            const dirty = lotsInput !== null && lotsInput.trim() !== serverStr
+            const commitLots = () => {
               if (lotsInput === null) return
               const trimmed = lotsInput.trim()
               if (trimmed === '') {
                 patchMutation.mutate({ qty_lots: null })
-              } else {
-                const parsed = Number(trimmed)
-                // Not a valid positive integer -- revert silently rather than
-                // sending NaN (which JSON.stringify would silently turn into
-                // null, clearing the override instead of rejecting the input).
-                if (Number.isInteger(parsed) && parsed > 0) {
-                  patchMutation.mutate({ qty_lots: parsed })
+                setLotsInput(null)
+                return
+              }
+              const parsed = Number(trimmed)
+              if (!Number.isInteger(parsed) || parsed <= 0) {
+                setLotsInput(null) // reject silently, revert to server value
+                return
+              }
+              const raising = serverValue === null || parsed > serverValue
+              if (liveSession && raising) {
+                const est =
+                  Math.ceil((parsed * LIVE_MARGIN_PER_LOT_ESTIMATE + 2000) / 1000) * 1000
+                if (
+                  !window.confirm(
+                    `Set ${config.name} to ${parsed} lot(s) for LIVE trading?\n\n` +
+                      `Keep roughly ₹${est.toLocaleString('en-IN')} free margin ready ` +
+                      `during market hours for a position this size.`,
+                  )
+                ) {
+                  return
                 }
               }
+              patchMutation.mutate({ qty_lots: parsed })
               setLotsInput(null)
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
-            }}
-          />
+            }
+            return (
+              <div className="lots-edit">
+                <input
+                  type="number"
+                  min={1}
+                  className="lots-input"
+                  placeholder={isPaperMode ? '10' : '1'}
+                  value={lotsInput ?? serverStr}
+                  disabled={patchMutation.isPending}
+                  onChange={(e) => setLotsInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitLots()
+                    if (e.key === 'Escape') setLotsInput(null)
+                  }}
+                />
+                {dirty && (
+                  <>
+                    <button
+                      type="button"
+                      className="btn-ghost lots-save"
+                      title="Save lots"
+                      disabled={patchMutation.isPending}
+                      onClick={commitLots}
+                    >
+                      ✓
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost lots-cancel"
+                      title="Cancel"
+                      onClick={() => setLotsInput(null)}
+                    >
+                      ✕
+                    </button>
+                  </>
+                )}
+                {!dirty && patchMutation.isSuccess && lotsInput === null && (
+                  <span className="muted lots-saved">saved</span>
+                )}
+              </div>
+            )
+          })()}
         </td>
         <td>
           {run ? (
