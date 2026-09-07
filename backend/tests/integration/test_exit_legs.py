@@ -402,7 +402,8 @@ def test_collapsed_dominant_leg_with_target_still_hits_it(
     )
     dispatch_trade_intent(db, trading_session, intent, broker=broker)
     position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
-    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one().suppress_hard_target is False
+    sp = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert sp.suppress_hard_target is False
 
     evaluate_open_position(db, trading_session, position, tick_price=90.5, broker=broker)
     db.refresh(position)
