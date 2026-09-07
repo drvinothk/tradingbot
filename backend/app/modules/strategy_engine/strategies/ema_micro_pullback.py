@@ -65,6 +65,7 @@ from app.modules.strategy_engine.common_rules import (
     _parse_hhmm,
     compute_body_ratio,
     compute_stop_target,
+    compute_stop_target_points,
     get_recent_completed_bars,
     get_recent_indicator_values,
     resolve_structure_break_buffer,
@@ -108,6 +109,8 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         qty_lots: int = 1,
         stop_pct: float = 0.08,
         target_pct: float = 0.12,
+        stop_points: float | None = None,
+        target_points: float | None = None,
         trail_activation_fraction: float = 0.5,
         trail_lock_fraction: float = 0.5,
         timeframe: str = BAR_TIMEFRAME,
@@ -126,6 +129,8 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         self.qty_lots = qty_lots
         self.stop_pct = stop_pct
         self.target_pct = target_pct
+        self.stop_points = stop_points
+        self.target_points = target_points
         self.trail_activation_fraction = trail_activation_fraction
         self.trail_lock_fraction = trail_lock_fraction
         self.ema_expansion_lookback = ema_expansion_lookback
@@ -235,9 +240,17 @@ class EMAMicroPullbackStrategy(ConfirmationFilterStrategy):
         entry_price = top.ltp
         instrument = db.get(Instrument, self.instrument_id)
         tick_size = float(instrument.tick_size) if instrument is not None else 0.0
-        stop_price, target_price = compute_stop_target(
-            entry_price, self.stop_pct, self.target_pct, tick_size
-        )
+        # Fixed-point scalp variant: opt-in, both must be set (default None
+        # each -- every existing config stays on the pct-based path below).
+        # Same shape as vwap_pullback.py's identical branch.
+        if self.stop_points is not None and self.target_points is not None:
+            stop_price, target_price = compute_stop_target_points(
+                entry_price, self.stop_points, self.target_points, tick_size
+            )
+        else:
+            stop_price, target_price = compute_stop_target(
+                entry_price, self.stop_pct, self.target_pct, tick_size
+            )
 
         logger.info(
             "run %s: EMA %s fired -- entry=%.2f stop=%.2f target=%.2f structure=%.2f",

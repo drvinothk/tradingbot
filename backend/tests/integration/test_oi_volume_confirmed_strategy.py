@@ -343,6 +343,81 @@ class TestOIVolumeConfirmedStrategy:
         assert proposal.stop_price < proposal.entry_price < proposal.target_price
         assert proposal.structure_break_buffer == pytest.approx(0.0)
 
+    def test_fixed_point_target_stop_used_when_both_set(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, stop_points=5.0, target_points=7.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.entry_price == pytest.approx(80.0)
+        assert proposal.stop_price == pytest.approx(75.0)  # 80 - 5, points not pct
+        assert proposal.target_price == pytest.approx(87.0)  # 80 + 7
+
+    def test_pct_based_target_stop_unchanged_when_points_left_unset(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Regression guard: every existing config (stop_points/target_points
+        both default None) must keep computing stop/target exactly as before
+        this feature existed."""
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS,
+        )  # stop_pct=0.11, target_pct=0.18
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.stop_price == pytest.approx(71.2)  # 80 * 0.89
+        assert proposal.target_price == pytest.approx(94.4)  # 80 * 1.18
+
+    def test_zero_grace_bars_lets_pending_candidate_expire_without_reentry_check(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Same setup as test_reentry_within_grace_period_blocks_direction_
+        permanently (default grace=3), but with oi_false_breakout_grace_bars=0
+        -- the pending candidate must expire on the very next bar *without*
+        ever being blocked, even though price re-enters the frozen range
+        exactly the way the default-grace test proves would otherwise block
+        it. This is the "quick entry, no confirmation wait" behavior."""
+        midday = datetime(2026, 7, 24, 12, 0, tzinfo=IST)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(
+            db, instrument, midday - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS),
+        )
+        breakout_bar = _seed_bar(
+            db, instrument, midday, open=22030, high=22055, low=22028, close=22050,
+        )
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, oi_morning_window_end="11:00",
+            oi_false_breakout_grace_bars=0,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+        assert OptionType.CE in strategy._pending_breakout  # noqa: SLF001
+
+        # One bar later, price falls back inside the frozen range -- with
+        # default grace=3 this would block the direction (see the sibling
+        # test); with grace=0 the pending entry has already expired.
+        reentry_bar = _seed_bar(
+            db, instrument, midday + timedelta(minutes=1),
+            open=22010, high=22015, low=22005, close=22010,
+        )
+        assert strategy.check_setup(db, strategy_run, reentry_bar) is None
+        assert OptionType.CE not in strategy._false_breakout_blocked  # noqa: SLF001
+        assert OptionType.CE not in strategy._pending_breakout  # noqa: SLF001
+
     def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
     ):

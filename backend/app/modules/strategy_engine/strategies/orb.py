@@ -56,9 +56,11 @@ from app.modules.strategy_engine.common_rules import (
     _parse_hhmm,
     compute_range_high_low,
     compute_stop_target,
+    get_latest_indicator_value,
     get_recent_completed_bars,
     pick_by_underlying,
     resolve_structure_break_buffer,
+    rsi_extreme_entry_blocked,
 )
 from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
@@ -106,6 +108,9 @@ class ORBStrategy(ConfirmationFilterStrategy):
         max_or_range_banknifty_points: float = 250.0,
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
+        entry_rsi_block_pe_below: float | None = None,
+        entry_rsi_block_ce_above: float | None = None,
+        entry_require_confirm_bar: bool = False,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -124,7 +129,21 @@ class ORBStrategy(ConfirmationFilterStrategy):
         self.max_or_range_banknifty_points = max_or_range_banknifty_points
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
+        # 2026-09-07 entry-avoidance filters -- both opt-in, off/None by
+        # default, byte-identical to pre-existing behavior when unset. See
+        # `common_rules.rsi_extreme_entry_blocked`'s own docstring for why
+        # this is a genuinely different gate than `conviction_gates
+        # .require_rsi_alignment`, not a duplicate under a new name.
+        self.entry_rsi_block_pe_below = entry_rsi_block_pe_below
+        self.entry_rsi_block_ce_above = entry_rsi_block_ce_above
+        self.entry_require_confirm_bar = entry_require_confirm_bar
         self._fired_directions: set[OptionType] = set()
+        # Direction -> the bucket_start of the bar that FIRST closed beyond
+        # the OR boundary in that direction, still awaiting one more
+        # confirming bar. Only populated/consulted when
+        # `entry_require_confirm_bar` is True; cleared whenever a bar closes
+        # back inside the range (the breakout didn't persist).
+        self._pending_confirm: dict[OptionType, datetime] = {}
 
     def _range_thresholds(self, symbol: str) -> tuple[float, float]:
         return pick_by_underlying(
@@ -222,9 +241,12 @@ class ORBStrategy(ConfirmationFilterStrategy):
 
         if close > or_high:
             option_type, structure_level = OptionType.CE, or_low
+            self._pending_confirm.pop(OptionType.PE, None)
         elif close < or_low:
             option_type, structure_level = OptionType.PE, or_high
+            self._pending_confirm.pop(OptionType.CE, None)
         else:
+            self._pending_confirm.clear()  # breakout didn't persist -- any pending confirm is void
             return None
 
         if option_type in self._fired_directions:
@@ -233,6 +255,26 @@ class ORBStrategy(ConfirmationFilterStrategy):
                 "OR[%.2f-%.2f], bar %s close=%.2f",
                 strategy_run.id, option_type.value, or_low, or_high,
                 latest_bar.bucket_start.isoformat(), close,
+            )
+            return None
+
+        if self.entry_require_confirm_bar and option_type not in self._pending_confirm:
+            self._pending_confirm[option_type] = latest_bar.bucket_start
+            self._log_once(
+                logger, f"confirm_pending_{option_type.value}",
+                "run %s: %s breakout detected at %s, awaiting one more confirming bar",
+                strategy_run.id, option_type.value, latest_bar.bucket_start.isoformat(),
+            )
+            return None
+
+        if rsi_extreme_entry_blocked(
+            get_latest_indicator_value(db, self.instrument_id, "RSI14", self.timeframe),
+            option_type, self.entry_rsi_block_pe_below, self.entry_rsi_block_ce_above,
+        ):
+            self._log_once(
+                logger, f"rsi_extreme_{option_type.value}",
+                "run %s: %s breakout rejected by RSI-extreme entry filter",
+                strategy_run.id, option_type.value,
             )
             return None
 

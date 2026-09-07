@@ -47,6 +47,7 @@ from app.modules.strategy_engine.common_rules import (
     ConfirmationFilterStrategy,
     _parse_hhmm,
     compute_stop_target,
+    compute_stop_target_points,
     get_open_position_for_run,
     get_recent_completed_bars,
     get_recent_indicator_values,
@@ -86,6 +87,33 @@ class TestComputeStopTarget:
         stop, target = compute_stop_target(100.0, 0.10, 0.15, tick_size=0.05)
         assert stop == 90.0
         assert target == 115.0
+
+
+class TestComputeStopTargetPoints:
+    """VWAP quick-scalper: fixed-premium-point target/stop instead of a
+    percentage of entry price."""
+
+    def test_basic_points_math(self):
+        stop, target = compute_stop_target_points(100.0, 5.0, 7.0, tick_size=0.05)
+        assert stop == 95.0
+        assert target == 107.0
+
+    def test_rounds_to_tick_size(self):
+        stop, target = compute_stop_target_points(100.03, 5.0, 7.0, tick_size=0.05)
+        # 100.03 - 5 = 95.03 -> rounds to 95.05; 100.03 + 7 = 107.03 -> rounds to 107.05
+        assert stop == 95.05
+        assert target == 107.05
+
+    def test_floors_stop_price_for_cheap_deep_otm_entry(self):
+        # entry=10, stop_points=15 would naively go negative (-5) -- a real
+        # risk for near-expiry deep-OTM premiums, not a hypothetical.
+        stop, target = compute_stop_target_points(10.0, 15.0, 10.0, tick_size=0.05)
+        assert stop == 0.05
+        assert target == 20.0
+
+    def test_floors_at_default_when_no_tick_size_supplied(self):
+        stop, _ = compute_stop_target_points(10.0, 15.0, 10.0, tick_size=0.0)
+        assert stop == 0.05
 
 
 @pytest.fixture

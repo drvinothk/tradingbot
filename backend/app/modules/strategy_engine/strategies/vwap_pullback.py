@@ -24,6 +24,7 @@ from app.modules.strategy_engine.common_rules import (
     DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
     ConfirmationFilterStrategy,
     compute_stop_target,
+    compute_stop_target_points,
     get_latest_indicator_value_with_ts,
     get_recent_completed_bars,
     resolve_structure_break_buffer,
@@ -60,6 +61,8 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         pullback_tolerance_frac: float = 0.0015,
         stop_pct: float = 0.10,
         target_pct: float = 0.15,
+        stop_points: float | None = None,
+        target_points: float | None = None,
         trail_activation_fraction: float = 0.5,
         trail_lock_fraction: float = 0.5,
         timeframe: str = BAR_TIMEFRAME,
@@ -77,6 +80,8 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         self.pullback_tolerance_frac = pullback_tolerance_frac
         self.stop_pct = stop_pct
         self.target_pct = target_pct
+        self.stop_points = stop_points
+        self.target_points = target_points
         self.trail_activation_fraction = trail_activation_fraction
         self.trail_lock_fraction = trail_lock_fraction
         self.trend_lookback_bars = trend_lookback_bars
@@ -153,9 +158,16 @@ class VWAPPullbackStrategy(ConfirmationFilterStrategy):
         entry_price = top.ltp
         instrument = db.get(Instrument, self.instrument_id)
         tick_size = float(instrument.tick_size) if instrument is not None else 0.0
-        stop_price, target_price = compute_stop_target(
-            entry_price, self.stop_pct, self.target_pct, tick_size
-        )
+        # Fixed-point scalp variant: opt-in, both must be set (default None
+        # each -- every existing config stays on the pct-based path below).
+        if self.stop_points is not None and self.target_points is not None:
+            stop_price, target_price = compute_stop_target_points(
+                entry_price, self.stop_points, self.target_points, tick_size
+            )
+        else:
+            stop_price, target_price = compute_stop_target(
+                entry_price, self.stop_pct, self.target_pct, tick_size
+            )
 
         return TradeProposal(
             option_contract_id=top.option_contract_id,

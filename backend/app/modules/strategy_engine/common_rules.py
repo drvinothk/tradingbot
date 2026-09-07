@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist
 from app.domain.execution.models import Position, PositionStatus
-from app.domain.market.models import IndicatorSnapshot, PriceBar
+from app.domain.market.models import IndicatorSnapshot, OptionType, PriceBar
 from app.domain.strategy.models import StrategyRun, TradeIntent
 from app.modules.strategy_engine.interface import SignalStatus, Strategy, TradeProposal
 
@@ -390,6 +390,57 @@ def compute_stop_target(
     stop_price = _round_to_tick(entry_price * (1 - stop_pct), tick_size)
     target_price = _round_to_tick(entry_price * (1 + target_pct), tick_size)
     return stop_price, target_price
+
+
+def compute_stop_target_points(
+    entry_price: float, stop_points: float, target_points: float, tick_size: float = 0.0
+) -> tuple[float, float]:
+    """Fixed-premium-point variant of `compute_stop_target`, for a scalp-style
+    strategy that wants a consistent absolute Rupee move (`points * lot_size`)
+    rather than a proportional one. Only ever buys premium in this codebase
+    (CE or PE), so "stop below entry, target above" needs no direction branch,
+    same as the pct-based formula above.
+
+    Floored at one tick above zero -- unlike `compute_stop_target` (where any
+    `stop_pct < 1.0` keeps `stop_price` positive for any positive
+    `entry_price`), a *fixed* point stop can exceed a cheap entry premium
+    (e.g. entry=10, stop_points=15 -> a meaningless negative price). Real
+    near-expiry entries as low as ~10-25 exist in this project's own
+    archive, so this isn't a hypothetical corner.
+    """
+    floor = tick_size if tick_size > 0 else 0.05
+    stop_price = _round_to_tick(max(entry_price - stop_points, floor), tick_size)
+    target_price = _round_to_tick(entry_price + target_points, tick_size)
+    return stop_price, target_price
+
+
+def rsi_extreme_entry_blocked(
+    rsi: float | None,
+    option_type: OptionType,
+    block_pe_below: float | None,
+    block_ce_above: float | None,
+) -> bool:
+    """2026-09-07 entry-avoidance filter (`entry_rsi_block_pe_below` /
+    `entry_rsi_block_ce_above`): skip a PE (bearish) entry when RSI14 is
+    already deeply oversold, or a CE (bullish) entry when RSI14 is already
+    deeply overbought -- the hypothesis being the move is exhausted, not
+    confirmed, so entering now is buying/selling at the tail end of the
+    trend. Deliberately the OPPOSITE shape of `conviction_gates
+    ._rsi_alignment_reject` (which *requires* RSI already past a neutral
+    band in the trade's own direction, i.e. rejects the *middle*) -- this
+    rejects one *tail* only, near-disjoint reject zones, not a relabeling
+    of the same gate. Both thresholds default `None` (off); returns `False`
+    (never blocks) whenever a threshold is unset or RSI is unavailable,
+    same "missing data never trips a gate" convention every other
+    indicator-based check in this codebase follows.
+    """
+    if rsi is None:
+        return False
+    if option_type is OptionType.PE and block_pe_below is not None and rsi <= block_pe_below:
+        return True
+    if option_type is OptionType.CE and block_ce_above is not None and rsi >= block_ce_above:
+        return True
+    return False
 
 
 def touch_and_confirm(

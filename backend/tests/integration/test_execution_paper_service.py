@@ -279,17 +279,32 @@ def _seed_price_bar(db: Session, instrument: Instrument, *, close: float) -> Pri
 
 
 def _seed_plateau_history(
-    db: Session, instrument: Instrument, *, bars: int, base_close: float, atr: float = 10.0
+    db: Session,
+    instrument: Instrument,
+    *,
+    bars: int,
+    base_close: float,
+    atr: float = 10.0,
+    after: datetime | None = None,
 ) -> None:
-    """`bars` sequential completed 60s `PriceBar` rows ending "now", closes
-    barely moving (a tiny back-and-forth, no net drift -- a plateau), plus a
-    matching flat RSI14 `IndicatorSnapshot` per bar and one ATR14 row -- the
-    underlying data `_momentum_plateau_detected` reads for the momentum-
-    plateau exit check.
+    """`bars` sequential completed 60s `PriceBar` rows, closes barely moving
+    (a tiny back-and-forth, no net drift -- a plateau), plus a matching flat
+    RSI14 `IndicatorSnapshot` per bar and one ATR14 row -- the underlying
+    data `_momentum_plateau_detected` reads for the momentum-plateau exit
+    check.
+
+    `after` (default `None` -> "now"): the bars are seeded *starting one
+    minute after* this anchor, not ending at it -- `_momentum_plateau_
+    detected` floors its lookup at the position's own `opened_at` (2026-09-04
+    fix, see that function's own docstring for the real bug this closes), so
+    a test simulating a plateau *during* an open trade must pass the
+    position's real `opened_at` here, otherwise every seeded bar lands
+    before entry and gets filtered out -- silently reproducing the exact bug
+    this fix closes instead of testing the fixed behavior.
     """
-    now = datetime.now(UTC)
+    anchor = after if after is not None else datetime.now(UTC)
     for i in range(bars):
-        ts = now - timedelta(minutes=bars - i)
+        ts = anchor + timedelta(minutes=i + 1)
         close = base_close + (0.5 if i % 2 == 0 else -0.5)
         db.add(
             PriceBar(
@@ -320,7 +335,7 @@ def _seed_plateau_history(
             indicator_name="ATR14",
             timeframe=BAR_TIMEFRAME,
             value=atr,
-            ts=now,
+            ts=anchor + timedelta(minutes=bars),
         )
     )
     db.flush()
@@ -2726,8 +2741,11 @@ def test_evaluate_open_position_exits_on_momentum_plateau(
 
     # Underlying barely moved over the last 5 bars (base_close +/- 0.5),
     # ATR14=10 -> flat threshold = 0.3*10 = 3.0, well above the observed
-    # ~1.0 net move -> plateaued.
-    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+    # ~1.0 net move -> plateaued. Seeded strictly AFTER entry -- see
+    # _seed_plateau_history's own docstring for why that's now required.
+    _seed_plateau_history(
+        db, instrument, bars=6, base_close=24000.0, atr=10.0, after=position.opened_at
+    )
 
     outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
 
@@ -2753,10 +2771,57 @@ def test_evaluate_open_position_momentum_plateau_default_off_is_a_no_op(
     dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
     position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
 
-    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+    _seed_plateau_history(
+        db, instrument, bars=6, base_close=24000.0, atr=10.0, after=position.opened_at
+    )
 
     outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
 
+    assert outcome is None
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+
+def test_evaluate_open_position_momentum_plateau_ignores_pre_entry_flat_bars(
+    db: Session, broker, trading_session, strategy_run, strategy_config, option_contract,
+    instrument,
+):
+    """The real bug found via the Phase 10 backtest sweep's own first
+    results, 2026-09-04: a breakout entry's *pre-entry* consolidation (the
+    calm setup the entry itself fired on) must never be read as a
+    post-entry plateau. Before the `since=entry_time` floor, this exact
+    scenario closed positions within 0-17 minutes of entry across ~35-40%
+    of all trades in the sweep, two at the *same minute* as entry.
+    """
+    strategy_config.params = {
+        "require_momentum_plateau_exit": True,
+        "plateau_use_slope": True,
+        "plateau_lookback_bars": 5,
+        "plateau_slope_atr_fraction": 0.3,
+    }
+    db.add(strategy_config)
+    db.flush()
+
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=80.0, stop_price=72.0, target_price=92.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    # Flat bars seeded strictly BEFORE entry (the pre-breakout
+    # consolidation) -- anchored 10 minutes before `position.opened_at` so
+    # every seeded bar lands well before it. Zero bars exist after entry.
+    _seed_plateau_history(
+        db, instrument, bars=6, base_close=24000.0, atr=10.0,
+        after=position.opened_at - timedelta(minutes=10),
+    )
+
+    outcome = evaluate_open_position(db, trading_session, position, tick_price=82.0, broker=broker)
+
+    # Not enough post-entry history yet -- must NOT plateau on pre-entry
+    # data, must stay open (same "missing data isn't an adverse regime"
+    # convention momentum_plateau_signals already documents).
     assert outcome is None
     db.refresh(position)
     assert position.status == PositionStatus.OPEN
@@ -2803,7 +2868,9 @@ def test_evaluate_open_position_momentum_plateau_skipped_once_trail_is_active(
 
     # 2. Underlying now plateaus -- must be skipped, trail owns the exit
     # from here (price hasn't pulled back through the trailed stop yet).
-    _seed_plateau_history(db, instrument, bars=6, base_close=24000.0, atr=10.0)
+    _seed_plateau_history(
+        db, instrument, bars=6, base_close=24000.0, atr=10.0, after=position.opened_at
+    )
     outcome = evaluate_open_position(
         db, trading_session, position, tick_price=activation_price, broker=broker
     )

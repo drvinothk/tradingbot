@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from typing import NamedTuple
 
@@ -249,21 +250,39 @@ def _resolve_momentum_plateau_params(db: Session, trade_intent: TradeIntent) -> 
 
 
 def _momentum_plateau_detected(
-    db: Session, instrument_id: uuid.UUID, params: PlateauParams
+    db: Session, instrument_id: uuid.UUID, params: PlateauParams, entry_time: datetime
 ) -> bool:
     """DB-backed wrapper around `momentum_plateau_signals` -- gathers the
     last `params.lookback_bars + 1` underlying closes / RSI14 values / the
     latest ATR14, then hands off to the shared pure function so production
     and the backtest's own in-memory-series equivalent can never silently
     diverge on the actual threshold logic (see that function's docstring).
+
+    2026-09-04 fix (found via the Phase 10 backtest sweep's own first real
+    results -- every completed config failed badly, ~35-40% of exits firing
+    within 0-17 minutes of entry, two at the *exact* entry minute): the
+    window is now floored at `entry_time` (`since=entry_time` on both
+    lookups) -- without this, the very first poll(s) after entry pull a
+    window still dominated by *pre-entry* bars, and for a breakout strategy
+    that's exactly the calm consolidation the entry itself fired on, not
+    genuine post-breakout decay. Live-confirmed on the sweep's own data: a
+    2025-10-01 09:35 ORB entry's un-anchored window (09:30-09:35, all
+    pre-entry-or-at-entry) moved only 0.8 points against a ~3.6-point
+    threshold, firing MOMENTUM_PLATEAU at the same minute as entry. Flooring
+    at `entry_time` means the check now simply has nothing to say (falls
+    through to "not enough history yet", per `momentum_plateau_signals`'
+    own graceful-degradation convention) until `lookback_bars + 1` bars have
+    genuinely accumulated *since* the position opened.
     """
     window = params.lookback_bars + 1
     closes = [
         float(b.close)
-        for b in get_recent_completed_bars(db, instrument_id, BAR_TIMEFRAME, limit=window)
+        for b in get_recent_completed_bars(
+            db, instrument_id, BAR_TIMEFRAME, since=entry_time, limit=window
+        )
     ]
     rsi_values = get_recent_indicator_values(
-        db, instrument_id, "RSI14", BAR_TIMEFRAME, limit=window
+        db, instrument_id, "RSI14", BAR_TIMEFRAME, since=entry_time, limit=window
     )
     atr = get_latest_indicator_value(db, instrument_id, "ATR14", BAR_TIMEFRAME)
     return momentum_plateau_signals(closes, rsi_values, atr, params)
@@ -2031,7 +2050,7 @@ def evaluate_open_position(
         if plateau_params.enabled:
             plateau_option_contract = db.get(OptionContract, position.option_contract_id)
             if plateau_option_contract is not None and _momentum_plateau_detected(
-                db, plateau_option_contract.instrument_id, plateau_params
+                db, plateau_option_contract.instrument_id, plateau_params, position.opened_at
             ):
                 return close_position(
                     db,

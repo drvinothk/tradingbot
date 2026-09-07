@@ -625,6 +625,74 @@ work, or vice versa.
 
 ## Known open items
 
+- **2026-09-07: phase14 sweep partial results applied — ORB 4→3-leg reweight
+  live, ORB_Convic_Live/Paper split created; VWAP/OI real-vs-backtest
+  frequency gap root-caused; DTE-aware strike selection found dormant.**
+  Config-only changes, applied directly to the live `trading_bot` DB (no
+  code commit — this session touched only `strategy_configs` rows).
+  - **ORB_Conviction**: 4-leg staged exit reduced to 3 — `tightlock` dropped
+    (strictly dominated by `core` on every metric, 100% trade-agreement,
+    zero diversification value; same for `core` vs `runner`, which
+    dominates it). New split `core`/`runner`/`target` at
+    **qty_fraction 0.25/0.25/0.50**. `target` leg's own exit updated from
+    the phase14 R:R grid: stop 0.18→0.22, target_pct 0.4→0.33 (same
+    trail act/lock, +28% net / +45% tail on the identical 40-trade entry
+    set the whole comparison is drawn from — an exit-shape optimization,
+    not new entry evidence; the entry gate itself, w=65+PDT+cutoff10:15,
+    was separately re-swept and confirmed real, not noise).
+    **`ORB_Conviction_Live`** created (`runtime_mode=NULL`, follows
+    session — routes real orders once `live_enabled`) alongside the
+    original kept paper-only, for a live-vs-paper comparison; user
+    subsequently renamed both to `ORB_Convic_Live` (added
+    `qty_lots: 2` explicit) / `ORB_Convic_Paper`. **ORB is the only
+    strategy with this live/paper split** — the only one with real
+    backtest validation behind it; OI/EMA/VWAP stay paper-only (below).
+  - **VWAP/OI**: root-caused why VWAP fires ~30-100x more often live than
+    a full year of backtest implies (`Test 4`: 221 real closed trades in
+    17 days vs ~40-113/config/year in backtest). Primary cause: backtest
+    resolves `vwap_pullback*` to `futures_proxy` (NIFTY **futures** OHLC)
+    while live trades real spot-index ticks (only volume is spliced from
+    futures, `ShoonyaBrokerAdapter._splice_future_volume`) — a genuinely
+    different price series for a level-sensitive strategy. Contributing:
+    live bars are built from ~350 real ticks/min vs backtest's single
+    static 1-min row. Evaluation cadence is **not** a cause — both sides
+    fire at most once per completed 60s bar, and `run_backtest.py`
+    literally imports and calls live's own `run_cycle`. Separately, an
+    older E4-VM sweep (`refined_sweep_20260828T072024Z`) already showed
+    `structure_break_persistence_seconds` under 120s is byte-identical to
+    0 on 1-min bars — meaning the 2026-09-04 "sb6" redesign
+    (`persistence_seconds:6`, applied uniformly to OI/EMA/VWAP base
+    configs) was never backtestable at this engine's bar resolution in
+    the first place. Real data confirms the old, disabled
+    `persistence_seconds:120` configs (`Test 4` for VWAP, `Test ` for OI —
+    disabled 2026-09-04 for an unrelated UI-naming-collision reason, not
+    performance) dramatically outperform both their `sb6` replacements
+    and their conviction siblings in real paper trading (VWAP: +139,027.80
+    net/221 trades/PF 1.83 vs `VWAP_Base`'s -16,025.75/22 trades; OI:
+    +29,733.50/56 trades/PF 1.54, beating even `OI_Volume_Conviction`'s
+    +2,830.75/22 trades — this project's own cleanest statistical pass).
+    Both revived as paper-only A/B arms alongside their `sb6` replacements;
+    EMA's equivalent (`Test 1`) not yet checked for the same pattern.
+    Recommended, not-yet-built fix: splice spot price + futures volume for
+    VWAP's backtest (matching what live already does) instead of full
+    `futures_proxy` substitution.
+  - **Strike selection**: found a full DTE/time-of-day-aware strike window
+    already built into `strike_ranking/engine.py` since Ops-Hardening
+    Phase 1 (2026-08-14) — narrows to ATM-to-1-ITM on expiry mornings,
+    jumps to a deep-ITM anchor on expiry afternoons — but **never wired
+    into any strategy** (`orb.py:239` calls it positionally, no
+    `dte=`/`current_time=`). Confirmed the underlying premise with real
+    1-min NIFTY data: during ORB's own entry window on a real expiry day,
+    an ITM strike decayed -17.2% vs ATM -46.0% / OTM -53.7%. Not wired up
+    or backtested yet — user is running a dedicated backtest, targeting a
+    decision before the next weekly expiry.
+  - Full writeups: local Claude memory
+    `project_orb_3leg_reweight_live_paper_split_2026_09_07`,
+    `project_vwap_oi_persistence_root_cause_and_revivals_2026_09_07`,
+    `project_strike_selection_dte_awareness_research_2026_09_07`, and the
+    `backtest_engine/backend/scripts/BACKTEST_LEARNINGS.md` 2026-09-07
+    entry.
+
 - **2026-09-02: first real live-trade day since the 2026-08-28 checklist —
   most items confirmed, one real incident found and fixed same-day (commit
   `206b7a0`), two follow-up gaps flagged by post-fix QC, not yet closed.**

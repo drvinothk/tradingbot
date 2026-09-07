@@ -108,6 +108,9 @@ ORB_PARAM_KEYS = {
     "max_or_range_banknifty_points",
     "structure_break_atr_multiplier",
     "structure_break_persistence_seconds",
+    "entry_rsi_block_pe_below",
+    "entry_rsi_block_ce_above",
+    "entry_require_confirm_bar",
 }
 # Deliberately NOT in the allowlist above: enabled_on_expiry_day,
 # expiry_orb_entry_cutoff_time, expiry_strike_bias. Phase 2 stores these in
@@ -149,6 +152,8 @@ EMA_MICRO_PULLBACK_PARAM_KEYS = {
     "qty_lots",
     "stop_pct",
     "target_pct",
+    "stop_points",
+    "target_points",
     "trail_activation_fraction",
     "trail_lock_fraction",
     "ema_expansion_lookback",
@@ -170,6 +175,9 @@ OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "lookback_bars",
     "stop_pct",
     "target_pct",
+    "stop_points",
+    "target_points",
+    "oi_false_breakout_grace_bars",
     "trail_activation_fraction",
     "trail_lock_fraction",
     "oi_use_futures_volume_confirmation",
@@ -186,6 +194,9 @@ OI_VOLUME_CONFIRMED_PARAM_KEYS = {
     "oi_afternoon_window_end",
     "structure_break_atr_multiplier",
     "structure_break_persistence_seconds",
+    "entry_rsi_block_pe_below",
+    "entry_rsi_block_ce_above",
+    "entry_require_confirm_bar",
 }
 # Its own explicit literal, not `= OI_VOLUME_CONFIRMED_PARAM_KEYS` -- that
 # alias was only ever safe because both strategies happened to accept an

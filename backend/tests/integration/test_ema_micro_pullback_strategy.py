@@ -338,6 +338,36 @@ class TestEMAMicroPullbackStrategy:
         assert proposal.structure_break_buffer == pytest.approx(2.0)  # 0.2 * 10.0
         assert proposal.structure_break_persistence_seconds == pytest.approx(20.0)
 
+    def test_fixed_point_target_stop_used_when_both_set(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _setup_bar, entry_bar = _seed_bullish_baseline(db, instrument)
+
+        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY, stop_points=5.0, target_points=7.0)
+        proposal = strategy.check_setup(db, strategy_run, entry_bar)
+
+        assert proposal is not None
+        assert proposal.entry_price == pytest.approx(80.0)
+        assert proposal.stop_price == pytest.approx(75.0)  # 80 - 5, points not pct
+        assert proposal.target_price == pytest.approx(87.0)  # 80 + 7
+
+    def test_pct_based_target_stop_unchanged_when_points_left_unset(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Regression guard: every existing config (stop_points/target_points
+        both default None) must keep computing stop/target exactly as before
+        this feature existed."""
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _setup_bar, entry_bar = _seed_bullish_baseline(db, instrument)
+
+        strategy = EMAMicroPullbackStrategy(instrument.id, EXPIRY)  # stop_pct=0.08, target_pct=0.12
+        proposal = strategy.check_setup(db, strategy_run, entry_bar)
+
+        assert proposal is not None
+        assert proposal.stop_price == pytest.approx(73.6)  # 80 * 0.92
+        assert proposal.target_price == pytest.approx(89.6)  # 80 * 1.12
+
     def test_bearish_setup_fires_buy_pe(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
     ):

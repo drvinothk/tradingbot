@@ -79,9 +79,12 @@ from app.modules.strategy_engine.common_rules import (
     compute_body_ratio,
     compute_range_high_low,
     compute_stop_target,
+    compute_stop_target_points,
+    get_latest_indicator_value,
     get_recent_completed_bars,
     pick_by_underlying,
     resolve_structure_break_buffer,
+    rsi_extreme_entry_blocked,
 )
 from app.modules.strategy_engine.env_metrics import get_latest_env_metrics
 from app.modules.strategy_engine.interface import TradeProposal
@@ -124,6 +127,9 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         lookback_bars: int = 5,
         stop_pct: float = 0.11,
         target_pct: float = 0.18,
+        stop_points: float | None = None,
+        target_points: float | None = None,
+        oi_false_breakout_grace_bars: int = FALSE_BREAKOUT_GRACE_BARS,
         trail_activation_fraction: float = 0.5,
         trail_lock_fraction: float = 0.5,
         timeframe: str = BAR_TIMEFRAME,
@@ -141,6 +147,9 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         oi_afternoon_window_end: str = "15:05",
         structure_break_atr_multiplier: float = DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
         structure_break_persistence_seconds: float = DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
+        entry_rsi_block_pe_below: float | None = None,
+        entry_rsi_block_ce_above: float | None = None,
+        entry_require_confirm_bar: bool = False,
     ) -> None:
         super().__init__(instrument_id, timeframe)
         self.expiry_date = expiry_date
@@ -149,6 +158,9 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         self.lookback_bars = lookback_bars
         self.stop_pct = stop_pct
         self.target_pct = target_pct
+        self.stop_points = stop_points
+        self.target_points = target_points
+        self.oi_false_breakout_grace_bars = oi_false_breakout_grace_bars
         self.trail_activation_fraction = trail_activation_fraction
         self.trail_lock_fraction = trail_lock_fraction
         self.oi_use_futures_volume_confirmation = oi_use_futures_volume_confirmation
@@ -165,6 +177,14 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         self.oi_afternoon_window_end = _parse_hhmm(oi_afternoon_window_end)
         self.structure_break_atr_multiplier = structure_break_atr_multiplier
         self.structure_break_persistence_seconds = structure_break_persistence_seconds
+        # 2026-09-07 entry-avoidance filters -- both opt-in, off/None by
+        # default, byte-identical to pre-existing behavior when unset. See
+        # `common_rules.rsi_extreme_entry_blocked`'s own docstring for why
+        # this is a genuinely different gate than `conviction_gates
+        # .require_rsi_alignment`, not a duplicate under a new name.
+        self.entry_rsi_block_pe_below = entry_rsi_block_pe_below
+        self.entry_rsi_block_ce_above = entry_rsi_block_ce_above
+        self.entry_require_confirm_bar = entry_require_confirm_bar
         self.bar_count = 0
         self._fired_directions: set[OptionType] = set()
         self._pending_breakout: dict[OptionType, tuple[float, float, int]] = {}
@@ -202,7 +222,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         # regardless of whether a *new* candidate is detected this bar.
         for direction in list(self._pending_breakout):
             snap_high, snap_low, detected_at = self._pending_breakout[direction]
-            if self.bar_count - detected_at > FALSE_BREAKOUT_GRACE_BARS:
+            if self.bar_count - detected_at > self.oi_false_breakout_grace_bars:
                 del self._pending_breakout[direction]
                 continue
             if snap_low <= close <= snap_high:
@@ -213,7 +233,7 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
                     "run %s: %s breakout (bar %d, window[%.2f-%.2f]) re-entered the "
                     "static range within %d bars -- blocking direction",
                     strategy_run.id, direction.value, detected_at, snap_low, snap_high,
-                    FALSE_BREAKOUT_GRACE_BARS,
+                    self.oi_false_breakout_grace_bars,
                 )
 
         needed = max(self.lookback_bars + 1, BODY_RATIO_LOOKBACK_BARS)
@@ -244,8 +264,18 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
         if candidate in self._fired_directions or candidate in self._false_breakout_blocked:
             return None
 
-        if candidate not in self._pending_breakout:
+        just_registered = candidate not in self._pending_breakout
+        if just_registered:
             self._pending_breakout[candidate] = (window_high, window_low, self.bar_count)
+
+        if self.entry_require_confirm_bar and just_registered:
+            self._log_once(
+                logger, f"confirm_pending_{candidate.value}",
+                "run %s: %s breakout detected (bar %d, window[%.2f-%.2f]), "
+                "awaiting one more confirming bar",
+                strategy_run.id, candidate.value, self.bar_count, window_low, window_high,
+            )
+            return None
 
         bar_time = to_ist(latest_bar.bucket_start).time()
         if not self._within_trade_windows(bar_time):
@@ -277,6 +307,17 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
             )
             return None
 
+        if rsi_extreme_entry_blocked(
+            get_latest_indicator_value(db, self.instrument_id, "RSI14", self.timeframe),
+            candidate, self.entry_rsi_block_pe_below, self.entry_rsi_block_ce_above,
+        ):
+            self._log_once(
+                logger, f"rsi_extreme_{candidate.value}",
+                "run %s: %s breakout rejected by RSI-extreme entry filter",
+                strategy_run.id, candidate.value,
+            )
+            return None
+
         ranked = rank_from_latest_snapshot(
             db, self.instrument_id, self.expiry_date, self.ranking_config
         )
@@ -289,9 +330,17 @@ class OIVolumeConfirmedStrategy(ConfirmationFilterStrategy):
 
         entry_price = top.ltp
         tick_size = float(instrument.tick_size) if instrument is not None else 0.0
-        stop_price, target_price = compute_stop_target(
-            entry_price, self.stop_pct, self.target_pct, tick_size
-        )
+        # Fixed-point scalp variant: opt-in, both must be set (default None
+        # each -- every existing config stays on the pct-based path below).
+        # Same shape as vwap_pullback.py's identical branch.
+        if self.stop_points is not None and self.target_points is not None:
+            stop_price, target_price = compute_stop_target_points(
+                entry_price, self.stop_points, self.target_points, tick_size
+            )
+        else:
+            stop_price, target_price = compute_stop_target(
+                entry_price, self.stop_pct, self.target_pct, tick_size
+            )
 
         logger.info(
             "run %s: %s breakout fired -- window[%.2f-%.2f] entry=%.2f stop=%.2f target=%.2f "

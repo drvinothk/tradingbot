@@ -287,6 +287,50 @@ class TestVWAPPullbackStrategy:
         # resolve_structure_break_buffer's own docstring).
         assert proposal.structure_break_buffer == pytest.approx(0.0)
 
+    def test_fixed_point_target_stop_used_when_both_set(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _seed_vwap(db, instrument, VWAP)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bullish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY, stop_points=5.0, target_points=7.0)
+        proposal = strategy.check_setup(db, strategy_run, confirmation)
+
+        assert proposal is not None
+        assert proposal.entry_price == pytest.approx(80.0)
+        assert proposal.stop_price == pytest.approx(75.0)  # 80 - 5, points not pct
+        assert proposal.target_price == pytest.approx(87.0)  # 80 + 7
+
+    def test_pct_based_target_stop_unchanged_when_points_left_unset(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        """Regression guard: every existing config (stop_points/target_points
+        both default None) must keep computing stop/target exactly as before
+        this feature existed."""
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe, ce_ltp=80.0)
+        _seed_vwap(db, instrument, VWAP)
+        base = datetime(2026, 7, 24, 10, 0, tzinfo=UTC)
+        _seed_trending_history(db, instrument, base, "bullish")
+        _seed_bar(db, instrument, base, open=22015, high=22020, low=VWAP, close=22010)
+        confirmation = _seed_bar(
+            db, instrument, base + timedelta(minutes=1),
+            open=22015, high=22035, low=22012, close=22030,
+        )
+
+        strategy = VWAPPullbackStrategy(instrument.id, EXPIRY)  # stop_pct=0.10, target_pct=0.15
+        proposal = strategy.check_setup(db, strategy_run, confirmation)
+
+        assert proposal is not None
+        assert proposal.stop_price == pytest.approx(72.0)  # 80 * 0.9
+        assert proposal.target_price == pytest.approx(92.0)  # 80 * 1.15
+
     def test_structure_break_buffer_is_atr_scaled_and_persistence_is_configurable(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
     ):
