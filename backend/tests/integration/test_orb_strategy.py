@@ -248,6 +248,20 @@ def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
     db.flush()
 
 
+def _seed_rsi(db: Session, instrument: Instrument, value: float, ts: datetime) -> None:
+    db.add(
+        IndicatorSnapshot(
+            id=uuid.uuid4(),
+            instrument_id=instrument.id,
+            indicator_name="RSI14",
+            timeframe=BAR_TIMEFRAME,
+            value=value,
+            ts=ts,
+        )
+    )
+    db.flush()
+
+
 class TestORBStrategy:
     def test_no_signal_within_opening_range_window(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
@@ -791,3 +805,108 @@ class TestORBEntryRequireConfirmBar:
 
         assert proposal is not None
         assert proposal.option_contract_id == option_contract_ce.id
+
+
+class TestORBEntryRsiStaleness:
+    """2026-09-08: RSI-extreme entry filter must sit out (never block wrongly
+    -- and never trade on a frozen value either) once RSI14 is too stale,
+    rather than trusting whatever the newest row happens to say. Staleness
+    is measured against the *evaluating bar's own* bucket_start, never
+    wall-clock -- critical for backtest determinism (a replayed historical
+    bar must not look "stale" just because real-world now() is far later)."""
+
+    def test_fresh_rsi_still_blocks(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        # 30s stale -- well inside the 120s grace window.
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=30))
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_rsi_block_ce_above=75.0,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+
+    def test_stale_rsi_is_treated_as_unavailable_and_does_not_block(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Same RSI value and threshold as the fresh case above -- would
+        block if trusted -- but the reading is 300s old (> 120s grace), so
+        the filter must sit this out as if RSI were unavailable, letting
+        the breakout fire normally instead of silently trading on frozen
+        data."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=300))
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_rsi_block_ce_above=75.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_no_rsi_row_at_all_does_not_block(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Distinct code path from the stale-row case -- no RSI14 snapshot
+        has ever been written for this instrument (e.g. freshly added)."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_rsi_block_ce_above=75.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_exactly_at_staleness_threshold_still_trusted(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Boundary: age == threshold (not >) is still fresh enough to
+        trust -- matches the strict `>` comparison, same convention as
+        VWAP Pullback's own staleness gate."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=120))
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_rsi_block_ce_above=75.0,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None

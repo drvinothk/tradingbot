@@ -58,6 +58,17 @@ from app.modules.strategy_engine.interface import SignalStatus, Strategy, TradeP
 # the only timeframe anything in this codebase persists.
 BAR_TIMEFRAME = "60s"
 
+# 2026-09-08: how old a RSI14 reading can be (measured against the
+# evaluating bar's own bucket_start, never wall-clock -- see
+# rsi_extreme_entry_blocked's callers) before rsi_extreme_entry_blocked
+# treats it as unavailable rather than trading on a frozen value. 2 bars'
+# grace at the system's 60s cadence -- same shape as VWAP Pullback's own
+# vwap_max_staleness_seconds gate, sized the same way relative to its bar
+# cadence. Under normal operation RSI14 updates every ~60-70s, so this is a
+# no-op in the healthy case; it only ever fires during a genuine indicator-
+# engine gap.
+ENTRY_RSI_MAX_STALENESS_SECONDS = 120.0
+
 _T = TypeVar("_T")
 
 

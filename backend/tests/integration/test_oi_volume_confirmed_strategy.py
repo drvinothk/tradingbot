@@ -268,6 +268,14 @@ def _seed_atr(db: Session, instrument: Instrument, value: float) -> None:
     db.flush()
 
 
+def _seed_rsi(db: Session, instrument: Instrument, value: float, ts: datetime) -> None:
+    db.add(IndicatorSnapshot(
+        id=uuid.uuid4(), instrument_id=instrument.id, indicator_name="RSI14",
+        timeframe=BAR_TIMEFRAME, value=value, ts=ts,
+    ))
+    db.flush()
+
+
 class TestOIVolumeConfirmedStrategy:
     def test_no_signal_with_insufficient_bars(
         self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
@@ -633,3 +641,75 @@ class TestOIVolumeConfirmedStrategy:
         )
         assert strategy.check_setup(db, strategy_run, breakout_bar) is None
 
+
+
+class TestOIEntryRsiStaleness:
+    """2026-09-08: same RSI staleness protection as ORB (see
+    TestORBEntryRsiStaleness for the full reasoning) -- mirrored here since
+    both strategies share rsi_extreme_entry_blocked and both call it from
+    their own check_setup, not a shared base-class method."""
+
+    def test_fresh_rsi_still_blocks(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=30))
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, entry_rsi_block_ce_above=75.0,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+
+    def test_stale_rsi_is_treated_as_unavailable_and_does_not_block(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=300))
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, entry_rsi_block_ce_above=75.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_no_rsi_row_at_all_does_not_block(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, entry_rsi_block_ce_above=75.0,
+        )
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_exactly_at_staleness_threshold_still_trusted(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, strategy_run,
+    ):
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_window_and_filler(db, instrument, BASE - timedelta(minutes=BODY_RATIO_LOOKBACK_BARS))
+        breakout_bar = _seed_bar(
+            db, instrument, BASE, open=22030, high=22055, low=22028, close=22050,
+        )
+        _seed_rsi(db, instrument, 80.0, breakout_bar.bucket_start - timedelta(seconds=120))
+
+        strategy = OIVolumeConfirmedStrategy(
+            instrument.id, EXPIRY, lookback_bars=LOOKBACK_BARS, entry_rsi_block_ce_above=75.0,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None

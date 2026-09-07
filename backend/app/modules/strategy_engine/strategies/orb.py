@@ -52,11 +52,12 @@ from app.modules.strategy_engine.common_rules import (
     BAR_TIMEFRAME,
     DEFAULT_STRUCTURE_BREAK_ATR_MULTIPLIER,
     DEFAULT_STRUCTURE_BREAK_PERSISTENCE_SECONDS,
+    ENTRY_RSI_MAX_STALENESS_SECONDS,
     ConfirmationFilterStrategy,
     _parse_hhmm,
     compute_range_high_low,
     compute_stop_target,
-    get_latest_indicator_value,
+    get_latest_indicator_value_with_ts,
     get_recent_completed_bars,
     pick_by_underlying,
     resolve_structure_break_buffer,
@@ -267,9 +268,25 @@ class ORBStrategy(ConfirmationFilterStrategy):
             )
             return None
 
+        rsi_row = get_latest_indicator_value_with_ts(
+            db, self.instrument_id, "RSI14", self.timeframe
+        )
+        rsi: float | None = None
+        if rsi_row is not None:
+            rsi_value, rsi_ts = rsi_row
+            rsi_age_seconds = (latest_bar.bucket_start - rsi_ts).total_seconds()
+            if rsi_age_seconds > ENTRY_RSI_MAX_STALENESS_SECONDS:
+                self._log_once(
+                    logger, "rsi_stale",
+                    "run %s: latest RSI14 is %.0fs stale (> %.0fs) -- treating as "
+                    "unavailable for the entry-avoidance filter",
+                    strategy_run.id, rsi_age_seconds, ENTRY_RSI_MAX_STALENESS_SECONDS,
+                )
+            else:
+                rsi = rsi_value
+
         if rsi_extreme_entry_blocked(
-            get_latest_indicator_value(db, self.instrument_id, "RSI14", self.timeframe),
-            option_type, self.entry_rsi_block_pe_below, self.entry_rsi_block_ce_above,
+            rsi, option_type, self.entry_rsi_block_pe_below, self.entry_rsi_block_ce_above,
         ):
             self._log_once(
                 logger, f"rsi_extreme_{option_type.value}",
