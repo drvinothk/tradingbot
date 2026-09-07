@@ -50,6 +50,7 @@ from app.modules.strategy_engine.common_rules import (
     get_open_position_for_run,
     get_recent_completed_bars,
     get_recent_indicator_values,
+    rsi_extreme_entry_blocked,
 )
 
 
@@ -86,6 +87,38 @@ class TestComputeStopTarget:
         stop, target = compute_stop_target(100.0, 0.10, 0.15, tick_size=0.05)
         assert stop == 90.0
         assert target == 115.0
+
+
+class TestRsiExtremeEntryBlocked:
+    """2026-09-07 entry-avoidance filter -- backtest-validated on
+    oi_volume_confirmed_conviction (phase15, OIC-R25) before promotion here."""
+
+    def test_missing_rsi_never_blocks(self):
+        assert rsi_extreme_entry_blocked(None, OptionType.PE, 25.0, 70.0) is False
+
+    def test_both_thresholds_unset_never_blocks(self):
+        assert rsi_extreme_entry_blocked(10.0, OptionType.PE, None, None) is False
+        assert rsi_extreme_entry_blocked(90.0, OptionType.CE, None, None) is False
+
+    def test_pe_blocked_at_or_below_threshold(self):
+        assert rsi_extreme_entry_blocked(25.0, OptionType.PE, 25.0, None) is True
+        assert rsi_extreme_entry_blocked(20.0, OptionType.PE, 25.0, None) is True
+
+    def test_pe_not_blocked_above_threshold(self):
+        assert rsi_extreme_entry_blocked(25.1, OptionType.PE, 25.0, None) is False
+
+    def test_ce_blocked_at_or_above_threshold(self):
+        assert rsi_extreme_entry_blocked(70.0, OptionType.CE, None, 70.0) is True
+        assert rsi_extreme_entry_blocked(80.0, OptionType.CE, None, 70.0) is True
+
+    def test_ce_not_blocked_below_threshold(self):
+        assert rsi_extreme_entry_blocked(69.9, OptionType.CE, None, 70.0) is False
+
+    def test_pe_threshold_never_applies_to_ce_and_vice_versa(self):
+        # A CE entry is never blocked by the PE-side threshold, even if RSI
+        # would satisfy it, and symmetrically for PE vs the CE-side threshold.
+        assert rsi_extreme_entry_blocked(10.0, OptionType.CE, 25.0, None) is False
+        assert rsi_extreme_entry_blocked(90.0, OptionType.PE, None, 70.0) is False
 
 
 @pytest.fixture

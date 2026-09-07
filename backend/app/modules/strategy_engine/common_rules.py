@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 
 from app.core.clock import now_ist
 from app.domain.execution.models import Position, PositionStatus
-from app.domain.market.models import IndicatorSnapshot, PriceBar
+from app.domain.market.models import IndicatorSnapshot, OptionType, PriceBar
 from app.domain.strategy.models import StrategyRun, TradeIntent
 from app.modules.strategy_engine.interface import SignalStatus, Strategy, TradeProposal
 
@@ -390,6 +390,35 @@ def compute_stop_target(
     stop_price = _round_to_tick(entry_price * (1 - stop_pct), tick_size)
     target_price = _round_to_tick(entry_price * (1 + target_pct), tick_size)
     return stop_price, target_price
+
+
+def rsi_extreme_entry_blocked(
+    rsi: float | None,
+    option_type: OptionType,
+    block_pe_below: float | None,
+    block_ce_above: float | None,
+) -> bool:
+    """2026-09-07 entry-avoidance filter (`entry_rsi_block_pe_below` /
+    `entry_rsi_block_ce_above`): skip a PE (bearish) entry when RSI14 is
+    already deeply oversold, or a CE (bullish) entry when RSI14 is already
+    deeply overbought -- the hypothesis being the move is exhausted, not
+    confirmed, so entering now is buying/selling at the tail end of the
+    trend. Deliberately the OPPOSITE shape of `conviction_gates
+    ._rsi_alignment_reject` (which *requires* RSI already past a neutral
+    band in the trade's own direction, i.e. rejects the *middle*) -- this
+    rejects one *tail* only, near-disjoint reject zones, not a relabeling
+    of the same gate. Both thresholds default `None` (off); returns `False`
+    (never blocks) whenever a threshold is unset or RSI is unavailable,
+    same "missing data never trips a gate" convention every other
+    indicator-based check in this codebase follows.
+    """
+    if rsi is None:
+        return False
+    if option_type is OptionType.PE and block_pe_below is not None and rsi <= block_pe_below:
+        return True
+    if option_type is OptionType.CE and block_ce_above is not None and rsi >= block_ce_above:
+        return True
+    return False
 
 
 def touch_and_confirm(
