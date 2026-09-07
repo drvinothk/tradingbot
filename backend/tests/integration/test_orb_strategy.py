@@ -654,3 +654,140 @@ class TestORBStrategy:
 
         assert proposal is not None
         assert proposal.option_contract_id == ce.id
+
+
+class TestORBEntryRequireConfirmBar:
+    """2026-09-07 entry-avoidance filter (`entry_require_confirm_bar`) --
+    backtest-validated (phase15, ORB-B: flips base ORB from net -2457.50 to
+    the sweep's best result, +10560.03) before being wired into a dedicated
+    test here. First real unit coverage of the `_pending_confirm` state
+    machine -- previously only exercised via the real backtest run, never a
+    controlled scenario."""
+
+    def test_first_breakout_bar_registers_pending_and_does_not_fire(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_require_confirm_bar=True,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+        assert OptionType.CE in strategy._pending_confirm  # noqa: SLF001
+
+    def test_confirming_bar_fires_the_signal(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        confirm_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES + 1),
+            open=22050, high=22065, low=22045, close=22055,
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_require_confirm_bar=True,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+        proposal = strategy.check_setup(db, strategy_run, confirm_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
+
+    def test_reversal_before_confirmation_clears_pending_and_never_fires(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Price breaks out, then closes back inside the range on the very
+        next bar -- the pending confirmation must be voided, not carried
+        forward to a later, unrelated breakout bar."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        reversal_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES + 1),
+            open=22050, high=22055, low=22005, close=22010,  # back inside [21990, 22030]
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_require_confirm_bar=True,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+        assert OptionType.CE in strategy._pending_confirm  # noqa: SLF001
+        assert strategy.check_setup(db, strategy_run, reversal_bar) is None
+        assert strategy._pending_confirm == {}  # noqa: SLF001
+
+    def test_confirmation_landing_after_cutoff_never_fires(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Known, accepted edge case (already baked into the phase15 backtest
+        numbers, not a new behavior): a breakout detected right at the
+        cutoff boundary registers pending, but if the confirming bar lands
+        past cutoff, the cutoff check returns None before the pending-
+        confirm logic ever runs -- the confirmation can never complete."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, datetime(2026, 7, 24, 10, 14, tzinfo=IST),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+        confirm_bar = _seed_bar(
+            db, instrument, datetime(2026, 7, 24, 10, 16, tzinfo=IST),
+            open=22050, high=22065, low=22045, close=22055,
+        )
+
+        strategy = ORBStrategy(
+            instrument.id, EXPIRY, or_minutes=OR_MINUTES, entry_require_confirm_bar=True,
+        )
+        assert strategy.check_setup(db, strategy_run, breakout_bar) is None
+        assert strategy.check_setup(db, strategy_run, confirm_bar) is None
+
+    def test_default_off_is_byte_identical_to_pre_existing_behavior(
+        self, db: Session, instrument, option_contract_ce, option_contract_pe, trading_session,
+        strategy_config, user,
+    ):
+        """Regression guard: entry_require_confirm_bar defaults False, so
+        every existing config (no override) must keep firing on the first
+        breakout bar exactly as before this feature existed."""
+        or_start = datetime(2026, 7, 24, 9, 16, tzinfo=IST)
+        strategy_run = _make_strategy_run(db, strategy_config, trading_session, user, or_start)
+        _seed_chain(db, instrument, option_contract_ce, option_contract_pe)
+        _seed_opening_range(db, instrument, or_start, or_high=22030.0, or_low=21990.0)
+
+        breakout_bar = _seed_bar(
+            db, instrument, or_start + timedelta(minutes=OR_MINUTES),
+            open=22030, high=22060, low=22025, close=22050,
+        )
+
+        strategy = ORBStrategy(instrument.id, EXPIRY, or_minutes=OR_MINUTES)
+        proposal = strategy.check_setup(db, strategy_run, breakout_bar)
+
+        assert proposal is not None
+        assert proposal.option_contract_id == option_contract_ce.id
