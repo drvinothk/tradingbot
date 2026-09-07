@@ -627,3 +627,51 @@ Approve? (yes / yes+add-allow-rules / no)
   /var/www/trading-bot/dist && sudo mv
   /var/www/trading-bot/dist.bak-20260902-035408 /var/www/trading-bot/dist
   && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
+
+- **2026-09-07 ~18:01 IST** — **LIVE exit-path redesign**, branch
+  `feat/live-exit-path-redesign` @ `06a5636` (NOT merged to main; deployed
+  from the branch, merge pending the 1-lot live verification). LIVE exits
+  now drive the already-accepted resting SL-LMT to fire via one
+  `ModifyOrder` instead of a fresh plain-`LIMIT` sell (which Shoonya RMS
+  margin-rejects as a naked short — the 2026-09-07 incident). Surgical
+  per-file deploy: `app/domain/execution/models.py`,
+  `app/modules/alerting/manager.py`,
+  `app/modules/execution_engine/paper/{exit_legs,protective_stop,service}.py`
+  + migration `0037` (`stop_plans.exit_fired_at` + `exit_fire_attempts`,
+  both nullable/defaulted — additive). Frontend: `AdvancedPage.tsx` (Lots
+  input Save/Cancel + live-raise margin confirm), `ControlRoomPage.tsx`
+  (`exit_order_attempts_exhausted` → attention set). Approved by operator
+  (yes + add-allow-rules; the settings.local.json edit was itself
+  classifier-blocked, allow-rule snippet handed to the operator to paste).
+
+  Tested: 1635 backend pytest pass (concurrent momentum/RSI tests stashed
+  out for the isolated run), ruff + mypy clean, `npm run build` clean.
+
+  Drift check first: OCI's copy of all 5 `.py` files was byte-identical to
+  the `main` baseline (`b3f5a2a`), so the surgical copy reverts nothing.
+  Safety gate (live): 18:01 IST (after close), session `live_enabled` but
+  **0 open positions** — restart safe. Backend backup
+  `~/deploy-bak/exitpath-20260907-175847/` (5 files + `ALEMBIC_BEFORE=0036`).
+  Frontend backup `/var/www/trading-bot/dist.bak-20260907-175847`.
+
+  Commands: tarball the 6 files (0 credentials confirmed) → scp
+  `/tmp/exitpath_files.tgz` → extract to staging, `cp` into place → `ls
+  credentials/` (intact) → `python -c "import app.main"` (OK) → `alembic
+  upgrade head` (`0036`→`0037 (head)`; both columns confirmed via
+  `information_schema`) → `systemctl restart trading-bot` (`active`,
+  `/health` `{"status":"ok"}`, strategy recovery clean, no
+  errors/tracebacks) → frontend tarball → backup + extract to
+  `/var/www/trading-bot/dist` + `chown www-data` (nginx now serves
+  `index-BxOQAPF6.js`, was `index-DzEsaNHx.js`). All 6 backend files
+  md5-verified local↔box.
+
+  Rollback (backend): `cd ~/trading-bot/backend && for f in
+  app/domain/execution/models.py app/modules/alerting/manager.py
+  app/modules/execution_engine/paper/exit_legs.py
+  app/modules/execution_engine/paper/protective_stop.py
+  app/modules/execution_engine/paper/service.py; do cp
+  ~/deploy-bak/exitpath-20260907-175847/$f $f; done && .venv/bin/python -m
+  alembic downgrade 0036 && sudo systemctl restart trading-bot`. Rollback
+  (frontend): `sudo rm -rf /var/www/trading-bot/dist && sudo mv
+  /var/www/trading-bot/dist.bak-20260907-175847 /var/www/trading-bot/dist
+  && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
