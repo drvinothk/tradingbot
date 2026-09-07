@@ -675,3 +675,57 @@ Approve? (yes / yes+add-allow-rules / no)
   (frontend): `sudo rm -rf /var/www/trading-bot/dist && sudo mv
   /var/www/trading-bot/dist.bak-20260907-175847 /var/www/trading-bot/dist
   && sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
+
+---
+
+## 2026-09-08 ~02:26 IST — WS1–WS6 exit-path batch (collapsed-leg + fire-now robustness + ops)
+
+`main` `1550447` (pushed to origin). Deployed to OCI `144.24.137.112`
+(`/home/ubuntu/trading-bot/backend`).
+
+**What:** WS1 collapsed single exit -> highest-allocation leg
+(`suppress_hard_target`, migration `0038`); WS2 fire-now robustness
+(A2 live-tick anchor, A3 stale re-anchor + `force` square-off, A5 central
+`exit_fired_at` guard); WS4 `scripts/prep_live_ramp.py` (dry-run-first
+lot-cap / runtime_mode / RSI-block setter — NOT run yet); WS6 approx
+slippage for reconciled fire-now exits (NEW-2) + `_modify_resting_order`
+docstring (A7). 1653 backend tests pass, ruff/mypy clean.
+
+**Files (7), surgical scp, all sha256-verified box == local worktree:**
+`app/domain/execution/models.py`,
+`app/modules/execution_engine/paper/exit_legs.py`,
+`app/modules/execution_engine/paper/protective_stop.py`,
+`app/modules/execution_engine/paper/service.py`,
+`app/modules/scheduler/eod_square_off.py`,
+`migrations/versions/0038_stop_plan_suppress_hard_target.py`,
+`scripts/prep_live_ramp.py`. 0 credentials in the set. No frontend change.
+
+**Drift check first:** box `common_rules.py` sha256 == local worktree
+(`7e3c4977…`) -> box was current at `3db6ffd`, holds the CRLF worktree
+representation. Baseline clean.
+
+**Safety gate:** 02:24 IST (market closed), session `paper_only`,
+**0 open positions**. Backend backup `~/deploy-bak/ws1-6-20260907-205545/`
+(5 replaced files; `ALEMBIC_BEFORE=0037`).
+
+**Steps:** scp 7 files -> `alembic upgrade head` (`0037`->`0038 (head)`;
+`information_schema` confirms `stop_plans.suppress_hard_target boolean
+YES`) -> `systemctl restart trading-bot` (`active`, `/health` `200`,
+Shoonya session restored from cache, token warm-up 6208, startup recovery
+1 session / 0 open positions / 0 stale runs, "Application startup
+complete", zero errors/tracebacks).
+
+**Still to do (operator):** run `scripts/prep_live_ramp.py` on the box
+(dry-run, review, `--apply`) to set `per_trade_lot_cap` to the ramp step,
+pin `Test 1` to `force_paper`, and set `entry_rsi_block_pe_below` on the
+OI conviction paper+live configs. Not done here — it changes the live DB.
+
+**Rollback:** `cd ~/trading-bot/backend && for f in
+app/domain/execution/models.py
+app/modules/execution_engine/paper/exit_legs.py
+app/modules/execution_engine/paper/protective_stop.py
+app/modules/execution_engine/paper/service.py
+app/modules/scheduler/eod_square_off.py; do cp
+~/deploy-bak/ws1-6-20260907-205545/$f $f; done && .venv/bin/python -m
+alembic downgrade 0037 && sudo systemctl restart trading-bot`
+(`scripts/prep_live_ramp.py` can stay — it is inert unless invoked).
