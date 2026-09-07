@@ -392,6 +392,28 @@ def compute_stop_target(
     return stop_price, target_price
 
 
+def compute_stop_target_points(
+    entry_price: float, stop_points: float, target_points: float, tick_size: float = 0.0
+) -> tuple[float, float]:
+    """Fixed-premium-point variant of `compute_stop_target`, for a scalp-style
+    strategy that wants a consistent absolute Rupee move (`points * lot_size`)
+    rather than a proportional one. Only ever buys premium in this codebase
+    (CE or PE), so "stop below entry, target above" needs no direction branch,
+    same as the pct-based formula above.
+
+    Floored at one tick above zero -- unlike `compute_stop_target` (where any
+    `stop_pct < 1.0` keeps `stop_price` positive for any positive
+    `entry_price`), a *fixed* point stop can exceed a cheap entry premium
+    (e.g. entry=10, stop_points=15 -> a meaningless negative price). Real
+    near-expiry entries as low as ~10-25 exist in this project's own
+    archive, so this isn't a hypothetical corner.
+    """
+    floor = tick_size if tick_size > 0 else 0.05
+    stop_price = _round_to_tick(max(entry_price - stop_points, floor), tick_size)
+    target_price = _round_to_tick(entry_price + target_points, tick_size)
+    return stop_price, target_price
+
+
 def rsi_extreme_entry_blocked(
     rsi: float | None,
     option_type: OptionType,
