@@ -15,7 +15,11 @@ export type StrategyType =
   | 'oi_volume_confirmed_conviction'
   | 'liquidity_sweep_reversal'
   | 'liquidity_sweep_reversal_conviction'
-export type RuntimeMode = 'force_paper'
+// The authoritative per-strategy real-money mark (2026-09-08 inversion).
+// force_live = places real orders in a live_enabled session; force_paper =
+// always the mock broker. Non-nullable server-side; the "Go Paper" master
+// switch still clamps every strategy to paper regardless of this.
+export type RuntimeMode = 'force_paper' | 'force_live'
 export type UnderlyingSymbol = 'NIFTY' | 'BANKNIFTY'
 
 export interface UserOut {
@@ -61,7 +65,8 @@ export interface StrategyConfigOut {
   strategy_type: string
   params: Record<string, unknown>
   is_enabled: boolean
-  runtime_mode: string | null
+  // Non-nullable server-side since the 2026-09-08 inversion (migration 0039).
+  runtime_mode: RuntimeMode
   underlying_symbol: string | null
   // null = active. Non-null = archived ("done with this one" -- distinct
   // from is_enabled, which stays the quick/temporary pause).

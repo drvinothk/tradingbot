@@ -1,8 +1,8 @@
 """Strategy runtime domain. `StrategyConfig` is a strategy's persistent
-definition (`is_enabled` on/off, `runtime_mode` force-paper override,
-`params`); `Signal`/`TradeIntent` are what every strategy — synthetic now,
-real from Phase 4 — is allowed to emit, per the shared `Strategy` interface
-in `app.modules.strategy_engine.interface` (no Order/Position access at any
+definition (`is_enabled` on/off, `runtime_mode` live/paper mark, `params`);
+`Signal`/`TradeIntent` are what every strategy — synthetic now, real from
+Phase 4 — is allowed to emit, per the shared `Strategy` interface in
+`app.modules.strategy_engine.interface` (no Order/Position access at any
 layer beneath it). A TradeIntent's own status lifecycle ends at `DISPATCHED`
 ("handed to Execution Service") — what happens after that lives in
 `app.domain.execution`'s Order/Position/TradeOutcome chain, not here.
@@ -12,6 +12,14 @@ layer beneath it). A TradeIntent's own status lifecycle ends at `DISPATCHED`
 it never had an API setter and its only remaining reader
 (`broker_adapter.composition.is_strategy_routed_live`) now decides live
 routing purely from the session's `SafeMode` plus `runtime_mode`.
+
+2026-09-08: paper/live model inverted (migration 0039). The daily session is
+now born `SafeMode.LIVE_ENABLED` and `runtime_mode` is the authoritative
+per-strategy real-money mark: `FORCE_LIVE` trades real money in a live
+session, `FORCE_PAPER` never does. There is no longer a "follow the session"
+(`None`) state — the column is non-nullable, defaulting to `FORCE_PAPER`.
+The session master switch (`go-paper`) is a global clamp: `SafeMode.PAPER_ONLY`
+forces every strategy to paper regardless of its own mark.
 """
 
 from __future__ import annotations
@@ -40,16 +48,24 @@ from app.core.db.base import Base, TimestampMixin, UUIDPkMixin
 
 
 class StrategyRuntimeMode(enum.StrEnum):
-    """Ops-Hardening Phase 1 (2026-08-14): a per-strategy "hold this one on
-    paper even though the session is live" override. Deliberately
-    downgrade-only, mirroring the `SafeMode` matrix's own "overrides only
-    ever restrict, never expand" philosophy
-    (`app.core.modes.state_machine`) — there is no `FORCE_LIVE` value; the
-    only way to raise a strategy to real money is the session master switch
-    (`SafeMode.LIVE_ENABLED`). `StrategyConfig.runtime_mode` is nullable;
-    `None` means "no override — route per the session mode."
+    """The authoritative per-strategy real-money mark — a symmetric explicit
+    pair, no "follow the session" state (2026-09-08 inversion, migration
+    0039). `FORCE_LIVE` = this strategy places real orders when the session
+    is `SafeMode.LIVE_ENABLED`; `FORCE_PAPER` = always the mock broker, even
+    in a live session. `StrategyConfig.runtime_mode` is non-nullable and
+    defaults to `FORCE_PAPER`, so "Live" is always something a human opts
+    into. The session master switch is a one-way clamp on top: a
+    `SafeMode.PAPER_ONLY` session routes *every* strategy to paper
+    regardless of its mark (see `broker_adapter.composition.
+    is_strategy_routed_live` / `get_execution_broker`).
+
+    History: introduced 2026-08-14 (Ops-Hardening Phase 1) as `FORCE_PAPER`
+    only — a downgrade-only "hold this one on paper even though the session
+    is live" override, back when the master switch was the only way to raise
+    anything to real money and every fresh session was born `paper_only`.
     """
 
+    FORCE_LIVE = "force_live"
     FORCE_PAPER = "force_paper"
 
 
@@ -104,8 +120,13 @@ class StrategyConfig(Base, UUIDPkMixin, TimestampMixin):
     # resume, so `is_enabled` is what tells that bootstrap which configs
     # should be auto-started each morning at all.
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    runtime_mode: Mapped[StrategyRuntimeMode | None] = mapped_column(
-        String(30), nullable=True, default=None
+    # The authoritative per-strategy real-money mark (see StrategyRuntimeMode).
+    # Non-nullable since the 2026-09-08 inversion (migration 0039): every
+    # config is explicitly FORCE_LIVE or FORCE_PAPER, defaulting to
+    # FORCE_PAPER so "Live" is always a deliberate human opt-in.
+    runtime_mode: Mapped[StrategyRuntimeMode] = mapped_column(
+        String(30), nullable=False, default=StrategyRuntimeMode.FORCE_PAPER,
+        server_default=StrategyRuntimeMode.FORCE_PAPER.value,
     )
     # Ops-Hardening Phase 6 (Auto-Spawner): which underlying (Instrument.symbol,
     # e.g. "NIFTY"/"BANKNIFTY") the daily auto-spawner should resolve an

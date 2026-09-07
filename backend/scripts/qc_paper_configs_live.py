@@ -101,9 +101,11 @@ def main() -> None:
             fail += 1
             continue
 
-        # runtime mode -- a NULL here follows the session, i.e. would route live
+        # runtime mode -- post-2026-09-08 inversion, force_live routes real
+        # orders in the (now live-by-default) daily session; only force_paper
+        # is safe for a paper-only config.
         if rmode != "force_paper":
-            print(f"  !! runtime_mode is {rmode}, not force_paper -- would follow session mode")
+            print(f"  !! runtime_mode is {rmode}, not force_paper -- would route LIVE")
             fail += 1
         else:
             print("  [0] runtime_mode    : force_paper OK")

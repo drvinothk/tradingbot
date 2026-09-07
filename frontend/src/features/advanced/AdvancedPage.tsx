@@ -605,9 +605,11 @@ function StrategyConfigRow({
   // explicitly) are resolved silently from data already on screen rather
   // than asked for again in a second form:
   //   - session: this row's own "Mode" select (config.runtime_mode) already
-  //     says Live vs Paper: force_paper -> the Paper session bucket,
-  //     otherwise the Live bucket (useSessionBuckets, same bucketing
-  //     Control Room's header uses).
+  //     says Live vs Paper: force_live -> the Live session bucket,
+  //     force_paper -> the Paper bucket, falling back to Live if no
+  //     mock-backed Paper session exists (a force_paper strategy still
+  //     routes to the mock via is_strategy_routed_live regardless).
+  //     useSessionBuckets is the same bucketing Control Room's header uses.
   //   - instrument: this row's own "Instrument" select (config
   //     .underlying_symbol) already names the underlying; resolved here to
   //     the matching Instrument row.
@@ -636,8 +638,11 @@ function StrategyConfigRow({
   })
 
   const instrument = instruments.find((i) => i.symbol === config.underlying_symbol)
-  const isPaperMode = config.runtime_mode === 'force_paper'
-  const targetSession = isPaperMode ? paperSession : liveSession
+  const isPaperMode = config.runtime_mode !== 'force_live'
+  // Post-inversion the daily session is live_enabled, so a Shoonya-backed
+  // workspace usually has no mock-backed Paper session -- fall back to the
+  // Live one (a force_paper strategy still routes to the mock).
+  const targetSession = isPaperMode ? (paperSession ?? liveSession) : liveSession
   const expiryDate = instrument?.expiry_dates[0] ?? null
 
   function handleStart() {
@@ -716,13 +721,13 @@ function StrategyConfigRow({
         </td>
         <td>
           <select
-            value={config.runtime_mode ?? ''}
+            value={config.runtime_mode}
             disabled={patchMutation.isPending}
             onChange={(e) =>
-              patchMutation.mutate({ runtime_mode: (e.target.value || null) as RuntimeMode | null })
+              patchMutation.mutate({ runtime_mode: e.target.value as RuntimeMode })
             }
           >
-            <option value="">Live</option>
+            <option value="force_live">Live</option>
             <option value="force_paper">Paper</option>
           </select>
         </td>

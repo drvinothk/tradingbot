@@ -12,8 +12,11 @@ writes a rollback snapshot and changes nothing):
 
 2. `--pin-config NAME` (repeatable) -> `strategy_configs.runtime_mode =
    force_paper`, `runtime_mode_source = manual` for that config. Use it on a
-   config that must never route live on a master-switch flip (e.g. `Test 1`,
-   whose `runtime_mode` is NULL today = "follow the session").
+   config that must stay on the mock broker.
+   `--arm-config NAME` (repeatable) -> the inverse: `runtime_mode =
+   force_live`, `runtime_mode_source = manual`. Arms the config for real
+   orders in a `live_enabled` session (which, post-2026-09-08 inversion, is
+   how the daily session is born). A name can't be in both lists.
 
 3. `--rsi-block "NAME=VALUE"` (repeatable) -> sets
    `params["entry_rsi_block_pe_below"] = float(VALUE)` on that config (the
@@ -131,6 +134,11 @@ def main() -> None:
         help="set runtime_mode=force_paper on this config (repeatable)",
     )
     p.add_argument(
+        "--arm-config", action="append", default=[], metavar="NAME",
+        help="set runtime_mode=force_live on this config -- arms it for real "
+             "orders in a live_enabled session (repeatable)",
+    )
+    p.add_argument(
         "--rsi-block", action="append", default=[], metavar="NAME=VALUE",
         help="set params.entry_rsi_block_pe_below on this config (repeatable)",
     )
@@ -148,10 +156,21 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    if args.lot_cap is None and not args.pin_config and not args.rsi_block:
-        raise SystemExit("nothing to do -- pass --lot-cap and/or --pin-config and/or --rsi-block")
+    if (
+        args.lot_cap is None
+        and not args.pin_config
+        and not args.arm_config
+        and not args.rsi_block
+    ):
+        raise SystemExit(
+            "nothing to do -- pass --lot-cap and/or --pin-config and/or --arm-config "
+            "and/or --rsi-block"
+        )
     if args.lot_cap is not None and args.lot_cap < 1:
         raise SystemExit("--lot-cap must be >= 1")
+    both = set(args.pin_config) & set(args.arm_config)
+    if both:
+        raise SystemExit(f"--pin-config and --arm-config both name: {sorted(both)}")
 
     rsi_specs = _parse_rsi_specs(args.rsi_block)
     ts_now = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -174,7 +193,9 @@ def main() -> None:
             .count()
         )
 
-        want_configs = list(dict.fromkeys([*args.pin_config, *rsi_specs.keys()]))
+        want_configs = list(
+            dict.fromkeys([*args.pin_config, *args.arm_config, *rsi_specs.keys()])
+        )
         cfg_rows = {
             c.name: c
             for c in db.query(StrategyConfig).filter(StrategyConfig.name.in_(want_configs)).all()
@@ -222,6 +243,13 @@ def main() -> None:
                 print(f"  pin {name!r}: already force_paper -- skip")
             else:
                 print(f"  pin {name!r}: runtime_mode {cur} -> force_paper, source -> manual")
+        for name in args.arm_config:
+            c = cfg_rows[name]
+            cur = _rm_str(c.runtime_mode) or "NULL"
+            if cur == StrategyRuntimeMode.FORCE_LIVE.value:
+                print(f"  arm {name!r}: already force_live -- skip")
+            else:
+                print(f"  arm {name!r}: runtime_mode {cur} -> force_live, source -> manual")
         for name, val in rsi_specs.items():
             c = cfg_rows[name]
             cur = (c.params or {}).get("entry_rsi_block_pe_below", "<unset>")
@@ -272,6 +300,14 @@ def main() -> None:
                 c.runtime_mode_source = "manual"
                 db.add(c)
                 print(f"  {name!r}: runtime_mode = force_paper")
+
+        for name in args.arm_config:
+            c = db.query(StrategyConfig).filter(StrategyConfig.name == name).one()
+            if _rm_str(c.runtime_mode) != StrategyRuntimeMode.FORCE_LIVE.value:
+                c.runtime_mode = StrategyRuntimeMode.FORCE_LIVE
+                c.runtime_mode_source = "manual"
+                db.add(c)
+                print(f"  {name!r}: runtime_mode = force_live")
 
         for name, val in rsi_specs.items():
             c = db.query(StrategyConfig).filter(StrategyConfig.name == name).one()

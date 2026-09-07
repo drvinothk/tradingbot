@@ -4,9 +4,15 @@ import { useActiveSessionMode } from '../shared/hooks/useActiveSessionMode'
 import { FeedLatencyBadge } from '../shared/components/FeedLatencyBadge'
 import type { ProviderPreferenceOut } from '../shared/api/types'
 
+// 2026-09-08 (paper/live inversion): live_enabled is now the normal resting
+// state (the daily session is born live), so it gets the plain label.
+// paper_only means the "Go Paper" master switch is engaged -- a deliberate,
+// usually-temporary global clamp -- so it's called out, but it's not an
+// alarm state (see isAlarming below, which still only covers the three
+// emergency modes).
 const MODE_LABELS: Record<string, string> = {
-  paper_only: 'Paper only',
-  live_enabled: 'Live enabled',
+  paper_only: 'Paper (global clamp on)',
+  live_enabled: 'Live',
   degraded_mode: 'Degraded mode',
   reconciliation_lock: 'Reconciliation lock',
   kill_switch: 'Kill switch',
@@ -38,6 +44,9 @@ export function ModeBanner() {
   const isAlarming =
     activeSession != null &&
     ['degraded_mode', 'reconciliation_lock', 'kill_switch'].includes(activeSession.mode)
+  // Not an alarm, but worth flagging: "Go Paper" is engaged, so no strategy
+  // is placing real orders regardless of its own Live mark.
+  const isPaperClamp = activeSession?.mode === 'paper_only'
 
   const activeLeg = providerQuery.data?.live_active_leg ?? null
   const providerSuffix = activeLeg ? ` (${PROVIDER_LABELS[activeLeg] ?? activeLeg})` : ''
@@ -60,7 +69,14 @@ export function ModeBanner() {
 
   return (
     <div className={`mode-banner${isAlarming ? ' mode-banner-alarm' : ''}`}>
-      <span>{activeSession ? `Active session: ${modeLabel}` : 'No active session'}</span>
+      <span>
+        {activeSession ? `Active session: ${modeLabel}` : 'No active session'}
+        {isPaperClamp && (
+          <span className="badge badge-warning" style={{ marginLeft: '0.5rem' }}>
+            Go Paper engaged — no real orders
+          </span>
+        )}
+      </span>
       <span className="row-actions">
         <span className="muted">
           <FeedLatencyBadge feedAgeSeconds={feedAgeSeconds} feedState={feedState} />

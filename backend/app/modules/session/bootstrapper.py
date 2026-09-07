@@ -213,7 +213,12 @@ def _bootstrap_workspace(
         workspace_id=workspace_id,
         broker_account_id=most_recent.broker_account_id,
         started_by_user_id=most_recent.started_by_user_id,
-        mode=SafeMode.PAPER_ONLY,
+        # 2026-09-08 (paper/live inversion): the daily session is born
+        # live_enabled. Live is the normal resting state; nothing trades
+        # real money until a strategy is explicitly marked
+        # `runtime_mode = force_live` (default is force_paper), and the
+        # "Go Paper" master switch still clamps the whole session to paper.
+        mode=SafeMode.LIVE_ENABLED,
         started_at=datetime.now(UTC),
         budget_amount=(
             float(global_daily.daily_budget_amount) if global_daily else defaults.default_budget
@@ -240,7 +245,10 @@ def _bootstrap_workspace(
         entity_id=new_session.id,
         trading_session_id=new_session.id,
         broker_account_id=new_session.broker_account_id,
-        payload={"broker_account_id": str(new_session.broker_account_id)},
+        payload={
+            "broker_account_id": str(new_session.broker_account_id),
+            "mode": SafeMode(new_session.mode).value,
+        },
     )
     logger.info(
         "Daily bootstrap: created today's trading_session %s for workspace %s "

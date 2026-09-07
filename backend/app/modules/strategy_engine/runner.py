@@ -39,7 +39,12 @@ from app.domain.market.models import Instrument, PriceBar
 from app.domain.ops.models import AlertSeverity
 from app.domain.risk.models import RiskDecision
 from app.domain.session.models import TradingSession
-from app.domain.strategy.models import StrategyConfig, StrategyRun, StrategyRunStatus
+from app.domain.strategy.models import (
+    StrategyConfig,
+    StrategyRun,
+    StrategyRunStatus,
+    StrategyRuntimeMode,
+)
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.composition import get_broker, is_strategy_routed_live
@@ -362,6 +367,13 @@ def run_cycle(
     # via the manual-edit endpoint, which stamps `runtime_mode_source=
     # "manual"` and clears cooldown_tier/cooldown_until on write) is never
     # touched here.
+    #
+    # 2026-09-08 (paper/live inversion): resume restores `FORCE_LIVE`, not
+    # `None`. The breaker is live-only by construction -- `record_trade_
+    # outcome_effects` returns early unless `is_live`, so only a strategy
+    # that was genuinely `FORCE_LIVE` (and lost real money) can ever be
+    # tripped here -- so `FORCE_LIVE` is the correct armed state to return
+    # it to. Post-inversion `None` is no longer a valid runtime_mode.
     if (
         strategy_run.cooldown_tier in (1, 2)
         and strategy_run.cooldown_until is not None
@@ -387,7 +399,7 @@ def run_cycle(
                 strategy_run.cooldown_until = None
                 strategy_run.consecutive_severe_losses = 0
                 db.add(strategy_run)
-                strategy_config.runtime_mode = None
+                strategy_config.runtime_mode = StrategyRuntimeMode.FORCE_LIVE
                 strategy_config.runtime_mode_source = "circuit_breaker"
                 db.add(strategy_config)
                 db.flush()

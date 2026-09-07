@@ -364,21 +364,31 @@ def is_strategy_routed_live(
     itself is also scoped to genuinely-live dispatches only.
 
     2026-08-28: simplified when `SafeMode.PAPER_PLUS_GUARDED_LIVE` /
-    `StrategyConfig.status` were retired. Live routing is now just: session
-    mode is `live_enabled` AND the strategy is not `FORCE_PAPER`.
+    `StrategyConfig.status` were retired.
+
+    2026-09-08 (paper/live inversion, migration 0039): `runtime_mode` is now
+    the authoritative real-money mark, not a downgrade-only brake. Live
+    routing for a specific strategy is: session mode is `live_enabled` AND
+    `runtime_mode == FORCE_LIVE`. `FORCE_PAPER` (and any config that can't be
+    resolved) routes to the mock. The session-only case (`strategy_run is
+    None` — reconciliation / EOD square-off / margin checks) keeps the pure
+    session-mode answer: those callers legitimately want "is this a live
+    session", not a per-strategy decision.
     """
     mode = SafeMode(trading_session.mode)
     if mode != SafeMode.LIVE_ENABLED:
         return False
 
-    if strategy_run is not None:
-        db = object_session(strategy_run)
-        if db is not None:
-            config = db.get(StrategyConfig, strategy_run.strategy_config_id)
-            if config is not None and config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER:
-                return False
+    if strategy_run is None:
+        return True
 
-    return True
+    db = object_session(strategy_run)
+    if db is None:
+        return False
+    config = db.get(StrategyConfig, strategy_run.strategy_config_id)
+    if config is None:
+        return False
+    return config.runtime_mode == StrategyRuntimeMode.FORCE_LIVE
 
 
 def get_execution_broker(
@@ -449,14 +459,18 @@ def get_execution_broker(
        `position`.
     2. `mode != live_enabled` (paper_only / degraded_mode / kill_switch /
        reconciliation_lock) → mock, unconditionally, regardless of
-       `strategy_run`.
+       `strategy_run`. `paper_only` is the global paper clamp (the "Go
+       Paper" master switch): it overrides every strategy's own
+       `runtime_mode`.
     3. `mode == live_enabled` AND (`strategy_run` is None OR its
-       `StrategyConfig.runtime_mode != FORCE_PAPER`) → real broker, gated on
+       `StrategyConfig.runtime_mode == FORCE_LIVE`) → real broker, gated on
        `allow_real_money_dispatch` (raises `ConfigurationError` rather than
        falling back to paper if it's off — a missing/false flag must never
        be silently read as "use paper instead," per explicit design intent).
-       `runtime_mode.FORCE_PAPER` (Ops-Hardening Phase 1) is the per-strategy
-       "hold this one on paper even in a live session" override.
+       `runtime_mode` is the authoritative per-strategy real-money mark
+       since the 2026-09-08 inversion (migration 0039): `FORCE_LIVE` opts a
+       strategy into real orders, `FORCE_PAPER` is the default and holds it
+       on the mock.
     4. `mode == live_enabled` AND `strategy_run`'s config is
        `runtime_mode == FORCE_PAPER` → mock.
 

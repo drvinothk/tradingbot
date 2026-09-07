@@ -299,15 +299,20 @@ function ControlRoomHeader({
       return
     }
     const typed = window.prompt(
-      'This switches the Live session to LIVE -- strategies whose own Mode is "Live" ' +
-        '(not "Paper") can then place real orders. Type LIVE to confirm.',
+      'Release the global paper clamp. Strategies whose own Mode is "Live" resume ' +
+        'placing real orders; "Paper" strategies stay on the mock. Type LIVE to confirm.',
     )
     if (typed === 'LIVE') goLiveMutation.mutate(liveSession.id)
   }
 
   function handleGoPaper() {
     if (!liveSession) return
-    if (window.confirm("Switch the Live session's master mode back to Paper?")) {
+    if (
+      window.confirm(
+        'Go Paper: clamp every strategy on this session to the mock broker right now, ' +
+          "overriding each strategy's own Live mark. Resets to Live at the next trading day.",
+      )
+    ) {
       goPaperMutation.mutate(liveSession.id)
     }
   }

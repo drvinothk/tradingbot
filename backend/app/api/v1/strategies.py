@@ -608,11 +608,11 @@ def create_strategy(
         strategy_type=body.strategy_type,
         params=body.params,
         underlying_symbol=body.underlying_symbol,
-        # Master-switch feature: default every new strategy to Paper
-        # (force_paper), not the column's own NULL default -- "Live" must
-        # always be something a human opts into via the Mode dropdown,
-        # never an inherited default. See the matching backfill migration
-        # 0019 for the same fix applied to strategies that already existed.
+        # Every new strategy defaults to Paper (force_paper) -- "Live" is
+        # always something a human opts into via the Mode dropdown, never an
+        # inherited default. Since the 2026-09-08 inversion this also matches
+        # the column's own default; kept explicit for intent. See migration
+        # 0039 for the same guarantee applied to strategies that predate it.
         runtime_mode=StrategyRuntimeMode.FORCE_PAPER,
     )
     db.add(config)
@@ -640,6 +640,10 @@ class UpdateStrategyRequest(BaseModel):
     # in-`model_fields_set`-vs-omitted distinction those three need.
     name: str | None = None
     is_enabled: bool | None = None
+    # `None` here means "not provided" only (detected via model_fields_set) --
+    # since the 2026-09-08 inversion `runtime_mode` is non-nullable, so an
+    # explicit `{"runtime_mode": null}` is a 400, not a "clear" (see
+    # update_strategy). A provided value must be `force_live` or `force_paper`.
     runtime_mode: StrategyRuntimeMode | None = None
     underlying_symbol: str | None = None
     # 2026-08-30: writes into params["qty_lots"] -- see
@@ -667,11 +671,12 @@ def update_strategy(
     config's name in the same workspace with a 409, same check
     `create_strategy` already does at creation time).
 
-    `runtime_mode: null`/`underlying_symbol: null`/`qty_lots: null`
-    explicitly clear the field, distinct from omitting it entirely (which
-    leaves it untouched) — distinguished via `model_fields_set` since both
-    parse to the same Python `None` otherwise. `is_enabled` has no such
-    "clear" case (it's a plain, non-nullable bool), so a plain `is not
+    `underlying_symbol: null`/`qty_lots: null` explicitly clear the field,
+    distinct from omitting it entirely (which leaves it untouched) —
+    distinguished via `model_fields_set` since both parse to the same Python
+    `None` otherwise. `runtime_mode` is non-nullable since the 2026-09-08
+    inversion, so `runtime_mode: null` is a 400, not a clear. `is_enabled`
+    has no "clear" case (a plain, non-nullable bool), so a plain `is not
     None` check is enough.
 
     `runtime_mode` feeds `broker_adapter.composition.get_execution_broker`'s
@@ -681,6 +686,18 @@ def update_strategy(
     alerted rather than guessed. This endpoint only ever updates the DB row;
     a currently-running `StrategyRun` started before this call is
     completely unaffected by it.
+
+    **Authorization note (2026-09-08 inversion — revisit if issues arise).**
+    This endpoint is gated on `strategy.edit`. Post-inversion, setting
+    `runtime_mode = force_live` here (or via `bulk_set_runtime_mode`) is the
+    *only* step needed to make a strategy trade real money — the daily
+    session is born `live_enabled` with no permission check, so the old
+    `livetrade.execute` gate (previously required to flip the master switch)
+    is no longer on the routine path to live dispatch. If that turns out to
+    matter, the fix is a small inline check here and in `bulk_set_runtime_
+    mode`: `if body.runtime_mode == StrategyRuntimeMode.FORCE_LIVE and
+    "livetrade.execute" not in get_user_permissions(db, user): raise 403`.
+    Deliberately NOT implemented now, per explicit user decision.
     """
     config = _get_strategy_config_or_404(db, user, strategy_id)
     fields_set = body.model_fields_set
@@ -710,18 +727,29 @@ def update_strategy(
         changes["is_enabled"] = body.is_enabled
         config.is_enabled = body.is_enabled
 
-    if "runtime_mode" in fields_set and body.runtime_mode != config.runtime_mode:
-        changes["runtime_mode"] = body.runtime_mode.value if body.runtime_mode is not None else None
+    if "runtime_mode" in fields_set and body.runtime_mode is None:
+        # Non-nullable since the 2026-09-08 inversion -- there is no "clear"
+        # case anymore; a strategy is always force_live or force_paper.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "runtime_mode must be 'force_live' or 'force_paper', not null",
+        )
+    if (
+        "runtime_mode" in fields_set
+        and body.runtime_mode is not None
+        and body.runtime_mode != config.runtime_mode
+    ):
+        changes["runtime_mode"] = body.runtime_mode.value
         config.runtime_mode = body.runtime_mode
         # 2026-09-04 (Issue 5): a human deliberately editing runtime_mode
         # always wins over the circuit breaker -- stamp the source so the
         # breaker's own auto-resume check (StrategyRunner.run_cycle) knows
         # this wasn't its own doing, and clear any pending cooldown on the
         # currently active run so a stale auto-timer can never later
-        # override this decision (e.g. a human clears force_paper mid-
-        # cooldown; without this, the run's own leftover cooldown_tier/
-        # cooldown_until would just sit there inert, but a *future* trip
-        # reusing the same run row could otherwise misread it).
+        # override this decision (post-inversion the human re-arms a
+        # breaker-tripped strategy with an explicit force_live -- always a
+        # different value from the breaker's force_paper, so this branch is
+        # reached).
         config.runtime_mode_source = "manual"
         active_run = (
             db.query(StrategyRun)
@@ -776,7 +804,9 @@ def update_strategy(
 
 
 class BulkRuntimeModeRequest(BaseModel):
-    mode: StrategyRuntimeMode | None
+    # Non-nullable since the 2026-09-08 inversion -- `force_live` or
+    # `force_paper`, never null (was: `None` meant "Live/no override").
+    mode: StrategyRuntimeMode
 
 
 class BulkRuntimeModeOut(BaseModel):
@@ -790,14 +820,14 @@ def bulk_set_runtime_mode(
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("strategy.edit")),
 ) -> BulkRuntimeModeOut:
-    """The "master switch" confirm dialog's bulk-apply action -- sets every
-    workspace strategy's `runtime_mode` to `body.mode` in one pass
-    (`body.mode=None` means "Live"/no override, `force_paper` means
-    "Paper", the same two values `update_strategy` already accepts one
-    strategy at a time). Deliberately a separate endpoint rather than the
-    frontend looping `PATCH /strategies/{id}` per row: one DB transaction
-    (all-or-nothing) and the audit trail records this as one deliberate
-    bulk action, not N indistinguishable individual edits.
+    """Bulk-apply action -- sets every workspace strategy's `runtime_mode`
+    to `body.mode` (`force_live` or `force_paper`) in one pass, the same
+    values `update_strategy` accepts one strategy at a time. Deliberately a
+    separate endpoint rather than the frontend looping `PATCH
+    /strategies/{id}` per row: one DB transaction (all-or-nothing) and the
+    audit trail records this as one deliberate bulk action, not N
+    indistinguishable individual edits. No frontend caller today; kept as a
+    scriptable "arm/disarm everything" hook.
     """
     configs = (
         db.query(StrategyConfig).filter(StrategyConfig.workspace_id == user.workspace_id).all()
@@ -839,7 +869,7 @@ def bulk_set_runtime_mode(
                 entity_id=config.id,
                 strategy_config_id=config.id,
                 payload={
-                    "runtime_mode": body.mode.value if body.mode is not None else None,
+                    "runtime_mode": body.mode.value,
                     "bulk": True,
                 },
             )

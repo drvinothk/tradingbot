@@ -197,7 +197,12 @@ def create_session(
             workspace_id=user.workspace_id,
             broker_account_id=broker_account.id,
             started_by_user_id=user.id,
-            mode=SafeMode.PAPER_ONLY,
+            # 2026-09-08 (paper/live inversion): born live_enabled, same as
+            # the daily bootstrapper. Real orders still require a strategy
+            # explicitly marked `runtime_mode = force_live` (default is
+            # force_paper) plus ALLOW_REAL_MONEY_DISPATCH and the instrument
+            # firewall; "Go Paper" clamps the whole session back to paper.
+            mode=SafeMode.LIVE_ENABLED,
             started_at=_utcnow(),
             budget_amount=body.budget_amount or resolved_budget,
             daily_target_profit=body.daily_target_profit or resolved_target,
@@ -400,6 +405,18 @@ def recover_from_kill_switch(
     needs, since clearing one is the more consequential direction.
     """
     trading_session = _get_session_or_404(db, user, session_id)
+    # Explicit guard (matches recover_from_reconciliation_lock's own). Before
+    # the 2026-09-08 inversion a fresh session was `paper_only`, so calling
+    # this on a non-kill_switch session was rejected only incidentally --
+    # `transition_mode(paper_only -> paper_only)` raised "already in
+    # paper_only". Now a fresh session is `live_enabled`, for which
+    # `-> paper_only` is a legal (go-paper) edge, so without this check this
+    # endpoint would silently double as a master-switch "Go Paper".
+    if SafeMode(trading_session.mode) != SafeMode.KILL_SWITCH:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"session is in {trading_session.mode}, not kill_switch",
+        )
     try:
         transition_mode(
             db,
