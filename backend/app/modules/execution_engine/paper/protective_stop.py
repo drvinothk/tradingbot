@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from datetime import timedelta
 from decimal import Decimal
 
 from sqlalchemy.orm import Session
@@ -432,6 +433,14 @@ def sync_resting_protective_stop(
     that: the position is not left unprotected, just running on its last
     confirmed level.
     """
+    # 2026-09-08 defense-in-depth: once `exit_via_resting_stop` has driven
+    # this same resting order to fire (`exit_fired_at` set), never move its
+    # trigger back toward a protective/trail level -- that would un-fire a
+    # pending fire-now exit. `evaluate_open_position`'s own call site already
+    # guards this; the guard is repeated here so no future caller can bypass
+    # it (see the 2026-09-07 exit-path redesign notes).
+    if stop_plan.exit_fired_at is not None:
+        return
     # Skip a redundant ModifyOrder when the tick-rounded trigger wouldn't
     # actually change at the broker -- `desired_trigger_price` creeps by
     # sub-tick amounts most cycles.
@@ -493,6 +502,14 @@ def resize_resting_protective_stop(
     fails, then the app disconnects, then price reaches the trigger), which
     reconciliation would then catch and lock on.
     """
+    # 2026-09-08: same guard as `sync_resting_protective_stop` -- a carrier
+    # already driven to fire (`exit_fired_at` set) must not have its trigger
+    # re-anchored to a leg stop, which would un-fire the pending exit. This is
+    # the call path `evaluate_open_position`'s own guard does NOT cover
+    # (`_sync_carrier_stop_after_leg_close`), so it is load-bearing here, not
+    # just belt-and-braces.
+    if stop_plan.exit_fired_at is not None:
+        return
     confirmed_trigger = _modify_resting_order(
         db,
         trading_session,
@@ -524,6 +541,20 @@ class ExitViaStopOutcome(enum.Enum):
     NO_RESTING_ORDER = "no_resting_order"
 
 
+# 2026-09-08 (A3): a fire-now `ModifyOrder` sets the trigger just below LTP, so
+# it normally fills within a tick or two. If this long passes with the position
+# still OPEN, the market has run away from the trigger (a TARGET exit where
+# premium kept rising is the textbook case) -- re-anchor the trigger to the
+# *current* LTP and try again. The window also rate-limits re-anchors so a
+# per-cycle `force` caller (margin-breach sweep) can't hammer the broker. A
+# non-`force` re-anchor consumes one `exit_fire_attempts`; after
+# `_MAX_EXIT_ORDER_ATTEMPTS` of them the caller escalates to
+# `_handle_exit_attempts_exhausted` (manual reconcile). A `force` re-anchor
+# (EOD / margin-breach / manual square-off) does not consume the budget -- an
+# operator flatten must keep chasing until it fills.
+_FIRE_NOW_STALE_TIMEOUT = timedelta(seconds=90)
+
+
 def exit_via_resting_stop(
     db: Session,
     trading_session: TradingSession,
@@ -533,6 +564,8 @@ def exit_via_resting_stop(
     ltp: float,
     qty: int,
     broker: BrokerPort | None,
+    *,
+    force: bool = False,
 ) -> ExitViaStopOutcome:
     """LIVE exit for a position that already has a resting broker SL-LMT:
     drive that order to fire *now* via one `ModifyOrder` instead of
@@ -562,6 +595,11 @@ def exit_via_resting_stop(
       cycle, and `_MAX_EXIT_ORDER_ATTEMPTS` bumps escalate to the
       exhaustion path (a resting-order position never creates `exit:{id}`
       rows, so the `Order`-count exhaustion check can't see it).
+
+    `force` (EOD / margin-breach / manual square-off) drives a re-anchor even
+    when a fire was already confirmed -- an operator flatten must not be
+    blocked by the idempotency gate if the earlier fire hasn't filled. Still
+    rate-limited to one re-anchor per `_FIRE_NOW_STALE_TIMEOUT`.
     """
     from app.modules.execution_engine.paper.service import _MAX_EXIT_ORDER_ATTEMPTS
 
@@ -569,15 +607,34 @@ def exit_via_resting_stop(
     if resting_order_id is None:
         return ExitViaStopOutcome.NO_RESTING_ORDER
 
-    # Idempotency: already fired -- do not re-`ModifyOrder` every ~3s poll
-    # while the async fill is pending.
+    # Already fired. Normally just report it and let
+    # `reconcile_pending_live_exit_orders` finalise the async fill -- do NOT
+    # re-`ModifyOrder` every ~3s poll. But if the fire has gone stale with no
+    # fill (market ran away from the trigger), or a `force` caller wants it
+    # out now, re-anchor to the current LTP -- once per `_FIRE_NOW_STALE_
+    # TIMEOUT`.
     if stop_plan.exit_fired_at is not None:
-        return ExitViaStopOutcome.FIRED_PENDING
+        recently_fired = _utcnow() - stop_plan.exit_fired_at <= _FIRE_NOW_STALE_TIMEOUT
+        if recently_fired:
+            return ExitViaStopOutcome.FIRED_PENDING
+        if not force and stop_plan.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
+            # Chased the market this many times with no fill -- stop hitting
+            # the broker; the caller's `>= _MAX` check routes to
+            # `_handle_exit_attempts_exhausted`.
+            return ExitViaStopOutcome.MODIFY_FAILED
+        if not force:
+            stop_plan.exit_fire_attempts += 1
+        stop_plan.exit_fired_at = None
+        stop_plan.updated_at = _utcnow()
+        db.add(stop_plan)
+        db.flush()
 
     # Retries exhausted -- stop bumping the counter / re-hitting the broker;
     # the caller's `>= _MAX_EXIT_ORDER_ATTEMPTS` check routes to
     # `_handle_exit_attempts_exhausted` (which keeps retrying auto-repair).
-    if stop_plan.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
+    # A `force` caller is exempt: an operator flatten still fires even at the
+    # cap (it just can't push the counter higher).
+    if not force and stop_plan.exit_fire_attempts >= _MAX_EXIT_ORDER_ATTEMPTS:
         return ExitViaStopOutcome.MODIFY_FAILED
 
     stop_order = (

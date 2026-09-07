@@ -662,7 +662,8 @@ def _check_leg(
         hit_stop = price <= stop_price if favorable else price >= stop_price
         if hit_stop:
             return _close_leg(
-                db, trading_session, position, leg, ExitReason.STOP, float(stop_price), broker
+                db, trading_session, position, leg, ExitReason.STOP, float(stop_price), broker,
+                fire_now_ltp=float(price),
             )
 
     # 2. Target (None => runner leg, skip).
@@ -671,7 +672,8 @@ def _check_leg(
         hit_target = price >= target_price if favorable else price <= target_price
         if hit_target:
             return _close_leg(
-                db, trading_session, position, leg, ExitReason.TARGET, float(target_price), broker
+                db, trading_session, position, leg, ExitReason.TARGET, float(target_price), broker,
+                fire_now_ltp=float(price),
             )
 
     # 3. Structure break — candidate/confirm/reclaim on the leg's own row.
@@ -731,6 +733,7 @@ def _check_leg(
                         ExitReason.STRUCTURE_BREAK,
                         float(price),
                         broker,
+                        fire_now_ltp=float(price),
                     )
         elif leg.structure_break_candidate_since is not None:
             leg.structure_break_candidate_since = None
@@ -743,7 +746,8 @@ def _check_leg(
         spread_pct = _dec(ask - bid) / price
         if spread_pct > _SPREAD_BLOWOUT_PCT:
             return _close_leg(
-                db, trading_session, position, leg, ExitReason.SPREAD_BLOWOUT, float(price), broker
+                db, trading_session, position, leg, ExitReason.SPREAD_BLOWOUT, float(price), broker,
+                fire_now_ltp=float(price),
             )
 
     # 5. Trail — activate at the leg's activation price, then tighten only.
@@ -793,6 +797,7 @@ def _check_leg(
                     ExitReason.TRAIL,
                     float(new_trail_stop),
                     broker,
+                    fire_now_ltp=float(price),
                 )
 
     return None
@@ -808,11 +813,17 @@ def close_all_open_legs(
     exit_reason: ExitReason,
     intended_price: float,
     broker: BrokerPort | None,
+    *,
+    force: bool = False,
 ) -> TradeOutcome | None:
     """The has-legs branch of `service.close_position` — flatten every
     still-OPEN leg at one shared `intended_price` (EOD / margin-breach /
     manual square-off). One price is passed straight through to each leg;
     no per-leg option-chain refresh (QC finding 7).
+
+    `force` (2026-09-08, A3) is threaded from `close_position` for the
+    square-off chain -> `exit_via_resting_stop` re-drives an already-fired
+    carrier toward the market instead of no-op'ing on the idempotency gate.
     """
     open_legs = (
         db.query(PositionExitLeg)
@@ -826,7 +837,7 @@ def close_all_open_legs(
     last_outcome: TradeOutcome | None = None
     for leg in open_legs:
         outcome = _close_leg(
-            db, trading_session, position, leg, exit_reason, intended_price, broker
+            db, trading_session, position, leg, exit_reason, intended_price, broker, force=force
         )
         if outcome is not None:
             last_outcome = outcome
@@ -841,6 +852,9 @@ def _close_leg(
     exit_reason: ExitReason,
     intended_price: float,
     broker: BrokerPort | None,
+    *,
+    fire_now_ltp: float | None = None,
+    force: bool = False,
 ) -> TradeOutcome | None:
     from app.modules.broker_adapter.composition import is_execution_broker_live
     from app.modules.execution_engine.paper.service import (
@@ -857,7 +871,8 @@ def _close_leg(
         if position.status != PositionStatus.OPEN or leg.status != PositionExitLegStatus.OPEN:
             return None
         return _close_leg_locked(
-            db, trading_session, position, leg, exit_reason, intended_price, broker, order_mode
+            db, trading_session, position, leg, exit_reason, intended_price, broker, order_mode,
+            fire_now_ltp=fire_now_ltp, force=force,
         )
 
 
@@ -870,6 +885,9 @@ def _close_leg_locked(
     intended_price: float,
     broker: BrokerPort,
     order_mode: OrderMode,
+    *,
+    fire_now_ltp: float | None = None,
+    force: bool = False,
 ) -> TradeOutcome | None:
     from app.modules.execution_engine.paper.protective_stop import (
         ExitViaStopOutcome,
@@ -910,9 +928,10 @@ def _close_leg_locked(
             position,
             carrier,
             exit_reason,
-            float(intended_price),
+            float(fire_now_ltp) if fire_now_ltp is not None else float(intended_price),
             position.qty,
             broker,
+            force=force,
         )
         if fire_outcome is ExitViaStopOutcome.FIRED_PENDING:
             return None

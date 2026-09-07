@@ -60,6 +60,10 @@ from app.modules.broker_adapter.base.contracts import (
 from app.modules.broker_adapter.base.contracts import OrderSide as ContractOrderSide
 from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
+from app.modules.execution_engine.paper.protective_stop import (
+    resize_resting_protective_stop,
+    sync_resting_protective_stop,
+)
 from app.modules.execution_engine.paper.service import (
     _MAX_EXIT_ORDER_ATTEMPTS,
     close_position,
@@ -2279,6 +2283,180 @@ def test_close_position_live_fires_resting_stop_and_reconciliation_finalizes_wit
     to = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
     assert to.exit_reason == ExitReason.TRAIL
     assert float(to.exit_price) == pytest.approx(128.0)
+
+
+def _open_live_position_with_resting_stop(db, trading_session, strategy_run, option_contract):
+    """Dispatch one LIVE position (entry 100, stop 90, target 140) whose
+    resting SL-LMT is accepted, and return (position, stop_plan, live_broker)."""
+    live_broker = _FakeLiveBrokerWithModify(entry_fill_price=100.0)
+    trade_intent = _make_trade_intent(
+        db, trading_session, strategy_run, option_contract,
+        entry_price=100.0, stop_price=90.0, target_price=140.0,
+    )
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=live_broker)  # type: ignore[arg-type]
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert stop_plan.resting_order_id is not None
+    return position, stop_plan, live_broker
+
+
+def test_fire_now_trigger_anchors_to_the_live_tick_not_the_reason_level(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """A2: premium ran to 160 well past the 140 target. The fire-now trigger
+    must be anchored to the live tick (160 - 1 tick), not target_price
+    (140 - 1 tick), so the resting stop is marketable and fills promptly."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, _sp, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+
+    close_position(
+        db, trading_session, position, ExitReason.TARGET, intended_price=140.0,
+        broker=live_broker, fire_now_ltp=160.0,  # type: ignore[arg-type]
+    )
+    assert live_broker.modify_calls[-1]["trigger_price"] == pytest.approx(159.95)
+
+
+def test_fire_now_trigger_falls_back_to_intended_price_without_live_tick(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """A2: no fire_now_ltp -> byte-identical to before (anchor = intended_price)."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, _sp, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+    close_position(
+        db, trading_session, position, ExitReason.TARGET, intended_price=140.0, broker=live_broker,
+    )  # type: ignore[arg-type]
+    assert live_broker.modify_calls[-1]["trigger_price"] == pytest.approx(139.95)
+
+
+def test_stale_fired_pending_reanchors_and_counts_toward_exhaustion(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """A3: a fire that hasn't filled in _FIRE_NOW_STALE_TIMEOUT re-anchors to
+    the current tick (a fresh ModifyOrder) and bumps exit_fire_attempts."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, stop_plan, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker, fire_now_ltp=130.0,  # type: ignore[arg-type]
+    )
+    db.refresh(stop_plan)
+    assert stop_plan.exit_fired_at is not None
+    modifies_after_first_fire = len(live_broker.modify_calls)
+
+    # Recent fire, not forced -> idempotent no-op.
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker, fire_now_ltp=129.0,  # type: ignore[arg-type]
+    )
+    assert len(live_broker.modify_calls) == modifies_after_first_fire
+
+    # Age the fire past the staleness window -> next cycle re-anchors.
+    stop_plan.exit_fired_at = datetime.now(UTC) - timedelta(seconds=120)
+    db.add(stop_plan)
+    db.flush()
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker, fire_now_ltp=125.0,  # type: ignore[arg-type]
+    )
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == modifies_after_first_fire + 1
+    assert live_broker.modify_calls[-1]["trigger_price"] == pytest.approx(124.95)
+    assert stop_plan.exit_fire_attempts == 1
+    assert stop_plan.exit_fired_at is not None  # re-fired
+
+
+def test_force_square_off_redrives_a_stale_fired_pending(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """A3: EOD/manual square-off (force=True) re-drives an already-fired but
+    unfilled resting stop toward the market, without consuming the retry
+    budget."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, stop_plan, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker, fire_now_ltp=130.0,  # type: ignore[arg-type]
+    )
+    modifies_after_first_fire = len(live_broker.modify_calls)
+    stop_plan.exit_fired_at = datetime.now(UTC) - timedelta(seconds=120)
+    db.add(stop_plan)
+    db.flush()
+
+    close_position(
+        db, trading_session, position, ExitReason.EOD_SQUARE_OFF, intended_price=126.0,
+        broker=live_broker, force=True,  # type: ignore[arg-type]
+    )
+    db.refresh(stop_plan)
+    assert len(live_broker.modify_calls) == modifies_after_first_fire + 1
+    assert live_broker.modify_calls[-1]["trigger_price"] == pytest.approx(125.95)
+    assert stop_plan.exit_fire_attempts == 0  # a forced re-drive doesn't consume the budget
+
+
+def test_sync_and_resize_resting_stop_no_op_once_a_fire_now_exit_is_pending(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """A5: once exit_via_resting_stop has driven the resting order to fire
+    (exit_fired_at set), neither sync_resting_protective_stop (TSL) nor
+    resize_resting_protective_stop (carrier shrink) may issue a ModifyOrder --
+    re-anchoring the trigger back to a protective/trail level would un-fire
+    the pending exit. Guards the _sync_carrier_stop_after_leg_close path that
+    evaluate_open_position's own call-site guard doesn't cover."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, stop_plan, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+    stop_plan.exit_fired_at = datetime.now(UTC)
+    db.add(stop_plan)
+    db.flush()
+    calls_before = len(live_broker.modify_calls)
+
+    sync_resting_protective_stop(
+        db, trading_session, position, stop_plan, stop_plan.resting_order_id,
+        Decimal("95.00"), live_broker,  # type: ignore[arg-type]
+    )
+    resize_resting_protective_stop(
+        db, trading_session, position, stop_plan, stop_plan.resting_order_id,
+        Decimal("95.00"), position.qty, live_broker,  # type: ignore[arg-type]
+    )
+    assert len(live_broker.modify_calls) == calls_before  # neither touched the broker
 
 
 def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(

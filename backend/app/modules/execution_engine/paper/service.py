@@ -1059,6 +1059,9 @@ def close_position(
     exit_reason: ExitReason,
     intended_price: float,
     broker: BrokerPort | None = None,
+    *,
+    fire_now_ltp: float | None = None,
+    force: bool = False,
 ) -> TradeOutcome | None:
     """Idempotent no-op (returns `None`) if the position is already closed —
     stop/target/trail checks and EOD square-off can all race to close the
@@ -1067,6 +1070,22 @@ def close_position(
     justified this exit (stop_price/target_price/the trail's current stop,
     or the current market price for EOD/manual) — it's what `slippage` is
     measured against, not a duplicate of the actual fill price.
+
+    `fire_now_ltp` (2026-09-08, A2): the *current* market tick, used only as
+    the LIVE fire-now `exit_via_resting_stop` trigger anchor. `intended_price`
+    (a reason level like `target_price` that price may have run well past)
+    would set the fire trigger too far below the market, delaying the fill.
+    `None` -> fall back to `intended_price`, byte-identical to before; a
+    poll-driven caller (`evaluate_open_position`) passes the real tick, while
+    EOD/manual/reconcile callers already pass a live price as `intended_price`
+    and leave this unset. Slippage measurement is unaffected either way (a
+    fire-now fill finalises with `intended_price=None` -> slippage 0).
+
+    `force` (2026-09-08, A3) is set only by the EOD / margin-breach / manual
+    square-off chain (`eod_square_off.run_single_position_square_off`): it lets
+    `exit_via_resting_stop` re-drive an already-fired-but-unfilled resting
+    stop toward the current market instead of no-op'ing on the idempotency
+    gate. Every other caller leaves it `False` -> unchanged.
     """
     # position-aware resolution: a position genuinely opened live must
     # always be closeable for real, regardless of current SafeMode
@@ -1089,7 +1108,7 @@ def close_position(
     # fetch by the caller, reused for each leg (QC finding 7).
     if position_has_exit_legs(db, position.id):
         return close_all_open_legs(
-            db, trading_session, position, exit_reason, intended_price, broker
+            db, trading_session, position, exit_reason, intended_price, broker, force=force
         )
 
     with advisory_lock(db, LOCK_EXECUTION_SINGLETON):
@@ -1134,9 +1153,10 @@ def close_position(
                 position,
                 stop_plan,
                 exit_reason,
-                float(intended_price),
+                float(fire_now_ltp) if fire_now_ltp is not None else float(intended_price),
                 position.qty,
                 broker,
+                force=force,
             )
             if fire_outcome is ExitViaStopOutcome.FIRED_PENDING:
                 return None
@@ -1992,7 +2012,8 @@ def evaluate_open_position(
         hit_target = price >= target_price if favorable else price <= target_price
         if hit_target:
             return close_position(
-                db, trading_session, position, ExitReason.TARGET, float(target_price), broker=broker
+                db, trading_session, position, ExitReason.TARGET, float(target_price),
+                broker=broker, fire_now_ltp=tick_price,
             )
 
     # 3. Structure break: the underlying-index level (opening-range boundary
@@ -2074,6 +2095,7 @@ def evaluate_open_position(
                         ExitReason.STRUCTURE_BREAK,
                         float(price),
                         broker=broker,
+                        fire_now_ltp=tick_price,
                     )
         elif stop_plan.structure_break_candidate_since is not None:
             # Reclaimed — price came back inside the buffered level before
@@ -2107,6 +2129,7 @@ def evaluate_open_position(
                     ExitReason.MOMENTUM_PLATEAU,
                     float(price),
                     broker=broker,
+                    fire_now_ltp=tick_price,
                 )
 
     # 4. Spread blowout: the option's own liquidity has dried up past a
@@ -2124,6 +2147,7 @@ def evaluate_open_position(
                 ExitReason.SPREAD_BLOWOUT,
                 float(price),
                 broker=broker,
+                fire_now_ltp=tick_price,
             )
 
     # 5. Trail: activate once favorable move reaches the activation price;
@@ -2179,6 +2203,7 @@ def evaluate_open_position(
                     ExitReason.TRAIL,
                     float(new_trail_stop),
                     broker=broker,
+                    fire_now_ltp=tick_price,
                 )
 
             # LIVE-only TSL: keep the resting protective stop's own

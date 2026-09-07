@@ -123,7 +123,7 @@ def run_single_position_square_off(
         session_factory=same_session,
     )
     return close_position(
-        db, trading_session, position, exit_reason, tick.ltp, broker=position_broker
+        db, trading_session, position, exit_reason, tick.ltp, broker=position_broker, force=True
     )
 
 
