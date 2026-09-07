@@ -59,7 +59,11 @@ from app.domain.execution.models import (
 from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
-from app.domain.strategy.exit_legs import allocate_leg_lots_floored, deserialize_exit_legs
+from app.domain.strategy.exit_legs import (
+    ExitLegSpec,
+    allocate_leg_lots_floored,
+    deserialize_exit_legs,
+)
 from app.domain.strategy.models import SignalSide, TradeIntent
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
@@ -180,6 +184,33 @@ def compute_position_potential_profit(db: Session, position: Position) -> float 
         return None
     per_unit = max(Decimal("0"), _dec(trade_intent.target_price) - _dec(position.entry_price))
     return float(per_unit * position.qty)
+
+
+def pick_collapsed_exit_leg(trade_intent: TradeIntent) -> ExitLegSpec | None:
+    """When `build_position_exit_legs` collapses a staged position to a single
+    full-qty exit (1 lot, or a fill that isn't a whole-lot multiple), this
+    returns the leg spec whose parameters that single exit should use:
+    **the highest `qty_fraction`, ties broken toward the earliest leg** (the
+    `core`/anchor). `_open_position_from_fill` reads it to build the single
+    `StopPlan`/`TrailPlan` from that leg's own stop / structure / arm / lock
+    instead of the strategy's top-level `params` -- so the forced single exit
+    behaves like the dominant leg would have, not a separate top-level config.
+
+    `None` whenever `TradeIntent.exit_legs` carries no >= 2-leg spec at all --
+    the caller then keeps the legacy top-level stop/target/trail path exactly
+    as before (there is no dominant leg to speak of). This helper does **not**
+    itself decide whether a collapse happened; the caller only consults it on
+    the path where `build_position_exit_legs` already returned `None`.
+    """
+    specs = deserialize_exit_legs(trade_intent.exit_legs)
+    if not specs or len(specs) < 2:
+        return None
+    # `max` with (qty_fraction, -index): on a fraction tie the smaller index
+    # wins -> earliest leg. Mirrors nothing in `allocate_leg_lots_floored`
+    # (which breaks lot-allocation ties toward *later* legs, for the runner);
+    # here the intent is the opposite -- the first/anchor leg is the one a
+    # single exit should inherit.
+    return max(enumerate(specs), key=lambda t: (t[1].qty_fraction, -t[0]))[1]
 
 
 def build_position_exit_legs(
@@ -365,8 +396,8 @@ def _alert_collapsed(
         severity=AlertSeverity.CRITICAL if is_live else AlertSeverity.WARNING,
         category="exit_legs_collapsed",
         message=(
-            f"Staged exit config ignored for position {position.id}; "
-            f"using a single full-qty exit instead ({why})."
+            f"Staged exit not applied for position {position.id}; using a single "
+            f"full-qty exit on the highest-allocation leg's parameters instead ({why})."
         ),
         mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
         dedup_key=f"exit_legs_collapsed:{position.id}",

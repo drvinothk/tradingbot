@@ -112,6 +112,7 @@ from app.modules.execution_engine.paper.exit_legs import (
     evaluate_leg_position,
     finalize_all_open_legs_from_one_fill,
     finalize_leg_from_resolved_exit_order,
+    pick_collapsed_exit_leg,
     position_has_exit_legs,
 )
 from app.modules.execution_engine.paper.order_helpers import (
@@ -583,6 +584,39 @@ def _open_position_from_fill(
         get_sleep_inhibitor().acquire(f"position:{position.id}")
         return position
 
+    # Staged-exit config present but the position collapsed to a single
+    # full-qty exit (1 lot, or a fill that isn't a whole-lot multiple --
+    # `build_position_exit_legs` returned `None` after alerting). Per the
+    # 2026-09-08 decision, that single exit is sourced from the
+    # highest-`qty_fraction` leg (`pick_collapsed_exit_leg`), never the
+    # strategy's top-level `params`/class defaults -- so it behaves like the
+    # dominant leg would have. `None` for every non-staged config: the legacy
+    # top-level path below is then byte-identical to before.
+    collapsed_leg = pick_collapsed_exit_leg(trade_intent)
+
+    if collapsed_leg is not None and collapsed_leg.stop_price is not None:
+        single_stop_price = float(collapsed_leg.stop_price)
+    else:
+        single_stop_price = float(trade_intent.stop_price)
+
+    # Structure trio: taken verbatim from the dominant leg (a leg that did not
+    # opt into `use_structure` carries `None` here, which correctly means "no
+    # structure-break check" -- do NOT fall back to the signal's own level in
+    # that case). Only the no-collapsed-leg path reads the TradeIntent's.
+    if collapsed_leg is not None:
+        single_structure_level = collapsed_leg.structure_level
+        single_structure_buffer = collapsed_leg.structure_break_buffer
+        single_structure_persistence = collapsed_leg.structure_break_persistence_seconds
+        # A no-target ("runner") dominant leg -> the collapsed single exit has
+        # no hard target either (migration 0038); `evaluate_open_position`
+        # step 2 skips its target check when this is set.
+        suppress_hard_target: bool | None = collapsed_leg.target_price is None
+    else:
+        single_structure_level = trade_intent.structure_level
+        single_structure_buffer = trade_intent.structure_break_buffer
+        single_structure_persistence = trade_intent.structure_break_persistence_seconds
+        suppress_hard_target = None
+
     # StopPlan.qty is meant to be recomputed on every fill event touching
     # this position — with the mock adapter's synchronous full-fill
     # behavior there's only ever one fill event this phase, so this always
@@ -591,32 +625,59 @@ def _open_position_from_fill(
     stop_plan = StopPlan(
         id=uuid.uuid4(),
         position_id=position.id,
-        stop_price=float(trade_intent.stop_price),
+        stop_price=single_stop_price,
         qty=position.qty,
-        structure_level=trade_intent.structure_level,
-        structure_break_buffer=trade_intent.structure_break_buffer,
-        structure_break_persistence_seconds=trade_intent.structure_break_persistence_seconds,
+        structure_level=single_structure_level,
+        structure_break_buffer=single_structure_buffer,
+        structure_break_persistence_seconds=single_structure_persistence,
+        suppress_hard_target=suppress_hard_target,
         status=StopPlanStatus.CONFIRMED,
         created_at=now,
         updated_at=now,
     )
 
     # Per-method trailing (Phase 4): a strategy that supplied its own
-    # activation/lock fractions on the TradeIntent overrides the generic
-    # Phase-3 0.5/0.5 rule; None (SyntheticStrategy, and any strategy that
-    # doesn't set them) falls back to it unchanged.
-    activation_fraction = (
-        _dec(trade_intent.trail_activation_fraction)
-        if trade_intent.trail_activation_fraction is not None
-        else TRAIL_ACTIVATION_FRACTION
-    )
-    lock_fraction = (
-        _dec(trade_intent.trail_lock_fraction)
-        if trade_intent.trail_lock_fraction is not None
-        else TRAIL_LOCK_FRACTION
-    )
+    # activation/lock fractions overrides the generic Phase-3 0.5/0.5 rule;
+    # None (SyntheticStrategy, and any strategy that doesn't set them) falls
+    # back to it unchanged. A collapsed staged position reads the dominant
+    # leg's own fractions (falling to the generic 0.5 when that leg omitted
+    # one -- same as a real leg does in `build_position_exit_legs`), never the
+    # top-level `params`.
+    if collapsed_leg is not None:
+        activation_fraction = (
+            _dec(collapsed_leg.trail_activation_fraction)
+            if collapsed_leg.trail_activation_fraction is not None
+            else TRAIL_ACTIVATION_FRACTION
+        )
+        lock_fraction = (
+            _dec(collapsed_leg.trail_lock_fraction)
+            if collapsed_leg.trail_lock_fraction is not None
+            else TRAIL_LOCK_FRACTION
+        )
+        # Trail-activation distance needs a reference target even for a
+        # no-target dominant leg -- use that leg's own target when it has one,
+        # else the signal's base target (identical to how a runner leg's
+        # activation is anchored in `build_position_exit_legs`).
+        activation_ref_target = (
+            _dec(collapsed_leg.target_price)
+            if collapsed_leg.target_price is not None
+            else _dec(trade_intent.target_price)
+        )
+    else:
+        activation_fraction = (
+            _dec(trade_intent.trail_activation_fraction)
+            if trade_intent.trail_activation_fraction is not None
+            else TRAIL_ACTIVATION_FRACTION
+        )
+        lock_fraction = (
+            _dec(trade_intent.trail_lock_fraction)
+            if trade_intent.trail_lock_fraction is not None
+            else TRAIL_LOCK_FRACTION
+        )
+        activation_ref_target = _dec(trade_intent.target_price)
+
     activation_distance = (
-        abs(_dec(trade_intent.target_price) - _dec(trade_intent.entry_price)) * activation_fraction
+        abs(activation_ref_target - _dec(trade_intent.entry_price)) * activation_fraction
     )
     activation_price = (
         entry_price + activation_distance
@@ -1921,12 +1982,18 @@ def evaluate_open_position(
             db, trading_session, position, ExitReason.STOP, float(stop_price), broker=broker
         )
 
-    # 2. Target hit.
-    hit_target = price >= target_price if favorable else price <= target_price
-    if hit_target:
-        return close_position(
-            db, trading_session, position, ExitReason.TARGET, float(target_price), broker=broker
-        )
+    # 2. Target hit. Skipped when this position is a staged-exit config that
+    # collapsed to a single full-qty exit inheriting a no-target ("runner")
+    # dominant leg (`stop_plan.suppress_hard_target`, migration 0038) -- that
+    # leg exits only on stop / structure / trail, exactly as it would have as
+    # a real leg. `None`/`False` (every existing row, every non-collapsed
+    # position) leaves this check running unchanged.
+    if not stop_plan.suppress_hard_target:
+        hit_target = price >= target_price if favorable else price <= target_price
+        if hit_target:
+            return close_position(
+                db, trading_session, position, ExitReason.TARGET, float(target_price), broker=broker
+            )
 
     # 3. Structure break: the underlying-index level (opening-range boundary
     # / pullback extreme / EMA9) that justified this setup has been crossed

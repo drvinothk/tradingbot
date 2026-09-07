@@ -23,6 +23,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -328,6 +329,16 @@ class StopPlan(Base, UUIDPkMixin):
     # drives `_MAX_EXIT_ORDER_ATTEMPTS` -> exhaustion for that path.
     exit_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     exit_fire_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 2026-09-08 (migration 0038). Set `True` only when a staged-exit position
+    # collapsed to a single full-qty exit (1 lot, or a non-lot-multiple fill)
+    # AND the highest-`qty_fraction` leg it inherited its parameters from is a
+    # no-target ("runner") leg (`ExitLegSpec.target_price is None`). Tells
+    # `evaluate_open_position`'s step-2 hard-target check to skip, since the
+    # legacy single-exit path reads `trade_intent.target_price` (NOT NULL)
+    # directly and has no no-target concept. `None` (every existing row, every
+    # non-collapsed position) / `False` == the check runs == unchanged
+    # behaviour. See `exit_legs.pick_collapsed_exit_leg`.
+    suppress_hard_target: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 

@@ -25,6 +25,7 @@ from app.domain.execution.models import (
     StopPlan,
     StopPlanStatus,
     TradeOutcome,
+    TrailPlan,
 )
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
 from app.domain.market.models import Instrument, OptionContract, OptionType
@@ -277,11 +278,12 @@ def test_dispatch_creates_legs_and_a_carrier_stop_plan(
     assert carrier.resting_order_id is None
 
 
-def test_one_lot_position_collapses_to_legacy_with_alert(
+def test_one_lot_position_collapses_to_dominant_leg_with_alert(
     db, broker, trading_session, strategy_run, option_contract
 ):
-    # A 1-lot position can't stage anything — collapse to the single full-qty
-    # exit (StopPlan/TrailPlan), WARNING alert.
+    # A 1-lot position can't stage anything — collapse to a single full-qty
+    # exit sourced from the highest-`qty_fraction` leg (`_three_legs`'s 0.4
+    # `runner`, which is no-target), never the top-level params. WARNING alert.
     intent = _make_intent(
         db, trading_session, strategy_run, option_contract, qty_lots=1, exit_legs=_three_legs()
     )
@@ -289,7 +291,9 @@ def test_one_lot_position_collapses_to_legacy_with_alert(
 
     position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
     assert _legs(db, position.id) == []
-    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one() is not None
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    # dominant leg is the 0.4 `runner` (target_price=None) -> hard target suppressed
+    assert stop_plan.suppress_hard_target is True
     alert = (
         db.query(SystemAlert)
         .filter(SystemAlert.category == "exit_legs_collapsed")
@@ -297,6 +301,132 @@ def test_one_lot_position_collapses_to_legacy_with_alert(
     )
     assert alert is not None
     assert alert.severity == AlertSeverity.WARNING
+
+
+def _distinct_dominant_legs() -> list[ExitLegSpec]:
+    # Dominant leg (0.5) carries a stop / trail deliberately unlike anything
+    # the top-level intent (`_make_intent`: stop 72, target 92, no trail
+    # fractions -> generic 0.5/0.5) would produce.
+    return [
+        ExitLegSpec(
+            qty_fraction=0.5,
+            kind="core",
+            stop_price=76.0,
+            target_price=88.0,
+            trail_activation_fraction=0.3,
+            trail_lock_fraction=0.9,
+        ),
+        ExitLegSpec(qty_fraction=0.25, kind="a", stop_price=72.0, target_price=92.0),
+        ExitLegSpec(qty_fraction=0.25, kind="b", stop_price=70.0, target_price=None),
+    ]
+
+
+def test_collapsed_one_lot_uses_dominant_leg_stop_and_trail(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract,
+        qty_lots=1, exit_legs=_distinct_dominant_legs(),
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one()
+
+    # Dominant leg, not the top-level intent (which would give 72.0 / 0.5).
+    assert float(stop_plan.stop_price) == pytest.approx(76.0)
+    assert float(trail_plan.trail_value) == pytest.approx(0.9)
+    assert stop_plan.suppress_hard_target is False
+    # activation ref = leg target 88.0: |88 - 80| * 0.3 = 2.4 -> 82.4
+    assert float(trail_plan.activation_price) == pytest.approx(82.4)
+
+
+def test_collapsed_dominant_leg_ties_break_to_earliest(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    legs = [
+        ExitLegSpec(qty_fraction=0.5, kind="first", stop_price=75.0, target_price=90.0),
+        ExitLegSpec(qty_fraction=0.5, kind="second", stop_price=71.0, target_price=90.0),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=1, exit_legs=legs
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    assert float(stop_plan.stop_price) == pytest.approx(75.0)  # leg 0, not leg 1
+
+
+def test_collapsed_no_target_dominant_leg_skips_hard_target_check(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    legs = [
+        ExitLegSpec(qty_fraction=0.6, kind="runner", stop_price=72.0, target_price=None),
+        ExitLegSpec(qty_fraction=0.2, kind="a", stop_price=72.0, target_price=92.0),
+        ExitLegSpec(qty_fraction=0.2, kind="b", stop_price=72.0, target_price=86.0),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract,
+        qty_lots=1, target_price=92.0, exit_legs=legs,
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one().suppress_hard_target
+
+    # Price well past the intent's 92.0 target must NOT close it — the dominant
+    # (runner) leg has no target, so the hard-target check is suppressed.
+    evaluate_open_position(db, trading_session, position, tick_price=99.0, broker=broker)
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+
+    # The stop still works.
+    evaluate_open_position(db, trading_session, position, tick_price=70.0, broker=broker)
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.STOP
+
+
+def test_collapsed_dominant_leg_with_target_still_hits_it(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    legs = [
+        ExitLegSpec(qty_fraction=0.6, kind="core", stop_price=72.0, target_price=90.0),
+        ExitLegSpec(qty_fraction=0.4, kind="runner", stop_price=72.0, target_price=None),
+    ]
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract,
+        qty_lots=1, target_price=90.0, exit_legs=legs,
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    assert db.query(StopPlan).filter(StopPlan.position_id == position.id).one().suppress_hard_target is False
+
+    evaluate_open_position(db, trading_session, position, tick_price=90.5, broker=broker)
+    db.refresh(position)
+    assert position.status == PositionStatus.CLOSED
+    outcome = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    assert outcome.exit_reason == ExitReason.TARGET
+
+
+def test_no_exit_legs_spec_leaves_legacy_single_exit_untouched(
+    db, broker, trading_session, strategy_run, option_contract
+):
+    # Regression guard: a plain (non-staged) config still builds its single
+    # StopPlan/TrailPlan from the top-level intent, with suppress_hard_target
+    # left None.
+    intent = _make_intent(
+        db, trading_session, strategy_run, option_contract, qty_lots=1, exit_legs=None
+    )
+    dispatch_trade_intent(db, trading_session, intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == intent.id).one()
+    stop_plan = db.query(StopPlan).filter(StopPlan.position_id == position.id).one()
+    trail_plan = db.query(TrailPlan).filter(TrailPlan.position_id == position.id).one()
+    assert float(stop_plan.stop_price) == pytest.approx(72.0)
+    assert stop_plan.suppress_hard_target is None
+    assert float(trail_plan.trail_value) == pytest.approx(0.5)
 
 
 def test_few_lots_stage_across_fewer_legs_with_reduced_alert(
