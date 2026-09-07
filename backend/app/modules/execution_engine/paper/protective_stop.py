@@ -335,9 +335,12 @@ def _modify_resting_order(
     Returns the tick-rounded trigger `Decimal` on success (the caller persists
     its own `stop_plan` fields from it) or `None` on any failure / unresolvable
     contract. `extra_modify_kwargs` is merged into the `modify_order` call
-    verbatim (e.g. `{"order_type": ...}` for the fire-now conversion); Shoonya
-    requires `qty` on every `ModifyOrder` regardless of what is changing, so it
-    is always sent.
+    verbatim -- a hook for a future caller that needs to change a field beyond
+    trigger/limit/qty; no current caller uses it (the fire-now exit keeps the
+    order type `SL-LIMIT`, only its trigger moves -- converting it to a plain
+    `LIMIT` would reintroduce the RMS naked-short rejection this design exists
+    to avoid). Shoonya requires `qty` on every `ModifyOrder` regardless of
+    what is changing, so it is always sent.
     """
     option_contract = db.get(OptionContract, position.option_contract_id)
     if option_contract is None:

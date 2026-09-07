@@ -2459,6 +2459,39 @@ def test_sync_and_resize_resting_stop_no_op_once_a_fire_now_exit_is_pending(
     assert len(live_broker.modify_calls) == calls_before  # neither touched the broker
 
 
+def test_reconciled_fire_now_exit_reports_approx_slippage_vs_the_fire_trigger(
+    db: Session, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """NEW-2: a fire-now exit finalised by reconciliation used to report a
+    flat slippage of 0 (no live intended price captured). It now measures
+    against the trigger we last confirmed at the broker
+    (stop_plan.resting_order_price)."""
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *a, **k: None,
+    )
+    position, stop_plan, live_broker = _open_live_position_with_resting_stop(
+        db, trading_session, strategy_run, option_contract
+    )
+    close_position(
+        db, trading_session, position, ExitReason.TRAIL, intended_price=130.0,
+        broker=live_broker, fire_now_ltp=130.0,  # type: ignore[arg-type]
+    )
+    db.refresh(stop_plan)
+    assert float(stop_plan.resting_order_price) == pytest.approx(129.95)  # 130 - 1 tick
+
+    live_broker.resting_fill_price = 128.0  # filled 1.95 below the trigger
+    reconcile_pending_live_exit_orders(
+        db, trading_session, allow_rest_fallback=True, broker=live_broker  # type: ignore[arg-type]
+    )
+    to = db.query(TradeOutcome).filter(TradeOutcome.position_id == position.id).one()
+    # (128.00 - 129.95) * 25 lots = -48.75, adverse (fill below the trigger).
+    assert float(to.slippage) == pytest.approx(-48.75)
+
+
 def test_evaluate_open_position_syncs_resting_stop_as_trail_tightens(
     db: Session, trading_session, strategy_run, option_contract, monkeypatch
 ):

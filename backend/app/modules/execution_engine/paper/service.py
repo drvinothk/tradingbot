@@ -1854,6 +1854,26 @@ def _apply_resolved_pending_exit_order(
                     db, trading_session, position, order, exit_reason, OrderMode(order.mode), broker
                 )
         else:
+            # NEW-2 (2026-09-08): a late-reconciled fill has no live "intended
+            # price" captured at fill time, so `_finalize_position_close`
+            # reported a flat slippage of 0. For a `stop:` order (a resting
+            # protective SL-LMT -- a fire-now exit included) the trigger we
+            # last confirmed at the broker (`stop_plan.resting_order_price`,
+            # else the plan's own `stop_price`) is an honest approximation of
+            # where we aimed -- measure against it. A plain late `exit:` order
+            # (RECONCILED, predates the intent field) still has nothing real
+            # to measure against -> `None` -> slippage 0, unchanged.
+            approx_intended: float | None = None
+            if is_protective_stop:
+                sp = (
+                    db.query(StopPlan)
+                    .filter(StopPlan.position_id == position.id)
+                    .one_or_none()
+                )
+                if sp is not None and sp.resting_order_price is not None:
+                    approx_intended = float(sp.resting_order_price)
+                elif sp is not None:
+                    approx_intended = float(sp.stop_price)
             _finalize_position_close(
                 db,
                 trading_session,
@@ -1861,7 +1881,7 @@ def _apply_resolved_pending_exit_order(
                 order,
                 exit_reason,
                 OrderMode(order.mode),
-                None,
+                approx_intended,
             )
     elif is_protective_stop:
         # The resting stop resolved to CANCELLED/REJECTED without this app
