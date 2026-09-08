@@ -1066,3 +1066,67 @@ app/modules/market_data/ingestion.py
 app/modules/alerting/manager.py; do cp
 ~/deploy-bak/chain-rails-20260908-<ts>/$f $f; done && sudo systemctl
 restart trading-bot` (no migration).
+
+---
+
+## DEPLOYED 2026-09-08 ~11:20 IST (05:50 UTC) — qc_paper_configs_live.py structural-validator rewrite
+
+`main` `96fd6fd` (ff-merged from `chore/qc-paper-configs-live-structural`, pushed).
+Classifier did **not** block the scp.
+
+**What:** `backend/scripts/qc_paper_configs_live.py` rewritten from a 2026-09-01
+snapshot checker (hardcoded `EXPECT`/`ALLOW` -> `KeyError` on every base-type row
+and every renamed/new config; bypassed by the last two config applies as a
+result) into a pure structural validator correct against any config set at any
+later time. Kept: [1] allowlist (now all 12 strategy_types via the live
+`*_PARAM_KEYS`; asserted complete vs `KNOWN_STRATEGY_TYPES` at import), [2]
+`validate_exit_leg_templates`, [3] dropped-leg-key, [4] `_build_strategy`
+construct. Removed: `EXPECT` / [7] "matches plan" / [8] "lock A/B clean" /
+`MUST_BE_DISABLED` -- plan-snapshot conformance, stale by construction; "did my
+apply land as intended" is now a `diff` of psql dumps (documented in the module
+docstring). [0] `runtime_mode` updated to the post-inversion reality (migration
+0039: non-nullable `force_paper`|`force_live`, no NULL "follow the session"
+state; an invalid value fails the run; `force_live` rows summarised as
+`ROUTES LIVE`). [5] sizing / [6] lot split -> informational, aligned to the
+2026-09-04 sizing model and to `allocate_leg_lots_floored` (the real dispatch
+path) plus the dominant-leg 1-lot collapse.
+
+**Files (1, offline script, 0 credentials):**
+`backend/scripts/qc_paper_configs_live.py`.
+**No migration** (box stays `0039`). **No service restart** -- standalone CLI,
+not imported by `app`; CI `ruff check .` lints it, nothing executes it there.
+
+**Safety gate:** 11:11 IST -- market hours, session `live_enabled`. Open-position
+check **N/A**: zero runtime impact (no restart, no imported code path touched).
+
+**Steps:** `scp` the one file ->
+`/home/ubuntu/trading-bot/backend/scripts/qc_paper_configs_live.py` -> verify on
+box: sha256 **box == local worktree**
+(`2cbd49b937f2962f7b52f2a59ce3fa9a04fb226e89c0c13484ccc7150c73f06b`),
+`ruff check` clean, `ast.parse` OK, empty-input run ->
+`ALL STRUCTURAL CHECKS PASSED` exit 0 (confirms `app.*` imports resolve against
+the deployed backend).
+
+**Behavioural confirmation -- ran against the live 13-config set on the box:**
+
+```
+13 config(s) checked -- ALL STRUCTURAL CHECKS PASSED   (exit 0)
+ROUTES LIVE (3): EMA_Convic_Live, OI_Convic_Live, ORB_Convic_Live
+```
+
+Every one of the 13 (base types `EMA_Base` / `Nifty_ORB_Base` / `OI/Vol_Base` /
+`VWAP_Base` / `Test `, renamed `*_Convic_Live` / `*_Convic_Paper`) would have
+crashed the pre-rewrite script. Informational flags surfaced, no failures:
+`EMA_Base` / `EMA_Convic_Paper` / `VWAP_RSI_Paper_Convic` carry an explicit
+`qty_lots: 10` while `force_paper` (inert today; Risk Service would reject it if
+ever flipped to `force_live` above the per-trade lot cap); `ORB_Convic_Live` =
+`qty_lots: 1`, the other two live configs = `2`.
+
+**Pre-change box copy** was the `5cb44d1` version (the stale 2026-09-01-snapshot
+one); not sha-captured before overwrite -- recoverable from git
+(`git show 89c1054:backend/scripts/qc_paper_configs_live.py`).
+
+**Rollback:** `git checkout 89c1054 -- backend/scripts/qc_paper_configs_live.py`
+then `scp` that file to
+`ubuntu@144.24.137.112:/home/ubuntu/trading-bot/backend/scripts/qc_paper_configs_live.py`.
+No migration, no restart.
