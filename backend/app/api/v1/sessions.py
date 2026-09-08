@@ -140,10 +140,13 @@ def create_session(
     # LOCK_EXECUTION_SINGLETON rather than a new named lock, same reasoning
     # start_strategy already uses it for "at most one active run per
     # strategy". This is the actual invariant
-    # reconciliation.service.run_reconciliation's unscoped
-    # broker.get_positions() comparison silently assumes: without it, two
-    # concurrently ACTIVE sessions on the same account would each see the
-    # other's positions as phantom mismatches.
+    # reconciliation.service.run_reconciliation's broker.get_positions()
+    # comparison relies on: without it, two concurrently ACTIVE sessions on
+    # the same account would each see the other's app-placed positions as
+    # phantom mismatches. (Since 2026-09-08 that comparison is scoped to
+    # symbols *this app* placed, so a manual position the user holds in the
+    # same account no longer trips it — but two app sessions on one account
+    # would still collide, hence this lock.)
     #
     # Scoped to "today" (IST), not "ever": nothing in this codebase
     # currently transitions TradingSession.status to ENDED (no

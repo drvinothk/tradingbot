@@ -242,6 +242,58 @@ def _dispatch_live_position(
     return db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
 
 
+def _make_dispatched_intent(
+    db: Session,
+    trading_session: TradingSession,
+    strategy_run: StrategyRun,
+    option_contract: OptionContract,
+) -> TradeIntent:
+    """A `TradeIntent` left at `status=DISPATCHED` with no resulting `Order`
+    or `Position` -- models the orphan-fill case (the local `Order` write
+    rolled back inside `dispatch_trade_intent` after the broker had already
+    accepted the order). The `Signal` + `TradeIntent` rows are exactly what
+    a real caller commits *before* `dispatch_trade_intent` is invoked, so
+    they survive that rollback.
+    """
+    now = datetime.now(UTC)
+    signal = Signal(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        strategy_config_id=strategy_run.strategy_config_id,
+        strategy_run_id=strategy_run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        side=SignalSide.BUY,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        qty_lots=1,
+        generated_at=now,
+    )
+    db.add(signal)
+    db.flush()
+    trade_intent = TradeIntent(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        signal_id=signal.id,
+        strategy_run_id=strategy_run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=option_contract.id,
+        idempotency_key=f"signal:{signal.id}",
+        side=SignalSide.BUY,
+        qty_lots=1,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        status=TradeIntentStatus.DISPATCHED,
+        created_at=now,
+        dispatched_at=now,
+    )
+    db.add(trade_intent)
+    db.flush()
+    return trade_intent
+
+
 def test_run_reconciliation_clean_when_local_matches_broker(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -380,19 +432,37 @@ def test_run_reconciliation_auto_resolves_a_stale_alert_on_the_next_clean_pass(
 
 
 def test_run_reconciliation_enters_reconciliation_lock_from_guarded_live_on_live_mismatch(
-    db: Session, broker, trading_session, strategy_run, option_contract
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
 ):
-    """A *live-book* mismatch on a live-eligible session locks the session."""
+    """A *live-book* mismatch on a live-eligible session locks the session --
+    here a genuine app-placed LIVE position whose broker-side net qty has
+    drifted below what this system recorded.
+    """
     trading_session.mode = SafeMode.LIVE_ENABLED
     db.add(trading_session)
     db.flush()
 
-    class _StrayLiveBroker:
+    fake_live_broker = _FakeLiveDelegatingBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda *args, **kwargs: fake_live_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    _dispatch_live_position(db, trading_session, strategy_run, option_contract)
+
+    class _DriftedLiveBroker:
         def get_positions(self) -> list[BrokerPosition]:
             return [BrokerPosition(contract_symbol=option_contract.symbol, qty=10, avg_price=80.0)]
 
     run = run_reconciliation(
-        db, _StrayLiveBroker(), trading_session, ReconciliationTrigger.POLL  # type: ignore[arg-type]
+        db, _DriftedLiveBroker(), trading_session, ReconciliationTrigger.POLL  # type: ignore[arg-type]
     )
 
     assert run.mismatches_found == 1
@@ -1050,19 +1120,40 @@ def test_run_full_reconciliation_checks_both_books(
     2026-08-19 coverage-gap fix: the account-wide call sites (periodic
     poll, manual endpoint, startup recovery) used to resolve a single,
     session-level broker that -- in live_enabled -- never
-    touched the real broker's book at all.
+    touched the real broker's book at all. The live pass is proven to
+    reach the real broker's own book by a genuine app-placed LIVE position
+    whose broker-side qty has drifted -- only the live pass can see it.
     """
-    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
 
-    class _StrayLiveBroker:
+    fake_live_broker = _FakeLiveDelegatingBroker(broker)
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.get_execution_broker",
+        lambda *args, **kwargs: fake_live_broker,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service.run_preflight_checks",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.modules.execution_engine.paper.service._raise_if_option_chain_stale",
+        lambda *args, **kwargs: None,
+    )
+    _dispatch_live_position(db, trading_session, strategy_run, option_contract)
+
+    class _DriftedLiveBroker:
         def get_positions(self) -> list[BrokerPosition]:
-            return [BrokerPosition(contract_symbol="NIFTY26JUL99999CE", qty=25, avg_price=80.0)]
+            return [BrokerPosition(contract_symbol=option_contract.symbol, qty=10, avg_price=80.0)]
 
     monkeypatch.setattr(
         "app.modules.reconciliation.service.is_execution_broker_connected", lambda: True
     )
     monkeypatch.setattr("app.modules.reconciliation.service.get_execution_mock", lambda: broker)
-    monkeypatch.setattr("app.modules.reconciliation.service.get_broker", lambda: _StrayLiveBroker())
+    monkeypatch.setattr(
+        "app.modules.reconciliation.service.get_broker", lambda: _DriftedLiveBroker()
+    )
 
     runs = run_full_reconciliation(db, trading_session, ReconciliationTrigger.POLL)
 
@@ -1070,7 +1161,7 @@ def test_run_full_reconciliation_checks_both_books(
     paper_run, live_run = runs
     assert paper_run.mismatches_found == 0
     assert live_run.mismatches_found == 1
-    assert live_run.detail["mismatches"][0]["symbol"] == "NIFTY26JUL99999CE"
+    assert live_run.detail["mismatches"][0]["symbol"] == option_contract.symbol
 
 
 def test_run_full_reconciliation_skips_live_pass_when_shoonya_not_configured(
@@ -1124,3 +1215,111 @@ def test_reconciliation_nets_same_symbol_across_two_strategies_of_the_same_mode(
         .one()
     )
     assert sync_state.local_qty == sync_state.broker_qty == 50
+
+
+def test_run_reconciliation_ignores_a_broker_position_the_app_never_placed(
+    db: Session, trading_session, strategy_run, option_contract
+):
+    """2026-09-08: a real broker's `get_positions()` is account-wide. A plain
+    equity sell the user made in the *same* broker account (nothing to do
+    with this system) used to read as a local-vs-broker mismatch and, on a
+    live session, tripped `reconciliation_lock`. It must now be ignored
+    entirely -- no mismatch, no alert, no lock.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    class _AccountWideLiveBroker:
+        def get_positions(self) -> list[BrokerPosition]:
+            # A non-F&O holding the user sold for margin -- never touched by
+            # this app, no Order and no TradeIntent for it anywhere.
+            return [BrokerPosition(contract_symbol="RELIANCE-EQ", qty=-100, avg_price=1400.0)]
+
+    run = run_reconciliation(
+        db, _AccountWideLiveBroker(), trading_session, ReconciliationTrigger.POLL  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 0
+    assert run.action_taken == "none"
+    assert trading_session.mode == SafeMode.LIVE_ENABLED
+    assert (
+        db.query(SystemAlert)
+        .filter(
+            SystemAlert.trading_session_id == trading_session.id,
+            SystemAlert.category == "reconciliation_mismatch",
+        )
+        .count()
+        == 0
+    )
+
+
+def test_run_reconciliation_still_flags_a_broker_position_from_a_dispatched_intent(
+    db: Session, trading_session, strategy_run, instrument
+):
+    """The orphan-fill net: a real order the broker accepted whose local
+    `Order` row write then rolled back inside `dispatch_trade_intent` leaves
+    the caller-committed `TradeIntent` at `DISPATCHED` with no `Order` and no
+    `Position`. Reconciliation must still catch a broker position for that
+    symbol -- "the app told the broker to trade this" is exactly an
+    app-placed trade.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+
+    orphan_contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=EXPIRY,
+        strike=22500,
+        option_type=OptionType.CE,
+        symbol="NIFTY26JUL22500CE-ORPHAN",
+    )
+    db.add(orphan_contract)
+    db.flush()
+    _make_dispatched_intent(db, trading_session, strategy_run, orphan_contract)
+
+    class _LiveBrokerWithOrphan:
+        def get_positions(self) -> list[BrokerPosition]:
+            return [
+                BrokerPosition(contract_symbol=orphan_contract.symbol, qty=25, avg_price=80.0)
+            ]
+
+    run = run_reconciliation(
+        db, _LiveBrokerWithOrphan(), trading_session, ReconciliationTrigger.POLL  # type: ignore[arg-type]
+    )
+
+    assert run.mismatches_found == 1
+    assert run.action_taken == "reconciliation_lock_entered"
+    assert trading_session.mode == SafeMode.RECONCILIATION_LOCK
+
+
+def test_run_reconciliation_broker_scope_is_mode_scoped(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """A symbol the app traded only on *paper* is out of scope for the LIVE
+    reconciliation pass -- a real broker position on it belongs to the user,
+    not this system. (Its paper `Order` row keeps it out of the orphan-fill
+    rescue too, matching `_local_net_qty_by_symbol`'s own mode scoping.)
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.add(trading_session)
+    db.flush()
+    _dispatch_position(db, trading_session, strategy_run, option_contract, broker)  # PAPER
+
+    class _LiveBrokerShowingThePaperSymbol:
+        def get_positions(self) -> list[BrokerPosition]:
+            return [
+                BrokerPosition(contract_symbol=option_contract.symbol, qty=25, avg_price=80.0)
+            ]
+
+    run = run_reconciliation(
+        db,
+        _LiveBrokerShowingThePaperSymbol(),  # type: ignore[arg-type]
+        trading_session,
+        ReconciliationTrigger.POLL,
+    )
+
+    assert run.mismatches_found == 0
+    assert trading_session.mode == SafeMode.LIVE_ENABLED

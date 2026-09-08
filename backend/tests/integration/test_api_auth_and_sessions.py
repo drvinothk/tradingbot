@@ -898,6 +898,150 @@ def _drop_session_into_reconciliation_lock(engine, session_id: str) -> None:
         db.commit()
 
 
+def _inject_orphan_intent_mismatch(engine, session_id: str, request) -> str:
+    """Make `run_full_reconciliation` see a genuine, app-attributable
+    mismatch: a still-`DISPATCHED` `TradeIntent` (no resulting `Order`/
+    `Position` -- the orphan-fill shape) plus a matching stray fill on the
+    persistent execution mock. Since 2026-09-08 a bare stray broker symbol
+    with nothing behind it is ignored, so it can no longer stand in for a
+    mismatch here. Returns the contract symbol used.
+
+    Registers its own `request` finalizer to delete every row it commits --
+    `seeded_admin`'s own teardown doesn't cover the strategy/market rows,
+    and a leaked `StrategyRun.started_by_user_id` FK would otherwise block
+    that teardown's `User`/`Workspace` deletes and poison every later test's
+    `seeded_admin` on a duplicate `permissions.code`.
+    """
+    from datetime import UTC, date, datetime
+
+    from app.domain.market.models import Instrument, OptionContract, OptionType
+    from app.domain.strategy.models import (
+        ExecutionMode,
+        Signal,
+        SignalSide,
+        StrategyConfig,
+        StrategyRun,
+        StrategyRunStatus,
+        TradeIntent,
+        TradeIntentStatus,
+    )
+    from app.modules.broker_adapter import composition
+    from app.modules.broker_adapter.base.contracts import OrderRequest, OrderSide, OrderType
+
+    symbol = f"NIFTY26JUL22000CE-RECOVERYTEST-{uuid.uuid4().hex[:8]}"
+    instrument_id = uuid.uuid4()
+    contract_id = uuid.uuid4()
+    config_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+    signal_id = uuid.uuid4()
+    intent_id = uuid.uuid4()
+    session_factory = sessionmaker(bind=engine, future=True)
+
+    def _cleanup() -> None:
+        with session_factory() as c:
+            c.query(TradeIntent).filter(TradeIntent.id == intent_id).delete()
+            c.query(Signal).filter(Signal.id == signal_id).delete()
+            c.query(StrategyRun).filter(StrategyRun.id == run_id).delete()
+            c.query(StrategyConfig).filter(StrategyConfig.id == config_id).delete()
+            c.query(OptionContract).filter(OptionContract.id == contract_id).delete()
+            c.query(Instrument).filter(Instrument.id == instrument_id).delete()
+            c.commit()
+
+    request.addfinalizer(_cleanup)
+
+    with session_factory() as db:
+        trading_session = db.get(TradingSession, uuid.UUID(session_id))
+        assert trading_session is not None
+        db.add(
+            Instrument(
+                id=instrument_id,
+                symbol=f"RECOVERTEST-{uuid.uuid4().hex[:8]}",
+                exchange="NFO",
+                lot_size=25,
+                tick_size=0.05,
+            )
+        )
+        db.flush()
+        db.add(
+            OptionContract(
+                id=contract_id,
+                instrument_id=instrument_id,
+                expiry_date=date(2026, 7, 30),
+                strike=22000,
+                option_type=OptionType.CE,
+                symbol=symbol,
+            )
+        )
+        db.flush()
+        db.add(
+            StrategyConfig(
+                id=config_id, workspace_id=trading_session.workspace_id, name="recover-recon-test"
+            )
+        )
+        db.flush()
+        db.add(
+            StrategyRun(
+                id=run_id,
+                strategy_config_id=config_id,
+                trading_session_id=trading_session.id,
+                execution_mode=ExecutionMode.AUTO,
+                status=StrategyRunStatus.SCANNING,
+                started_at=datetime.now(UTC),
+                started_by_user_id=trading_session.started_by_user_id,
+            )
+        )
+        db.flush()
+        now = datetime.now(UTC)
+        db.add(
+            Signal(
+                id=signal_id,
+                workspace_id=trading_session.workspace_id,
+                strategy_config_id=config_id,
+                strategy_run_id=run_id,
+                trading_session_id=trading_session.id,
+                option_contract_id=contract_id,
+                side=SignalSide.BUY,
+                entry_price=80.0,
+                stop_price=72.0,
+                target_price=92.0,
+                qty_lots=1,
+                generated_at=now,
+            )
+        )
+        db.flush()
+        db.add(
+            TradeIntent(
+                id=intent_id,
+                workspace_id=trading_session.workspace_id,
+                signal_id=signal_id,
+                strategy_run_id=run_id,
+                trading_session_id=trading_session.id,
+                option_contract_id=contract_id,
+                idempotency_key=f"signal:{signal_id}",
+                side=SignalSide.BUY,
+                qty_lots=1,
+                entry_price=80.0,
+                stop_price=72.0,
+                target_price=92.0,
+                status=TradeIntentStatus.DISPATCHED,
+                created_at=now,
+                dispatched_at=now,
+            )
+        )
+        db.commit()
+
+    composition.get_execution_mock().place_order(
+        OrderRequest(
+            idempotency_key=f"manual-injection-{uuid.uuid4()}",
+            contract_symbol=symbol,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=25,
+        )
+    )
+    return symbol
+
+
 def test_recover_from_reconciliation_lock_restores_live_when_that_was_prior_mode_and_clean(
     api_client: TestClient, seeded_admin, engine
 ):
@@ -1008,32 +1152,21 @@ def test_recover_from_reconciliation_lock_requires_livetrade_execute_for_a_live_
 
 
 def test_recover_from_reconciliation_lock_refuses_when_still_mismatched(
-    api_client: TestClient, seeded_admin, engine
+    api_client: TestClient, seeded_admin, engine, request
 ):
     """The real point of this endpoint over a bare permissioned override --
     it re-checks first (`run_full_reconciliation`) and refuses to transition
     if a fresh broker-side mismatch still exists, rather than trusting a
     stale assumption that whatever caused the lock is already fixed.
     """
-    from app.modules.broker_adapter import composition
-    from app.modules.broker_adapter.base.contracts import OrderRequest, OrderSide, OrderType
-
     session_id = _login_and_create_session(api_client, seeded_admin)
     api_client.post(f"/api/v1/sessions/{session_id}/go-live")
     _drop_session_into_reconciliation_lock(engine, session_id)
 
-    # Same injection pattern test_reconciliation.py's own tests use -- a
-    # stray fill against the persistent execution mock with no matching
-    # local position, independent of any dispatch machinery.
-    composition.get_execution_mock().place_order(
-        OrderRequest(
-            idempotency_key=f"manual-injection-{uuid.uuid4()}",
-            contract_symbol="NIFTY26JUL22000CE-RECOVERYTEST",
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            qty=25,
-        )
-    )
+    # A genuine, app-attributable broker-side mismatch (orphan DISPATCHED
+    # intent + matching stray mock fill). A bare stray symbol is ignored
+    # since 2026-09-08 -- see reconciliation.service's module docstring.
+    _inject_orphan_intent_mismatch(engine, session_id, request)
 
     response = api_client.post(
         f"/api/v1/sessions/{session_id}/recover-from-reconciliation-lock"

@@ -49,6 +49,31 @@ a repeat SSH session next time. Deliberately narrow — see that function's
 own docstring for the exact conditions it requires before ever touching a
 position, and why an ambiguous case still falls through to the existing
 alert/escalate path unchanged.
+
+**2026-09-08: the broker-side comparison is scoped to symbols this app
+actually placed.** Live incident: a `live_enabled` session tripped
+`reconciliation_lock` with a `local_qty: 0, broker_qty: <nonzero>,
+option_contract_id: null` mismatch on a symbol the app had never traded —
+a plain equity sell the user made in the *same* broker account, entirely
+outside this system (sold for delivery to free up margin). `broker.get_
+positions()` is account-wide for a real broker (Shoonya's `PositionBook`
+spans every segment — NFO, NSE cash, CDS, MCX — with no filter), and the
+old comparison diffed *every* returned symbol against local, so any manual
+position the user held for their own reasons read as a phantom local-vs-
+broker mismatch and (on a live-eligible session) halted live execution.
+Reconciliation's job is to keep *this app's* own order/position state
+consistent with the broker's record of *this app's* orders — a position
+the user opened and manages by hand has no app-side state to be
+inconsistent with. So `run_reconciliation` now drops, from the broker
+book, any symbol that has neither a local open position, an `Order` this
+workspace placed in the matching mode, nor a still-`DISPATCHED`
+`TradeIntent` on this session (the last one is the orphan-fill net: a
+real live order the broker accepted whose local `Order` row write then
+rolled back — the `TradeIntent` is committed by the caller before
+`dispatch_trade_intent` runs, so it survives that rollback). Known,
+accepted limitation: if the user hand-trades the *exact* strike the bot
+is live on, the broker's net qty blends the two and can still flag/lock —
+procedural mitigation only ("don't"), see `_broker_symbols_the_app_placed`.
 """
 
 from __future__ import annotations
@@ -66,6 +91,7 @@ from app.domain.execution.models import Order, OrderMode, OrderSide, Position, P
 from app.domain.market.models import OptionContract
 from app.domain.ops.models import AlertSeverity, SystemAlert
 from app.domain.session.models import SafeMode, TradingSession, TransitionTriggerType
+from app.domain.strategy.models import TradeIntent, TradeIntentStatus
 from app.modules.alerting.manager import send_alert
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
@@ -121,6 +147,82 @@ def _local_net_qty_by_symbol(
         existing_qty, _ = result.get(option_contract.symbol, (0, option_contract.id))
         result[option_contract.symbol] = (existing_qty + signed_qty, option_contract.id)
     return result
+
+
+def _broker_symbols_the_app_placed(
+    db: Session,
+    trading_session: TradingSession,
+    order_mode: OrderMode,
+    candidate_symbols: set[str],
+) -> set[str]:
+    """Of `candidate_symbols` (symbols present on the *broker* side of a
+    reconciliation pass but with no local open position), the subset this
+    app actually placed an order for — so `run_reconciliation` can ignore
+    the rest.
+
+    See this module's own docstring (2026-09-08) for why: `broker.get_
+    positions()` is account-wide for a real broker, and a position the user
+    opened and manages by hand (an unrelated equity sell, a manual option
+    trade on a strike the bot never touched) is not something reconciliation
+    can or should keep consistent with anything.
+
+    A symbol counts as "the app placed it" if either:
+    - an `Order` row exists for it in this workspace with `mode ==
+      order_mode` (the normal case — every dispatched entry writes one
+      before the broker call returns; scoped workspace-wide, not session-
+      wide, and to all history, exactly like `_already_claimed_broker_
+      order_ids` — a mid-day restart starts a fresh `TradingSession` and an
+      earlier session's orders must still count, and `symbol` already
+      encodes the expiry so a prior week's contract can't collide); or
+    - it has *no* `Order` row at all (any mode) yet has a still-`DISPATCHED`
+      `TradeIntent` on this session (the orphan-fill net: a real order the
+      broker accepted whose local `Order` write then rolled back inside
+      `dispatch_trade_intent`. The `TradeIntent` is committed by the caller
+      *before* `dispatch_trade_intent` runs, so it survives that rollback).
+      A symbol that *does* have an `Order` in the *other* mode is
+      deliberately not rescued this way — that means the app traded it on
+      the other book, and a broker position for it in *this* mode is the
+      user's, not this system's (keeps the mode-scoping honest, matching
+      `_local_net_qty_by_symbol`).
+
+    Deliberately queried against `candidate_symbols` only (the broker-only
+    set, near-always 0-1 symbols) rather than materialising every symbol
+    the app has ever traded — keeps this cheap enough to run while holding
+    `LOCK_EXECUTION_SINGLETON` on the event-triggered path, with no new
+    index needed.
+    """
+    if not candidate_symbols:
+        return set()
+
+    order_rows = (
+        db.query(OptionContract.symbol, Order.mode)
+        .join(Order, Order.option_contract_id == OptionContract.id)
+        .filter(
+            OptionContract.symbol.in_(candidate_symbols),
+            Order.workspace_id == trading_session.workspace_id,
+        )
+        .distinct()
+        .all()
+    )
+    symbols_with_any_order = {symbol for symbol, _ in order_rows}
+    placed: set[str] = {symbol for symbol, mode in order_rows if mode == order_mode}
+
+    orphan_candidates = candidate_symbols - symbols_with_any_order
+    if orphan_candidates:
+        intent_rows = (
+            db.query(OptionContract.symbol)
+            .join(TradeIntent, TradeIntent.option_contract_id == OptionContract.id)
+            .filter(
+                OptionContract.symbol.in_(orphan_candidates),
+                TradeIntent.trading_session_id == trading_session.id,
+                TradeIntent.status == TradeIntentStatus.DISPATCHED,
+            )
+            .distinct()
+            .all()
+        )
+        placed |= {row[0] for row in intent_rows}
+
+    return placed
 
 
 def _already_claimed_broker_order_ids(
@@ -328,6 +430,21 @@ def run_reconciliation(
     order_mode = OrderMode.LIVE if is_execution_broker_live(broker) else OrderMode.PAPER
     local_by_symbol = _local_net_qty_by_symbol(db, trading_session.id, order_mode)
     broker_by_symbol = {p.contract_symbol: p.qty for p in broker.get_positions()}
+
+    # Scope the broker book to symbols this app actually placed. A real
+    # broker's get_positions() is account-wide (see this module's docstring,
+    # 2026-09-08) — anything the user trades by hand in the same account is
+    # not reconciliation's concern and must never halt live execution.
+    # Local symbols are app-placed by construction (every open Position has
+    # an opening Order in this mode), so only the broker-only remainder
+    # needs checking.
+    broker_only = set(broker_by_symbol) - set(local_by_symbol)
+    if broker_only:
+        app_placed = _broker_symbols_the_app_placed(
+            db, trading_session, order_mode, broker_only
+        )
+        for stray_symbol in broker_only - app_placed:
+            broker_by_symbol.pop(stray_symbol, None)
 
     mismatches: list[dict[str, object]] = []
     for symbol in set(local_by_symbol) | set(broker_by_symbol):

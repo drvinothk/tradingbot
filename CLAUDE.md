@@ -625,6 +625,43 @@ work, or vice versa.
 
 ## Known open items
 
+- **2026-09-08: reconciliation scoped to app-placed symbols — implemented +
+  tested on branch `fix/reconciliation-scope-to-app-symbols`, NOT yet
+  merged/deployed.** Live incident: a `live_enabled` session tripped
+  `reconciliation_lock` with a `local_qty: 0, broker_qty: <nonzero>,
+  option_contract_id: null` mismatch on a symbol the app never traded — the
+  user had made a plain **cash-segment equity sell in the same Shoonya
+  account** (sold holdings for delivery to free up margin), entirely outside
+  this system. `ShoonyaRestClient.position_book()` /
+  `normalizer.parse_position()` return the account-wide `PositionBook` with
+  no `exch`/segment/product filter, so `run_reconciliation`'s
+  `broker.get_positions()` comparison diffed that equity row against local
+  and (being the LIVE book on a live-eligible session) escalated to the
+  lock. Neither recovery path could clear it while the equity position
+  stayed open — the manual endpoint and `ReconciliationLockRecoveryScheduler`
+  both re-run `run_full_reconciliation` and require it clean.
+  **Fix**: `run_reconciliation` now drops, from the broker book, any symbol
+  that has neither a local open position, an `Order` this workspace placed
+  in the matching mode, nor a still-`DISPATCHED` `TradeIntent` on this
+  session (`_broker_symbols_the_app_placed`, scoped to the broker-only
+  remainder so it's cheap enough for the `LOCK_EXECUTION_SINGLETON`-held
+  event path; the `TradeIntent` clause is the orphan-fill net — a real
+  order the broker accepted whose local `Order` write then rolled back
+  inside `dispatch_trade_intent`, since the caller commits the intent
+  first). Mode-scoping stays honest: an `Order` in the *other* mode does
+  not rescue a symbol. **Known accepted limitation**: if the user
+  hand-trades the *exact* strike the bot is live on, the broker's net qty
+  blends both and can still flag/lock — procedural mitigation only. No
+  schema change. `_local_net_qty_by_symbol`, `_attempt_auto_repair`,
+  `BrokerSyncState`, the clean-pass stale-alert auto-resolve, and the
+  2026-08-27 paper-phantom path are all unaffected (verified). 1670 backend
+  tests pass (+3), ruff/mypy clean. On deploy the currently-locked live
+  session self-clears within ~3 min (recovery scheduler) and its standing
+  `reconciliation_mismatch` alerts auto-resolve. Interim unblock if needed
+  before deploy: Kill Switch -> "Recover from kill switch" drops the
+  session to `paper_only`, where `run_reconciliation` cannot escalate to
+  the lock (only `live_enabled` can), so paper strategies resume.
+
 - **2026-09-02: first real live-trade day since the 2026-08-28 checklist —
   most items confirmed, one real incident found and fixed same-day (commit
   `206b7a0`), two follow-up gaps flagged by post-fix QC, not yet closed.**

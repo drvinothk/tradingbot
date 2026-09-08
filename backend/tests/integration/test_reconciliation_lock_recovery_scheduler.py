@@ -17,19 +17,30 @@ from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy.orm import Session
 
 from app.core.modes.state_machine import transition_mode
 from app.domain.identity.models import BrokerAccount, BrokerAccountStatus, BrokerType, User
+from app.domain.market.models import Instrument, OptionContract, OptionType
 from app.domain.session.models import (
     FundingMode,
     SafeMode,
     SessionModeTransition,
     TradingSession,
     TransitionTriggerType,
+)
+from app.domain.strategy.models import (
+    ExecutionMode,
+    Signal,
+    SignalSide,
+    StrategyConfig,
+    StrategyRun,
+    StrategyRunStatus,
+    TradeIntent,
+    TradeIntentStatus,
 )
 from app.modules.broker_adapter import composition
 from app.modules.broker_adapter.base.contracts import OrderRequest, OrderSide, OrderType
@@ -112,14 +123,86 @@ def _lock_session(db: Session, trading_session: TradingSession, authorized_user:
     assert trading_session.reconciliation_lock_clean_streak == 0
 
 
-def _inject_stray_mismatch() -> None:
-    """Same injection pattern `test_api_auth_and_sessions.py`'s own
-    reconciliation-lock tests use -- a stray fill against the persistent
-    execution mock with no matching local position."""
+def _inject_stray_mismatch(db: Session, trading_session: TradingSession, user: User) -> None:
+    """A stray fill against the persistent execution mock for a contract this
+    app has a still-`DISPATCHED` `TradeIntent` for -- i.e. the orphan-fill
+    shape reconciliation stays scoped to catch since 2026-09-08 (a real
+    order the broker accepted whose local `Order` row never landed). A bare
+    stray symbol with no app `Order`/`TradeIntent` behind it is now
+    deliberately ignored, so it can no longer stand in for "a mismatch".
+    """
+    instrument = Instrument(
+        id=uuid.uuid4(), symbol="NIFTY", exchange="NFO", lot_size=25, tick_size=0.05
+    )
+    db.add(instrument)
+    db.flush()
+    contract = OptionContract(
+        id=uuid.uuid4(),
+        instrument_id=instrument.id,
+        expiry_date=date(2026, 7, 30),
+        strike=22000,
+        option_type=OptionType.CE,
+        symbol="NIFTY26JUL22000CE-SCHEDULERTEST",
+    )
+    db.add(contract)
+    db.flush()
+    config = StrategyConfig(
+        id=uuid.uuid4(), workspace_id=trading_session.workspace_id, name="sched-recon-test"
+    )
+    db.add(config)
+    db.flush()
+    run = StrategyRun(
+        id=uuid.uuid4(),
+        strategy_config_id=config.id,
+        trading_session_id=trading_session.id,
+        execution_mode=ExecutionMode.AUTO,
+        status=StrategyRunStatus.SCANNING,
+        started_at=datetime.now(UTC),
+        started_by_user_id=user.id,
+    )
+    db.add(run)
+    db.flush()
+    now = datetime.now(UTC)
+    signal = Signal(
+        id=uuid.uuid4(),
+        workspace_id=trading_session.workspace_id,
+        strategy_config_id=config.id,
+        strategy_run_id=run.id,
+        trading_session_id=trading_session.id,
+        option_contract_id=contract.id,
+        side=SignalSide.BUY,
+        entry_price=80.0,
+        stop_price=72.0,
+        target_price=92.0,
+        qty_lots=1,
+        generated_at=now,
+    )
+    db.add(signal)
+    db.flush()
+    db.add(
+        TradeIntent(
+            id=uuid.uuid4(),
+            workspace_id=trading_session.workspace_id,
+            signal_id=signal.id,
+            strategy_run_id=run.id,
+            trading_session_id=trading_session.id,
+            option_contract_id=contract.id,
+            idempotency_key=f"signal:{signal.id}",
+            side=SignalSide.BUY,
+            qty_lots=1,
+            entry_price=80.0,
+            stop_price=72.0,
+            target_price=92.0,
+            status=TradeIntentStatus.DISPATCHED,
+            created_at=now,
+            dispatched_at=now,
+        )
+    )
+    db.flush()
     composition.get_execution_mock().place_order(
         OrderRequest(
             idempotency_key=f"manual-injection-{uuid.uuid4()}",
-            contract_symbol="NIFTY26JUL22000CE-SCHEDULERTEST",
+            contract_symbol=contract.symbol,
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
             qty=25,
@@ -146,7 +229,7 @@ def test_dirty_check_resets_the_streak(db: Session, trading_session, authorized_
     db.refresh(trading_session)
     assert trading_session.reconciliation_lock_clean_streak == 1
 
-    _inject_stray_mismatch()
+    _inject_stray_mismatch(db, trading_session, authorized_user)
     scheduler.run_once()
 
     db.refresh(trading_session)
