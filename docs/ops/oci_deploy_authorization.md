@@ -849,3 +849,56 @@ sudo systemctl restart trading-bot
 ```
 
 Approve? (yes — operator runs the steps / no)
+
+### DEPLOYED 2026-09-08 ~05:50 IST (00:20 UTC) — paper/live model inversion
+
+Branch `feat/invert-paper-live-model` @ `5cb44d1`. Operator added the
+`Bash(ssh -i * ubuntu@144.24.137.112 *)` allow-rule; Claude ran the deploy.
+
+**Safety gate (05:44 IST, market closed):** 1 active session `paper_only`,
+**0 open positions** (any mode), 0 non-terminal StrategyRuns, service active,
+box at `0038`. 3 configs had `runtime_mode IS NULL`.
+
+**Backend:** 9 files scp'd (`git`-less box, tarball of the worktree). All 9
+sha256 **box == local worktree**, byte-identical. Credentials dir untouched
+(`alice_blue/angel_one/shoonya/telegram/truedata.env` all present).
+`import app.main OK`. Backup `~/deploy-bak/invert-20260908-001705/`
+(8 replaced files; `ALEMBIC_BEFORE=0038`; `0039` is new, no backup).
+
+**Migration:** `alembic upgrade head` → `0038 -> 0039` clean →
+`alembic current` = `0039 (head)`. `strategy_configs.runtime_mode` now
+`varchar(30) NOT NULL DEFAULT 'force_paper'`. All **23 configs → `force_paper`**
+(3 NULLs backfilled), **0 `force_live`** — nothing trades live until re-armed.
+
+**Restart:** `systemctl restart trading-bot` → `active`, `NRestarts=0`,
+`/health` `{"status":"ok"}`, "Application startup complete", startup recovery
+clean (1 session, 0 open positions, 0 stale runs), 6208 persisted option
+tokens replayed. Today's session **stays `paper_only`** (born-live applies to
+tomorrow's daily bootstrap, by design).
+
+**Non-issue:** startup logged Shoonya `HTTP 502 Bad Gateway` on
+`Limits`/`SearchScrip` during token warm-up — `api.shoonya.com` is returning
+502 to a raw curl from the box right now (pre-market broker infra). Handled by
+existing lazy-retry/MarketDataScheduler; none of the failing files are in this
+changeset. Unrelated to the deploy.
+
+**Frontend:** `npm run build` → new `index-D4oW_Zy4.js` (was `index-BxOQAPF6.js`;
+CSS unchanged). Backup `/var/www/trading-bot/dist.bak-20260908-001854`.
+Extracted to `/var/www/trading-bot/dist`, `chown www-data`. nginx `/` → 200,
+new asset → 200, `index.html` references the new JS.
+
+**Post-deploy TODO (operator):** re-arm the strategies that should trade live —
+UI Mode dropdown → Live, or `scripts/prep_live_ramp.py --arm-config "<name>"`
+on the box. There is no more manual `go-live`; tomorrow's session is born
+`live_enabled`.
+
+**Rollback:** `cd ~/trading-bot/backend && for f in app/api/v1/sessions.py
+app/api/v1/strategies.py app/domain/strategy/models.py
+app/modules/broker_adapter/composition.py app/modules/session/bootstrapper.py
+app/modules/strategy_engine/runner.py scripts/prep_live_ramp.py
+scripts/qc_paper_configs_live.py; do cp
+~/deploy-bak/invert-20260908-001705/$f $f; done && .venv/bin/python -m alembic
+downgrade 0038 && sudo systemctl restart trading-bot`. Frontend:
+`sudo rm -rf /var/www/trading-bot/dist && sudo mv
+/var/www/trading-bot/dist.bak-20260908-001854 /var/www/trading-bot/dist &&
+sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
