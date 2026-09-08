@@ -902,3 +902,89 @@ downgrade 0038 && sudo systemctl restart trading-bot`. Frontend:
 `sudo rm -rf /var/www/trading-bot/dist && sudo mv
 /var/www/trading-bot/dist.bak-20260908-001854 /var/www/trading-bot/dist &&
 sudo chown -R www-data:www-data /var/www/trading-bot/dist`.
+
+---
+
+## DEPLOY APPROVAL REQUEST — reconciliation scoped to app-placed symbols (PENDING operator)
+
+**Emitted:** 2026-09-08 ~10:28 IST. Classifier blocked the SSH extract/restart
+into the live app tree. Read-only SSH (safety gate, drift check) and the `scp`
+already ran — the tarball is staged on the box at `/tmp/recon-fix.tgz`.
+
+- **Target:** `144.24.137.112` (`ubuntu@`, live OCI, systemd `trading-bot`)
+- **Source:** `main` @ `b4e33a2` (merged ff-only, pushed to `origin`).
+- **Change:** `run_reconciliation` scopes the broker-book diff to symbols this
+  app placed (an `Order` in the matching mode, or a still-`DISPATCHED`
+  `TradeIntent` on the session; local open positions always qualify). Fixes the
+  live incident where a plain cash-segment equity sell the operator made in the
+  same Shoonya account (holdings sold for margin) read as a
+  `local_qty:0 / broker_qty:<nonzero> / option_contract_id:null` mismatch and
+  held session `8e82700d-…` in `reconciliation_lock`. See memory
+  `project_reconciliation_scope_to_app_symbols_2026_09_08` and CLAUDE.md's
+  Known-open-items entry.
+- **Files (2, surgical, 0 credentials):**
+  `app/modules/reconciliation/service.py`, `app/api/v1/sessions.py`
+  (the second is a comment-only edit — carried so sha256 verification stays
+  clean). **No migration** (box stays at `0039 (head)`). No frontend change.
+- **Tested:** 1670 backend pytest pass (+3 new), `ruff` + `mypy` clean.
+- **Drift check (done, box pre-change):** `_broker_symbols_the_app_placed`
+  count `0` on box; `_attempt_auto_repair` `4`, `unscoped` in `sessions.py` `2`
+  (both present → right files, pre-change). Box pre-change sha256:
+  `service.py db80e9f8ce98d867dda26c70b712a2bab29d3e5a1d1a20f5c8856ae79d7af873`,
+  `sessions.py 322504b04ebfdc285701ce4c799dbbec5f9742766b500f435e94adbf87f0db00`.
+- **Safety gate (done, 04:54 UTC / 10:24 IST — market hours, real check):**
+  1 active session `8e82700d-…` = `reconciliation_lock`; **0 open positions any
+  mode; 0 open `live` positions**. Box logs confirm the paper pass is clean and
+  the *live* pass is the one still finding the equity mismatch (recovery
+  streak stuck at 0) — exactly what this change fixes. Restart is safe.
+- **Expected effect:** on the first post-restart `run_full_reconciliation`, the
+  equity symbol is filtered out → live pass clean → `ReconciliationLockRecovery
+  Scheduler` auto-recovers session `8e82700d-…` to `live_enabled` within ~3
+  cycles (~3 min); standing `reconciliation_mismatch` alerts auto-resolve.
+- **Post-change local worktree sha256 (box must match after extract — CRLF):**
+  `service.py aa84bb5cf85e7c3b328907995bfab0bd33410403f0eec69d779231c40c3b22df`,
+  `sessions.py cc7aa8de68243da945ad4fafded39292970e53bc95ff6826ac0c0d705ce40970`.
+
+### Commands (operator)
+
+```
+ssh -i "D:\Documents\Trading Bot_Oracle\ssh-key-2026-08-03_Pvt Key.key" ubuntu@144.24.137.112 'set -e
+  cd ~/trading-bot/backend
+  BK=~/deploy-bak/recon-scope-$(date +%Y%m%d-%H%M%S)
+  mkdir -p "$BK/app/modules/reconciliation" "$BK/app/api/v1"
+  cp -a app/modules/reconciliation/service.py "$BK/app/modules/reconciliation/service.py"
+  cp -a app/api/v1/sessions.py               "$BK/app/api/v1/sessions.py"
+  .venv/bin/python -m alembic current > "$BK/ALEMBIC_BEFORE" 2>/dev/null
+  echo "backup at $BK"
+  tar -xzf /tmp/recon-fix.tgz -C .
+  ls app/config/credentials/                                  # real .env / caches intact
+  grep -c "_broker_symbols_the_app_placed" app/modules/reconciliation/service.py   # expect 1+
+  sha256sum app/modules/reconciliation/service.py app/api/v1/sessions.py           # expect aa84bb5c… / cc7aa8de…
+  .venv/bin/python -c "import app.main; print(\"import app.main OK\")"
+  .venv/bin/python -m alembic current                          # expect 0039 (head) — unchanged
+  sudo systemctl restart trading-bot
+  sleep 5 && systemctl is-active trading-bot
+  curl -s http://127.0.0.1:5000/health'
+```
+
+Then, after ~3 min:
+
+```
+ssh -i <key> ubuntu@144.24.137.112 'sudo -u postgres psql trading_bot -tA -c \
+  "SELECT id,mode,reconciliation_lock_clean_streak FROM trading_sessions WHERE status='"'"'active'"'"';"
+  sudo journalctl -u trading-bot --since "5 min ago" --no-pager | grep -iE "reconciliation|auto-recovered" | tail -15'
+```
+Expect `mode = live_enabled` and an `auto-recovered from reconciliation_lock`
+log line.
+
+### Rollback
+
+```
+ssh -i <key> ubuntu@144.24.137.112 'cd ~/trading-bot/backend &&
+  cp ~/deploy-bak/recon-scope-<ts>/app/modules/reconciliation/service.py app/modules/reconciliation/service.py &&
+  cp ~/deploy-bak/recon-scope-<ts>/app/api/v1/sessions.py               app/api/v1/sessions.py &&
+  sudo systemctl restart trading-bot'
+```
+(No migration to reverse.)
+
+Approve? (yes — operator runs the steps / no)
