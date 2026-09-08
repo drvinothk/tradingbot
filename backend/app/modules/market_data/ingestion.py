@@ -17,13 +17,15 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.db.session import SessionFactory, session_scope
-from app.domain.execution.models import Position, PositionStatus
+from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
 from app.domain.market.models import DepthSnapshot as DepthSnapshotRow
 from app.domain.market.models import IndicatorSnapshot as IndicatorSnapshotRow
 from app.domain.market.models import Instrument, OptionContract
 from app.domain.market.models import OptionChainSnapshot as OptionChainSnapshotRow
 from app.domain.market.models import PriceBar as PriceBarRow
 from app.domain.market.models import QuoteTick as QuoteTickRow
+from app.domain.ops.models import AlertSeverity, SystemAlert
+from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.base.contracts import (
     DepthSnapshot,
@@ -38,9 +40,22 @@ from app.modules.broker_adapter.base.errors import BrokerError, BrokerRateLimite
 from app.modules.market_data.indicators.bar_aggregator import Bar
 from app.modules.market_data.indicators.engine import IndicatorEngine
 from app.modules.market_data.providers.base import BaseMarketDataProvider
-from app.modules.market_data.tick_plausibility import is_plausible_option_tick
+from app.modules.market_data.tick_plausibility import (
+    is_plausible_option_entry,
+    is_plausible_option_tick,
+)
 
 logger = logging.getLogger("app.market_data")
+
+# Rail 4 (2026-09-08, docs/ops/shoonya_option_chain_spot_leak.md) — how many
+# consecutive `record_option_chain_snapshot` fetches for a given
+# (underlying, expiry) have dropped at least one entry as implausible. Used
+# only to enrich the aggregated warning and to gate the "sustained
+# degradation" alert. A ±1 miscount under concurrent fetches is harmless
+# against the threshold, but the update is cheap to lock anyway.
+_option_chain_implausible_streak: dict[tuple[str, str], int] = {}
+_option_chain_streak_lock = threading.Lock()
+_OPTION_CHAIN_SUSTAINED_STREAK = 4
 
 # How long to wait after subscribing before deciding WS isn't delivering
 # ticks and falling back to REST polling for this symbol — long enough to
@@ -982,6 +997,77 @@ def _preserve_open_position_pricing(
         )
 
 
+def _alert_on_degraded_option_chain(
+    db: Session,
+    underlying_symbol: str,
+    expiry: date,
+    dropped: list[tuple[str, float, str]],
+    streak: int,
+) -> None:
+    """Rail 4 escalation. A dropped entry that belongs to a contract this
+    system currently holds OPEN is genuinely actionable (that position can't
+    be priced from the chain this cycle) -> CRITICAL alert, attributed to
+    that position's own workspace/session. A clean fetch resolves any
+    standing alert for this (underlying, expiry). A long implausible streak
+    with *no* open position affected is logged at ERROR but not alerted --
+    no live risk to interrupt anyone over, and there is no workspace to
+    attribute a bare infra alert to here (see
+    docs/ops/shoonya_option_chain_spot_leak.md).
+    """
+    dedup_key = f"option_chain_degraded:{underlying_symbol}:{expiry.isoformat()}"
+
+    if not dropped:
+        db.query(SystemAlert).filter(
+            SystemAlert.category == "option_chain_degraded",
+            SystemAlert.dedup_key == dedup_key,
+            SystemAlert.is_resolved.is_(False),
+        ).update(
+            {"is_resolved": True, "resolved_at": datetime.now(UTC)},
+            synchronize_session=False,
+        )
+        return
+
+    dropped_symbols = {s for s, _, _ in dropped}
+    matched = (
+        db.query(Position, Order.mode, OptionContract.symbol)
+        .join(OptionContract, OptionContract.id == Position.option_contract_id)
+        .join(Order, Order.id == Position.opening_order_id)
+        .filter(
+            OptionContract.symbol.in_(dropped_symbols),
+            Position.status == PositionStatus.OPEN,
+        )
+        .all()
+    )
+    if matched:
+        position, opening_mode, _ = matched[0]
+        affected = sorted({sym for _, _, sym in matched})
+        send_alert(
+            db,
+            workspace_id=position.workspace_id,
+            trading_session_id=position.trading_session_id,
+            severity=AlertSeverity.CRITICAL,
+            category="option_chain_degraded",
+            message=(
+                f"Option-chain feed degraded for {underlying_symbol} {expiry.isoformat()}: "
+                f"{len(dropped)} entr(ies) dropped as implausible, including open "
+                f"position contract(s) {', '.join(affected)}. Stop/target/trail pricing "
+                f"for those positions is falling back to broker.get_quote()."
+            ),
+            mode=OrderMode(opening_mode),
+            dedup_key=dedup_key,
+            payload={"dropped": dropped[:20], "streak": streak},
+        )
+    elif streak >= _OPTION_CHAIN_SUSTAINED_STREAK:
+        logger.error(
+            "option chain %s %s: implausible entries for %d consecutive fetches "
+            "(no open position affected). Likely a stale/wrong broker token map -- "
+            "see docs/ops/shoonya_option_chain_spot_leak.md.",
+            underlying_symbol,
+            expiry,
+            streak,
+        )
+
+
 def record_option_chain_snapshot(
     db_underlying_instrument_id: uuid.UUID,
     broker: BrokerPort,
@@ -1025,24 +1111,58 @@ def record_option_chain_snapshot(
     """
     chain = broker.get_option_chain(underlying_symbol, expiry)
     plausible_entries = []
+    dropped: list[tuple[str, float, str]] = []  # (symbol, ltp, reason)
     for e in chain.entries:
-        if is_plausible_option_tick(e.ltp, e.bid, e.ask, e.volume):
+        if is_plausible_option_entry(
+            e.ltp,
+            e.bid,
+            e.ask,
+            e.volume,
+            strike=e.strike,
+            is_call=e.option_type == BrokerOptionType.CE,
+            underlying=underlying_symbol,
+            spot=chain.underlying_ltp,
+        ):
             plausible_entries.append(e)
         else:
-            logger.error(
-                "REJECTED implausible option-chain entry for %r (underlying=%s, expiry=%s): "
-                "ltp=%.4f bid=%.4f ask=%.4f volume=%d -- looks like a leaked underlying/"
-                "wrong-instrument value, not a real option premium (see tick_plausibility.py). "
-                "Dropping this entry from the snapshot rather than persisting it.",
-                e.contract_symbol,
-                underlying_symbol,
-                expiry,
-                e.ltp,
-                e.bid,
-                e.ask,
-                e.volume,
+            reason = (
+                "no_book"
+                if (e.bid == 0 and e.ask == 0 and e.volume == 0)
+                else "no_arb"
             )
+            dropped.append((e.contract_symbol, e.ltp, reason))
+
+    # Rail 4 (2026-09-08) — one aggregated WARNING per fetch instead of an
+    # ERROR per row per ~60s cycle, plus a consecutive-degradation streak and
+    # a "this affects an open position" escalation. See
+    # docs/ops/shoonya_option_chain_spot_leak.md.
+    total = len(chain.entries)
+    streak_key = (underlying_symbol, expiry.isoformat())
+    with _option_chain_streak_lock:
+        if dropped:
+            streak = _option_chain_implausible_streak.get(streak_key, 0) + 1
+            _option_chain_implausible_streak[streak_key] = streak
+        else:
+            streak = 0
+            _option_chain_implausible_streak.pop(streak_key, None)
+    if dropped:
+        by_reason: dict[str, int] = {}
+        for _, _, r in dropped:
+            by_reason[r] = by_reason.get(r, 0) + 1
+        logger.warning(
+            "option chain %s %s: dropped %d/%d entries as implausible (%s); "
+            "%d consecutive fetch(es) affected. Samples: %s",
+            underlying_symbol,
+            expiry,
+            len(dropped),
+            total,
+            ", ".join(f"{k}={v}" for k, v in sorted(by_reason.items())),
+            streak,
+            dropped[:8],
+        )
+
     with session_factory() as db:
+        _alert_on_degraded_option_chain(db, underlying_symbol, expiry, dropped, streak)
         # Only when the broker actually returned *some* real chain data --
         # never for a genuinely empty/dead chain (a broker with no
         # instruments configured, a real outage). An empty chain already

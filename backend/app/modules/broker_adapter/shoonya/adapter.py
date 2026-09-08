@@ -492,10 +492,33 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # any single contract degrades that one entry to zero rather than
         # discarding the whole snapshot over one bad call.
         entries = []
+        token_substitutions: list[tuple[str, str, str]] = []
         for row in rows:
             symbol = str(row.get("tsym", ""))
-            token = str(row.get("token", ""))
-            self._remember_token(symbol, exchange, token)
+            row_token = str(row.get("token", ""))
+
+            # Rail 1 (2026-09-08) — cross-check the GetOptionChain row's token
+            # against the *trusted* scrip-master token
+            # (`_token_by_symbol`, populated by `get_instrument_master`'s NFO
+            # static-file path / `warm_token_cache`). A stale/recycled/index
+            # token in a GetOptionChain row is the leading hypothesis for the
+            # spot-price leak into option premiums (see
+            # docs/ops/shoonya_option_chain_spot_leak.md): GetQuotes then
+            # faithfully prices the *wrong* instrument. When a trusted token
+            # exists and disagrees, use it and never overwrite the trusted
+            # entry with the row's suspect one. When there is no trusted
+            # entry yet (sync hasn't run — e.g. right after a restart), fall
+            # through to today's behaviour; Rail 2's no-arb bound is the net
+            # for that window.
+            with self._token_lock:
+                trusted = self._token_by_symbol.get(symbol)
+            if trusted and trusted[1] and row_token and trusted[1] != row_token:
+                exch_for_row, token = trusted
+                token_substitutions.append((symbol, row_token, token))
+            else:
+                exch_for_row, token = exchange, row_token
+                self._remember_token(symbol, exch_for_row, token)
+
             quote: dict = {}
             if token:
                 # Second, tighter gate in series with ShoonyaRestClient's own
@@ -511,7 +534,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
                     )
                 else:
                     try:
-                        quote = self._rest.get_quotes(self._uid, exchange, token)
+                        quote = self._rest.get_quotes(self._uid, exch_for_row, token)
                     except ShoonyaApiError:
                         logger.warning(
                             "Failed to fetch live quote for %s (token=%s); using zeros",
@@ -519,6 +542,18 @@ class ShoonyaBrokerAdapter(BrokerPort):
                             token,
                         )
             entries.append(normalizer.parse_option_chain_entry(row, symbol, quote))
+
+        if token_substitutions:
+            logger.warning(
+                "GetOptionChain %s expiry %s: %d/%d rows carried a token that disagreed with "
+                "the trusted scrip-master token; priced with the trusted one instead "
+                "(symbol, row_token, trusted_token): %s",
+                underlying,
+                expiry,
+                len(token_substitutions),
+                len(rows),
+                token_substitutions[:10],
+            )
 
         logger.info(
             "GetOptionChain %s expiry %s: %d entries, sample=%r",
@@ -532,6 +567,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
             expiry=expiry,
             ts=_utcnow(),
             entries=tuple(entries),
+            underlying_ltp=strike_price if strike_price > 0 else 0.0,
         )
 
     def _resolve_underlying_token(self, underlying: str) -> tuple[str, str]:

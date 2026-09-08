@@ -1155,6 +1155,84 @@ def test_get_option_chain_zero_fills_entry_when_live_quote_fetch_fails():
     assert snapshot.entries[0].oi == 0
 
 
+def test_get_option_chain_sets_underlying_ltp_on_the_snapshot():
+    """Rail 2 (2026-09-08): the snapshot carries the underlying spot the
+    adapter already fetched to anchor the chain, so
+    `market_data.tick_plausibility.is_plausible_option_entry` can apply
+    no-arbitrage premium bounds downstream.
+    """
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_quotes_response = {"lp": "23670.50", "bp1": "0", "sp1": "0", "v": "0", "oi": "0"}
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert snapshot.underlying_ltp == 23670.50
+
+
+def test_get_option_chain_prefers_the_trusted_scrip_master_token_over_a_disagreeing_row():
+    """Rail 1 (2026-09-08, docs/ops/shoonya_option_chain_spot_leak.md): a
+    GetOptionChain row whose `token` disagrees with the trusted
+    scrip-master token (from `get_instrument_master` / `warm_token_cache`)
+    is the leading hypothesis for the spot-price leak — GetQuotes then
+    prices the wrong instrument. The trusted token must win, and the
+    trusted cache entry must not be overwritten by the row's suspect one.
+    """
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = _nse_index_rows()
+    adapter, rest = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    adapter.warm_token_cache([("NIFTY30JUL26C24000", "TRUSTED999")])
+
+    rest.get_option_chain_response = [
+        {
+            "tsym": "NIFTY30JUL26C24000",
+            "token": "ROW111",  # disagrees with the trusted TRUSTED999
+            "strprc": "24000.00",
+            "optt": "CE",
+            "instname": "OPTIDX",
+        },
+    ]
+    rest.get_quotes_response = {
+        "lp": "142.35", "bp1": "142.00", "sp1": "142.70", "v": "125000", "oi": "980000",
+    }
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    quote_calls = [call[1] for call in rest.calls if call[0] == "get_quotes"]
+    assert ("FA1", "NFO", "TRUSTED999") in quote_calls
+    assert ("FA1", "NFO", "ROW111") not in quote_calls
+    assert snapshot.entries[0].ltp == 142.35
+    # trusted entry untouched by the suspect row token
+    assert adapter._resolve_token("NIFTY30JUL26C24000") == ("NFO", "TRUSTED999")
+
+
+def test_get_option_chain_uses_the_row_token_when_there_is_no_trusted_entry():
+    """Regression guard for Rail 1: with no scrip-master token cached for a
+    symbol (e.g. right after a restart, before sync), behaviour is exactly
+    as before — the row's own token is used and remembered.
+    """
+    rest = _FakeRestClient()
+    adapter, rest = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_option_chain_response = [
+        {
+            "tsym": "NIFTY30JUL26P24000",
+            "token": "ROW222",
+            "strprc": "24000.00",
+            "optt": "PE",
+            "instname": "OPTIDX",
+        },
+    ]
+
+    adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    quote_calls = [call[1] for call in rest.calls if call[0] == "get_quotes"]
+    assert ("FA1", "NFO", "ROW222") in quote_calls
+    assert adapter._resolve_token("NIFTY30JUL26P24000") == ("NFO", "ROW222")
+
+
 def test_get_option_chain_requests_a_narrowed_strike_count():
     """2026-09-03 rate-limit incident: GetOptionChain used to fetch Shoonya's
     default count=10 (~40 structural rows), then fired one GetQuotes REST

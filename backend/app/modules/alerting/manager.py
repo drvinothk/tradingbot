@@ -159,6 +159,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "market_data_stale",
         "market_data_failover_switch",
         "market_data_no_session",
+        "option_chain_degraded",
         "trade_approval_pending",
         "exit_legs_collapsed",
         "db_pool_saturated",
@@ -243,6 +244,12 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "market_data_no_session": (
         "Neither Shoonya nor the failback provider has a live session yet -- "
         "connect at least one from the Sessions page before market open."
+    ),
+    "option_chain_degraded": (
+        "Broker is returning implausible option prices (likely a stale token map). "
+        "An open position's stop/target/trail is pricing off broker.get_quote() -- "
+        "watch it; a targeted contract re-sync may be needed. See "
+        "docs/ops/shoonya_option_chain_spot_leak.md."
     ),
     "trade_approval_pending": (
         "Open Control Room and Approve/Reject before the approval window expires."

@@ -63,6 +63,18 @@ from app.modules.market_data.providers.broker_port_shim import BrokerPortMarketD
 EXPIRY = date(2026, 7, 31)
 
 
+@pytest.fixture(autouse=True)
+def _reset_option_chain_implausible_streak():
+    """Rail 4's consecutive-fetch counter is a module global — clear it
+    between tests so a prior test's dropped-entry run can't leak a streak
+    value into this one's assertions."""
+    from app.modules.market_data import ingestion
+
+    ingestion._option_chain_implausible_streak.clear()  # noqa: SLF001
+    yield
+    ingestion._option_chain_implausible_streak.clear()  # noqa: SLF001
+
+
 def _provider(broker):
     """MarketDataIngestionService now depends on BaseMarketDataProvider, not
     BrokerPort directly (see that class's own updated docstring) — every
@@ -1185,6 +1197,166 @@ def test_record_option_chain_snapshot_drops_an_implausible_entry(
     assert all(e["ltp"] < 5000 for e in row.chain_data)
 
 
+def test_record_option_chain_snapshot_logs_one_aggregated_warning_not_per_row(
+    seeded_universe, test_session_factory, db: Session, caplog
+):
+    """Rail 4 (2026-09-08): several dropped entries per ~60s fetch used to
+    each be a separate ERROR, burying real ERRORs. Now one aggregated
+    WARNING per fetch with the drop count and a consecutive-fetch streak.
+    """
+    from dataclasses import replace
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=8)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    class _TwoCorruptedBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            for i in (0, 1):
+                entries[i] = replace(entries[i], ltp=23870.0, bid=0.0, ask=0.0, volume=0)
+            return replace(chain, entries=tuple(entries))
+
+    with caplog.at_level(logging.WARNING, logger="app.market_data"):
+        record_option_chain_snapshot(
+            nifty.id, _TwoCorruptedBroker(), "NIFTY", EXPIRY,  # type: ignore[arg-type]
+            session_factory=test_session_factory,
+        )
+
+    assert "REJECTED implausible option-chain entry" not in caplog.text
+    warnings = [
+        r.message for r in caplog.records
+        if r.levelno == logging.WARNING and "dropped 2/" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert "consecutive fetch" in caplog.text
+
+
+def test_record_option_chain_snapshot_no_arb_bound_drops_a_spot_leak_with_a_fake_book(
+    seeded_universe, test_session_factory, db: Session
+):
+    """Rail 2: a corrupted quote that carries a *nonzero* book (so the
+    zero-book check passes it) but an `ltp` ~= spot is still dropped by the
+    no-arbitrage upper bound, using the snapshot's `underlying_ltp`.
+    """
+    from dataclasses import replace
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=8)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    class _FakeBookLeakBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            entries[0] = replace(entries[0], ltp=23670.0, bid=1.0, ask=2.0, volume=5)
+            return replace(chain, entries=tuple(entries), underlying_ltp=23670.0)
+
+    row = record_option_chain_snapshot(
+        nifty.id, _FakeBookLeakBroker(), "NIFTY", EXPIRY,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+    )
+
+    assert len(row.chain_data) == 41
+    assert all(e["ltp"] < 5000 for e in row.chain_data)
+
+
+def test_record_option_chain_snapshot_alerts_when_a_dropped_symbol_has_an_open_position(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """Rail 4 escalation: a dropped entry on a contract this system holds
+    OPEN is actionable (that position now prices off broker.get_quote()) ->
+    a CRITICAL `option_chain_degraded` alert, attributed to that position's
+    own workspace/session.
+    """
+    from dataclasses import replace
+
+    from app.domain.ops.models import SystemAlert
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=11)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    real_chain = real_broker.get_option_chain("NIFTY", EXPIRY)
+    held_symbol = real_chain.entries[0].contract_symbol
+    held_contract = (
+        db.query(OptionContract).filter(OptionContract.symbol == held_symbol).one()
+    )
+    open_position_factory(held_contract.id)
+
+    class _CorruptHeldBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            entries[0] = replace(entries[0], ltp=23870.0, bid=0.0, ask=0.0, volume=0)
+            return replace(chain, entries=tuple(entries))
+
+        def get_quote(self, contract_symbol):
+            return real_broker.get_quote(contract_symbol)
+
+    record_option_chain_snapshot(
+        nifty.id, _CorruptHeldBroker(), "NIFTY", EXPIRY,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+    )
+
+    with test_session_factory() as check_db:
+        alerts = (
+            check_db.query(SystemAlert)
+            .filter(SystemAlert.category == "option_chain_degraded")
+            .all()
+        )
+        assert len(alerts) == 1
+        assert alerts[0].is_resolved is False
+        assert held_symbol in alerts[0].message
+        assert alerts[0].dedup_key == f"option_chain_degraded:NIFTY:{EXPIRY.isoformat()}"
+
+
+def test_record_option_chain_snapshot_resolves_the_degraded_alert_on_a_clean_fetch(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """The degraded alert self-resolves once a fetch comes back clean --
+    same "verified fixed, not just quiet" contract reconciliation's
+    clean-pass auto-resolve uses.
+    """
+    from dataclasses import replace
+
+    from app.domain.ops.models import SystemAlert
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=11)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    real_chain = real_broker.get_option_chain("NIFTY", EXPIRY)
+    held_symbol = real_chain.entries[0].contract_symbol
+    held_contract = (
+        db.query(OptionContract).filter(OptionContract.symbol == held_symbol).one()
+    )
+    open_position_factory(held_contract.id)
+
+    class _CorruptHeldBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            entries[0] = replace(entries[0], ltp=23870.0, bid=0.0, ask=0.0, volume=0)
+            return replace(chain, entries=tuple(entries))
+
+        def get_quote(self, contract_symbol):
+            return real_broker.get_quote(contract_symbol)
+
+    record_option_chain_snapshot(
+        nifty.id, _CorruptHeldBroker(), "NIFTY", EXPIRY,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+    )
+    record_option_chain_snapshot(
+        nifty.id, real_broker, "NIFTY", EXPIRY,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+    )
+
+    with test_session_factory() as check_db:
+        alert = (
+            check_db.query(SystemAlert)
+            .filter(SystemAlert.category == "option_chain_degraded")
+            .one()
+        )
+        assert alert.is_resolved is True
+        assert alert.resolved_at is not None
+
+
 @pytest.fixture
 def open_position_factory(test_session_factory):
     """Yields a callable that commits a minimal but real Workspace -> User ->
@@ -1213,6 +1385,8 @@ def open_position_factory(test_session_factory):
 
     yield _create
 
+    from app.domain.ops.models import SystemAlert
+
     with test_session_factory() as cleanup_db:
         for workspace_id in created_workspace_ids:
             trading_session_ids = [
@@ -1221,6 +1395,12 @@ def open_position_factory(test_session_factory):
                     TradingSession.workspace_id == workspace_id
                 )
             ]
+            # Rail 4's `option_chain_degraded` alert (or any alert a test
+            # triggers) FKs workspace_id/trading_session_id -- must go before
+            # the TradingSession/Workspace deletes below.
+            cleanup_db.query(SystemAlert).filter(
+                SystemAlert.workspace_id == workspace_id
+            ).delete(synchronize_session=False)
             cleanup_db.query(Position).filter(
                 Position.trading_session_id.in_(trading_session_ids)
             ).delete(synchronize_session=False)

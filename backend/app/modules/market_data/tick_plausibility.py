@@ -42,6 +42,71 @@ movement" philosophy as that existing guard.
 
 MAX_PLAUSIBLE_OPTION_PREMIUM = 5000.0
 
+# --- no-arbitrage bounds for the option-chain path (2026-09-08) ------------
+#
+# The flat ceiling above is a blunt "wrong instrument entirely" catch. When
+# the *underlying spot* is known (the option-chain fetch already has it —
+# see `OptionChainSnapshot.underlying_ltp`), a much tighter, self-calibrating
+# bound is available: an option can never be worth less than its intrinsic
+# value, nor meaningfully more than intrinsic + a modest slice of spot for
+# time value. A leaked spot-price tick (`ltp` ~= spot) blows past this for
+# every strike in the traded window regardless of underlying or volatility
+# regime, with no magic number to re-tune. See
+# docs/ops/shoonya_option_chain_spot_leak.md.
+#
+# 0.05 headroom: NIFTY ATM 0-DTE tops out ~300-600 on a violent day (spot
+# ~24k -> cap ~1,200); BANKNIFTY ~800-1,200 (spot ~51k -> cap ~2,550). Both
+# leave a wide multiple of margin. If a real tail-event premium is ever
+# clipped, the only consequence is that strike being dropped from ranking
+# for one ~60s cycle -- never a bad fill -- so a slightly generous cap is
+# the safe direction. Tunable; validate against real ATM premiums.
+EXTRINSIC_CAP_FRACTION = 0.05
+
+# Wide sanity band per underlying for the spot value itself, so a corrupted
+# *underlying* quote can't feed a garbage bound. Outside the band -> treat
+# spot as unknown and fall back to the flat ceiling.
+_SPOT_SANITY_BANDS: dict[str, tuple[float, float]] = {
+    "NIFTY": (10_000.0, 50_000.0),
+    "BANKNIFTY": (20_000.0, 120_000.0),
+    "FINNIFTY": (10_000.0, 60_000.0),
+}
+
+
+def _spot_is_sane(underlying: str, spot: float) -> bool:
+    lo, hi = _SPOT_SANITY_BANDS.get(underlying.upper(), (0.0, float("inf")))
+    return lo <= spot <= hi
+
+
+def option_premium_upper_bound(strike: float, is_call: bool, spot: float) -> float:
+    """Highest an option on `strike` can plausibly trade at, given `spot`:
+    intrinsic value + `EXTRINSIC_CAP_FRACTION` of spot for time value."""
+    intrinsic = max(0.0, spot - strike) if is_call else max(0.0, strike - spot)
+    return intrinsic + EXTRINSIC_CAP_FRACTION * spot
+
+
+def is_plausible_option_entry(
+    ltp: float,
+    bid: float,
+    ask: float,
+    volume: int,
+    *,
+    strike: float,
+    is_call: bool,
+    underlying: str,
+    spot: float,
+) -> bool:
+    """Option-chain-path variant of `is_plausible_option_tick` — adds a
+    no-arbitrage upper bound when `spot` is known and in-band. Falls back to
+    exactly `is_plausible_option_tick`'s behaviour otherwise (spot 0/unknown,
+    or an underlying with no sanity band). The zero-book check is unchanged
+    and still first.
+    """
+    if bid == 0 and ask == 0 and volume == 0:
+        return False
+    if spot > 0 and strike > 0 and _spot_is_sane(underlying, spot):
+        return ltp <= option_premium_upper_bound(strike, is_call, spot)
+    return ltp <= MAX_PLAUSIBLE_OPTION_PREMIUM
+
 
 def is_plausible_option_tick(ltp: float, bid: float, ask: float, volume: int) -> bool:
     """`False` means "don't trust this as a real option premium" -- every

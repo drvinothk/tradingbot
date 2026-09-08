@@ -123,6 +123,13 @@ class OptionChainSnapshot:
     expiry: date
     ts: datetime
     entries: tuple[OptionChainEntry, ...] = field(default_factory=tuple)
+    # The underlying's own spot LTP at fetch time, when the adapter knows it
+    # (Shoonya fetches it anyway to anchor the chain; mock leaves it 0.0).
+    # Consumed by `market_data.tick_plausibility.is_plausible_option_entry`
+    # for no-arbitrage premium bounds — 0.0 means "unknown", and that check
+    # falls back to a flat ceiling. See
+    # docs/ops/shoonya_option_chain_spot_leak.md.
+    underlying_ltp: float = 0.0
 
 
 @dataclass(frozen=True)

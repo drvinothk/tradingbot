@@ -625,9 +625,46 @@ work, or vice versa.
 
 ## Known open items
 
-- **2026-09-08: reconciliation scoped to app-placed symbols — implemented +
-  tested on branch `fix/reconciliation-scope-to-app-symbols`, NOT yet
-  merged/deployed.** Live incident: a `live_enabled` session tripped
+- **2026-09-08: option-chain plausibility "rails" (Rails 1+2+4) — built +
+  tested on branch `fix/option-chain-plausibility-rails`, NOT yet
+  merged/deployed.** Shoonya's `GetOptionChain` + per-strike `GetQuotes`
+  routinely returns `ltp ≈ spot, bid=ask=vol=0` for some strikes (incl.
+  ~ATM 0-DTE); the 2026-09-03 plausibility guard drops them but noisily (an
+  `ERROR` per row per ~60s). Built structural rails so the guard is the
+  exception, not the norm — full problem + all 6 candidate solutions in
+  [docs/ops/shoonya_option_chain_spot_leak.md](docs/ops/shoonya_option_chain_spot_leak.md).
+  **Rail 1** (`shoonya/adapter.py::get_option_chain`): per row, cross-check
+  the row's `token` against the trusted scrip-master token in
+  `_token_by_symbol`; disagree → price with the trusted one, don't cache the
+  suspect one, one aggregated `WARNING`. Redesigned during QC away from the
+  original "check GetQuotes echo fields" (compared against the token we
+  *sent*, and depended on an unconfirmed response shape). **Rail 2**
+  (`market_data/tick_plausibility.py`): new `is_plausible_option_entry` with
+  a no-arbitrage upper bound `intrinsic + 0.05·spot`; `OptionChainSnapshot`
+  gained `underlying_ltp` (Shoonya sets it, mock leaves 0.0 → falls back to
+  the flat ceiling); `_SPOT_SANITY_BANDS` guards a corrupted underlying
+  quote. Existing `is_plausible_option_tick` + its WS/`current_contract_price`
+  call sites untouched. **Rail 4** (`record_option_chain_snapshot`): one
+  aggregated `WARNING` per fetch with `no_book`/`no_arb` reason counts + a
+  consecutive-fetch streak; CRITICAL `option_chain_degraded` `SystemAlert`
+  (Telegram-allowlisted, in Control Room's attention set) ONLY when a
+  dropped symbol matches an OPEN position (attributed to its
+  workspace/session), self-resolving on a clean fetch; sustained
+  degradation with no open position → `ERROR` log only. `metric_series`
+  deferred (needs `workspace_id` threaded through 3 callers). The reason
+  tags are the diagnostic — `no_arb` drops persisting *after* Rail 1 means
+  Shoonya returns spot for a *correct* token (escalate to Rail 5 targeted
+  re-sync / Rail 6 TrueData-or-AliceBlue chain source). Test-teardown
+  gotcha fixed: `open_position_factory` in `test_market_data_ingestion.py`
+  didn't delete `SystemAlert` rows → Rail 4's alert FK-blocked workspace
+  teardown. 1685 backend tests pass (+15), ruff/mypy clean, frontend
+  `npm run build` clean.
+
+- **2026-09-08: reconciliation scoped to app-placed symbols — MERGED to
+  `main` (`b4e33a2`) + DEPLOYED to OCI + live-verified (session
+  `8e82700d-…` auto-recovered `reconciliation_lock -> live_enabled` after 3
+  clean checks; standing alerts auto-resolved).** Live incident: a
+  `live_enabled` session tripped
   `reconciliation_lock` with a `local_qty: 0, broker_qty: <nonzero>,
   option_contract_id: null` mismatch on a symbol the app never traded — the
   user had made a plain **cash-segment equity sell in the same Shoonya

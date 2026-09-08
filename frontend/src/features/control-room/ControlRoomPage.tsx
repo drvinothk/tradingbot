@@ -879,6 +879,7 @@ const ATTENTION_ALERT_CATEGORIES = new Set([
   'broker_disconnected',
   'market_data_stale',
   'market_data_failover_switch',
+  'option_chain_degraded',
 ])
 
 interface AttentionItem {
