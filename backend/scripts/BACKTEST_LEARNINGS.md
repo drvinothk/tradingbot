@@ -8,6 +8,1097 @@ costs are applied only in analysis.
 
 ---
 
+## 2026-09-08 (~12:45 IST) — p18s VWAP `--volume-source` smoke: verdict + unsynced-work triage
+
+### p18s — `run_backtest.py --volume-source {same,futures}` splice, VWAP smoke (2 configs, `s6_p18s`, run ~05:37 IST)
+
+**What / why.** 2026-09-07 root-caused backtest VWAP diverging from live to a
+price-series + volume mismatch: live's `vwap_pullback*` runs on real spot-index
+PRICE with **spliced real futures VOLUME**
+(`ShoonyaBrokerAdapter._splice_future_volume`); the backtest ran either on
+`alice_index` (real spot price, **volume=0** → VWAP degenerate) or
+`futures_proxy` (futures *price*, not spot). New `run_backtest.py
+--volume-source futures` reproduces live: keep `alice_index`'s spot PRICE bars,
+overwrite each bar's VOLUME with the same-minute value from
+`NIFTY_underlying_proxy_1min.csv`. `--volume-source same` (default) = byte-identical
+to today. Applied to the box bundle only via `patch_volume_source.py` (LF-native);
+NOT committed anywhere.
+
+**Smoke** — `vwap_pullback_conviction` + `require_momentum_alignment` /
+`momentum_lookback_bars=1` (= live `VWAP_RSI_Paper_Convic`):
+
+| config | series | trades | win% | E/lot | PF | IS E | OOS E | P(mean≤0) |
+|---|---|---|---|---|---|---|---|---|
+| VW-N1-FIX | alice_index price + spliced futures volume | 16 | 31.2% | −343.2 | 0.27 | −388.0 | −268.6 | 0.981 |
+| VW-N1-OLD | futures_proxy price (control) | 16 | 25.0% | −352.1 | 0.26 | −435.8 | −212.6 | 0.986 |
+
+- ts-alignment proxy→alice 99.7%; futures-volume coverage ~100% of near-expiry
+  weeks. ~9/16 trades identical, ~7 differ by strike-within-same-expiry (real
+  volume nudges the VWAP line, not whether the setup fires).
+- **The fix works as designed** — the VWAP series is now the one live sees — **but
+  both legs are deep losers on this sample**: E ~−340/lot, PF ~0.27,
+  P(mean≤0) ~0.98. FIX is marginally less bad (win 31 vs 25, IS −388 vs −436),
+  not a meaningful improvement.
+
+**Verdict — data-coverage wall, NOT a strategy verdict.** Both legs = 16 trades,
+100% DTE 5–6, near-expiry weeks only. `vwap_pullback` has no once-per-run cap;
+the setup just occurs ~0–2×/week across the ~26 near-expiry weeks the archive
+covers, vs live running every session on real ticks (~13/day). The smoke
+**cannot adjudicate live VWAP either way.** Standing point (user, 2026-09-08):
+no-backtest ≠ no-live — VWAP is validated *forward* (paper signal-count +
+outcome ledger, then monitored 1-lot live), and the raw signal frequency/edge
+can be checked on the full continuous `alice_index` series independent of any
+option data.
+
+**Decisions:**
+- **Full Phase 18 VWAP sweep — NOT run** (fails the "only if the smoke improves"
+  gate).
+- **`--volume-source` patch — KEPT dormant on the box bundle** (`same` default =
+  no-op). `patch_volume_source.py` preserved in the session scratchpad. Re-run a
+  real VWAP sweep on it once the near-expiry option archive has grown enough to
+  lift the 16-trade ceiling.
+- **VWAP stays paper-only / directional**, unchanged.
+
+### Unsynced-work triage (2026-09-08)
+
+Cleared the piled-up not-synced backtest work.
+
+**Kept (active / dormant):**
+- `wip/strike-selection-dte-batch` (local, unpushed) —
+  `analyze_strike_selection_dte_split.py` + `phase16/17_*.txt`. p17 runs 15:32
+  IST tonight. Stays local per the backtest-scripts-local-only policy.
+- **DTE-aware strike-selection wiring** on the box bundle
+  (`strike_ranking/engine.py` `resolve_dte_ranking` + `dte_aware_strike_selection`
+  / 5 window params on ORB/OI/EMA + `strategies.py` param allowlist). p16: only
+  ORB's `non_expiry_day_window` (ATM±1) helps; OI negative, EMA worse; expiry-day
+  levers untestable (no DTE 0–3 option data). ORB *conviction* re-test = p17.
+  Box backup at `~/deploy-bak/strike-sel-batch-20260908/`; edited copies in the
+  session scratchpad `bundle/`.
+- `--volume-source` patch — above.
+
+**Archived (removed from the working set):**
+- `wip/entry-filters-and-momentum-plateau` (79e57c3) → tag
+  `archive/entry-filters-and-momentum-plateau` (local branch deleted; origin
+  branch left in place). +539/−30: RSI14-extreme entry block + confirm-bar
+  filters across all 4 strategies, the momentum-plateau `entry_time`-floor
+  bugfix, and tests. **Not promoted — why:**
+  - **p10c** (momentum-plateau EXIT sweep, 2026-09-04): `require_momentum_plateau_exit`
+    HURTS the two strategies that matter — ORB conv +122 → **−80** (P 0.19→0.83),
+    OI conv +187 → +35. Feature stays dormant (deployed opt-in, no config sets
+    it). The `entry_time`-floor bugfix rides with that feature and doesn't earn
+    a merge alone.
+  - **p15** (entry-avoidance filters, 2026-09-07): RSI-block-*alone* degrades base
+    ORB (E +105→+59, OOS +33→+2); the live `ORB_Convic_*` (RSI + confirm-bar) is
+    already the best config in the p15 set (E +209, P 0.053). No config change.
+  Restore if a new entry-filter test is planned:
+  `git checkout -b <name> archive/entry-filters-and-momentum-plateau`.
+
+**Deleted:**
+- 6 merged local branch refs (`feat/collapsed-exit-uses-dominant-leg`,
+  `feat/invert-paper-live-model`, `feat/live-exit-path-redesign`,
+  `feat/staged-exit-collapse-and-live-carrier-stop`,
+  `fix/option-chain-plausibility-rails`, `fix/reconciliation-scope-to-app-symbols`)
+  — all ancestors of `main`, all deployed; history intact on `main`.
+- Box `sweep_configs/phase18_smoke.txt` — consumed; the 2 configs, for the
+  record:
+  ```
+  VW-N1-FIX|vwap_pullback_conviction|alice_index|{"require_momentum_alignment": true, "momentum_lookback_bars": 1}
+  VW-N1-OLD|vwap_pullback_conviction|futures_proxy|{"require_momentum_alignment": true, "momentum_lookback_bars": 1}
+  ```
+
+**Committed:** `backend/scripts/fetch_shoonya_near_expiry_options.py` (was
+untracked on `main` — the near-expiry option-pull source, deployed to the box
+2026-09-05).
+
+### Ledger resync
+
+This file on `main` was ~6 days / ~12 entries behind the `backtest_engine` box
+bundle copy (the box copy is the working source of truth — phases 10c–16 and
+Part 0 were only ever written there). Replaced `main`'s copy wholesale with the
+box copy — verified a clean prepend-only superset: identical from the 2026-09-02
+entry down, the sole other divergence being the CANONICAL section, where the box
+copy is the newer one (documents `run_sweep_canonical.sh`). Entries
+2026-09-03 "Phase 9 concluded" → 2026-09-08 "Part 0" plus this entry now land on
+`main` together.
+
+
+## 2026-09-08 (~08:50 IST) — Part 0: analyzed p15/p14-tails/p10c (all 3 unwritten) + Phase 17 (ORB conv strike-width + OR-width) scheduled
+
+### p15 — entry-avoidance filters (RSI14-extreme block + confirm-bar), 26 configs, run 2026-09-07
+
+Walk-forward (IS ≤ 2026-04-01 / OOS after; 10k bootstrap). Config names:
+`{ORB,OI}` = base type, `{ORBC,OIC}` = conviction; `C0` none, `B` confirm-bar,
+`R2575`/`R25` etc. = RSI block, `RB` = both.
+
+| config | E/lot | PF | P(mean≤0) | OOS E | read |
+|---|---|---|---|---|---|
+| **OIC-R25** (= live `OI_Convic_*`) | **+224** | 3.38 | **0.013** | +180 | **best in the OI set** |
+| OIC-C0 | +187 | 2.75 | 0.029 | +180 | RSI block PE<25 adds real value |
+| OIC-R30 | +230 | 3.57 | 0.015 | +179 | ~tie with R25 |
+| OIC-R2570 (adds CE>70) | +149 | 2.21 | 0.109 | +137 | CE-side block hurts (n 18→13) |
+| OIC-B / OIC-RB (confirm bar) | — | — | — | — | **kills OI conv** (n→5 / n→1) |
+| **ORBC-RB** (= live `ORB_Convic_*`, RSI+confirm) | **+209** | 1.97 | **0.053** | +300 | **best in the ORB set** |
+| ORBC-B (confirm only) | +185 | 1.74 | 0.114 | +326 | strong; RB edges it on P/E |
+| ORBC-C0 | +122 | 1.49 | 0.186 | +35 | |
+| ORBC-R2575 (RSI only) | +59 | 1.21 | 0.338 | +2 | **RSI block alone hurts** |
+| ORB-B (= live `Nifty_ORB_Base`) | +105 | 1.40 | 0.214 | +33 | confirm bar rescues base ORB (C0 = −177) |
+| ORB-RB (base, RSI+confirm) | +68 | 1.23 | 0.309 | −41 | RSI block degrades the base confirm config |
+| OI base (all) | −132 … −447 | <0.65 | >0.88 | neg | stays parked |
+
+**Verdict: the two live conviction configs (`OI_Convic_*` RSI PE<25, `ORB_Convic_*`
+RSI+confirm) are the best configs in their respective p15 sets. WS5 validated.
+No config change.** (Caveat: p15's ORBC exit params were the pre-2026-09-07
+`stop .18/target 1.0`, not the current `.22/.33` from phase14's R:R grid — the
+*relative* filter ranking is the signal, not the absolute E.)
+
+### p14 — OI/EMA/VWAP R:R grid tails (3 SL × 4 ratios each), 36 configs, run 2026-09-06
+
+| grid | best cell | E/lot | PF | P(mean≤0) | vs live |
+|---|---|---|---|---|---|
+| OI | `g_oi_s11_r20` (SL .11 / ratio 2.0) | +200 | 2.87 | **0.025** | **= live `OI_Convic_*` top-level (.11/.22)** — at optimum |
+| EMA | `g_ema_s08_r15` (SL .08 / ratio 1.5) | +94 | 1.72 | **0.069** | **= live `EMA_Convic_*` (.08/.12)** — at optimum |
+| VWAP | every cell **fails** (E −260…−425, P 0.94–0.99) | | | | ran on `futures_proxy` = the broken series → **invalid, ignore** |
+
+**Verdict: OI and EMA conviction exit params already sit at their grid optimum.
+No change. VWAP grid must be rerun after the price-series fix (Phase 18).**
+
+### p10c — momentum-plateau EXIT (`slope` 5-bar / `slopelb10` 10-bar vs `off`), 24 configs, run 2026-09-04
+
+| strategy | off | slope | slopelb10 |
+|---|---|---|---|
+| ORB conv | +122 (P 0.186) | **−80** (P 0.83) | +36 (P 0.37) |
+| OI conv | **+187** (P 0.029) | +35 (P 0.36) | +161 (P 0.05) |
+| EMA base | −54 | +4 | −63 | (all ≈ 0, noise) |
+| VWAP | all deeply negative (invalid series) | | |
+
+**Verdict: `require_momentum_plateau_exit` HURTS the two strategies that matter
+(ORB/OI conviction). Do NOT promote. Feature stays dormant (deployed opt-in,
+no config sets it). Leave the parked entry-anchor bugfix on
+`wip/entry-filters-and-momentum-plateau` parked — the feature doesn't earn it.**
+
+### Phase 17 (RUN_TAG=p17) — scheduled 15:32 IST via `p17-delayed-launch.timer` (rule 7: outside market hours; reaper stopped per rule 13)
+
+6 `orb_conviction` configs (`sweep_configs/phase17_orb_conviction_strike_and_width.txt`),
+base = `ORB_Convic_Paper` params (exit_legs omitted — `--exit-mode current`
+doesn't read them), ~2.3 h at SHARD_COUNT 4.
+
+- **Strike-width (Batch 2 of strike-selection)** — carry Phase 16 Batch 1's
+  ORB-base finding (ATM±1 beat ATM±3: E +33 %, PF 1.40→1.52, P 0.214→0.160)
+  onto the real conviction entry gate. `OC-C0` control / `OC-NW1`
+  (`non_expiry_day_window` 1) / `OC-NW2` (2). Expiry-day levers still excluded
+  (no DTE 0–3 option data).
+- **OR-range width re-sweep** (open since 2026-09-01) —
+  `max_or_range_nifty_points` ∈ {55, 65(=`OC-C0`), 75, 85} with
+  `require_prior_day_trend` on, which the 2026-08-28 width-ridge sweep never
+  tested. Gates any decision to size ORB above 1 lot.
+
+### Still planned (not yet started)
+
+- **Phase 18 — VWAP price-series fix**: new `run_backtest.py --volume-source
+  {same,futures}` (splice real spot price from `alice_index` + volume joined
+  from `NIFTY_underlying_proxy_1min.csv` on ts), SOURCE_MAP `vwap_pullback*` →
+  `alice_index`. Then a 7-config VWAP sweep (base / p120 / conviction ± momentum
+  N1–N3) on the corrected series + a before/after `futures_proxy` control. Smoke
+  the ts-overlap % first (futures volume ≈ 1 wk/month = the near-expiry weeks
+  `--near-expiry-days 6` already filters to).
+- **EMA persistence=120s** — real `trade_outcomes` comparison, not a backtest
+  (persistence 6/30/60/120 are indistinguishable from 0 on 1-min bars).
+
+
+## 2026-09-08 (~06:00 IST) — Phase 16: DTE / expiry-day-aware STRIKE SELECTION wired + Batch 1 (base configs) launched
+
+**What it is.** `strike_ranking/engine.py` has carried a full DTE/time-of-day
+strike-window since Ops-Hardening Phase 1 (2026-08-14) —
+`_dte_allowed_strikes` + `StrikeRankingConfig`'s `non_expiry_day_window` /
+`expiry_morning_window` / `expiry_morning_premium_floor` /
+`expiry_afternoon_deep_itm_offset` / `expiry_afternoon_window` — but no
+strategy ever called `rank_from_latest_snapshot` with `dte=`/`current_time=`,
+so it was 100% dormant. Own-data confirmation of the premise (2026-09-07
+research): NIFTY 2026-08-18 expiry, ORB's 09:16→10:15 window — ITM (24100)
+decayed −17.2 % vs ATM (24250) −46.0 % vs OTM (24400) −53.7 %.
+
+**Wiring (bundle `app/` re-pin, 5 files — deliberate, per README rule 4).**
+New `strike_ranking.engine.resolve_dte_ranking(base, expiry_date, now_ist, *,
+enabled, <5 overrides>)` → `(config, dte, current_time)`; `enabled=False` →
+`(base, None, None)` = byte-identical to the pre-existing plain-`atm_range`
+path. Called from ORB / OI-Volume / EMA Micro-pullback's one
+`rank_from_latest_snapshot` site each, `now_ist =
+to_ist(latest_bar.bucket_start)` (bar-derived, never a wall-clock read —
+same restart-safe convention ORB's own opening-range anchor uses). 6 new
+opt-in `params` keys (`dte_aware_strike_selection` + the 5 window overrides)
+added to `ORB/EMA/OI *_PARAM_KEYS` via a shared `_DTE_STRIKE_SELECTION_KEYS`
+set, so the conviction variants inherit them for Batch 2. VWAP deferred —
+its `futures_proxy` price-series fix (2026-09-07 root-cause entry) comes
+first. `dataclasses.replace` preserves OI-Volume's `min_oi`/`min_volume`/
+weight overrides while swapping only the window fields (QC-verified).
+
+**QC done before any compute.** `resolve_and_qc.py` builds all 8 lines via
+the real `_build_strategy` (rule 14) — pass. Explicit assertion that
+`dte_aware_strike_selection` + overrides land on the constructed object —
+pass. `resolve_dte_ranking` disabled→passthrough, dte=0/dte=5 branches, OI
+`replace` preservation — pass. Synthetic-chain `rank_strikes` windowing:
+flat = ATM±3; expiry-morning CE = {ATM, 1-ITM-lower}; expiry-morning PE =
+{ATM, 1-ITM-higher} (directional, correct); non-expiry D1 = ATM±1;
+non-expiry `non_expiry_day_window=3` ≡ flat (**D3's non-expiry path is
+byte-identical to C0** — the batch's isolation claim); expiry-afternoon
+offset2/band1 anchors 2-ITM ±1; `expiry_morning_premium_floor=20` drops
+sub-₹20 strikes. Real-data smoke (ORB `--expiry 2026-09-01`) ran clean, no
+errors/traceback.
+
+**Batch 1 — 8 configs, base only (`sweep_configs/phase16_strike_selection_base.txt`, RUN_TAG=p16).**
+Rows = each strategy's live-BASE top-level params (trading_bot DB
+2026-09-08, `exit_legs` stripped — exit shape held constant, phase15 method)
++ overlay. `--exit-mode current --all-expiries --near-expiry-days 6`,
+`alice_index` for all (SOURCE_MAP). Variants, uniform across strategies:
+
+| tag | dte_aware | non-expiry window | expiry-morning | ₹ floor | expiry-afternoon (offset/band) |
+|---|---|---|---|---|---|
+| C0 | off | ATM±3 (today) | — | — | — |
+| D1 | on | ATM±1 | ATM→1-ITM | 0 | 3 / 0 |
+| D3 | on | ATM±3 (≡ C0) | ATM→1-ITM | 20 | 2 / 1 |
+
+ORB C0/D1/D3, OI C0/D1/D3 (3-deep — `D3−C0` = pure expiry-day effect,
+`D1−D3` = non-expiry-tightening effect), EMA C0/D1 (2-deep first screen).
+All windows clamped ≤ ATM±3 (older archive expiries carry only ~ATM±5–6
+strikes). NB: expiry-afternoon params inert for ORB (all entries ≤ 10:15 =
+"morning").
+
+**Known Batch-1 limitations (by design).** Exits at class defaults → the
+ITM-vs-ATM absolute-stop-width confounder is not addressed (ITM-tuned exits
+= Batch 2). `exit_legs` stripped ≠ the live multi-leg exit shape (same
+entries, different P&L — measure within-batch deltas only). OI/EMA `dte==0`
+subset is ~1/5 of a small base n → directional read; ORB has the n.
+
+**Analysis plan.** `analyze_walkforward.py` for the standard read, **plus a
+DTE split** — bucket each `_current.csv` trade by `entry_date ==
+parse_expiry(symbol)` and compare C0 vs D1/D3 on the expiry-day subset and
+the non-expiry subset separately (that's the whole point of the batch).
+
+**Status:** launched RUN_TAG=p16, ~3.1 h (8 × ~23 min orb/oi/ema-family,
+SHARD_COUNT=4). Results + verdict appended when done. `main`'s tracked
+
+### RESULTS (2026-09-08 ~08:45 IST) — completed 08:32 IST, 209 min, 8/8 OK, zero shard failures
+
+**🔴 The primary question — expiry-day theta avoidance — could NOT be tested.
+Zero trades at DTE 0–3 in the entire batch.** DTE distribution across all 8
+configs: ORB `{1:1, 4:7, 5:6, 6:30}`, OI/EMA `{5:3, 6:42}`. The
+`options_1min_past` near-expiry archive is ~100 % DTE 5–6 for these expiries,
+and ORB/OI/EMA each fire once per direction per expiry-week run — so the
+entry lands on the Wednesday (DTE 6) and `_fired_directions` blocks any
+later same-week entry. The `expiry_morning_window` / `expiry_afternoon_*` /
+`expiry_morning_premium_floor` levers got **zero exercise**. This is the data
+wall `[[project_shoonya_near_expiry_pull_2026_09_05]]` addresses going
+forward; the historical archive doesn't have DTE 0–3 option data. **D3 ≡ C0
+byte-for-byte** for ORB and OI (D3's `non_expiry_day_window=3` == C0, and no
+expiry-day trades to differ on) — confirms the wiring is correct and
+non-destructive.
+
+**Secondary finding — the `non_expiry_day_window` lever (DTE 6, ATM±1 vs
+ATM±3): a real, clean improvement for ORB only.** All comparisons are on the
+identical 44/45/47-trade entry set (strike selection doesn't touch entry
+logic) — 9 of ORB's 44 strikes changed under D1, every one toward ATM
+(richer premium); 7/9 improved P&L.
+
+`analyze_walkforward.py` (IS ≤ 2026-02-19 / OOS after; 10k bootstrap):
+
+| config | E/lot | PF | win% | P(mean≤0) | IS E | OOS E | slip @1.0% |
+|---|---|---|---|---|---|---|---|
+| **ORB-C0** (ATM±3) | +104.6 | 1.40 | 45.5 % | 0.214 | +154 | +33 | −2 |
+| **ORB-D1** (ATM±1) | **+139.2** | **1.52** | 47.7 % | **0.160** | +201 | +49 | +32 |
+| ORB-D3 (≡ C0) | +104.6 | 1.40 | 45.5 % | 0.214 | — | — | — |
+| OI-C0 | −132.3 | 0.63 | 42.2 % | 0.887 | −90 | −196 | −236 |
+| OI-D1 | −124.9 | 0.66 | 42.2 % | 0.864 | −81 | −191 | −231 |
+| EMA-C0 | −75.8 | 0.75 | 44.7 % | 0.794 | −83 | −65 | −173 |
+| EMA-D1 | −86.5 | 0.72 | 44.7 % | 0.821 | −104 | −61 | −186 |
+
+- **ORB**: D1 beats C0 on every metric — +33 % E, PF 1.40→1.52,
+  P(mean≤0) 0.214→**0.160** (just outside the 0.15 bar), both halves
+  positive, and materially **less slippage-fragile** (+32 vs −2 at 1.0 %/
+  side). One 44-trade sample, doesn't clear the bar outright, but a
+  consistent directional gain. **Carry ATM±1 into Batch 2 (conviction
+  configs)** — ORB is the one strategy with a live split.
+- **OI**: deeply negative either way (already a parked strategy per the
+  2026-09-01 archive triage). D1 marginally less bad, still a clear fail.
+- **EMA**: D1 is **worse** than C0 (E −87 vs −76). Tightening the window
+  hurts EMA. Don't carry it.
+
+**Batch-1 limitations that stand:** exits at class defaults (the ITM-vs-ATM
+absolute-stop-width confounder was never reached — no ITM entries fired);
+`exit_legs` stripped ≠ live multi-leg shape; base configs ≠ the live
+conviction configs; single 44-trade sample.
+
+**Next:**
+1. Expiry-day strike selection stays **unbacktestable** until the near-expiry
+   pull accumulates real DTE 0–3 option data (weeks–months) — or decide it
+   on logic/paper alone. Historical backfill is out (brokers reject expired
+   tokens).
+2. **Batch 2**: ORB conviction (`ORB_Convic_*`) C0 vs `non_expiry_day_window`
+   ∈ {1, 2} on the real live params, to confirm the ATM±1 gain survives the
+   conviction entry gate + multi-leg exits. Skip OI/EMA (no signal / negative).
+3. VWAP price-series fix, then a VWAP strike-selection run, per the standing
+   plan.
+
+`BACKTEST_LEARNINGS.md` is ~800 lines / 5 days behind this box copy
+(phase10–14) — needs its own resync-to-main commit, out of scope here.
+## 2026-09-07 (~03:30 IST) — phase14 partial analysis: ORB leg/R:R findings applied live; root-caused why VWAP/OI live trade frequency vastly exceeds backtest; DTE-aware strike selection found dormant
+
+**phase14 status at time of writing**: 27/55 configs done, zero shard
+failures, on pace (~26min/config for orb/oi/ema-family). Original ~17.8hr
+estimate revised to ~14:00-14:30 IST 2026-09-07 (the run straddles today's
+09:00 IST market-open CPU-quota throttle, 200%→100%, an existing safety
+net — confirmed independent of the sweep's own SHARD_COUNT).
+
+### ORB — Group C completion + R:R grid, fully analyzed, applied live
+
+All 4 multi-leg exit legs (core/runner/tightlock/target — same 40-trade
+entry set, confirmed via symbol+entry_time hash) compared:
+`core`/`runner`/`tightlock` are **100% trade-agreement** — same
+winners/losers, only trail-lock timing differs the magnitude. `runner`
+strictly dominates both on net AND tail-check; `tightlock` is strictly
+dominated by `core`. Zero diversification among the three. `target`
+(bounded exit, not pure trail) is genuinely different — 85% agreement, and
+has the best "sustained" profile (lowest max drawdown, best mean/std, fewest
+negative months) despite lower raw net.
+
+**Decision applied live** (`ORB_Conviction`,
+`trading_bot.strategy_configs`): dropped `tightlock`, kept
+core/runner/target at **qty_fraction 0.25/0.25/0.50**. Blending the three
+100%-position backtests linearly (valid — all three share identical
+entries, PnL scales with qty) confirmed 25/25/50 captures the full
+drawdown improvement of heavier target-weighting without giving up as much
+net. Target leg's own exit params also updated from the R:R grid
+(`g_orb_s22_r15`: stop 0.22/target 0.33, same trail 0.12/0.6 as before) —
+beat the live target leg's old params (stop 0.18/target 0.4) by +28% net /
++45% tail on the identical entry set.
+
+**ORB's R:R grid itself (12 configs) all share the SAME 40-trade entry set
+as everything above** — exit-overlay comparisons, not independent
+evidence (same trap as ORB's earlier 79-exit-overlay archive finding).
+Within that one sample: net PnL and tail both fall monotonically as target
+ratio loosens past 1.5x SL; `g_orb_s22_r15` (widest SL tested, tightest
+ratio) currently wins.
+
+A live-vs-paper split was created (`ORB_Conviction_Live`, later renamed
+`ORB_Convic_Live`/`ORB_Convic_Paper` by the user) — ORB is the only
+strategy family with this split, since it's the only one with real
+backtest validation behind it.
+
+Full writeup: local Claude memory
+`project_orb_3leg_reweight_live_paper_split_2026_09_07`.
+
+### VWAP/OI — root-caused a 30-100x live-vs-backtest trade-frequency gap
+
+User noticed VWAP fires far more often live than backtest implies (`Test 4`
+had 221 closed trades in 17 real days; a full year of backtest for one
+config is only 40-113 trades). Root-caused via background investigation,
+ranked:
+
+1. **Primary: underlying price-series mismatch.** `resolve_and_qc.py`'s
+   `SOURCE_MAP` resolves `vwap_pullback*` to `futures_proxy` (NIFTY futures
+   OHLC) — every other strategy uses `alice_index` (real spot). Live trades
+   real spot ticks, only splicing in *volume* from futures
+   (`ShoonyaBrokerAdapter._splice_future_volume`). Two genuinely different
+   price series for a level-sensitive (VWAP-touch) strategy — this file
+   already flagged this as "real for anything level-sensitive" when the
+   `futures_proxy` substitution was first made.
+2. **Contributing: bar-construction fidelity.** Live bars are built from
+   ~350 real ticks/min (true running high/low); backtest replays one
+   static pre-aggregated 1-min row from the (wrong) futures instrument.
+   This is the corrected form of "tick vs 1-min bar" — not eval frequency,
+   bar quality on the wrong series.
+3. **Refuted: evaluation cadence.** Both sides fire at most once per
+   completed 60s bar — `run_backtest.py` literally imports and calls
+   live's own `run_cycle`, not a reimplementation. Byte-identical.
+4. **Ruled out**: the 2026-09-02 trade-cap removal (VWAP wasn't in that
+   commit; paper sessions exempt from caps since 08-12; no step-change in
+   real daily trade counts around 09-02) and multi-instrument scope (both
+   configs checked trade NIFTY only).
+
+**A second, independent piece of evidence, found via an older E4-VM sweep**
+(`refined_sweep_20260828T072024Z`, this file's own 2026-08-28 entry,
+Batch 1): `structure_break_persistence_seconds` 30s/60s are **byte-identical
+to persistence=0 on 1-min bars** (a 60s bar can't resolve <2 bars' worth of
+time); 120s barely helps; 600s hurts. This means the 2026-09-04 "sb6-2leg"
+redesign (`persistence_seconds:6`, applied uniformly to OI/EMA/VWAP base
+configs) was **never backtested because it structurally can't be** at 1-min
+resolution — it would look identical to persistence=0. Real live/paper data
+is the *only* evidence that can exist on this question.
+
+**Real data confirms it, twice over** — the old, disabled
+`persistence_seconds:120` configs (an untuned 2026-08-24 placeholder,
+disabled 2026-09-04 purely for an unrelated UI-naming-collision reason, not
+performance) dramatically outperform their `sb6` (persistence=6)
+replacements AND the respective conviction variants in real trading:
+
+| strategy | config | n | net PnL | avg/trade | PF |
+|---|---|---|---|---|---|
+| VWAP | `Test 4` (persistence=120s) | 221 | +139,027.80 | +629.09 | 1.83 |
+| VWAP | `VWAP_Base` (persistence=6s, "sb6") | 22 | -16,025.75 | -728.44 | 0.46 |
+| VWAP | `VWAP_RSI_Paper_Convic` (conviction+N1, live) | 30 | +19,193.20 | +639.77 | 1.46 |
+| OI | `Test ` (persistence=120s) | 56 | +29,733.50 | +530.96 | 1.54 |
+| OI | `OI/Vol_Base` (persistence=6s, "sb6") | 4 | +7,527.00 | — | too thin |
+| OI | `OI_Volume_Conviction` (statistically-confirmed peak) | 22 | +2,830.75 | +128.67 | 1.22 |
+
+Even `OI_Volume_Conviction` — this project's cleanest statistical pass
+(P(mean≤0)=0.004) — is beaten on real per-trade average by the untested,
+disabled base config. Revived both persistence=120s configs as paper-only
+A/B arms alongside their sb6 replacements. EMA's equivalent (`Test 1`) not
+yet checked for the same pattern — flagged as an open next step.
+
+**Recommended fix, not yet built**: teach the backtest engine to splice
+real spot price + futures volume for VWAP (matching what live already
+does) instead of fully substituting to `futures_proxy` — would close the
+primary gap using 1-min data already on hand, without waiting for the
+user's new tick-by-tick data collection effort to mature (which addresses
+the secondary, bar-fidelity gap).
+
+**Comparative ranking of VWAP's existing 113-config archive** (since the
+fixed pass/fail bar doesn't fit a strategy whose real frequency this
+outpaces its backtest sample): best raw net is `g1_s06_t50` (+250/lot) but
+fails the tail-check hard (drop-2 -91, "3 trades deep"); most defensible is
+the full-conviction + momentum-N1 variant (+84/lot, P=0.248) — exactly
+what's live today. Phase 11's later quick-scalper redesign came back worse
+(0/22, this file's own 2026-09-04 ~22:53 IST entry) — the live pick is
+already the best of a genuinely weak field.
+
+**Standing decision**: only ORB gets a live-vs-paper split for now.
+OI/EMA/VWAP stay paper-only until the price-series fix + more tick data +
+the still-running phase14 EMA/VWAP R:R grid tails give them a real verdict.
+
+Full writeup: local Claude memory
+`project_vwap_oi_persistence_root_cause_and_revivals_2026_09_07`.
+
+### Strike selection — DTE-aware window found dormant, real ITM/OTM decay data pulled
+
+Current ORB (and every strategy) uses a plain symmetric ATM±3 window,
+identical every day. Found a full DTE/time-of-day-aware window already
+built into `strike_ranking/engine.py` since Ops-Hardening Phase 1
+(2026-08-14) — expiry-morning narrows to ATM-to-1-ITM only, expiry-afternoon
+jumps to a deep-ITM anchor, explicitly built "to completely avoid theta
+decay traps" — but **never wired into any strategy's call site**
+(`orb.py:239` calls it positionally, no `dte=`/`current_time=`). Fully
+dormant since creation.
+
+Pulled real 1-min NIFTY option data for the 2026-08-18 expiry, ORB's own
+entry window (09:16→10:15 IST): ITM (24100) decayed -17.2%, ATM (24250)
+-46.0%, OTM (24400) -53.7% — confirms the theory directly, not just
+external research. Design wrinkle flagged: %-based stop/target thresholds
+tuned on near-ATM premiums likely need separate tuning for an ITM strike's
+very different premium scale — not a straight carry-over.
+
+**Not backtested yet** — user is planning a dedicated ORB expiry-day
+backtest (DTE-aware strike selection on vs off) targeting a decision before
+Tuesday's weekly expiry.
+
+Full writeup: local Claude memory
+`project_strike_selection_dte_awareness_research_2026_09_07`.
+
+---
+
+## 2026-09-05 (~15:30 IST) — recurring near-expiry-week option data pull built, deployed, first real pull done (NIFTY)
+
+Follow-up to the open `project_backtest_data_coverage_monthly_append_todo`
+gap (~2-3wk missing since the last TrueData load). TrueData's trial expired
+2026-08-24 (credentials already pulled off the box) — confirmed dead, not
+just stale. Tested both remaining brokers' option-history depth live:
+
+- **Shoonya `TPSeries`**: real 1-min data for a *currently-listed* option's
+  full life (BANKNIFTY monthly returned 45+ real days back — no artificial
+  cap, matching what was already known for futures). **But the instant a
+  contract expires, its token is rejected outright**
+  (`"invalid input[Token not prsent]"`), confirmed directly against a token
+  already cached in our own `option_contracts` table from 4 days after its
+  own expiry — there is no retroactive backfill path, at all, ever. A
+  farthest-dated NIFTY/BANKNIFTY "LEAP" (listed years out) returned zero
+  rows on every window — listed, but never once traded, so it can't
+  answer a depth question either way.
+- **Alice Blue NFO history**: contrary to the 2026-08-26 audit's "confirmed
+  dead end" (which used a broken, illiquid-strike query), a near-ATM query
+  now returns real data — but **every row is an exact duplicate** (770
+  candles / 385 unique timestamps for one real trading day, confirmed by
+  hand), and it has the same >45-day cliff and zero >1yr data as Shoonya.
+  No depth advantage; would need a dedup pass to ever be usable. Not
+  pursued further given Shoonya already covers the same window cleanly.
+
+**Conclusion: there is no way to backfill already-expired weeks from
+either broker — the only usable design is capturing each week's
+near-expiry data *before* its own expiry.** Matches exactly what this
+system actually needs (`run_backtest.py --near-expiry-days 6` already only
+ever replays the Wed→Tue week before expiry).
+
+**Built**: `backend/scripts/fetch_shoonya_near_expiry_options.py` (new,
+uncommitted) — reuses the live app's own cached Shoonya session (no
+separate login) and its own already-synced `option_contracts` rows (real
+ATM-centered strikes come straight from production's daily sync; no
+SearchScrip lookup needed). Narrows to the nearest `--strikes-each-side`
+strikes to the latest known spot (from this app's own `price_bars`) before
+fetching — production's `is_active` band for a single NIFTY weekly turned
+out to be 454 rows (mostly stale never-cleaned structural rows from
+routine chain syncs, most strikes never near the money), which would have
+burned ~450 near-useless TPSeries calls per run without this filter.
+Pulls `TPSeries` for the Wed→Tue window, converts to the archive's exact
+`{underlying}{expiry:%y%m%d}{strike}{CE|PE}.csv` filename convention
+(matches `run_backtest.py`'s `_parse_option_symbol` byte for byte),
+applies the existing `MAX_PLAUSIBLE_OPTION_PREMIUM` ceiling, and
+merges into any existing file by timestamp (idempotent — safe to re-run
+mid-week or after a partial failure). Skips an underlying gracefully (not
+an error storm) when its nearest expiry's own near-expiry week hasn't
+started yet — BANKNIFTY's monthly expiry (2026-09-29) correctly no-op'd
+with "starts in 18d" instead of firing 60 doomed API calls.
+
+**Deployed**: `fetch-shoonya-near-expiry.service`/`.timer` on A1
+(`/etc/systemd/system/`), two `OnCalendar=Tue` runs — 09:50 UTC (15:20 IST,
+safety run before market close, in case the token dies exactly at close)
+and 10:05 UTC (15:35 IST, the requested time) — both hit the same
+idempotent script, so a token-death-at-close scenario still gets
+everything but the last ~10 minutes from the first run. Confirmed enabled,
+next fire correctly shows Tue 2026-09-08 09:50 UTC (this week's real NIFTY
+expiry).
+
+**First real pull (manual, this session)**: NIFTY 2026-09-08 expiry, 60
+contracts (ATM±15, spot ~23,950-24,300 through the week), 66,432 rows
+written to `options_1min_past/NIFTY/2026-09-08/` — 1125 rows/contract for
+the 3 full trading days so far this week (Sep 2-4; Sep 5 is a Saturday, so
+correctly nothing beyond Sep 4), a couple of far strikes showing fewer
+rows (807/375) from only recently coming into range — expected, not a
+bug. Cross-validated `intv` (per-bar volume) against an independent
+source: diffed consecutive `option_chain_snapshots` cumulative-volume
+reads for the same contract/window and got the same order of magnitude
+(~1-2M/min) as the fetched bars — confirms the large numbers are real
+NIFTY option volume, not a unit-mislabeling bug. BANKNIFTY correctly
+no-op'd (its own near-expiry week doesn't start until ~Sep 23).
+
+**Not yet done**: git commit (script lives in `backend/scripts/`, not
+`backend/app/`, so the local-only-uncommitted-backtest-code policy doesn't
+strictly apply, but it hasn't been asked for yet); a second real week's
+data to confirm the systemd timer fires and merges correctly unattended
+(next real test is this coming Tuesday, 2026-09-08); BANKNIFTY's own first
+real pull (~2026-09-23 onward).
+
+---
+
+## 2026-09-05 (~12:30 IST) — Phase 12 CONCLUDED: 0/42 pass, one genuine near-miss (`ema_t10_sl150`), OI/Volume's smoke-test edge did not generalize
+
+Sweep completed 06:37 IST (281min, all 42 configs OK, 16 trades each, zero
+errors — confirmed via `journalctl`, disk stable, `trading-bot.service`
+unaffected throughout). Analyzed via `analyze_walkforward.py` against the
+standing bar (positive IS+OOS+both halves; bootstrap P(mean≤0)≤0.15 with
+non-negative 5th-pctile; survives 1.0%/side slippage).
+
+**0/42 pass, but `ema_t10_sl150` is the closest anything has come across
+every phase of this research line.** target=10/stop=15: PF 1.82 overall,
+positive in ALL of IS (+566, PF 1.55) / OOS (+856, PF 2.23) / H1 (+310, PF
+1.35) / H2 (+1111, PF 2.32) — the first config anywhere in this ledger to
+clear that specific combination. Bootstrap P(mean≤0)=0.144, just under the
+0.15 bar. **Fails on the two tail-risk checks only**: 5th-percentile
+bootstrap is −₹51 (bar wants ≥0), and at 1.0%/side slippage it flips to
+−₹5/lot (bar wants net-positive). Both misses are thin, not decisive, but
+a miss under the bar's own rule. `ema_t10_sl200` is byte-identical (same
+16 trades, same exits) — the stop never actually gets hit at either 15 or
+20 points once the target is this wide; same plateau shows up at
+`ema_t8_sl150`==`sl200` and `ema_t12_sl150`==`sl200`. Confirms wider SL
+stops mattering past ~150% of a target this size — a real, useful boundary
+found, not a bug.
+
+**OI/Volume's smoke-test signal did not generalize across the full grid.**
+Every one of the 21 scalp configs still has a negative IS half — the
+OOS/H2-only strength that looked promising in `p12_smoke`
+(`oi_scalp_t5_sl100`/`t7_sl150`) shows up again here (e.g. `oi_t10_sl200`
+OOS +565 vs IS −2235) but never once pairs with a positive IS, across 21
+independent configs. Reads as a temporal-regime effect (recent months
+trade differently from older ones in this archive) rather than a real,
+stable edge — consistent enough across the full grid that it's no longer
+plausible as sampling noise the way Phase 11's single-point spikes were.
+
+**Action**: neither strategy's quick-scalper variant clears the bar.
+`ema_t10_sl150`/`sl200` is worth remembering if this line is ever revisited
+(closest near-miss on record), but per the standing rule ("at n≈20-40,
+every pass is paper-trade to collect live data, never deploy") it doesn't
+even qualify for that — it isn't a pass. `backtest-reaper.timer`
+re-enabled on A1. Code (`stop_points`/`target_points` on both strategies,
+`oi_false_breakout_grace_bars`) stays LOCAL/UNCOMMITTED — no reason to
+commit for a non-passing result; left as-is pending explicit user
+direction on whether to keep, discard, or fold the near-miss into a future
+targeted follow-up (e.g. a tighter grid around target 9-11 / SL 125-175%
+for EMA specifically).
+
+**Housekeeping note**: this session lost SSH/HTTPS/ICMP reachability to
+the A1 box for a period while the sweep was running (user-confirmed
+network issue on their end, resolved itself) — the sweep, being a detached
+`systemd` unit, was completely unaffected and ran to completion regardless,
+exactly as designed.
+
+---
+
+## 2026-09-05 (~02:26 IST) — Phase 12 launched: EMA Micro-pullback + OI/Volume Confirmed quick-scalpers, full 42-config grid
+
+Follows the same points-based target/SL redesign Phase 11 applied to VWAP,
+now extended to EMA Micro-pullback and OI/Volume Confirmed per explicit
+user request ("in the same pattern... EMA and OI/volume strategy, remove
+the rate limiter in entry and exit, keep similar profit range and SL
+combo, keep the base as control").
+
+**Rate-limiter evaluation** (both strategies have several candidate
+mechanisms, unlike VWAP's single obvious knob — see
+`project_vwap_quick_scalper_2026_09_04` memory for the full writeup):
+`structure_break_persistence_seconds` (exit, both strategies) left UNSET
+everywhere — already defaults to 6.0s (not VWAP's 120.0 control override),
+already proven "quick enough" by Phase 11's own smoke test. EMA's Bone
+Zone 2-bar entry confirmation left UNCHANGED — structural to the strategy's
+own definition, same category as VWAP's 2-bar touch+confirm which stayed.
+OI/Volume's false-breakout 3-bar re-entry grace (`FALSE_BREAKOUT_GRACE_
+BARS`) was the one genuine entry-side rate limiter found — made into a new
+opt-in `oi_false_breakout_grace_bars` param (default 3, zero behavior
+change for every existing config) and set to `0` on every OI scalp config.
+
+**Code**: `stop_points`/`target_points` added to both `EMAMicroPullback
+Strategy` and `OIVolumeConfirmedStrategy` (identical opt-in pattern to
+VWAP's, reusing the existing `compute_stop_target_points` helper — no
+changes needed there). `oi_false_breakout_grace_bars` added to
+`OIVolumeConfirmedStrategy`. Both strategies' `api/v1/strategies.py`
+param-forwarding allowlists updated in both copies (real repo +
+`backtest_engine`'s pin) up front this time — the exact 2-copy gotcha
+Phase 11 hit once already. 6 new tests (fixed-point vs pct-based
+regression guards per strategy + a grace-bars=0 behavior test), 86/86
+relevant tests pass, ruff/mypy clean. **LOCAL/UNCOMMITTED in the main
+repo**, same standing status as every other backtest-only change this
+session — see `project_backtest_local_only_standing_policy_2026_09_04`.
+
+**Smoke test first** (`p12_smoke`, 6 configs: control + 2 scalp variants
+per strategy) — genuinely different result from Phase 11's clean 0/22:
+`oi_control` PF 0.27 (dismal) vs `oi_scalp_t5_sl100`/`t7_sl150` PF
+0.94-0.96, win 63-69%, strong OOS/H2 halves (+₹355-637). `ema_scalp_
+t7_sl150` was IS-positive (PF 1.11). **Diffed the actual trades**:
+`oi_control` vs `oi_scalp_t5_sl100` share 15/16 identical entries — the PF
+jump is overwhelmingly from the points-based exit, not from
+`grace_bars=0` (which changed exactly 1 trade). Kept `grace_bars=0` on
+every OI scalp config anyway (cheap, that 1 trade was net-positive) but
+didn't build a separate isolation dimension for it.
+
+**Grid redesign from the smoke test's own evidence, not just copied from
+Phase 11**: plotted VWAP's Phase 11 PF-by-target at fixed SL ratio (e.g.
+SL150: t4=0.48 t5=0.81 t6=0.30 t7=0.31) — a single-point spike at t5 with
+flat neighbors on both sides, noise at n=16 trades/config, not a
+resolvable curve. Sparsified target grid from Phase 11's dense {4..10} to
+{4,6,8,10,12} — same number of samples, extended range instead of denser
+resolution in a region that wasn't resolving anything reliable. SL ratio
+grid extended from {50,100,150%} to {50,100,150,200%} — wider SL has won
+in every smoke/sweep result so far across all three strategies (VWAP/EMA/
+OI), 150% hasn't been shown to be the ceiling.
+
+**Final grid**: target ∈ {4,6,8,10,12} pts × SL ratio ∈ {50,100,150,200%}
+= 20 scalp configs + control, per strategy × 2 strategies = **42 configs
+total**. `sweep_configs/phase12_ema_oi_scalper.txt`, checksum verified
+local == A1. Launched `backtest-20260904-202555.service`, 02:25:55 IST
+2026-09-05 (Saturday, well off-hours, whole run fits inside the weekend —
+`SHARD_COUNT=4` applies throughout). Reaper timer stopped for the
+duration. **42 configs confirmed in the launch log.**
+
+**ETA**: smoke test measured ~405-407s/config for BOTH strategies (not
+the README's ~22-25min/config conviction-variant rate — that table was
+for the conviction subclasses; these plain base classes run at VWAP's own
+pace). 42 × ~6.8min ≈ **~4.75 hours → complete by ~07:15 IST**. Analyze
+`s6_p12` with `analyze_walkforward.py` once done, same robustness bar as
+every prior sweep. Re-enable `backtest-reaper.timer` once done.
+
+---
+
+## 2026-09-04 (~22:53 IST) — Phase 11 CONCLUDED: VWAP quick-scalper fails the robustness bar outright, PARK — none of 22 configs pass, worse than %-based control
+
+Sweep `s6_p11` completed 16:02:34 UTC (21:32 IST, 144 min, all 22 configs OK,
+16 trades each). Analyzed with `analyze_walkforward.py` (default cost model,
+`--oos-from 2026-04-01`) against all 22 configs, same robustness bar as
+every prior sweep (positive IS *and* OOS *and* both 6-month halves; bootstrap
+P(mean≤0) ≤ ~0.15 with non-negative 5th-percentile; survives 1.0%/side
+slippage).
+
+**Verdict: 0/22 pass — a clean, decisive negative result, not a marginal
+one.** Every single config, `p11_control` included, has a negative overall
+expectancy and a negative IS expectancy; bootstrap `P(mean≤0)` ranges
+0.599–0.998, nowhere close to the ≤0.15 bar. A handful of the wider-SL
+configs (`t5_sl150`, `t6_sl150`, `t7_sl150`, `t8_sl150`, `t9_sl50`,
+`t10_sl50`) show a positive OOS half, but every one of those still fails IS
+hard (IS tot from −643 to −4079) — the bar requires both, not either. Least
+bad by total/PF: `p11_scalp_t5_sl150` (tot −325, E −20.3, PF 0.81) — still a
+clear fail (bootstrap P(mean≤0)=0.599).
+
+**Reading**: the fixed-point target/SL reparameterization (this session's
+whole premise — swap %-of-entry for absolute premium points, see the entry
+below) did *not* fix the underlying problem. `p11_control` itself (the
+%-based baseline, re-run fresh this batch) is comparably bad to the
+already-parked `VWAP_Pullback` (0/113 gates, see the 2026-09-01 archive
+triage below) — this reads as further confirmation that VWAP_Pullback's
+issue is upstream of exit parameterization (entry/signal quality), not
+something either the % or the points-based exit design can fix by itself.
+Entry logic (2-bar VWAP touch+confirm) was deliberately left untouched this
+sweep per the original plan — that's the next thing to question if VWAP
+pullback is ever revisited, not another exit-grid sweep.
+
+**Action**: VWAP quick-scalper joins `VWAP_Pullback`/`Liquidity_Sweep` on
+the PARKED list. `backtest-reaper.timer` re-enabled on A1 (sweep + analysis
+both complete, results already on the box, nothing pulled to Windows per
+restrictive rule 11 — the full analysis output above is the only artifact
+needed). The `stop_points`/`target_points` code additions
+(`vwap_pullback.py`, `common_rules.py`) remain LOCAL/UNCOMMITTED in the main
+repo per standing policy — no reason to commit code for a parked approach;
+left as-is pending explicit user direction on whether to keep, discard, or
+repurpose for a different strategy.
+
+---
+
+## 2026-09-04 (~19:08 IST) — Phase 11 launched: VWAP quick-scalper, fixed premium-point target/SL instead of %-of-entry
+
+**Done.** New opt-in `stop_points`/`target_points` params on
+`VWAPPullbackStrategy` (`app/modules/strategy_engine/strategies/
+vwap_pullback.py`) + a new shared `compute_stop_target_points` helper
+(`common_rules.py`, mirrors `compute_stop_target`'s shape — absolute
+points instead of percent, floored at one tick above zero since a fixed
+stop can exceed a cheap deep-OTM entry premium, unlike the pct-based
+formula). Both params default `None` — zero behavior change for every
+existing config; entry logic (2-bar VWAP touch+confirm) is untouched, kept
+deliberately per explicit user decision. **This code is LOCAL/UNCOMMITTED
+in the main repo (`backend/app/...`), by explicit user instruction — same
+standing status as the momentum-plateau entry-anchor fix two entries
+below.** Not pushed, not deployed. 40/40 relevant tests pass, ruff/mypy
+clean.
+
+**Two real bugs the plan's own pre-sweep smoke test caught, before any
+compute was wasted**:
+1. `api/v1/strategies.py`'s param-forwarding allowlist exists in two
+   copies (real repo + `backtest_engine`'s own pin) — only the real repo's
+   copy got the new keys on the first pass, so the smoke test's
+   `--strategy-params` silently fell back to the old %-based path with zero
+   error (`_build_strategy` drops unknown keys before the constructor ever
+   sees them). Fixed with a **surgical 2-line patch** on both copies
+   (local + OCI), not a full-file sync — `backtest_engine`'s copy of this
+   file has drifted too far from unrelated same-day production work
+   (archive/rename/circuit-breaker) to safely overwrite wholesale.
+2. Original design set `structure_break_persistence_seconds: 0` on every
+   scalper config to "remove exit delay." Smoke test showed this produces
+   a real artifact: **~25% of trades exit at the exact entry minute with
+   exactly zero pnl** — a same-bar-wick false breach with no grace to
+   reclaim, sourced from the very confirmation bar that fired entry.
+   Re-tested with the param left **unset** (class default 6.0s) — same
+   trades still exit via `structure_break` within ~1 minute, but with real
+   price movement, not a flat freeze. 6.0s is already effectively instant
+   for a scalp that plays out over several minutes; final sweep leaves it
+   unset on all 21 scalper configs (control keeps 120.0, matching Phase
+   10c's `p10c_vwap_off` exactly).
+
+**Sweep**: `sweep_configs/phase11_vwap_scalper.txt`, 22 configs —
+`p11_control` (VWAP_base unchanged, run fresh in this batch rather than
+reused from Phase 10c, for a byte-identical comparison environment) + 21
+scalper configs = target ∈ {4..10 points} × SL ratio ∈ {50%,100%,150% of
+that config's own target}. Trail left at class defaults (0.5/0.5) — self-
+scales lighter automatically against the smaller target, no separate sweep
+dimension. Launched `backtest-20260904-133808.service` (first attempt
+failed instantly — wrapped `run_bt.sh` in a redundant outer `systemd-run`
+when it already does that internally; fixed by calling it directly per its
+own usage comment). 22 configs confirmed in the launch log, reaper timer
+stopped for the duration.
+
+**ETA ~21:40-22:10 IST tonight** (VWAP-family configs ran ~410s/config in
+Phase 10c, `futures_proxy` source). **Analyze `s6_p11`** with
+`analyze_walkforward.py` against `p11_control`, same robustness bar as
+every prior sweep. Re-enable `backtest-reaper.timer` once done.
+
+**PENDING — backtest data coverage gap, not started, not part of this
+sweep**: current NIFTY/options data covers ~52 weeks (~1yr); ~2-3 weeks of
+real data collected live since the last load hasn't been appended. Two
+closure options flagged by the user, neither evaluated: (a) append what's
+already been collected live, or (b) backfill the gap directly from Alice
+Blue/Shoonya historical data. Intended to become a **recurring monthly
+append** once done once. Needs its own dedicated session — IST handling,
+tick-vs-1-min-bar granularity, the near-expiry-week convention, and the
+same data-quality skepticism behind the 2026-09-03 option-tick-
+plausibility fix all apply. Full detail in the
+`project_backtest_data_coverage_monthly_append_todo_2026_09_04` Claude
+memory entry — do not attempt inline with an unrelated sweep.
+
+---
+
+## 2026-09-04 (~03:14 IST) — Phase 10c launched: rescoped to the 8 currently-enabled strategies, RSI/bothor/bothand dropped, lookback_bars=10 added
+
+Continues the entry below (same session, same feature). `p10b` (the first
+relaunch after the entry-anchor bug fix, see the entry two below) was
+stopped after 2/44 configs (`p10_orb_slope`, `p10_orb_rsi` both OK) once
+its own fresh, bug-fixed data gave a real answer to the open RSI-vs-slope
+question — decisively no, RSI is worse than slope on every metric on
+apples-to-apples fixed data (win 38.6% vs 34.1%, E −210 vs −183, PF 0.31 vs
+0.43, P(mean≤0) 0.991 vs 0.949). `p10b`'s partial output backed up to
+`/tmp/s6_p10b_partial_2configs_backup` on the box (2 configs only, not
+useful beyond what's already recorded here).
+
+**Separately, three fast targeted smoke tests** (`run_backtest.py --pairs
+'YYYY-MM-DD:YYYY-MM-DD,...'`, replaying only the exact 3 (entry, expiry)
+day-pairs the fixed `orb_slope` run's own `momentum_plateau` exits came
+from — not a full near-expiry-week scan) tested whether the default
+5-bar lookback window is simply too tight, independent of the RSI
+question: `plateau_lookback_bars` 5 -> 10 -> 15 on those same 3 trades
+gave a monotonic, large improvement (total PnL −676 -> −43 -> +67). Two of
+the three trades already resolve (stop/trail) before bar 10, so 10->15
+changed nothing further for them; the third trade's loss kept shrinking
+(−588 -> −371 -> −260) as it got more room. n=3, hand-picked (these were
+exactly the trades the tight window damaged) — not a base rate, but a real,
+concrete, monotonic signal on top of the RSI finding.
+
+**Rescoped and relaunched as `backtest-20260903-214405.service`
+(`RUN_TAG=p10c`, output `s6_p10c`)** at 21:44:05 UTC / ~03:14 IST:
+- **8 baselines** instead of 11 — the 8 currently-**enabled**
+  `strategy_configs` rows only (dropped the 4 disabled ones this session's
+  earlier 11-baseline design had included). `VWAP_RSI_modified`'s real
+  live params (`momentum_lookback_bars:1, require_momentum_alignment:true`)
+  now used as the `vwap_pullback_conviction` slot, replacing disabled
+  `VWAP_Conviction` — the earlier exclusion of `VWAP_RSI_modified` was
+  reversed once the user asked to use all 8 enabled configs.
+- **3 variants per baseline** (not 5): `off` (new — no plateau at all,
+  the control this design was missing before), `slope` (default 5-bar),
+  `slopelb10` (10-bar). RSI, bothor, bothand all dropped per the findings
+  above. 8 x 3 = 24 configs — same count as the original trimmed plan,
+  swapped for more informative data per explicit user instruction.
+- Ordered by explicit user priority: VWAP, EMA, ORB, OI/Vol (each
+  base+conviction pair together) — `sweep_configs/phase10c_trimmed.txt`.
+- QC'd against real `_build_strategy` before launch (all 24 clean, 0
+  build failures) — same pre-launch check every prior batch has used.
+  Checksum-verified box copy matches the local QC'd source exactly
+  (`12f7449ae9d61b43ba9ab084d1b77515`) before launching.
+- Pre-launch safety checks all clean: reaper timer confirmed still
+  stopped, no other backtest process running, credentials dir clean
+  (no real `.env`/session-cache files), 85GB free.
+- One cosmetic-only anomaly checked and ruled out: `run_sweep.sh`'s own
+  config-count log line says "25 configs" (its `grep -cv '^#'` counts a
+  blank separator line between the file's comment header and the first
+  config as if it were one) — confirmed via live log inspection that the
+  actual while-loop correctly skips it (no phantom `--- ` log entry, no
+  error, first real log entry is `p10c_vwap_off`) — display-only, not a
+  functional bug, and not something this session introduced (same file
+  shape every prior sweep here has used).
+
+**ETA ~10.4hrs from launch** (24 configs at the ~26min/config observed
+rate) — expect completion **~13:30-14:00 IST 2026-09-04**. **Analyze
+`s6_p10c`** (not `s6_p10` or `s6_p10b`, both superseded/backed up, not
+deleted). Re-enable `backtest-reaper.timer` once done and results are
+pulled, per standing rule 13.
+
+---
+
+## 2026-09-04 (~02:04 IST) — Phase 10 real bug found from the sweep's own first results, fixed, relaunched
+
+The first Phase 10 run (`backtest-20260903-154300.service`) was stopped
+after 10/44 configs — every single one failed catastrophically (PF
+0.24-0.62, P(mean≤0) 0.83-1.00, win rates crashed to 20-38% vs. these
+strategies' normal 40-50%+ baselines). Traced to a real, structural bug,
+not noise — killed and its output moved to
+`/tmp/s6_p10_buggy_pre_entry_anchor_fix_backup` on the box (not deleted,
+kept for reference).
+
+**Root cause, confirmed against real underlying data, not inferred**:
+`momentum_plateau` accounted for ~35-40% of all exits, every one firing
+within 0-17 minutes of entry (two at the *exact* entry minute). The
+lookback window was "last N bars **as of now**", not "last N bars **since
+entry**" — on the very first poll after entry, that window is still
+dominated by *pre-entry* bars. For a breakout strategy (ORB/OI), the
+pre-entry window is by definition the calm consolidation the entry itself
+fired on — not genuine post-breakout decay. Verified on one real case: a
+2025-10-01 09:35 ORB entry's window (09:30-09:35, all pre-entry-or-at-entry)
+moved only 0.8 points against a ~3.6-point (0.3×ATR) threshold, firing
+`MOMENTUM_PLATEAU` at the *same minute* as entry.
+
+**Fix**: both the production wrapper (`_momentum_plateau_detected`, now
+takes `entry_time` and passes `since=entry_time` to both
+`get_recent_completed_bars`/`get_recent_indicator_values`) and the
+backtest's `_lookup_last_n_at_or_before` (new `since` floor param, applied
+at the Step 3b call site with `since=entry_time`) now floor the window at
+the position's real entry — `position.opened_at` in production,
+`trade_intent.created_at` in the backtest (already the function's own
+`entry_time` reference). The shared pure function `momentum_plateau_signals`
+itself needed no change — the bug was entirely in the two *data-gathering*
+wrappers, confirming that "shared pure function, different data-gathering"
+split was the right original design (one isolated fix per side, not two).
+
+New regression test
+(`test_evaluate_open_position_momentum_plateau_ignores_pre_entry_flat_bars`)
+directly reproduces the real bug (flat bars seeded before entry only) and
+asserts the position stays open. 1582/1582 backend tests pass, ruff/mypy
+clean. Live-confirmed via a re-run smoke test against the exact strategy
+that showed 0-minute exits: momentum_plateau exits now hold 8-14 minutes,
+zero 0-minute exits observed.
+
+Relaunched as `backtest-20260903-203447.service` (`RUN_TAG=p10b`, output
+`s6_p10b`) at 20:34:47 UTC / ~02:04 IST — same 44 configs, same
+methodology as the original Phase 10 design. Superseded by the rescoped
+Phase 10c launch above before it got past 2 configs.
+
+---
+
+## 2026-09-03 (~15:43 IST) — Phase 10 launched: new exit-side "momentum plateau" condition built + tested, 44-config sweep running
+
+**New production feature** (not yet deployed live — backtest-only for now,
+per standing "backtest first, judge against real data" discipline):
+`ExitReason.MOMENTUM_PLATEAU`, a new stateless exit check in
+`evaluate_open_position` (between structure_break and spread_blowout,
+skipped once TRAIL is already ACTIVE) — exits when the underlying's own
+breakout drive has flattened (price-slope and/or RSI14 barely moved over
+the last N bars), independent of `structure_level` proximity. Params
+(`require_momentum_plateau_exit`, `plateau_use_slope`, `plateau_use_rsi`,
+`plateau_combine_mode` any/all, `plateau_lookback_bars`,
+`plateau_slope_atr_fraction`, `plateau_rsi_flatten_delta`) resolved live
+off the owning `StrategyConfig.params` row (not frozen at signal time,
+strategy-type agnostic — applies to base and `*_conviction` alike with
+zero constructor changes). Zero new DB columns/migration. Threshold logic
+lives in one shared pure function, `common_rules.momentum_plateau_signals`
+— production wraps it with DB reads, the backtest wraps it with
+`underlying_series`/`rsi_series`/`atr_series` in-memory slicing (same
+performance reasoning `atr_series` itself exists for), so the two can't
+silently diverge. 1553/1553 backend tests pass (up from 1550), ruff/mypy
+clean.
+
+**Two real bugs caught before/during this build, both fixed same session**:
+1. First draft unioned the new params into the same `*_PARAM_KEYS` sets
+   `_build_strategy` uses to forward kwargs into each strategy's
+   constructor — crashed immediately (`TypeError: unexpected keyword
+   argument 'require_momentum_plateau_exit'`) since none of the 10
+   strategy constructors accept them, by design (params are read live off
+   `strategy_config.params`, never through a constructed object). Fixed by
+   *not* unioning them in at all — same "inert config the constructor
+   doesn't need" pattern `ORB_PARAM_KEYS`'s own comment already documents.
+2. The backtest engine's `HistoricalBrokerAdapter` never implemented
+   `BrokerPort.get_recent_trades` (added to the interface 2026-09-02 for
+   production's reconciliation auto-repair path) — the smoke test's first
+   run crashed on `TypeError: Can't instantiate abstract class` the moment
+   the re-synced `app/` pin picked up the new abstract method. Fixed with
+   an unconditional `[]` (mirrors `MockBrokerAdapter`'s own choice) —
+   genuinely never called in a backtest replay, but costs nothing to
+   implement correctly rather than leave crashing.
+
+**Re-sync near-miss, twice, both caught and fixed before anything left this
+machine**: a plain `robocopy /MIR` of `backend/app` -> `backtest_engine
+/backend/app` (no exclude) copied real, live `.env` credentials (shoonya,
+alice_blue, angel_one, telegram, truedata) and the Alice Blue session-cache
+JSON into the backtest copy — the exact filesystem-copy-leaks-gitignored-
+secrets trap this ledger already knew about from an earlier session, just
+rediscovered under `/MIR` specifically. Caught and deleted both times
+before any `scp`/commit. A subsequent `/XD` exclude attempt to fix it
+*also* failed to actually exclude the directory (robocopy's multi-segment
+`/XD` path matching didn't behave as expected) and leaked the same files a
+second time — caught and cleaned immediately again. **Lesson for next
+resync**: don't use `robocopy /MIR` (or any recursive mirror) against
+`backend/app` at all — copy only the specific files that actually changed,
+or if a full mirror is ever truly needed, exclude `config/credentials`
+by full absolute source AND dest path on both sides of the command, then
+verify with an explicit `find -iname '*.env' -not -iname '*.example'`
+before any `scp`/git operation, every time, not just once.
+
+**Sweep**: 11 baselines (every current `strategy_configs` row, deduped,
+`VWAP_RSI_modified` excluded per explicit instruction — it's the
+`require_momentum_alignment` config, not `require_rsi_alignment`, matching
+naming intent) × 4 exit-side variants (`plateau_slope` / `plateau_rsi` /
+`plateau_both_or` / `plateau_both_and`) = 44 configs,
+`sweep_configs/phase10_plateau_exit.txt`. Every line QC'd against the real
+`_build_strategy` before launch (all clean, matching the established
+pre-launch check). Launched detached
+(`backtest-20260903-154300.service`, `RUN_TAG=p10`, reaper stopped first)
+at 15:43 IST — smoke-tested first (1 config, 4-shard) before the full
+launch, confirmed real `momentum_plateau` exits firing correctly (2 of 4
+sample trades) alongside an unaffected `structure_break` exit in the same
+small sample. ETA ~18-19hrs (44 configs at Batch 4's observed ~25min/config
+rate) — analyze with `analyze_walkforward.py` once done, same methodology
+as every prior batch, same trade-level noise-spike skepticism the ORB
+momentum-entry N=5 result already demonstrated this session (check
+neighboring param values, check whether a "pass" traces to 1-2 trades).
+Re-enable `backtest-reaper.timer` once the sweep completes and results are
+pulled, per standing rule 13.
+
+---
+
+## 2026-09-03 (~10:00 IST) — Phase 9 concluded: Batch 4 (full conviction battery) analyzed — momentum gate NOT promoted for either strategy
+
+Continues the entry below (same session pin `83ee6ad`). `backtest-20260902-180928.service`
+completed cleanly at 00:27 UTC / 05:57 IST — within the ~05:30-06:00 IST
+ETA, all 15/15 configs `OK`, zero failures, 377min total. `backtest-reaper.timer`
+re-enabled per standing rule 13 once results were pulled. Analyzed with the
+same `analyze_walkforward.py` methodology (`--oos-from 2026-04-01`,
+0.5%/side slippage, bar = `P(mean≤0)≤0.15`).
+
+### ORB_Conviction (full baseline) — off/N1..N10
+
+| N | n | win% | E/lot | PF | P(mean≤0) | bar (≤0.15)? |
+|---|---|---|---|---|---|---|
+| off / N1 (identical) | 40 | 50.0% | 122 | 1.49 | 0.186 | fail (marginal) |
+| N2 | 40 | 50.0% | 52 | 1.16 | 0.374 | fail |
+| N3 | 40 | 52.5% | 28 | 1.08 | 0.429 | fail |
+| N4 | 38 | 55.3% | 47 | 1.14 | 0.380 | fail |
+| N5 | 35 | 57.1% | **226** | 2.08 | **0.062** | **pass** |
+| N6 | 27 | 48.1% | 99 | 1.43 | 0.250 | fail |
+| N8 ⚠️ | 9 | 44.4% | 353 | 5.61 | 0.040 | pass, fragile (n=9) |
+| N10 ⚠️ | 5 | 60.0% | 371 | 7.17 | 0.077 | pass, fragile (n=5) |
+
+**N5's numbers are byte-identical to Batch 1's already-known N5 result** —
+same deterministic entry set, not independent confirmation (per this
+ledger's own 2026-09-01 methodological point: pass-counts on a shared
+entry set aren't new evidence). What's genuinely new here is the
+**neighbourhood**: N4 fails (P=0.380) and N6 fails (P=0.250) on both
+sides of N5's pass, on respectable sample sizes (38, 27) — not thin-n
+noise. A single point surrounded by clean failures on adequately-sized
+neighbours is the **same "lone spike = noise" shape already flagged for
+the ORB width sweep** (see [[reference_orb_width_resweep_pending]]) and
+for Batch 3's N=8. **Read: ORB_Conviction's momentum "edge" at N=5 does
+not clear the bar for promotion** — it looks like a fluke in this specific
+N, not a real monotonic momentum effect. N8/N10 passes were already
+expected-fragile (n=9, n=5) and don't change this.
+
+### OI_Volume_Conviction (full baseline) — off/N1..N5
+
+| N | n | win% | E/lot | PF | P(mean≤0) | bar (≤0.15)? |
+|---|---|---|---|---|---|---|
+| off / N1 (identical) | 14 | 71.4% | 274 | 5.07 | **0.004** | **pass** |
+| N2 | 10 | 70.0% | 299 | 8.75 | 0.002 | pass |
+| N3 | 8 | 75.0% | 342 | 10.18 | 0.002 | pass |
+| N4 ⚠️ | 5 | 60.0% | 166 | 3.78 | 0.100 | pass, thin |
+| N5 ⚠️ | 4 | 75.0% | 267 | 19.32 | 0.004 | pass, thin (n=4) |
+
+**Important correction to how Batch 1's OI result was framed**:
+`momentum_lookback_bars=1` requires the last **1** close to be
+"monotonic" — trivially always true for a single point — so `off` and
+`N1` are identical by construction (same convention already noted for
+every other config family in Batch 2/3). That means **the OI baseline
+already clears the bar with zero momentum filtering at all**
+(n=14, win 71.4% in *both* IS and OOS halves, P=0.004) — momentum was
+never the thing making OI pass. N2/N3 stay passing as N tightens, but
+sample shrinks fast (14→10→8) with no clear improvement in P, and N4/N5
+are too thin (5, 4) to trust either way. **Read: momentum adds no
+demonstrated incremental value for OI_Volume_Conviction — the strategy
+was already robust without it.** Do not add the gate to the live
+`OI_Volume_Conviction` paper config on this evidence; it would only
+shrink the sample for no proven gain.
+
+### Verdict — momentum gate (`require_momentum_alignment`) not promoted anywhere this series
+
+Across all 4 batches (Batch 1-4, VWAP/EMA/ORB/OI, base and full
+baselines): **no config shows a clean, non-fragile, monotonic momentum
+benefit.** EMA_Micro_Conviction's earlier pass (Batch 1/2) predates
+momentum entirely — it's the pre-existing `full` conviction gate set,
+already live. Every apparent momentum "win" elsewhere (ORB N5, ORB
+N8/N10, OI N2-N5) is either a lone spike between failing neighbours or
+too thin a sample to trust — the identical failure mode already
+catalogued in the 2026-09-01 full-archive triage's own methodological
+notes. `VWAP_RSI_modified` (momentum N=1 only, already live in paper
+per the entry below) stays as-is — no code or config change follows from
+this analysis; it was already a low-risk, no-other-gates test. Phase 9
+is concluded: the new gate is built, tested, documented, and evidently
+doesn't move the needle for ORB/OI/VWAP at any N — no further sweeping
+planned unless a new hypothesis motivates it.
+
+### Housekeeping
+
+- `backtest-reaper.timer` re-enabled (`sudo systemctl start
+  backtest-reaper.timer`), confirmed active, daily 16:00 IST cadence.
+- `backend/scripts/BACKTEST_LEARNINGS.md` re-synced box↔local
+  (checksum-verified) before and after this entry.
+- Disk: 86G free on the A1 box post-sweep, no cleanup needed.
+
+---
+
 ## 2026-09-02 (~23:45 IST) — Phase 9 continued: Batch 2 (EMA) + Batch 3 fully analyzed, Batch 4 (full conviction battery) launched detached, reaper cadence changed to daily
 
 Continues the entry below (same session, same pin `83ee6ad`). Methodology
@@ -1365,8 +2456,47 @@ fate: `wf_p2_results.txt`, `wf_p3_results.txt`, `wf_p4_results.txt` (new),
 
 ## CANONICAL RELIABLE-BACKTEST SETUP (read this first — don't rediscover it)
 
-**The one invocation that gives trustworthy numbers** (per-strategy sharded,
-all 52 NIFTY weekly / 12 BANKNIFTY monthly expiries):
+**2026-09-05 update: use `run_sweep_canonical.sh` for any new sweep, don't
+hand-build the invocation below anymore.** Built the same day a sweep
+(`phase13_exit_staging`) launched with `--underlying-source futures_proxy`
+on every config — wrong for everything except `vwap_pullback*`, caught only
+because `a_pdt_w65` came back with 9 trades instead of the established 26.
+The source-per-strategy-type rule below had been sitting in this exact
+section in prose the whole time; it just wasn't enforced anywhere in code,
+so a rebuilt config file could silently get it wrong again.
+
+`run_sweep_canonical.sh` + `resolve_and_qc.py` (`backend/scripts/`, synced
+to A1) wrap `run_phase6_generic.sh` (shard/merge/reap logic untouched,
+proven) with two things that used to be manual: (1) auto-resolves
+`--underlying-source` from `resolve_and_qc.py`'s `SOURCE_MAP` — config
+files are now 3-field (`name|strategy_type|params_json`), no source column
+to mistype; a 4th field still works as a deliberate override, printed
+loudly as `OVERRIDE`, never silent; (2) runs the real `_build_strategy` QC
+gate automatically before anything launches — a bad config aborts with a
+clear error, zero shards started. Also auto-injects
+`oi_use_futures_volume_confirmation:false`/`oi_use_atm_oi_buildup:false`
+for any `oi_volume_confirmed*` config that doesn't already set them
+(matches the existing class defaults — belt-and-suspenders, not a
+behavior change).
+
+Usage: `RUN_TAG=<tag> ./run_sweep_canonical.sh sweep_configs/<file>.txt`
+(from `backend/scripts/`), then launch that through `run_bt.sh` exactly as
+before. Old 4-field config files (phase7-12) still work unchanged — the
+resolver accepts either 3 or 4 fields.
+
+**QC'd 2026-09-05** (syntax check, resolver correctness on 4 hand-built
+cases, failure path, and a full end-to-end abort-path test through the real
+wrapper — see `project_canonical_sweep_harness_2026_09_05` Claude memory for
+the complete record). **Pristine baseline saved** at
+`backend/scripts/_baseline_2026_09_05/` (both local and A1, checksum-
+verified) before any future edit. **Standing rule: start every new sweep
+from this harness — update its config file / `SOURCE_MAP`, don't rebuild —
+unless a genuinely significant change is needed**, in which case copy from
+the baseline first and record a new one the same way.
+
+**The underlying invocation this generates** (per-strategy sharded, all 52
+NIFTY weekly / 12 BANKNIFTY monthly expiries) — kept here for reference,
+not for hand-building:
 
 ```
 ./.venv/bin/python scripts/run_backtest.py \
@@ -1376,10 +2506,12 @@ all 52 NIFTY weekly / 12 BANKNIFTY monthly expiries):
   --exit-mode current --fast \
   --near-expiry-days 6 \
   --strategy-params '<json>' \
-  --shard-count 18 --shard-index <i> \
+  --shard-count 28 --shard-index <i> \
   --db-suffix <unique> --out-csv <dir>/<name>_s<i>.csv
 ```
 then `merge_backtest_shards.py --glob '<dir>/<name>_s*.csv' --out <dir>/<name>_current.csv`.
+(Shard count corrected 18→28 in this doc — every real sweep since Phase 6
+has actually used 28, the 18 here was stale.)
 
 **Non-negotiables, each learned the hard way:**
 - **`--near-expiry-days 6` is mandatory.** Without it, `--all-expiries` replays
