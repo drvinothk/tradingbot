@@ -988,3 +988,81 @@ ssh -i <key> ubuntu@144.24.137.112 'cd ~/trading-bot/backend &&
 (No migration to reverse.)
 
 Approve? (yes — operator runs the steps / no)
+
+### DEPLOYED 2026-09-08 ~11:57 IST (06:27 UTC) — reconciliation-scope fix
+
+Ran by the operator via the recorded command block. Box `alembic current`
+`0039 (head)`, service `active` `NRestarts=0`, 5 backend files sha256
+**box == local worktree** (`aa84bb5c…` / `cc7aa8de…`), `import app.main OK`.
+Session `8e82700d-…` auto-recovered `reconciliation_lock -> live_enabled`
+`05:08:37 UTC` after 3 clean checks; standing `reconciliation_mismatch`
+alerts auto-resolved (0 unresolved). (This entry logs the recon-scope
+deploy that the request above was for — done between then and the
+option-chain deploy below.)
+
+---
+
+## DEPLOYED 2026-09-08 ~12:00 IST (06:27 UTC) — option-chain plausibility rails
+
+`main` `d8b1ca0` (merged ff-only, pushed). Classifier did **not** block the
+extract this time (restart issued as a separate command).
+
+**Files (5 backend, surgical, 0 credentials):**
+`app/modules/broker_adapter/base/contracts.py`,
+`app/modules/broker_adapter/shoonya/adapter.py`,
+`app/modules/market_data/tick_plausibility.py`,
+`app/modules/market_data/ingestion.py`,
+`app/modules/alerting/manager.py`. **No migration** (box stays `0039`).
+Frontend `ControlRoomPage.tsx` (1-line: `option_chain_degraded` in the
+attention-set) **NOT deployed** — cosmetic, deploy with the next FE bundle.
+
+**Drift check (box pre-change):** all three new-symbol greps `0`; box sha256
+`828436b5 / b1128fc5 / 4fe37934 / ce8a711d / c2c678ed`.
+
+**Safety gate (06:26 UTC / 11:56 IST — market hours, real check):** session
+`8e82700d-…` `live_enabled`, **0 open positions**. 42 `REJECTED implausible
+option-chain entry` lines in the prior 15 min (leak active).
+
+**Steps:** scp `/tmp/chain-rails.tgz` → backup
+`~/deploy-bak/chain-rails-20260908-<ts>/` (5 files, `ALEMBIC_BEFORE=0039`)
+→ extract → credentials dir intact (13 files) → new symbols present
+(`is_plausible_option_entry` 1, `token_substitutions` 5,
+`option_chain_degraded` 2) → 5 sha256 **box == local worktree**
+(`86198b84 / a370e96b / 6fe958ab / cf39a14a / fe733c1c`) → `import app.main
+OK` → `alembic current` `0039 (head)` → `systemctl restart trading-bot` →
+`active`, `NRestarts=0`, `/health` `{"status":"ok"}`, startup recovery
+"1 active session, none with open positions", 13 strategy runners resumed,
+"Application startup complete", no tracebacks.
+
+**Behavioural confirmation (06:28:37 UTC, first post-restart chain fetch):**
+
+```
+WARNING app.market_data: option chain NIFTY 2026-09-08: dropped 1/28 entries
+  as implausible (no_book=1); 1 consecutive fetch(es) affected.
+  Samples: [('NIFTY08SEP26P24000', 23663.15, 'no_book')]
+```
+
+- Rail 4 ✓ — **one aggregated WARNING** replaces the ~7-12 per-row ERRORs
+  per fetch; `REJECTED implausible option-chain entry` count since restart
+  is **0**.
+- Reason tag ✓ — `no_book` (the zero-book kind); `no_arb` count 0 so far
+  (the flat-ceiling→no-arb tightening is not clipping anything extra).
+- Drop volume down to **1/28** this fetch (vs. many per fetch pre-restart)
+  — one data point, could be Rail 1 already helping or just a cleaner
+  fetch.
+- Rail 1 `carried a token that was missing or disagreed` count: **0** so
+  far — either the scrip-master map agrees with the row tokens (→ residual
+  cause is hypothesis 2, Noren returning spot for a *correct* token, which
+  the `no_book` shape is consistent with) or it's not populated for this
+  expiry yet. Monitor over the next couple of days.
+- `option_chain_degraded` DB alerts: **0** (no open positions → no
+  escalation; Rail 4 gate working).
+
+**Rollback:** `cd ~/trading-bot/backend && for f in
+app/modules/broker_adapter/base/contracts.py
+app/modules/broker_adapter/shoonya/adapter.py
+app/modules/market_data/tick_plausibility.py
+app/modules/market_data/ingestion.py
+app/modules/alerting/manager.py; do cp
+~/deploy-bak/chain-rails-20260908-<ts>/$f $f; done && sudo systemctl
+restart trading-bot` (no migration).

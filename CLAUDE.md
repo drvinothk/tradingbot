@@ -625,9 +625,16 @@ work, or vice versa.
 
 ## Known open items
 
-- **2026-09-08: option-chain plausibility "rails" (Rails 1+2+4) — built +
-  tested on branch `fix/option-chain-plausibility-rails`, NOT yet
-  merged/deployed.** Shoonya's `GetOptionChain` + per-strike `GetQuotes`
+- **2026-09-08: option-chain plausibility "rails" (Rails 1+2+4) — MERGED to
+  `main` (`d8b1ca0`) + DEPLOYED to OCI (5 backend files, no migration) +
+  live-confirmed.** First post-restart chain fetch logged one aggregated
+  `WARNING` ("dropped 1/28 entries as implausible (no_book=1)") in place of
+  the ~7-12 per-row `ERROR`s; zero `no_arb` drops so far (no false clips
+  from the no-arb bound); zero Rail 1 token-substitution lines so far
+  (residual cause leans hypothesis 2 — Noren returning spot for a *correct*
+  token — pending a couple of days of the `no_book`/`no_arb` split).
+  Frontend `ControlRoomPage.tsx` 1-liner (attention-set) not deployed yet
+  (cosmetic; next FE bundle). Shoonya's `GetOptionChain` + per-strike `GetQuotes`
   routinely returns `ltp ≈ spot, bid=ask=vol=0` for some strikes (incl.
   ~ATM 0-DTE); the 2026-09-03 plausibility guard drops them but noisily (an
   `ERROR` per row per ~60s). Built structural rails so the guard is the
