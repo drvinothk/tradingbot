@@ -33,7 +33,8 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
-from datetime import date, datetime, time as dt_time, timedelta
+from datetime import date, datetime, timedelta
+from datetime import time as dt_time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -141,21 +142,25 @@ def _parse_tpseries_row(row: dict) -> tuple[datetime, float, float, float, float
     None for a row missing required fields (defensive; not observed live)."""
     try:
         ts = datetime.strptime(row["time"], "%d-%m-%Y %H:%M:%S")
-        o, h, l, c = float(row["into"]), float(row["inth"]), float(row["intl"]), float(row["intc"])
+        o, h, lo, c = float(row["into"]), float(row["inth"]), float(row["intl"]), float(row["intc"])
         vol = int(float(row.get("intv", 0)))
         oi = int(float(row.get("oi", 0)))
     except (KeyError, ValueError):
         return None
-    return ts, o, h, l, c, vol, oi
+    return ts, o, h, lo, c, vol, oi
 
 
-def _is_plausible_bar(o: float, h: float, l: float, c: float) -> bool:
-    return 0 < o <= MAX_PLAUSIBLE_OPTION_PREMIUM and 0 < h <= MAX_PLAUSIBLE_OPTION_PREMIUM \
-        and 0 < l <= MAX_PLAUSIBLE_OPTION_PREMIUM and 0 < c <= MAX_PLAUSIBLE_OPTION_PREMIUM \
-        and l <= o <= h and l <= c <= h
+def _is_plausible_bar(o: float, h: float, lo: float, c: float) -> bool:
+    hi = MAX_PLAUSIBLE_OPTION_PREMIUM
+    return (
+        0 < o <= hi and 0 < h <= hi and 0 < lo <= hi and 0 < c <= hi
+        and lo <= o <= h and lo <= c <= h
+    )
 
 
-def _merge_and_write(path: Path, new_rows: list[tuple[datetime, float, float, float, float, int, int]]) -> int:
+def _merge_and_write(
+    path: Path, new_rows: list[tuple[datetime, float, float, float, float, int, int]]
+) -> int:
     """Merges new_rows into any existing CSV at `path` by timestamp (new
     values win on overlap), sorts ascending, writes back. Returns the total
     row count after merge."""
@@ -175,8 +180,8 @@ def _merge_and_write(path: Path, new_rows: list[tuple[datetime, float, float, fl
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "open", "high", "low", "close", "volume", "oi"])
-        for ts, o, h, l, c, vol, oi in ordered:
-            writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), o, h, l, c, vol, oi])
+        for ts, o, h, lo, c, vol, oi in ordered:
+            writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), o, h, lo, c, vol, oi])
     return len(ordered)
 
 
@@ -186,7 +191,8 @@ def fetch_underlying(
 ) -> None:
     today = datetime.now().date()
     expiry, contracts = _active_near_expiry_contracts(underlying, today, strikes_each_side)
-    print(f"\n{'=' * 70}\n{underlying} -- expiry {expiry} ({len(contracts)} active contracts)\n{'=' * 70}")
+    sep = "=" * 70
+    print(f"\n{sep}\n{underlying} -- expiry {expiry} -- {len(contracts)} contracts\n{sep}")
     if not contracts:
         print("  No active near-term contracts with a real broker_token -- nothing to fetch.")
         return
@@ -201,7 +207,7 @@ def fetch_underlying(
         # Shoonya correctly -- but unhelpfully -- reports as "no data" per
         # contract instead of one clear reason.
         days_away = (near_expiry_start - today).days
-        print(f"  Near-expiry week starts in {days_away}d (expiry {expiry}) -- nothing to fetch yet.")
+        print(f"  Near-expiry week starts in {days_away}d ({expiry}) -- nothing yet.")
         return
 
     window_start = datetime.combine(near_expiry_start, dt_time(0, 0))
@@ -230,7 +236,9 @@ def fetch_underlying(
         dropped = len(parsed) - len(plausible)
         total_dropped += dropped
 
-        filename = _archive_filename(underlying, expiry, float(contract.strike), contract.option_type)
+        filename = _archive_filename(
+            underlying, expiry, float(contract.strike), contract.option_type
+        )
         dest_path = dest_dir / f"{filename}.csv"
         if dry_run:
             total_written += len(plausible)
@@ -248,14 +256,18 @@ def fetch_underlying(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--underlying", choices=["NIFTY", "BANKNIFTY", "both"], default="both")
     parser.add_argument("--archive-root", type=Path, required=True,
                          help="Path to backtest_engine's options_1min_past/ directory.")
     parser.add_argument("--near-expiry-days", type=int, default=NEAR_EXPIRY_DAYS)
     parser.add_argument("--strikes-each-side", type=int, default=15,
                          help="Nearest-to-spot strikes to fetch, each side of ATM (default 15).")
-    parser.add_argument("--dry-run", action="store_true", help="Fetch and QC but don't write any files.")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Fetch and QC but don't write any files."
+    )
     args = parser.parse_args()
 
     settings = get_settings().shoonya
