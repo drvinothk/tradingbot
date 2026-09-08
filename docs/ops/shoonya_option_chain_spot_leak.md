@@ -116,6 +116,19 @@ contract_price`/preservation-quote call sites don't have reliable spot in hand).
   the aggregated log + reason tags carry the monitoring signal for now. Add later
   if a graph is wanted.
 
+QC refinements (post-implementation review):
+- **A** — the clean-fetch auto-resolve UPDATE is gated on an in-memory
+  `_option_chain_alerted_keys` set, so a near-always-clean fetch never
+  sequential-scans `system_alerts` (no index covers `category`+`dedup_key`
+  without `workspace_id`). Restart clears the set → a pre-restart standing alert
+  falls back to `alert_housekeeping` / the next drop→clean cycle.
+- **B** — when a dropped contract is held by both a paper and a live position,
+  the alert is attributed to the LIVE one (`send_alert` paper-suppresses
+  `mode=PAPER`).
+- **C** — Rail 1 also substitutes the trusted token when the GetOptionChain row's
+  token is *missing* (the exact 2026-08-12 empty-`broker_token` bug), not only
+  when it disagrees.
+
 ### Rail 5 — self-healing re-sync  *(LATER, if it persists)*
 
 When >X% of a chain's ATM window is implausible for N consecutive fetches, trigger

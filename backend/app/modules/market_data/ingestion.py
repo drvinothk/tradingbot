@@ -54,6 +54,15 @@ logger = logging.getLogger("app.market_data")
 # degradation" alert. A ±1 miscount under concurrent fetches is harmless
 # against the threshold, but the update is cheap to lock anyway.
 _option_chain_implausible_streak: dict[tuple[str, str], int] = {}
+# (underlying, expiry-iso) keys for which THIS process has raised an
+# unresolved `option_chain_degraded` alert. The clean-fetch path only runs
+# its `SystemAlert` auto-resolve UPDATE for a key in here -- otherwise every
+# (near-always clean) chain fetch would sequential-scan `system_alerts`
+# (no index covers `category`+`dedup_key` without `workspace_id`) to resolve
+# nothing. A restart clears this, so a pre-restart standing alert falls back
+# to `alert_housekeeping`'s collapse window / the next drop->clean cycle --
+# same restart semantics as `send_alert`'s own in-memory dedup.
+_option_chain_alerted_keys: set[tuple[str, str]] = set()
 _option_chain_streak_lock = threading.Lock()
 _OPTION_CHAIN_SUSTAINED_STREAK = 4
 
@@ -1007,24 +1016,33 @@ def _alert_on_degraded_option_chain(
     """Rail 4 escalation. A dropped entry that belongs to a contract this
     system currently holds OPEN is genuinely actionable (that position can't
     be priced from the chain this cycle) -> CRITICAL alert, attributed to
-    that position's own workspace/session. A clean fetch resolves any
-    standing alert for this (underlying, expiry). A long implausible streak
-    with *no* open position affected is logged at ERROR but not alerted --
-    no live risk to interrupt anyone over, and there is no workspace to
-    attribute a bare infra alert to here (see
-    docs/ops/shoonya_option_chain_spot_leak.md).
+    that position's own workspace/session (preferring a LIVE holding so a
+    co-held paper position can't mute the push). A clean fetch resolves a
+    standing alert *this process* raised for this (underlying, expiry) --
+    gated on the in-memory `_option_chain_alerted_keys` set so a near-always
+    clean fetch doesn't sequential-scan `system_alerts` to resolve nothing;
+    a pre-restart standing alert falls back to `alert_housekeeping` /
+    the next drop->clean cycle. A long implausible streak with *no* open
+    position affected is logged at ERROR but not alerted -- no live risk to
+    interrupt anyone over, and there is no workspace to attribute a bare
+    infra alert to here (see docs/ops/shoonya_option_chain_spot_leak.md).
     """
+    key = (underlying_symbol, expiry.isoformat())
     dedup_key = f"option_chain_degraded:{underlying_symbol}:{expiry.isoformat()}"
 
     if not dropped:
-        db.query(SystemAlert).filter(
-            SystemAlert.category == "option_chain_degraded",
-            SystemAlert.dedup_key == dedup_key,
-            SystemAlert.is_resolved.is_(False),
-        ).update(
-            {"is_resolved": True, "resolved_at": datetime.now(UTC)},
-            synchronize_session=False,
-        )
+        with _option_chain_streak_lock:
+            had_alert = key in _option_chain_alerted_keys
+            _option_chain_alerted_keys.discard(key)
+        if had_alert:
+            db.query(SystemAlert).filter(
+                SystemAlert.category == "option_chain_degraded",
+                SystemAlert.dedup_key == dedup_key,
+                SystemAlert.is_resolved.is_(False),
+            ).update(
+                {"is_resolved": True, "resolved_at": datetime.now(UTC)},
+                synchronize_session=False,
+            )
         return
 
     dropped_symbols = {s for s, _, _ in dropped}
@@ -1039,8 +1057,15 @@ def _alert_on_degraded_option_chain(
         .all()
     )
     if matched:
+        # Prefer a LIVE-held contract: send_alert paper-suppresses the
+        # Telegram push for mode=PAPER, so if a dropped contract is held by
+        # both a paper and a live position, picking the paper one would mute
+        # the alert for the live one.
+        matched.sort(key=lambda m: 0 if OrderMode(m[1]) == OrderMode.LIVE else 1)
         position, opening_mode, _ = matched[0]
         affected = sorted({sym for _, _, sym in matched})
+        with _option_chain_streak_lock:
+            _option_chain_alerted_keys.add(key)
         send_alert(
             db,
             workspace_id=position.workspace_id,

@@ -657,8 +657,14 @@ work, or vice versa.
   re-sync / Rail 6 TrueData-or-AliceBlue chain source). Test-teardown
   gotcha fixed: `open_position_factory` in `test_market_data_ingestion.py`
   didn't delete `SystemAlert` rows → Rail 4's alert FK-blocked workspace
-  teardown. 1685 backend tests pass (+15), ruff/mypy clean, frontend
-  `npm run build` clean.
+  teardown. **QC refinements applied**: (A) the clean-fetch auto-resolve
+  `SystemAlert` UPDATE is gated on an in-memory `_option_chain_alerted_keys`
+  set so a near-always-clean fetch never sequential-scans `system_alerts`;
+  (B) the alert prefers a LIVE-held contract so a co-held paper position
+  can't paper-suppress the push; (C) Rail 1 also substitutes the trusted
+  token when the row's token is *missing* (the 2026-08-12 empty-
+  `broker_token` case), not only when it disagrees. 1688 backend tests pass
+  (+18), ruff/mypy clean, frontend `npm run build` clean.
 
 - **2026-09-08: reconciliation scoped to app-placed symbols — MERGED to
   `main` (`b4e33a2`) + DEPLOYED to OCI + live-verified (session

@@ -1233,6 +1233,38 @@ def test_get_option_chain_uses_the_row_token_when_there_is_no_trusted_entry():
     assert adapter._resolve_token("NIFTY30JUL26P24000") == ("NFO", "ROW222")
 
 
+def test_get_option_chain_uses_the_trusted_token_when_the_row_token_is_missing():
+    """Rail 1 finding C (QC): an *empty* `token` on a GetOptionChain row is
+    the exact 2026-08-12 empty-`broker_token` bug -- when a trusted
+    scrip-master token exists for that symbol, price with it rather than
+    zero-filling the entry.
+    """
+    rest = _FakeRestClient()
+    rest.search_scrip_response_by_exchange["NSE"] = _nse_index_rows()
+    adapter, rest = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    adapter.warm_token_cache([("NIFTY30JUL26C24000", "TRUSTED999")])
+
+    rest.get_option_chain_response = [
+        {
+            "tsym": "NIFTY30JUL26C24000",
+            "token": "",  # missing, the 2026-08-12 bug
+            "strprc": "24000.00",
+            "optt": "CE",
+            "instname": "OPTIDX",
+        },
+    ]
+    rest.get_quotes_response = {
+        "lp": "142.35", "bp1": "142.00", "sp1": "142.70", "v": "125000", "oi": "980000",
+    }
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    quote_calls = [call[1] for call in rest.calls if call[0] == "get_quotes"]
+    assert ("FA1", "NFO", "TRUSTED999") in quote_calls
+    assert snapshot.entries[0].ltp == 142.35
+
+
 def test_get_option_chain_requests_a_narrowed_strike_count():
     """2026-09-03 rate-limit incident: GetOptionChain used to fetch Shoonya's
     default count=10 (~40 structural rows), then fired one GetQuotes REST

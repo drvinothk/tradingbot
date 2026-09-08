@@ -501,18 +501,20 @@ class ShoonyaBrokerAdapter(BrokerPort):
             # against the *trusted* scrip-master token
             # (`_token_by_symbol`, populated by `get_instrument_master`'s NFO
             # static-file path / `warm_token_cache`). A stale/recycled/index
-            # token in a GetOptionChain row is the leading hypothesis for the
-            # spot-price leak into option premiums (see
+            # token in a GetOptionChain row (or a missing one — the exact
+            # 2026-08-12 empty-`broker_token` bug) is the leading hypothesis
+            # for the spot-price leak into option premiums (see
             # docs/ops/shoonya_option_chain_spot_leak.md): GetQuotes then
-            # faithfully prices the *wrong* instrument. When a trusted token
-            # exists and disagrees, use it and never overwrite the trusted
+            # faithfully prices the *wrong* instrument, or nothing at all.
+            # When a trusted token exists and the row's is missing or
+            # disagrees, use the trusted one and never overwrite the trusted
             # entry with the row's suspect one. When there is no trusted
             # entry yet (sync hasn't run — e.g. right after a restart), fall
             # through to today's behaviour; Rail 2's no-arb bound is the net
             # for that window.
             with self._token_lock:
                 trusted = self._token_by_symbol.get(symbol)
-            if trusted and trusted[1] and row_token and trusted[1] != row_token:
+            if trusted and trusted[1] and (not row_token or trusted[1] != row_token):
                 exch_for_row, token = trusted
                 token_substitutions.append((symbol, row_token, token))
             else:
@@ -545,9 +547,9 @@ class ShoonyaBrokerAdapter(BrokerPort):
 
         if token_substitutions:
             logger.warning(
-                "GetOptionChain %s expiry %s: %d/%d rows carried a token that disagreed with "
-                "the trusted scrip-master token; priced with the trusted one instead "
-                "(symbol, row_token, trusted_token): %s",
+                "GetOptionChain %s expiry %s: %d/%d rows carried a token that was missing or "
+                "disagreed with the trusted scrip-master token; priced with the trusted one "
+                "instead (symbol, row_token, trusted_token): %s",
                 underlying,
                 expiry,
                 len(token_substitutions),

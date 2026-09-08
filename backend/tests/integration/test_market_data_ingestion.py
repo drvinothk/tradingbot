@@ -65,14 +65,16 @@ EXPIRY = date(2026, 7, 31)
 
 @pytest.fixture(autouse=True)
 def _reset_option_chain_implausible_streak():
-    """Rail 4's consecutive-fetch counter is a module global — clear it
-    between tests so a prior test's dropped-entry run can't leak a streak
-    value into this one's assertions."""
+    """Rail 4's consecutive-fetch counter and alerted-keys set are module
+    globals — clear them between tests so a prior test's dropped-entry /
+    alert run can't leak state into this one's assertions."""
     from app.modules.market_data import ingestion
 
     ingestion._option_chain_implausible_streak.clear()  # noqa: SLF001
+    ingestion._option_chain_alerted_keys.clear()  # noqa: SLF001
     yield
     ingestion._option_chain_implausible_streak.clear()  # noqa: SLF001
+    ingestion._option_chain_alerted_keys.clear()  # noqa: SLF001
 
 
 def _provider(broker):
@@ -1357,6 +1359,105 @@ def test_record_option_chain_snapshot_resolves_the_degraded_alert_on_a_clean_fet
         assert alert.resolved_at is not None
 
 
+def test_record_option_chain_snapshot_degraded_alert_prefers_a_live_held_contract(
+    seeded_universe, test_session_factory, db: Session, open_position_factory
+):
+    """Rail 4 finding B (QC): if a dropped contract is held by both a paper
+    and a live position, the alert's `mode` must be the LIVE one -- else
+    `send_alert`'s paper-suppression would mute the Telegram push for the
+    live position.
+    """
+    from dataclasses import replace
+
+    from app.domain.ops.models import SystemAlert
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=11)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+    held_symbol = real_broker.get_option_chain("NIFTY", EXPIRY).entries[0].contract_symbol
+    held_contract = (
+        db.query(OptionContract).filter(OptionContract.symbol == held_symbol).one()
+    )
+    # Same contract, one paper position and one live -- paper seeded first so
+    # a naive matched[0] would pick it.
+    open_position_factory(held_contract.id, mode=OrderMode.PAPER)
+    open_position_factory(held_contract.id, mode=OrderMode.LIVE)
+
+    class _CorruptHeldBroker:
+        def get_option_chain(self, *args, **kwargs):
+            chain = real_broker.get_option_chain(*args, **kwargs)
+            entries = list(chain.entries)
+            entries[0] = replace(entries[0], ltp=23870.0, bid=0.0, ask=0.0, volume=0)
+            return replace(chain, entries=tuple(entries))
+
+        def get_quote(self, contract_symbol):
+            return real_broker.get_quote(contract_symbol)
+
+    record_option_chain_snapshot(
+        nifty.id, _CorruptHeldBroker(), "NIFTY", EXPIRY,  # type: ignore[arg-type]
+        session_factory=test_session_factory,
+    )
+
+    with test_session_factory() as check_db:
+        alert = (
+            check_db.query(SystemAlert)
+            .filter(SystemAlert.category == "option_chain_degraded")
+            .one()
+        )
+        assert alert.mode == OrderMode.LIVE
+
+
+def test_record_option_chain_snapshot_clean_fetch_does_not_touch_an_unrelated_standing_alert(
+    seeded_universe, test_session_factory, db: Session
+):
+    """Rail 4 finding A (QC): the clean-fetch auto-resolve UPDATE only runs
+    for a key THIS process raised an alert on -- otherwise every (near-always
+    clean) fetch would sequential-scan `system_alerts` to resolve nothing.
+    A standing `option_chain_degraded` alert this process didn't raise (e.g.
+    from before a restart) is left untouched by a clean fetch.
+    """
+    from app.domain.ops.models import AlertSeverity, SystemAlert
+    from app.modules.alerting.manager import send_alert
+    from app.modules.market_data import ingestion
+
+    real_broker = MockBrokerAdapter(instruments=seeded_universe, seed=8)
+    nifty = db.query(Instrument).filter(Instrument.symbol == "NIFTY").one()
+
+    workspace_id = uuid.uuid4()
+    with test_session_factory() as setup_db:
+        setup_db.add(Workspace(id=workspace_id, name=f"standing-{uuid.uuid4().hex[:8]}"))
+        setup_db.flush()
+        send_alert(
+            setup_db,
+            workspace_id=workspace_id,
+            severity=AlertSeverity.CRITICAL,
+            category="option_chain_degraded",
+            message="pre-existing, not raised by this process",
+            dedup_key=f"option_chain_degraded:NIFTY:{EXPIRY.isoformat()}",
+        )
+    # Simulate "raised by a prior process / before a restart" -- the
+    # in-memory alerted-keys set does not know about it.
+    ingestion._option_chain_alerted_keys.clear()  # noqa: SLF001
+
+    try:
+        record_option_chain_snapshot(
+            nifty.id, real_broker, "NIFTY", EXPIRY,  # type: ignore[arg-type]
+            session_factory=test_session_factory,
+        )
+        with test_session_factory() as check_db:
+            alert = (
+                check_db.query(SystemAlert)
+                .filter(SystemAlert.workspace_id == workspace_id)
+                .one()
+            )
+            assert alert.is_resolved is False  # untouched by the clean fetch
+    finally:
+        with test_session_factory() as cleanup_db:
+            cleanup_db.query(SystemAlert).filter(
+                SystemAlert.workspace_id == workspace_id
+            ).delete()
+            cleanup_db.query(Workspace).filter(Workspace.id == workspace_id).delete()
+
+
 @pytest.fixture
 def open_position_factory(test_session_factory):
     """Yields a callable that commits a minimal but real Workspace -> User ->
@@ -1378,9 +1479,11 @@ def open_position_factory(test_session_factory):
     """
     created_workspace_ids: list[uuid.UUID] = []
 
-    def _create(option_contract_id: uuid.UUID) -> None:
+    def _create(
+        option_contract_id: uuid.UUID, mode: OrderMode = OrderMode.PAPER
+    ) -> None:
         _seed_open_position_on_contract(
-            test_session_factory, option_contract_id, created_workspace_ids
+            test_session_factory, option_contract_id, created_workspace_ids, mode=mode
         )
 
     yield _create
@@ -1434,7 +1537,10 @@ def open_position_factory(test_session_factory):
 
 
 def _seed_open_position_on_contract(
-    test_session_factory, option_contract_id: uuid.UUID, created_workspace_ids: list[uuid.UUID]
+    test_session_factory,
+    option_contract_id: uuid.UUID,
+    created_workspace_ids: list[uuid.UUID],
+    mode: OrderMode = OrderMode.PAPER,
 ) -> None:
     """Field values are otherwise arbitrary; only FK validity and
     `Position.status == OPEN` are exercised by the behavior under test.
@@ -1538,7 +1644,7 @@ def _seed_open_position_on_contract(
             option_contract_id=option_contract_id,
             trade_intent_id=intent.id,
             idempotency_key=f"open-{uuid.uuid4()}",
-            mode=OrderMode.PAPER,
+            mode=mode,
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
             qty=25,
