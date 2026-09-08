@@ -121,7 +121,10 @@ def _make_run(
     trading_session: TradingSession,
     user: User,
     *,
-    runtime_mode: StrategyRuntimeMode | None = None,
+    # Post-2026-09-08 inversion: FORCE_LIVE = "would route real money".
+    # Default it so is_live-is-True cases exercise a genuinely armed
+    # strategy; the FORCE_PAPER case overrides.
+    runtime_mode: StrategyRuntimeMode = StrategyRuntimeMode.FORCE_LIVE,
 ):
     config = StrategyConfig(
         id=uuid.uuid4(),
@@ -243,8 +246,8 @@ def _row_for(rows: list[RunningStrategyOut], run_id: uuid.UUID) -> RunningStrate
 def test_paper_position_stays_paper_after_session_flips_to_live_enabled(
     db: Session, workspace, broker_account, option_contract, user: User
 ):
-    """The exact live incident: a normal (not FORCE_PAPER) strategy's
-    position was opened while paper -- e.g. the session was `paper_only` at
+    """The exact live incident: a FORCE_LIVE strategy's position was opened
+    while paper -- e.g. the session was `paper_only` (Go Paper clamp) at
     dispatch time -- and is still open now that the session is
     `live_enabled`. `is_live` (current-config) is `True`, but the position
     itself must still report `mode == "paper"`.

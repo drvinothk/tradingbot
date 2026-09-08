@@ -67,7 +67,10 @@ def _make_run(
     trading_session: TradingSession,
     user: User,
     *,
-    runtime_mode: StrategyRuntimeMode | None = None,
+    # Post-2026-09-08 inversion: FORCE_LIVE is the "would route real money"
+    # mark. Default it so the live-routing cases exercise a genuinely armed
+    # strategy; the FORCE_PAPER case overrides.
+    runtime_mode: StrategyRuntimeMode = StrategyRuntimeMode.FORCE_LIVE,
 ):
     config = StrategyConfig(
         id=uuid.uuid4(),
@@ -97,7 +100,7 @@ def _row_for(rows: list[RunningStrategyOut], run_id: uuid.UUID) -> RunningStrate
     return next(r for r in rows if r.strategy_run_id == run_id)
 
 
-def test_is_live_true_for_normal_strategy_in_live_enabled_session(
+def test_is_live_true_for_force_live_strategy_in_live_enabled_session(
     db: Session, workspace, broker_account, user: User
 ):
     session = _make_session(db, workspace, broker_account, user, mode=SafeMode.LIVE_ENABLED)
@@ -121,9 +124,11 @@ def test_is_live_false_for_force_paper_strategy_in_live_enabled_session(
     assert _row_for(rows, run.id).is_live is False
 
 
-def test_is_live_false_for_normal_strategy_in_paper_only_session(
+def test_is_live_false_for_force_live_strategy_in_paper_only_session(
     db: Session, workspace, broker_account, user: User
 ):
+    # Even a FORCE_LIVE strategy routes paper when the "Go Paper" master
+    # clamp is on (session PAPER_ONLY).
     session = _make_session(db, workspace, broker_account, user, mode=SafeMode.PAPER_ONLY)
     run = _make_run(db, workspace, session, user)
 

@@ -55,6 +55,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -653,6 +654,10 @@ def test_approving_a_pending_trade_dispatches_to_a_real_position(
                 id=uuid.uuid4(),
                 workspace_id=seeded_admin["workspace_id"],
                 name="approval-flow-test",
+                # Genuine live-routing: session LIVE_ENABLED + strategy
+                # FORCE_LIVE (a PENDING_APPROVAL state can only occur for a
+                # live-routed strategy -- paper always auto-dispatches).
+                runtime_mode=StrategyRuntimeMode.FORCE_LIVE,
             )
             db.add(strategy_config)
             db.flush()
@@ -862,24 +867,30 @@ def test_patch_toggles_is_enabled(api_client: TestClient, seeded_admin):
     assert updated["is_enabled"] is False
 
 
-def test_patch_sets_and_clears_runtime_mode(api_client: TestClient, seeded_admin):
+def test_patch_sets_runtime_mode(api_client: TestClient, seeded_admin):
     _login(api_client, seeded_admin)
     strategy_id = api_client.post(
         "/api/v1/strategies", json={"name": "orb-patch-runtime-mode"}
     ).json()["id"]
 
-    set_resp = api_client.patch(
+    # New strategies default to force_paper; arm it, then disarm it.
+    arm_resp = api_client.patch(
+        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_live"}
+    )
+    assert arm_resp.status_code == 200
+    assert arm_resp.json()["runtime_mode"] == "force_live"
+    assert arm_resp.json()["is_enabled"] is True  # untouched by this call
+
+    disarm_resp = api_client.patch(
         f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_paper"}
     )
-    assert set_resp.status_code == 200
-    assert set_resp.json()["runtime_mode"] == "force_paper"
-    assert set_resp.json()["is_enabled"] is True  # untouched by this call
+    assert disarm_resp.status_code == 200
+    assert disarm_resp.json()["runtime_mode"] == "force_paper"
 
-    # Explicit null clears the override -- distinct from simply omitting
-    # the field, which the next test covers.
-    clear_resp = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None})
-    assert clear_resp.status_code == 200
-    assert clear_resp.json()["runtime_mode"] is None
+    # Post-2026-09-08 inversion runtime_mode is non-nullable -- an explicit
+    # null is a 400, not a "clear".
+    null_resp = api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None})
+    assert null_resp.status_code == 400
 
 
 def test_patch_sets_and_clears_qty_lots(api_client: TestClient, seeded_admin):
@@ -946,7 +957,7 @@ def test_patch_rejects_unknown_runtime_mode_value(api_client: TestClient, seeded
     ]
 
     response = api_client.patch(
-        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_live"}
+        f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_yolo"}
     )
 
     assert response.status_code == 422
@@ -959,15 +970,26 @@ def test_bulk_runtime_mode_sets_every_workspace_strategy_to_live(
     id_a = api_client.post("/api/v1/strategies", json={"name": "bulk-a"}).json()["id"]
     id_b = api_client.post("/api/v1/strategies", json={"name": "bulk-b"}).json()["id"]
 
-    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": None})
+    response = api_client.post(
+        "/api/v1/strategies/bulk-runtime-mode", json={"mode": "force_live"}
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["updated_count"] == 2
     assert set(body["strategy_ids"]) == {id_a, id_b}
 
     refetched = {row["id"]: row for row in api_client.get("/api/v1/strategies").json()}
-    assert refetched[id_a]["runtime_mode"] is None
-    assert refetched[id_b]["runtime_mode"] is None
+    assert refetched[id_a]["runtime_mode"] == "force_live"
+    assert refetched[id_b]["runtime_mode"] == "force_live"
+
+
+def test_bulk_runtime_mode_rejects_null_mode(api_client: TestClient, seeded_admin):
+    _login(api_client, seeded_admin)
+    api_client.post("/api/v1/strategies", json={"name": "bulk-null"})
+
+    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": None})
+
+    assert response.status_code == 422
 
 
 def test_bulk_runtime_mode_sets_every_workspace_strategy_to_paper(
@@ -975,9 +997,9 @@ def test_bulk_runtime_mode_sets_every_workspace_strategy_to_paper(
 ):
     _login(api_client, seeded_admin)
     strategy_id = api_client.post("/api/v1/strategies", json={"name": "bulk-paper"}).json()["id"]
-    # New strategies already default to force_paper -- clear it first so this
+    # New strategies already default to force_paper -- arm it first so this
     # test actually exercises a real change, not a no-op.
-    api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": None})
+    api_client.patch(f"/api/v1/strategies/{strategy_id}", json={"runtime_mode": "force_live"})
 
     response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": "force_paper"})
     assert response.status_code == 200
@@ -1002,7 +1024,9 @@ def test_bulk_runtime_mode_is_a_noop_when_already_at_target(api_client: TestClie
 
 
 def test_bulk_runtime_mode_requires_login(api_client: TestClient):
-    response = api_client.post("/api/v1/strategies/bulk-runtime-mode", json={"mode": None})
+    response = api_client.post(
+        "/api/v1/strategies/bulk-runtime-mode", json={"mode": "force_paper"}
+    )
     assert response.status_code == 401
 
 

@@ -674,21 +674,25 @@ def _login_and_create_session(api_client: TestClient, seeded_admin) -> str:
     return session_id
 
 
-def test_go_live_walks_a_fresh_session_to_live_enabled(api_client: TestClient, seeded_admin):
+def test_fresh_session_is_born_live_enabled(api_client: TestClient, seeded_admin):
+    # 2026-09-08 inversion: a session is created live_enabled, not paper_only.
     session_id = _login_and_create_session(api_client, seeded_admin)
 
-    response = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
-    assert response.status_code == 200
+    response = api_client.get(f"/api/v1/sessions/{session_id}")
     assert response.json()["mode"] == "live_enabled"
 
 
-def test_go_live_then_go_paper_restores_paper_only(api_client: TestClient, seeded_admin):
+def test_go_paper_then_go_live_round_trips(api_client: TestClient, seeded_admin):
     session_id = _login_and_create_session(api_client, seeded_admin)
-    api_client.post(f"/api/v1/sessions/{session_id}/go-live")
 
-    response = api_client.post(f"/api/v1/sessions/{session_id}/go-paper")
-    assert response.status_code == 200
-    assert response.json()["mode"] == "paper_only"
+    # Clamp to paper (the master switch), then release it back to live.
+    paper_resp = api_client.post(f"/api/v1/sessions/{session_id}/go-paper")
+    assert paper_resp.status_code == 200
+    assert paper_resp.json()["mode"] == "paper_only"
+
+    live_resp = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
+    assert live_resp.status_code == 200
+    assert live_resp.json()["mode"] == "live_enabled"
 
 
 def test_go_live_is_idempotent_when_already_live(api_client: TestClient, seeded_admin):

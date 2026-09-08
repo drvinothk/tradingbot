@@ -1,8 +1,8 @@
-"""get_execution_broker's per-strategy (FORCE_PAPER inside a live_enabled
-session) and position-aware (opened-live exits bypass SafeMode) gating --
-the branches that need real DB rows (StrategyConfig.runtime_mode / Order.mode
-via object_session), unlike the mode-only branches already covered in
-tests/unit/test_broker_composition.py.
+"""get_execution_broker's per-strategy (FORCE_LIVE / FORCE_PAPER inside a
+live_enabled session) and position-aware (opened-live exits bypass SafeMode)
+gating -- the branches that need real DB rows (StrategyConfig.runtime_mode /
+Order.mode via object_session), unlike the mode-only branches already covered
+in tests/unit/test_broker_composition.py.
 """
 
 from __future__ import annotations
@@ -98,7 +98,10 @@ def _strategy_run(
     workspace,
     trading_session,
     user,
-    runtime_mode: StrategyRuntimeMode | None = None,
+    # Post-2026-09-08 inversion: FORCE_LIVE is the "would route real money"
+    # mark. Default it here so the live-routing tests below actually route
+    # live; the mock-pin tests pass FORCE_PAPER explicitly.
+    runtime_mode: StrategyRuntimeMode = StrategyRuntimeMode.FORCE_LIVE,
     instrument_id: uuid.UUID | None = None,
 ) -> StrategyRun:
     config = StrategyConfig(
@@ -124,10 +127,10 @@ def _strategy_run(
     return run
 
 
-# -- live_enabled + per-strategy FORCE_PAPER gating --------------------
+# -- live_enabled + per-strategy FORCE_LIVE / FORCE_PAPER gating -------
 
 
-def test_live_session_plain_strategy_and_flag_returns_real(
+def test_live_session_force_live_strategy_and_flag_returns_real(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     _allow_real_money(monkeypatch, True)
@@ -139,7 +142,7 @@ def test_live_session_plain_strategy_and_flag_returns_real(
     assert not isinstance(broker, MockBrokerAdapter)
 
 
-def test_live_session_plain_strategy_but_no_flag_raises(
+def test_live_session_force_live_strategy_but_no_flag_raises(
     db: Session, workspace, trading_session, user, monkeypatch
 ):
     _allow_real_money(monkeypatch, False)
@@ -608,15 +611,19 @@ def test_paper_opened_position_stays_mock_when_strategy_now_live_routed(
     opened while `runtime_mode=FORCE_PAPER` was active correctly filled
     paper (`Order.mode=PAPER`), but by the time its exit was dispatched the
     strategy's `force_paper` hold had been lifted -- session is
-    `live_enabled` and the strategy is *currently* plain live-routed. Before
-    the fix, this fell through step 3 and resolved the real broker for a
-    position that broker never had. The fix must keep it pinned to mock
+    `live_enabled` and the strategy is *currently* `FORCE_LIVE` (live-routed).
+    Before the fix, this fell through step 3 and resolved the real broker for
+    a position that broker never had. The fix must keep it pinned to mock
     regardless of the strategy's current routing.
     """
     _allow_real_money(monkeypatch, True)
     composition.set_broker(_FakeRealBroker())
     run = _strategy_run(
-        db, workspace=workspace, trading_session=trading_session, user=user, runtime_mode=None
+        db,
+        workspace=workspace,
+        trading_session=trading_session,
+        user=user,
+        runtime_mode=StrategyRuntimeMode.FORCE_LIVE,
     )
     position = _position(
         db,

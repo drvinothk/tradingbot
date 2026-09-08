@@ -71,7 +71,10 @@ def _config_and_run(
     trading_session: TradingSession,
     *,
     params: dict | None = None,
-    runtime_mode: StrategyRuntimeMode | None = None,
+    # Post-2026-09-08 inversion runtime_mode is the authoritative real-money
+    # mark; default it to FORCE_LIVE here so the "routed live" tests below
+    # actually route live. The paper-path tests pass FORCE_PAPER explicitly.
+    runtime_mode: StrategyRuntimeMode = StrategyRuntimeMode.FORCE_LIVE,
 ) -> tuple[StrategyConfig, StrategyRun]:
     config = StrategyConfig(
         id=uuid.uuid4(),

@@ -30,6 +30,7 @@ from app.domain.strategy.models import (
     StrategyConfig,
     StrategyRun,
     StrategyRunStatus,
+    StrategyRuntimeMode,
     TradeIntent,
     TradeIntentStatus,
 )
@@ -116,7 +117,17 @@ def option_contract(db: Session, instrument: Instrument) -> OptionContract:
 
 @pytest.fixture
 def strategy_config(db: Session, workspace) -> StrategyConfig:
-    config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="test-strategy")
+    # runtime_mode=FORCE_LIVE preserves the pre-2026-09-08-inversion default
+    # exactly: in a paper_only session the "Go Paper" clamp still routes it
+    # paper, and in a live_enabled session it routes live -- the tests that
+    # want a paper-in-a-live-session strategy set runtime_mode="force_paper"
+    # explicitly (and several already do).
+    config = StrategyConfig(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        name="test-strategy",
+        runtime_mode=StrategyRuntimeMode.FORCE_LIVE,
+    )
     db.add(config)
     db.flush()
     return config
@@ -648,7 +659,13 @@ def _make_strategy_run(
     strategy_type: str = "synthetic",
 ) -> StrategyRun:
     config = StrategyConfig(
-        id=uuid.uuid4(), workspace_id=workspace.id, name=name, strategy_type=strategy_type
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        name=name,
+        strategy_type=strategy_type,
+        # See the strategy_config fixture -- FORCE_LIVE preserves the
+        # pre-inversion "follow the session" default behaviour.
+        runtime_mode=StrategyRuntimeMode.FORCE_LIVE,
     )
     db.add(config)
     db.flush()
@@ -2217,6 +2234,12 @@ def test_record_trade_outcome_effects_is_a_noop_for_paper(
     "loss"/"profit" that never touched real money. `is_live=False` must
     return before touching anything, not just before the loss-cap/target
     triggers -- proven here with a paper loss well past daily_loss_cap.
+
+    2026-09-08 (paper/live inversion): also the invariant that keeps the
+    per-strategy circuit breaker live-only "by construction" -- a
+    FORCE_PAPER strategy's losses never reach `_apply_strategy_circuit_
+    breaker`, so its runtime_mode can never be flipped by the breaker (and
+    hence never auto-resumed to FORCE_LIVE). Asserted below via cooldown_tier.
     """
     position = _outcome_effects_position(db, trading_session, strategy_run, option_contract, broker)
 
@@ -2228,6 +2251,9 @@ def test_record_trade_outcome_effects_is_a_noop_for_paper(
     assert float(trading_session.cumulative_realized_pnl) == 0.0
     assert trading_session.mode == SafeMode.PAPER_ONLY
     assert trading_session.entries_paused_reason is None
+    db.refresh(strategy_run)
+    assert strategy_run.cooldown_tier == 0
+    assert strategy_run.consecutive_severe_losses == 0
 
 
 def test_entries_paused_blocks_further_trade_intents(
@@ -2463,7 +2489,9 @@ def test_manual_runtime_mode_edit_cancels_a_pending_cooldown(
     """2026-09-04 (Issue 5): a human editing runtime_mode via the API always
     wins over the circuit breaker -- must clear any pending cooldown_tier/
     cooldown_until on the active run and stamp runtime_mode_source='manual',
-    so a stale auto-timer can never later override this decision.
+    so a stale auto-timer can never later override this decision. Post-
+    2026-09-08 inversion the human re-arms with an explicit force_live rather
+    than a "clear to null".
     """
     from app.api.v1.strategies import UpdateStrategyRequest, update_strategy
 
@@ -2478,18 +2506,19 @@ def test_manual_runtime_mode_edit_cancels_a_pending_cooldown(
     db.refresh(strategy_run)
     db.refresh(strategy_config)
     assert strategy_run.cooldown_tier == 1
+    assert strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_PAPER  # breaker tripped it
     assert strategy_config.runtime_mode_source == "circuit_breaker"
 
     update_strategy(
         strategy_id=strategy_config.id,
-        body=UpdateStrategyRequest(runtime_mode=None),
+        body=UpdateStrategyRequest(runtime_mode=StrategyRuntimeMode.FORCE_LIVE),
         db=db,
         user=authorized_user,
     )
 
     db.refresh(strategy_run)
     db.refresh(strategy_config)
-    assert strategy_config.runtime_mode is None
+    assert strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_LIVE
     assert strategy_config.runtime_mode_source == "manual"
     assert strategy_run.cooldown_tier == 0
     assert strategy_run.cooldown_until is None

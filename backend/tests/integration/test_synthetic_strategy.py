@@ -136,7 +136,15 @@ def option_contract(db: Session, instrument: Instrument) -> OptionContract:
 
 @pytest.fixture
 def strategy_config(db: Session, workspace) -> StrategyConfig:
-    config = StrategyConfig(id=uuid.uuid4(), workspace_id=workspace.id, name="synthetic")
+    # runtime_mode=FORCE_LIVE preserves the pre-2026-09-08-inversion default
+    # exactly: the "Go Paper" clamp still routes it paper in a paper_only
+    # session, and it routes live in a live_enabled session.
+    config = StrategyConfig(
+        id=uuid.uuid4(),
+        workspace_id=workspace.id,
+        name="synthetic",
+        runtime_mode=StrategyRuntimeMode.FORCE_LIVE,
+    )
     db.add(config)
     db.flush()
     return config
@@ -247,7 +255,8 @@ def test_run_cycle_auto_resumes_a_strategy_once_its_cooldown_expires(
     _apply_strategy_circuit_breaker -- once a circuit-breaker-tripped
     strategy's timed cooldown window has passed, the *next* run_cycle must
     auto-flip it back to live and clear the cooldown state, tagged the same
-    'circuit_breaker' source.
+    'circuit_breaker' source. Post-2026-09-08 inversion "back to live" means
+    runtime_mode=FORCE_LIVE (was: None).
     """
     from datetime import timedelta
 
@@ -264,7 +273,7 @@ def test_run_cycle_auto_resumes_a_strategy_once_its_cooldown_expires(
     run_cycle(db, strategy, strategy_run, trading_session, strategy_config,
               alert_session_factory=_same_session_factory(db))
 
-    assert strategy_config.runtime_mode is None
+    assert strategy_config.runtime_mode == StrategyRuntimeMode.FORCE_LIVE
     assert strategy_config.runtime_mode_source == "circuit_breaker"
     assert strategy_run.cooldown_tier == 0
     assert strategy_run.cooldown_until is None

@@ -310,6 +310,9 @@ def test_creates_todays_session_continuing_from_most_recent(
     assert new_session.broker_account_id == broker_account.id
     assert new_session.started_by_user_id == user.id
     assert new_session.funding_mode == FundingMode.MTF  # carried from previous session
+    # 2026-09-08 inversion: born live_enabled, regardless of yesterday's mode.
+    # Nothing trades real money until a strategy is explicitly force_live.
+    assert SafeMode(new_session.mode) == SafeMode.LIVE_ENABLED
 
 
 def test_creates_todays_session_from_global_daily_limits_config_when_present(
@@ -536,3 +539,12 @@ def test_auto_spawner_runs_against_todays_freshly_created_session(
     run = db.query(StrategyRun).filter(StrategyRun.strategy_config_id == config.id).one()
     assert run.trading_session_id == new_session.id
     assert run.expiry_date == date(2026, 8, 20)
+
+    # Guardrail invariant: the session is born live_enabled, but a config
+    # that was never explicitly armed (default runtime_mode=force_paper)
+    # still does NOT route real money -- nothing trades live until a human
+    # sets force_live.
+    from app.modules.broker_adapter.composition import is_strategy_routed_live
+
+    assert SafeMode(new_session.mode) == SafeMode.LIVE_ENABLED
+    assert is_strategy_routed_live(new_session, run) is False
