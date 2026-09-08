@@ -2,6 +2,12 @@ name: backend-ci
 
 on:
   push:
+    # Branch pushes and PRs only — never tag pushes. Archive tags
+    # (archive/**, per the backtest unsynced-work lifecycle rule) point at
+    # deliberately-parked commits that were never meant to be green; running
+    # CI on them just produces noise failures.
+    tags-ignore:
+      - "**"
     paths:
       - "backend/**"
       - ".github/workflows/backend-ci.yml"
