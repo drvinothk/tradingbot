@@ -729,3 +729,123 @@ app/modules/scheduler/eod_square_off.py; do cp
 ~/deploy-bak/ws1-6-20260907-205545/$f $f; done && .venv/bin/python -m
 alembic downgrade 0037 && sudo systemctl restart trading-bot`
 (`scripts/prep_live_ramp.py` can stay — it is inert unless invoked).
+
+---
+
+## DEPLOY APPROVAL REQUEST — paper/live model inversion (PENDING operator)
+
+**Emitted:** 2026-09-08 (~00:30 IST). Classifier blocked Claude's SSH to the box;
+migration `0039` is also a prod-DB write (categorically operator-only). Awaiting
+operator to run the steps below (or grant approval).
+
+- **Target:** `144.24.137.112` (`ubuntu@`, live OCI, systemd `trading-bot`)
+- **Source:** branch `feat/invert-paper-live-model` @ `5cb44d1`, pushed to
+  `origin`. NOT merged to `main`. Test-file updates deliberately kept local
+  (uncommitted), per operator instruction — so the branch's own CI would be red;
+  irrelevant to a tarball deploy.
+- **Change:** the paper/live model inversion (see the commit body / memory
+  `project_paper_live_inversion_2026_09_08`). `runtime_mode` becomes the
+  authoritative real-money mark (`force_live`/`force_paper`, non-nullable,
+  migration `0039` backfills every `NULL` -> `force_paper`); the daily session
+  is born `live_enabled`; "Go Paper" is a global clamp; circuit-breaker resume
+  restores `force_live`; `recover_from_kill_switch` gets an explicit
+  `!= kill_switch -> 409` guard.
+- **Tested:** 1667 backend tests pass; `ruff`/`mypy` clean; frontend
+  `npm run build` clean; migration `0039` round-tripped on a scratch Postgres;
+  live API smoke on the local dev DB (born-live session, `force_paper` default,
+  PATCH 400/422 validation, go-paper/go-live, recover 409).
+- **Safety gate:** ~00:30 IST, market closed — formality. Operator still
+  confirms on the box: active session `mode='paper_only'` and **0 open `live`
+  positions** before restarting.
+- **Atomicity (critical):** migration `0039` and the 6 `app/` files must land
+  **together**, one restart. Landing the born-live bootstrapper without the new
+  `is_strategy_routed_live` would route every still-`NULL` config live.
+- **Deferred effect:** today's already-running OCI session (created this morning
+  as `paper_only` under old code) stays `paper_only` on restart — born-live only
+  takes effect at tomorrow's daily bootstrap. `is_strategy_routed_live` on a
+  `paper_only` session returns `False` regardless of `runtime_mode`, so no
+  behavior change to today's session.
+- **Post-deploy (operator):** `0039` sets every `NULL` `runtime_mode` ->
+  `force_paper`, so **any strategy that should trade live must be explicitly
+  re-armed** — UI Mode dropdown -> Live, or
+  `scripts/prep_live_ramp.py --arm-config "<name>"`. There is no more manual
+  `go-live`; the session is born live.
+
+### Files (surgical, 0 credentials)
+
+backend (8): `app/api/v1/sessions.py`, `app/api/v1/strategies.py`,
+`app/domain/strategy/models.py`, `app/modules/broker_adapter/composition.py`,
+`app/modules/session/bootstrapper.py`, `app/modules/strategy_engine/runner.py`,
+`migrations/versions/0039_strategy_runtime_mode_force_live.py` (NEW),
+`scripts/prep_live_ramp.py`, `scripts/qc_paper_configs_live.py`
+frontend (rebuild `dist`): `ModeBanner.tsx`, `features/advanced/AdvancedPage.tsx`,
+`features/control-room/ControlRoomPage.tsx`, `shared/api/types.ts`
+
+### Steps
+
+```
+# --- local ---
+cd "/c/Users/drvin/Trading Bot/backend"
+git archive feat/invert-paper-live-model -o /tmp/invert.tar \
+  app/api/v1/sessions.py app/api/v1/strategies.py app/domain/strategy/models.py \
+  app/modules/broker_adapter/composition.py app/modules/session/bootstrapper.py \
+  app/modules/strategy_engine/runner.py \
+  migrations/versions/0039_strategy_runtime_mode_force_live.py \
+  scripts/prep_live_ramp.py scripts/qc_paper_configs_live.py
+scp -i <key> /tmp/invert.tar ubuntu@144.24.137.112:/tmp/invert.tar
+
+# --- on box: safety gate ---
+cd ~/trading-bot/backend
+sudo -u postgres psql trading_bot -c \
+  "SELECT id,mode,status FROM trading_sessions WHERE status='active';"
+sudo -u postgres psql trading_bot -c \
+  "SELECT p.id FROM positions p JOIN orders o ON o.id=p.opening_order_id \
+   WHERE p.status<>'closed' AND o.mode='live';"   # any row -> STOP
+
+# --- on box: deploy (atomic) ---
+BK=~/deploy-bak/invert-$(date +%Y%m%d-%H%M%S) && mkdir -p "$BK"
+for f in app/api/v1/sessions.py app/api/v1/strategies.py app/domain/strategy/models.py \
+  app/modules/broker_adapter/composition.py app/modules/session/bootstrapper.py \
+  app/modules/strategy_engine/runner.py scripts/prep_live_ramp.py scripts/qc_paper_configs_live.py; do
+  mkdir -p "$BK/$(dirname "$f")" && cp -a "$f" "$BK/$f"; done
+.venv/bin/python -m alembic current | tee "$BK/ALEMBIC_BEFORE"   # expect 0038
+tar -xf /tmp/invert.tar -C .
+ls app/config/credentials/                       # real .env / caches intact
+.venv/bin/python -c "import app.main; print('import OK')"
+.venv/bin/python -m alembic upgrade head          # 0038 -> 0039
+sudo -u postgres psql trading_bot -c "\d strategy_configs" | grep runtime_mode
+                                                  # -> "not null", default 'force_paper'
+sudo systemctl restart trading-bot
+sleep 5 && systemctl is-active trading-bot && curl -s http://127.0.0.1:5000/health
+
+# --- frontend ---
+# local:  cd "/c/Users/drvin/Trading Bot/frontend" && npm run build && tar -czf /tmp/invert-dist.tgz -C dist .
+# scp -i <key> /tmp/invert-dist.tgz ubuntu@144.24.137.112:/tmp/invert-dist.tgz
+# box:  sudo cp -a /var/www/trading-bot/dist /var/www/trading-bot/dist.bak-<ts> && \
+#       sudo tar -xzf /tmp/invert-dist.tgz -C /var/www/trading-bot/dist && \
+#       sudo chown -R www-data:www-data /var/www/trading-bot/dist
+```
+
+### Post-deploy verification
+
+- box `alembic current` == `0039`
+- `GET /strategies/running` -> `is_live=false` for every row
+- today's active session still `mode='paper_only'`
+- sha256 of each of the 8 backend files: box == local worktree
+- clean startup log (Shoonya session restored, recovery clean, no tracebacks)
+
+### Rollback
+
+```
+cd ~/trading-bot/backend
+for f in app/api/v1/sessions.py app/api/v1/strategies.py app/domain/strategy/models.py \
+  app/modules/broker_adapter/composition.py app/modules/session/bootstrapper.py \
+  app/modules/strategy_engine/runner.py; do cp "$BK/$f" "$f"; done
+.venv/bin/python -m alembic downgrade 0038
+sudo systemctl restart trading-bot
+# frontend: sudo rm -rf /var/www/trading-bot/dist && \
+#   sudo mv /var/www/trading-bot/dist.bak-<ts> /var/www/trading-bot/dist && \
+#   sudo chown -R www-data:www-data /var/www/trading-bot/dist
+```
+
+Approve? (yes — operator runs the steps / no)
