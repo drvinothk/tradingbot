@@ -2522,11 +2522,21 @@ has actually used 28, the 18 here was stale.)
   artifact of omitting this.
 - **`--exit-mode current`** = the faithful exit stack (see below). `legacy` /
   `target_mult` had a 26× PnL-scale bug (fixed) and model close-only fills.
-- **`--underlying-source alice_index`** for everything EXCEPT `vwap_pullback`,
-  which needs **`futures_proxy`** — the index feed reports volume=0 so VWAP
-  never forms (matches the production `set_volume_proxy` gap). Note:
-  futures_proxy also swaps the *price* series to the future (~index + basis;
-  negligible for breakout logic, real for anything level-sensitive).
+- **`--underlying-source alice_index`** for everything EXCEPT `vwap_pullback*`,
+  which the `SOURCE_MAP` routes to **`futures_proxy`** — the index feed reports
+  volume=0 so VWAP never forms. **Caveat, established p18s / Part 0
+  (2026-09-08): `futures_proxy` is a volume stopgap that also substitutes the
+  *price* series to the future (~index + basis). For a breakout signal that is
+  negligible; for VWAP — a price-line mean-reversion signal — it is not. The
+  faithful series is `alice_index` spot price + spliced real futures volume,
+  which is what live does (`ShoonyaBrokerAdapter._splice_future_volume`).** That
+  path is built as `run_backtest.py --volume-source futures` (idempotent applier
+  `patch_volume_source.py`), dormant on the box, not promoted — the p18s smoke
+  showed it corrects the series but the near-expiry archive still caps
+  `vwap_pullback` at ~16 trades (see the uncapped-strategy note under the
+  robustness bar). Until it is promoted, **every `vwap_pullback*` backtest KPI
+  is directional only, not a live proxy** — the p14 VWAP R:R grid was voided
+  for exactly this.
 - **VIX + PCR are seeded/floored automatically** inside `run_backtest.py` now
   (VIX as real `INDIA VIX` QuoteTicks; PCR returns `None` below
   `PCR_MIN_SIDE_OI = 100_000` instead of garbage). Sweep #1's VIX gate was
@@ -2556,13 +2566,30 @@ option premiums (52 NIFTY weeklies / 12 BANKNIFTY monthlies, Aug'25–Aug'26);
 1-min bars, no ticks (structure-break persistence collapses); no real bid/ask
 anywhere (synthetic spread from OI/volume); no cross-trade P&L feedback in the
 sim (daily-loss / consecutive-loss breakers are analysis overlays only);
-BANKNIFTY current-week ORB is ~9 trades/yr — too thin to backtest a strategy.
+BANKNIFTY current-week ORB is ~9 trades/yr — too thin to backtest a strategy;
+**the near-expiry archive is ~100% DTE 5–6 (established p16, 2026-09-08) — and
+ORB/OI/EMA fire once per direction per `--all-expiries` expiry-week run, the
+entry landing on the first eligible day (DTE ~6) with `_fired_directions`
+blocking the rest — so ZERO DTE 0–3 trades are producible: any expiry-day /
+theta-decay / expiry-morning-vs-afternoon lever is untestable on this archive,
+and max n for these strategies = (near-expiry weeks with data) × 2 regardless
+of intra-week data volume.**
 
 **Robustness bar for any candidate** (`analyze_walkforward.py`): positive in
 IS *and* OOS *and* both 6-month halves; bootstrap P(mean≤0) ≤ ~0.15 with a
 non-negative 5th-percentile; survives 1.0%/side slippage; expiry-week sign
 test as supporting (not decisive — n is small). At n≈20–40, every pass is
 "paper-trade to collect live data", never "deploy".
+
+**Uncapped strategies (`vwap_pullback`) do not even reach n≈20–40 here (p18s,
+2026-09-08).** With no once-per-run cap the setup fires only when it occurs
+(~0–2×/week), and `--near-expiry-days 6` restricts to ~26 weeks → ~16 trades
+total across the whole archive, vs live running every session (~13/day). Their
+backtest KPIs measure a tiny unrepresentative near-expiry slice and are not a
+live proxy. Validate these **forward** — paper signal-count + outcome ledger,
+then monitored 1-lot live — and characterise the raw signal (frequency, points
+edge, MFE/MAE) on the full continuous `alice_index` series independent of any
+option data.
 
 ---
 
