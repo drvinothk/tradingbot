@@ -285,9 +285,12 @@ def test_kill_switch_schedules_a_restart_and_audits(
     import app.api.v1.sessions as sessions_module
 
     calls: list[str] = []
-    monkeypatch.setattr(
-        sessions_module, "schedule_backend_restart", lambda reason="": calls.append(reason) or True
-    )
+
+    def _fake_restart(reason: str = "") -> bool:
+        calls.append(reason)
+        return True
+
+    monkeypatch.setattr(sessions_module, "schedule_backend_restart", _fake_restart)
     api_client.post(
         "/api/v1/auth/login",
         json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},

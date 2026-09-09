@@ -21,6 +21,7 @@ import platform
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -545,6 +546,14 @@ def restart_backend(
 
 
 _reconnect_auto_lock = threading.Lock()
+_last_auto_reconnect_at: float = 0.0
+# The isolated engine's own run (up to 2 headless-login attempts 30s apart,
+# then maybe a `systemctl restart`) can take ~90s. A second trigger inside
+# that window would race two headless logins against the same broker and
+# possibly fire two restarts -- and the per-row frontend `busy` guard does
+# NOT cover the *other* broker row's button hitting this same endpoint, or a
+# second tab. Refuse a repeat trigger for a cooldown that covers one run.
+_AUTO_RECONNECT_COOLDOWN_SECONDS = 120.0
 
 
 class ReconnectBrokersResponse(BaseModel):
@@ -583,22 +592,23 @@ def reconnect_brokers_auto(
             "the auto-login engine is not installed on this host — use Manual reconnect.",
         )
 
-    if not _reconnect_auto_lock.acquire(blocking=False):
-        return ReconnectBrokersResponse(
-            triggered=False, message="an auto-reconnect is already in progress"
-        )
-    try:
-        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, detached
-            [sys.executable, "-m", "autologin", "--force"],
-            cwd=str(BACKEND_ROOT_DIR),
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    finally:
-        # The child is detached; the lock only guards the ~instant spawn
-        # window against a double-click, not the engine's whole run.
-        _reconnect_auto_lock.release()
+    global _last_auto_reconnect_at
+    with _reconnect_auto_lock:
+        monotonic_now = time.monotonic()
+        if monotonic_now - _last_auto_reconnect_at < _AUTO_RECONNECT_COOLDOWN_SECONDS:
+            return ReconnectBrokersResponse(
+                triggered=False,
+                message="an auto-reconnect was started recently — wait ~2 min before retrying",
+            )
+        _last_auto_reconnect_at = monotonic_now
+
+    subprocess.Popen(  # noqa: S603 - fixed argv, no shell, detached
+        [sys.executable, "-m", "autologin", "--force"],
+        cwd=str(BACKEND_ROOT_DIR),
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
     record_event(
         db,
@@ -607,7 +617,7 @@ def reconnect_brokers_auto(
         actor_id=user.id,
         event_category=EventCategory.CREDENTIAL_CONFIG_CHANGE,
         event_type="broker.auto_reconnect_requested",
-        payload={},
+        payload={"engine": "autologin", "force": True},
     )
     db.commit()
     return ReconnectBrokersResponse(

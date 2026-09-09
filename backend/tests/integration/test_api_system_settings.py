@@ -896,6 +896,9 @@ def test_reconnect_brokers_auto_launches_the_engine_detached(
     engine_dir.mkdir()
     (engine_dir / "__main__.py").write_text("")
     monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+    # A prior test in this session may have left the cooldown timestamp set.
+    monkeypatch.setattr(system_settings_module, "_last_auto_reconnect_at", 0.0)
+    monkeypatch.setattr(system_settings_module.time, "monotonic", lambda: 10_000.0)
 
     calls: list[dict] = []
     monkeypatch.setattr(
@@ -915,22 +918,43 @@ def test_reconnect_brokers_auto_launches_the_engine_detached(
     assert calls[0]["kw"].get("start_new_session") is True
 
 
-def test_reconnect_brokers_auto_double_trigger_is_a_noop(
+def test_reconnect_brokers_auto_cooldown_refuses_a_rapid_repeat(
     api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
 ):
+    """The engine's own run can take ~90s; a second trigger inside a short
+    window would race two headless logins / two restarts. Deterministic via
+    a faked monotonic clock -- no real wait.
+    """
     monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
     engine_dir = tmp_path / "autologin"
     engine_dir.mkdir()
     (engine_dir / "__main__.py").write_text("")
     monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
-    monkeypatch.setattr(system_settings_module.subprocess, "Popen", lambda argv, **kw: None)
+    monkeypatch.setattr(system_settings_module, "_last_auto_reconnect_at", 0.0)
+
+    fake_now = [10_000.0]
+    monkeypatch.setattr(system_settings_module.time, "monotonic", lambda: fake_now[0])
+    spawns: list[int] = []
+    monkeypatch.setattr(
+        system_settings_module.subprocess, "Popen", lambda argv, **kw: spawns.append(1)
+    )
     _login(api_client, seeded_admin)
     _grant_permission(engine, seeded_admin, "session.start")
-    # Hold the lock as if a run were already in progress.
-    system_settings_module._reconnect_auto_lock.acquire()
-    try:
-        resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
-        assert resp.status_code == 200
-        assert resp.json()["triggered"] is False
-    finally:
-        system_settings_module._reconnect_auto_lock.release()
+
+    first = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+    assert first.status_code == 200
+    assert first.json()["triggered"] is True
+
+    # Same instant -- inside the cooldown, refused, engine not re-launched.
+    second = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+    assert second.status_code == 200
+    assert second.json()["triggered"] is False
+    assert "recently" in second.json()["message"]
+    assert len(spawns) == 1
+
+    # Past the cooldown -- allowed again.
+    fake_now[0] += system_settings_module._AUTO_RECONNECT_COOLDOWN_SECONDS + 1.0
+    third = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+    assert third.status_code == 200
+    assert third.json()["triggered"] is True
+    assert len(spawns) == 2

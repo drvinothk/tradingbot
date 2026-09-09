@@ -559,7 +559,9 @@ def trigger_kill_switch(
     """The operator's manual Kill Switch (2026-09-09 redesign). Master
     square-off of every open **LIVE** position, then drop the session to
     `paper_only` (paper strategies keep running — use Go Live to resume
-    live), then restart the backend to clear any transient state.
+    live). If the session was `live_enabled`, also restart the backend to
+    clear transient live state (`restarting` in the response); from
+    `paper_only` there is nothing live left to clear, so no restart.
 
     Deliberately no longer enters the sticky `kill_switch` *mode* — that
     mode still exists and is still where Risk Service's automatic
@@ -621,6 +623,9 @@ def trigger_kill_switch(
 
     restarting = False
     if from_mode == SafeMode.LIVE_ENABLED:
+        # Only a live session carries transient live state worth a restart;
+        # a clamped paper_only session's live positions (if any) were just
+        # squared off and nothing else needs clearing.
         restarting = schedule_backend_restart(reason="kill switch")
 
     return KillSwitchResultOut(
