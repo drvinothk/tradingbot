@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import { ApiError, shoonyaApi } from '../api/client'
 import { api } from '../api/client'
 import type { ShoonyaLoginUrlOut, ShoonyaStatusOut } from '../api/types'
@@ -24,10 +24,6 @@ export function BrokerConnectionRow({
   const queryClient = useQueryClient()
   const [error, setError] = useState<string | null>(null)
   const { isWaiting: isRestarting, message: restartMessage, waitForRestart } = useWaitForRestart()
-  // Set when the user clicks "Manual reconnect": once the status query flips
-  // to connected we know the browser OAuth completed, and the backend has a
-  // restart queued (it always does after a manual login) -- start polling.
-  const awaitingManualConnect = useRef(false)
 
   const statusQuery = useQuery({
     queryKey: [queryKeyPrefix, 'status'],
@@ -37,18 +33,18 @@ export function BrokerConnectionRow({
 
   const connected = statusQuery.data?.connected ?? false
 
-  useEffect(() => {
-    if (connected && awaitingManualConnect.current) {
-      awaitingManualConnect.current = false
-      void waitForRestart(`${brokerLabel} reconnected — finalising with a backend restart…`)
-    }
-  }, [connected, brokerLabel, waitForRestart])
-
   const manualReconnectMutation = useMutation({
     mutationFn: () => shoonyaApi.get<ShoonyaLoginUrlOut>(loginUrlPath),
     onSuccess: (data) => {
-      awaitingManualConnect.current = true
       window.open(data.authorize_url, '_blank', 'noopener,noreferrer')
+      // Every manual OAuth callback ends by scheduling a backend restart, but
+      // its timing depends on the user finishing login in the other tab.
+      // Poll from now with a wide window; clear quietly if they never do
+      // (the restart, if it lands later, is harmless and self-heals).
+      void waitForRestart(`${brokerLabel} reconnected — finalising with a backend restart…`, {
+        expectRestart: false,
+        timeoutMs: 180_000,
+      })
       queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, 'status'] })
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not start login'),
@@ -62,8 +58,12 @@ export function BrokerConnectionRow({
     onSuccess: (data) => {
       setError(null)
       // The engine restarts the backend only if it did a fresh login; poll
-      // either way -- boot-status just won't change if it didn't.
-      void waitForRestart('Auto-reconnect running (both brokers) — checking for a restart…')
+      // either way. `expectRestart: false` so "no boot_id change" clears
+      // quietly instead of a spurious "check the server logs" after 2 min.
+      void waitForRestart('Auto-reconnect running (both brokers) — checking for a restart…', {
+        expectRestart: false,
+        timeoutMs: 120_000,
+      })
       if (!data.triggered) setError(data.message)
       queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, 'status'] })
       queryClient.invalidateQueries({ queryKey: ['alice_blue', 'status'] })
