@@ -8,6 +8,187 @@ costs are applied only in analysis.
 
 ---
 
+## 2026-09-09 (~21:00 IST) — p18 Batches 0–3 RESULTS + FINAL ORB exit/width decision
+
+Arc p17→p18b3, all `orb_conviction`, live ORB_Convic entry gate (confirm-bar +
+RSI PE<25 / CE>75 + PDT + cutoff 10:15), `--exit-mode current`,
+`--all-expiries --near-expiry-days 6`, `alice_index`, `analyze_walkforward.py`
+(OOS from 2026-04-01). Every cross-run anchor reproduced to the decimal
+(`OC-C0`=`EX-W65-CAP`; `OW-70`=`EX-W70-CAP`=`X70-CTRL` all +69.1/n40;
+`OW-75`=`EX-W75-CAP`=`X75-CTRL` all +64.2/n41) — harness rock-solid, all four
+runs pooled as one dataset. n≈40 throughout (data ceiling).
+
+### p18b0 (`s6_p18b0`, 10 cfg, 252 min)
+- **OR-width sweep closed.** w55 −33 / w65 +7 / **w70 +69.1** (P 0.172) /
+  **w75 +64.2** (P 0.189) / w80 −124 / w85 −113. **w75 is a plateau (70–75),
+  not a lone spike** — sharp cliffs at 65 and 80. w70 marginally on top.
+- **Rolling-Donchian mechanism pre-screen (8× `atr_breakout`, `B0-*`): DEAD.**
+  Every config OOS-negative and H2-negative (best `B0-L30-R10-M15` all +56 but
+  OOS −88). ATR-expansion gate is load-bearing (R10 configs +35/+56 vs R05 all
+  −20 to −274) but even gated there is no OOS edge. `_fired_directions` 1/dir/day
+  cap meant 79–85% of fills landed 09:00–11:00, 0 after 13:00 — "whole-day"
+  never actually tested. **Verdict: do NOT build the `breakout_reference_mode:
+  rolling` extension; p18 Batches 1–6 abandoned.** The ORB conviction edge does
+  not survive being generalised to a bare/light whole-day breakout.
+
+### p18b1 (`s6_p18b1`, 6 cfg, 158 min) — width × exit-route
+`EX-W65-RIDE` reproduces p15 `ORBC-RB` exactly (E +208.8, PF 1.97, P 0.053).
+Same w65 39-trade entry set: **CAP `.22/.33` → +6.7 vs RIDE `.18/1.0` → +208.8.
+The exit route, not the entry, is the whole lever.** `EX-W70-RIDE` E +232.7,
+P 0.037, IS +243 / OOS +218 — first ORB-conv config with edge *not* concentrated
+in one half.
+
+### p18b2 (`s6_p18b2`, 9 cfg, 237 min) — reshaped-exit grid at w70
+**Decomposition (CTRL → RIDE-L75, one change at a time):** uncap target
+.33→1.0 = **+152/lot (88% of the gain)**; stop .22→.18 = +11; trail lock
+.60→.75 = +10. **The win is staying in longer (removing the +33% ceiling),
+NOT a tighter trail** — the winning shapes arm the trail *later* (+12% vs
+CTRL's +4%; arm% = `target_pct × trail_activation_fraction`), so they are
+*less* noise-prone live, not more. Slippage stress (mean net/lot @ 1.0%/side):
+CTRL **−16**, RIDE-L75 **+157**, MID-T66 **+210**, CAP-T50-L80 **+149** — a
+bigger avg win absorbs a fixed-% haircut far better than a capped one.
+Top single shapes (all w70, n40): **X70-MID-T66** (sl.20/tgt.66/arm.18/lock.70,
+cap +66%) E **+296.7**, PF 2.71, P **0.008**, boot5 +92; **X70-RIDE-L75**
+(sl.18/tgt1.0/arm.12/lock.75, no cap) E +243, P 0.030 (cleanest — single axis,
+monotonic L50<L60<L75); **X70-CAP-T50-L80** (sl.22/tgt.50/arm.24/lock.80,
+cap +50%) E +235, IS +235 / OOS +237 (best-balanced). Wider hard stop
+(.18→.22→.25) only bleeds E.
+
+### p18b3 (`s6_p18b3`, 6 cfg, 157 min) — final w70 vs w75
+The 4 finalist legs at w75 + both controls. **w70 beats w75 on every one of
+5 legs by +7 to +10/lot**, lower P(mean≤0) on each. → **WIDTH DECISION: w70**
+(also one step further from the w80 cliff).
+
+### Blends (2-leg beats 3-leg; a 3rd uncapped leg dilutes robustness)
+| blend (w70) | E/lot | PF | P(mean≤0) | boot5 | E −2best | IS→OOS |
+|---|---|---|---|---|---|---|
+| **PRIMARY 60 MID-T66 / 40 CAP-T50-L80** | **+272** | 2.50 | **0.014** | +68 | +170 | +236→+326 |
+| ALT2 50 MID-T66 / 50 CAP-T50-L80 | +266 | 2.41 | 0.017 | +61 | +163 | +236→+311 |
+| ALT 60 RIDE-L75 / 40 CAP-T50-L60 | +208 | 2.21 | 0.024 | +35 | +130 | +184→+242 |
+| current live (CTRL, .22/.33/.12/.6) | +69 | 1.51 | 0.173 | −57 | +26 | −5→+181 |
+
+MID-T66-solo's July'26 concentration (⅓ of its edge over RIDE-L75 was that one
+month) is **resolved by the blend** — PRIMARY's Jul'26 = +1639, edge now spread
+evenly over Nov/Dec/Jan/Jun/Jul. 7 chop months flat/negative, identical to CTRL:
+same directional calls, ~4× the winner-capture.
+
+### DECISION — reshape live `ORB_Convic_Live` + `ORB_Convic_Paper`
+1. `max_or_range_nifty_points`: **65 → 70**.
+2. Exit → **2-leg 60/40**:
+   - **Leg A (0.60)**: stop .20 / target .66 / trail_activation_fraction .18 /
+     trail_lock_fraction .70  (arm ~+12%, cap +66% — profit engine)
+   - **Leg B (0.40)**: stop .22 / target .50 / trail_activation_fraction .24 /
+     trail_lock_fraction .80  (arm +12%, cap +50% — banks faster/harder)
+3. **Top-level fallback params = Leg A** (`build_position_exit_legs` returns
+   `None` for a 1-lot / LIVE position → exit collapses to top-level; so the
+   higher-proportion leg governs the 1-lot case).
+- **Why 2 legs / these two:** best E *and* best robustness of the grid, and
+  **both legs carry a hard profit ceiling** → no uncapped runner, every position
+  has a defined exit (the real-world-noise hedge). 3rd leg added no robustness;
+  making it uncapped re-introduced the tail risk. Rejected ALT (60 RIDE-L75 /
+  40 CAP-T50-L60): lower E + one uncapped leg.
+- **Trend-strategy caveat carried forward:** ~5 months (Nov/Dec/Jan/Jun/Jul)
+  carry the year; n≈40; deleting each candidate's 2 best trades cuts E ~40%.
+  RIDE-family win rate 55% vs CAP-family 67% (more scratch-loss trail-outs,
+  wins 3–4× bigger). Size for lumpiness; hard to hold live.
+- **Status: handoff written for an app session; live config update PENDING
+  (operator).** Verify whether the exit engine runs staged legs *live* or only
+  paper — if paper-only, deploy the best single shape (MID-T66, or CAP-T50-L80
+  for the de-risked/ceilinged version), both ≫ current +69.
+- Reaper (`backtest-reaper.timer`) was stopped for the whole p17→p18b3 arc;
+  arc complete, nothing queued — safe to restart.
+
+
+
+### p17 — 6 `orb_conviction` configs, completed 18:07 IST (155 min, 6/6 OK, `s6_p17`)
+
+Base = live `ORB_Convic_Paper` gate (confirm-bar + RSI PE<25 / CE>75 + PDT +
+w65 + cutoff 10:15), `--exit-mode current` top-level exit (.22 / .33 / .12 / .6),
+`--all-expiries --near-expiry-days 6`, `alice_index`. `analyze_walkforward.py`,
+OOS from 2026-04-01.
+
+**Strike-width Batch 2 (OC-C0 = ATM±3 control / NW1 = ±1 / NW2 = ±2)** —
+identical 39-trade entry set:
+
+| cfg | E/lot | PF | P(mean≤0) | slip@1.0% |
+|---|---|---|---|---|
+| OC-C0 (±3) | +6.7 | 1.04 | 0.452 | −72 |
+| OC-NW1 (±1) | −25.0 | 0.89 | 0.570 | −109 |
+| OC-NW2 (±2) | +12.2 | 1.07 | 0.426 | −69 |
+
+→ **p16's "ATM±1 helps ORB base" does NOT carry onto the conviction gate.**
+±1 is actively worse, ±2 ≈ ±3. **No change to live strike selection — stays
+ATM±3**; `dte_aware_strike_selection` stays dormant for ORB.
+
+**OR-width re-sweep — `require_prior_day_trend` ON** (the never-tested combo,
+open since 2026-09-01, "gates sizing ORB above 1 lot"):
+
+| cfg (`max_or_range_nifty_points`) | n | E/lot | PF | P(mean≤0) | IS | OOS | H1 / H2 | slip@1.0% |
+|---|---|---|---|---|---|---|---|---|
+| OW-55 | 32 | −32.9 | 0.84 | 0.592 | −114 | +86 | — | −109 |
+| OC-C0 (65, live) | 39 | +6.7 | 1.04 | 0.452 | −112 | +178 | mixed | −72 |
+| **OW-75** | 41 | **+64.2** | **1.47** | **0.189** | −4 | +170 | −1 / +157 | **−21** |
+| OW-85 | 45 | −112.9 | 0.65 | 0.696 | −18 | −243 | +6 / −249 | −223 |
+
+→ **the width peak is 75, not the live 65.** w75: highest E/PF, lowest
+P(mean≤0) (0.189, just outside the ~0.15 bar), IS flat-not-negative, both
+6-month halves non-negative, least slippage-fragile of the set. w55 too tight
+(chokes n), w85 lets in noise (reproduces the long-standing "wide range =
+noise"). Edge still concentrated in a ~17-trade OOS half — promising, not
+proven. w70 / w80 brackets added to p18b0 to confirm plateau-vs-spike.
+
+**Actionable:** (1) candidate live change `ORB_Convic_Live`/`Paper`
+`max_or_range_nifty_points` 65 → 75, pending w70/w80; (2) strongest evidence
+yet toward sizing ORB > 1 lot, but P 0.189 keeps it a judgment call; (3) p18
+base gate uses w75.
+
+### p18 — whole-day rolling breakout / trend / scalper (new idea; planning + Batch 0)
+
+**Idea (user):** generalise the live ORB conviction config from the fixed
+09:16–09:30 opening range to a **rolling intraday reference level**, fired all
+session — a whole-day breakout/trend/scalper strategy. **No time-of-day config
+axis** (explicit user call) — every config runs the full session; time-of-day
+is a post-hoc analysis slice only (by entry-hour / session-third / exit-hour /
+day-of-week). Data-ceiling note: re-entry (`max_entries_per_direction > 1`)
+breaks the `_fired_directions` 1/dir/day cap → scalper variants can reach
+~80–150+ trades vs the ~26–44 ORB-family norm; a widened `--near-expiry-days`
++ calendar-day dedup 2–4×'s calendar coverage as a directional cross-check.
+
+**Batches 1–6** (window · trigger · width-band · firing-policy · conviction-gates
+· exit-shape · strike) need a `breakout_reference_mode: "rolling"` extension to
+`ORBStrategy` / `ORBConvictionStrategy` (opt-in; byte-identical when off; new
+params `rolling_lookback_bars`, `rolling_{min,max}_range_*_points`,
+`max_entries_per_direction`, `reentry_cooldown_minutes`) — a box `app/` re-pin,
+**not yet built, gated on Batch 0**.
+
+**Batch 0 (RUN_TAG=p18b0) — launched 19:50 IST, 10 configs, SHARD_COUNT 4,
+ETA ~23:50 IST, `s6_p18b0`:**
+- `OW-70`, `OW-80` — the p17 OR-width completion (above).
+- `B0-L{20,30,45}-R{05,10}-M{15,30}` (8) — rolling-Donchian **mechanism
+  pre-screen** via the existing `atr_breakout` strategy (bare close-break of a
+  rolling N-bar high/low, no RSI / confirm-bar / PDT). Exit matched to live
+  ORB_Convic (.22 / .33 / .12 / .6), entry 09:30–15:00, VIX off.
+  `atr_expansion_min_ratio` 0.5 (gate ~neutered) vs 1.0 (= the 2026-08-28
+  as-abandoned control). **Q: was the Aug `atr_breakout` failure the Donchian
+  mechanism itself, or only the mandatory ATR-expansion gate?**
+- **Gate:** all `B0-*` deep-negative with the Aug fat-tail signature →
+  mechanism dead, don't build the rolling extension. Any near-breakeven / a
+  viable by-hour slice → build it, run Batches 1–6.
+
+**Harness change:** `atr_breakout` had no `SOURCE_MAP` entry in
+`resolve_and_qc.py` — added `"atr_breakout": "alice_index"` (box + local
+mirror; `resolve_and_qc.py.bak-p18b0` kept on box). Canonical baseline
+`_baseline_2026_09_05/` left as-is (a routine map extension, not a rebuild).
+First launch aborted cleanly at QC — config was in `~/backtest_engine/
+sweep_configs/`, but the canonical harness (run from `backend/scripts/`)
+resolves `sweep_configs/` relative to `backend/scripts/`; moved there,
+md5-verified, relaunched. Zero shards / zero DB leak from the aborted attempt.
+Mid-run health check: `OW-70 OK (40 trades)` — in the p17 OW band, so no
+source / near-expiry mixup; real DTE-6 near-expiry option symbols; VIX/ATR/
+PCR/OI columns populated; shard DBs for the current config only; no journal
+errors.
+
+
 ## 2026-09-08 (~12:45 IST) — p18s VWAP `--volume-source` smoke: verdict + unsynced-work triage
 
 ### p18s — `run_backtest.py --volume-source {same,futures}` splice, VWAP smoke (2 configs, `s6_p18s`, run ~05:37 IST)
