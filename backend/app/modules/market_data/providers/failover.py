@@ -906,22 +906,43 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             )
 
         if not backup_streaming:
-            # Nothing is gained by dwelling on a silent backup.
-            if primary_healthy:
-                self._promote_primary(
-                    now,
-                    reason=(
-                        f"backup {self._backup_name!r} is delivering no ticks and "
-                        f"{self._primary_name!r} is back"
-                    ),
-                )
-            else:
+            # Silent backup: subscribed, but no ticks are flowing (2026-09-08:
+            # failover tripped to Alice Blue, which then delivered nothing). A
+            # flapping primary and a silent backup are equally useless, so do
+            # NOT yank straight back the instant the primary delivers one tick
+            # -- make it hold healthy for the BASE stabilization window first.
+            # Reuses the same `_recovery_started_at` dwell machinery as the
+            # streaming path below, but deliberately NOT flap-escalated:
+            # minutes on end sitting on a silent backup would be worse than the
+            # flap it prevents (bounded worst case: one base window).
+            if not primary_healthy:
                 # Both legs silent -- do NOT oscillate onto a dead primary.
                 # The existing "both_down" alert and
                 # HealthCheckScheduler._check_market_data_staleness (5-min
                 # CRITICAL) already cover this; flipping would only add churn.
                 with self._lock:
                     self._recovery_started_at = None
+                return
+            with self._lock:
+                if self._recovery_started_at is None:
+                    self._recovery_started_at = now
+                    logger.info(
+                        "Failover recovery: %r back online while backup %r is silent "
+                        "— holding %.0fs before switching back",
+                        self._primary_name,
+                        self._backup_name,
+                        self._recovery_stabilization_seconds,
+                    )
+                    return
+                if (now - self._recovery_started_at) < self._recovery_stabilization_seconds:
+                    return
+            self._promote_primary(
+                now,
+                reason=(
+                    f"backup {self._backup_name!r} silent; {self._primary_name!r} "
+                    f"healthy for {self._recovery_stabilization_seconds:.0f}s"
+                ),
+            )
             return
 
         # Backup is streaming -- the normal anti-flap dwell applies, scaled

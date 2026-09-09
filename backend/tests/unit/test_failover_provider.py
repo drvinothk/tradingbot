@@ -424,8 +424,8 @@ def test_recovery_requires_the_full_stabilization_window(make_provider):
 
     # First healthy observation after the trip starts the recovery timer.
     # The backup keeps streaming throughout -- that's what makes the full
-    # anti-flap dwell apply (a *silent* backup collapses the dwell to 0, see
-    # test_silent_backup_switches_back_immediately).
+    # flap-escalated dwell apply (a *silent* backup holds only the base
+    # window, see test_silent_backup_holds_base_window_before_switching_back).
     recovery_start = clock.now
     backup.fire_tick(_tick())
     primary.fire_tick(_tick())
@@ -510,10 +510,12 @@ def test_recovery_disconnects_backup_and_flips_back(make_provider):
 # --- 2026-09-09 anti-flap hardening ----------------------------------------
 
 
-def test_silent_backup_with_healthy_primary_switches_back_immediately(make_provider):
-    """The 2026-09-08 hole: failover tripped to a backup that then delivered
-    no ticks, and the fixed dwell kept the feed there while a recovering
-    primary was ignored. A silent backup collapses the recovery dwell to 0.
+def test_silent_backup_holds_base_window_before_switching_back(make_provider):
+    """2026-09-09 revision of the 2026-09-08 fix. A silent backup used to
+    collapse the recovery dwell to 0 -- which let a 502-storming primary
+    thrash the feed back on every brief healthy blip. It now holds the
+    *base* stabilization window first (but never the flap-escalated one:
+    minutes sitting on a silent backup would be worse than the flap).
     """
     primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
     provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
@@ -521,12 +523,120 @@ def test_silent_backup_with_healthy_primary_switches_back_immediately(make_provi
 
     # Past the backup's first-tick grace, still no backup tick ever.
     clock.advance(_THRESHOLD + 1.0)
+    recovery_start = clock.now
+    primary.fire_tick(_tick())
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"  # timer armed, not switched
+
+    # Just short of the base window -- still on the backup.
+    clock.now = recovery_start + _RECOVERY - 1.0
+    primary.fire_tick(_tick())
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+
+    # Cross the base window -- back to primary, backup torn down.
+    clock.now = recovery_start + _RECOVERY + 1.0
+    primary.fire_tick(_tick())
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+    assert backup.disconnect_calls == 1
+
+
+def test_silent_backup_does_not_thrash_on_a_flapping_primary(make_provider):
+    """The real 2026-09-08 shape: the primary 502-storms (a brief healthy
+    blip, then silent again) while the backup stays silent too. Each lapse
+    resets the recovery timer, so the feed must NOT flip back on every blip
+    the way the collapse-to-0 behaviour did (it would have switched on the
+    very first blip below).
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+    clock.advance(_THRESHOLD + 1.0)  # past the backup first-tick grace
+
+    for _ in range(8):  # ~56s total -- well past _RECOVERY
+        primary.fire_tick(_tick())  # brief healthy blip
+        provider.run_once()
+        assert provider.active_provider_name == "angel_one"
+        clock.advance(_THRESHOLD + 2.0)  # primary silent again > threshold
+        provider.run_once()  # -> unhealthy -> recovery timer reset
+        assert provider.active_provider_name == "angel_one"
+
+
+def test_silent_backup_mid_dwell_discards_flap_escalation_credit(make_provider):
+    """2026-09-10 QC finding, confirmed as intentional (not a bug) after
+    reverting an attempted fix broke `test_recovery_disconnects_backup_and_
+    flips_back` / `test_clearing_override_resumes_automatic_recovery_not_
+    instant_snapback` -- both rely on the exact same cross-regime carryover
+    this test exercises at a higher flap level (they just don't expose it,
+    since they stay at flap level 0, where the base window and the
+    escalated window are numerically identical).
+
+    Sequence: the primary flaps to escalation level 2 (effective_dwell =
+    10x base), recovery arms while the backup is genuinely STREAMING (a
+    real, earned escalated-dwell commitment) -- then the backup goes
+    silent partway through, with the primary still healthy throughout.
+    `_recovery_started_at` is shared, un-reset, machinery across both
+    branches, so once the silent branch takes over it checks elapsed time
+    against only the BASE window, not the escalated one it was armed
+    under -- promoting as soon as *that* smaller bar is cleared, even
+    though the escalated bar was never reached.
+
+    This is `_check_recovery`'s documented policy taken to its logical
+    end: "deliberately NOT flap-escalated [while the backup is silent]:
+    minutes on end sitting on a silent backup would be worse than the
+    flap it prevents" applies regardless of how the timer was armed --
+    once the backup stops being useful, continuing to defer trust in the
+    primary on its account is judged not worth it, full stop. Do not
+    "fix" this without first re-checking the two sibling tests above.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    def _recover(dwell: float) -> None:
+        start = clock.now
+        _fire_both(primary, backup)
+        provider.run_once()
+        clock.now = start + dwell + 1.0
+        _fire_both(primary, backup)
+        provider.run_once()
+        assert provider.active_provider_name == "shoonya"
+
+    def _flap_primary() -> None:
+        clock.advance(_THRESHOLD + 1.0)
+        provider.run_once()
+        assert provider.active_provider_name == "angel_one"
+
+    # Reach flap level 2 (effective_dwell = 10x base = 200s), same recipe as
+    # test_recovery_dwell_escalates_after_repeated_primary_flaps.
+    _recover(_RECOVERY)
+    _flap_primary()
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY * (10.0 / 3.0) + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+    _flap_primary()  # now at flap level 2
+
+    # Arm recovery under the STREAMING path -- a real, earned 200s dwell.
+    recovery_start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+
+    # Just past the BASE window (20s) but nowhere near the 200s escalated
+    # one -- backup goes silent, primary stays healthy. Only fire primary.
+    clock.now = recovery_start + _RECOVERY + 1.0
     primary.fire_tick(_tick())
     provider.run_once()
 
-    # No dwell -- straight back to primary the moment it has a tick.
+    # Promotes on the base window alone -- the 200s flap-escalated
+    # commitment earned while the backup was streaming is discarded the
+    # moment it goes silent. Confirmed intentional, see docstring above.
     assert provider.active_provider_name == "shoonya"
-    assert backup.disconnect_calls == 1
 
 
 def test_both_legs_silent_does_not_oscillate(make_provider):
