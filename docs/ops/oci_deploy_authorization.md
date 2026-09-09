@@ -1313,3 +1313,63 @@ below the trade tables.
 **Rollback:** `sudo rm -rf /var/www/trading-bot/dist && sudo mv
 /var/www/trading-bot/dist.bak-20260909-173536 /var/www/trading-bot/dist && sudo
 chown -R www-data:www-data /var/www/trading-bot/dist`. No backend/migration to revert.
+
+---
+
+## PENDING prod-DB write — ORB conviction config update (w70 + 2-leg exit)
+
+**Emitted:** 2026-09-09 ~18:10 IST. Branch `ops/orb-conviction-w70-2leg-exit` @
+`1b2f155`, pushed to origin. NOT merged to `main`. **No code deploy, no
+migration, no restart** — `strategy_configs.params` is read fresh per auto-spawn
+/ per signal (`_apply_exit_leg_templates`). Classifier blocks the prod-DB write
+from Claude (psql and uploaded ORM script alike — same as every prior
+`strategy_configs` change in this log), so the operator runs the staged
+idempotent script.
+
+- **Target:** `144.24.137.112`, Postgres `trading_bot`, rows
+  `7329fdf0-aef6-4b11-bec2-385d1c3a5c81` (`ORB_Convic_Live`) +
+  `76b61473-075f-4b59-bb31-ab985195f255` (`ORB_Convic_Paper`), both
+  `orb_conviction` / NIFTY / `force_paper`.
+- **Change:** applies the 2026-09-09 p18b0–b3 backtest decision —
+  `max_or_range_nifty_points` 65→70; `exit_legs` 3-leg 25/25/50 (two uncapped
+  legs) → 2-leg 60/40 both hard-capped (core .20/.66/.18/.70,
+  runner .22/.50/.24/.80, `use_structure` kept); top-level fallback params →
+  Leg A. `qty_lots` (Live) and the entry gate carried verbatim. `runtime_mode`
+  / `_source` untouched. Full before/after + rollback JSON in
+  `docs/ops/orb_conviction_config_update_2026_09_09.md`.
+- **Tested (local):** `ruff` + `mypy` clean on the script;
+  `deserialize_exit_leg_templates` + `validate_exit_leg_templates` +
+  `_build_strategy` pass for both target param sets;
+  `allocate_leg_lots_floored` → n10 `[6,4]` / n3 `[2,1]` / n2 `[1,1]` /
+  n1 collapse. Script re-runs as a no-op once applied (idempotent).
+- **Safety gate:** 18:05 IST (market closed — formality). Live-checked:
+  **0 open positions** system-wide; all ORB_Convic StrategyRuns for the day
+  `stopped`. Session `fbdfeccd…` `live_enabled`/active but both target rows are
+  `force_paper` → they trade paper regardless.
+- **Backup:** the script prints each row's OLD `params` before writing; the
+  verbatim pre-change JSON is also in the change-note doc. Rollback = re-run
+  with the OLD dicts, or `psql UPDATE`.
+
+### Steps (operator, on the box)
+
+```
+# script already scp'd to /tmp/ (sha256
+# 9bbeb8f2d1a050e87cb9822b825ad409176c0d0f0cb9fa947e75d144ebcb2bfa,
+# box == local worktree); re-copy if stale:
+#   scp -i <key> backend/scripts/ops_update_orb_conviction_2leg_exit_2026_09_09.py \
+#       ubuntu@144.24.137.112:/tmp/
+
+cd /home/ubuntu/trading-bot/backend && \
+  .venv/bin/python /tmp/ops_update_orb_conviction_2leg_exit_2026_09_09.py
+```
+
+### Verify (Claude, over SSH, after the operator runs it)
+
+- `SELECT name, params FROM strategy_configs WHERE id IN (…)` — diff vs the
+  "Target params" block in the change note; `runtime_mode`/`_source` unchanged.
+- fresh enabled-config dump → `python scripts/qc_paper_configs_live.py rows.txt`
+  → `ALL STRUCTURAL CHECKS PASSED`.
+- fill in the "Applied" line of `orb_conviction_config_update_2026_09_09.md` +
+  this entry.
+
+Approve? (yes — operator runs the one command / no)
