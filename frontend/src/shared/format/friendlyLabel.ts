@@ -32,6 +32,21 @@ export function strategyTypeLabel(strategyType: string): string {
   return STRATEGY_TYPE_LABELS[strategyType] ?? strategyType
 }
 
+// Shoonya packs the tradable symbol as {UNDERLYING}{DDMMMYY}{P|C}{STRIKE}
+// (e.g. "NIFTY15SEP26P23500", "BANKNIFTY25AUG26C57900") -- the P/C wedged
+// between expiry and strike is hard to scan. Re-space it and move the option
+// type to the end as PE/CE: "NIFTY 15SEP26 23500 PE". Any symbol that isn't
+// in this exact shape (mock/synthetic universe, an already-friendly string)
+// is returned verbatim -- this is pure display polish and must never throw.
+const SHOONYA_CONTRACT_RE = /^([A-Z]+)(\d{1,2}[A-Z]{3}\d{2})([PC])(\d+(?:\.\d+)?)$/
+
+export function prettyContractSymbol(symbol: string): string {
+  const m = SHOONYA_CONTRACT_RE.exec(symbol)
+  if (!m) return symbol
+  const [, underlying, expiry, pc, strike] = m
+  return `${underlying} ${expiry} ${strike} ${pc === 'P' ? 'PE' : 'CE'}`
+}
+
 // 2026-09-04: `strategyName` (the config's own name, e.g.
 // "OI_Volume_Conviction") is now the primary identifier when available --
 // two configs of the same strategyType (e.g. "Test" and "Test 4", both
@@ -50,7 +65,10 @@ export function friendlyTradeLabel(
   const typeLabel = strategyTypeLabel(strategyType)
   const primaryLabel =
     strategyName && strategyName !== strategyType ? `${strategyName} (${typeLabel})` : typeLabel
-  const parts: (string | null)[] = [primaryLabel, instrumentSymbol ?? null]
+  const parts: (string | null)[] = [
+    primaryLabel,
+    instrumentSymbol ? prettyContractSymbol(instrumentSymbol) : null,
+  ]
   // The trade table has its own dedicated Entry/Exit time column, so once a
   // real contract is known (order/position rows) a trailing timestamp here
   // is just a duplicate of that column. Only the pending-approval fallback

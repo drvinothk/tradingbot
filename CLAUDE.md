@@ -633,8 +633,9 @@ work, or vice versa.
   from the no-arb bound); zero Rail 1 token-substitution lines so far
   (residual cause leans hypothesis 2 — Noren returning spot for a *correct*
   token — pending a couple of days of the `no_book`/`no_arb` split).
-  Frontend `ControlRoomPage.tsx` 1-liner (attention-set) not deployed yet
-  (cosmetic; next FE bundle). Shoonya's `GetOptionChain` + per-strike `GetQuotes`
+  Frontend `ControlRoomPage.tsx` 1-liner (`option_chain_degraded` in the
+  attention-set) shipped with the 2026-09-09 Kill Switch bundle (`1e78b5f`,
+  `index-Dh2z6QSI.js`) — confirmed live. Shoonya's `GetOptionChain` + per-strike `GetQuotes`
   routinely returns `ltp ≈ spot, bid=ask=vol=0` for some strikes (incl.
   ~ATM 0-DTE); the 2026-09-03 plausibility guard drops them but noisily (an
   `ERROR` per row per ~60s). Built structural rails so the guard is the

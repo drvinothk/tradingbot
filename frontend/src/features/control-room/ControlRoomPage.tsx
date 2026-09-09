@@ -587,7 +587,20 @@ function TodaysActivityCard({
     <div className="card">
       <div className="card-header">
         <h3>Today&apos;s Activity</h3>
-        <span className="badge badge-success">Live</span>
+        {/* Scope pill + the Paper visibility toggle, together on the right so
+            it's obvious the checkbox is what adds the "Paper" sub-strip
+            (it used to be a lone checkbox in a card footer -- easy to miss). */}
+        <span className="row-actions">
+          <span className="badge badge-success">{showPaper ? 'Live + Paper' : 'Live'}</span>
+          <label className="paper-toggle">
+            <input
+              type="checkbox"
+              checked={showPaper}
+              onChange={(e) => handleShowPaperChange(e.target.checked)}
+            />
+            Paper
+          </label>
+        </span>
       </div>
       <div className="metrics-strip">
         <ActivityMetricsBoxes metrics={liveMetrics} />
@@ -600,35 +613,24 @@ function TodaysActivityCard({
           </div>
         </>
       )}
-      <div className="card-footer-row">
-        <label className="paper-toggle">
-          <input
-            type="checkbox"
-            checked={showPaper}
-            onChange={(e) => handleShowPaperChange(e.target.checked)}
-          />
-          Paper
-        </label>
-      </div>
     </div>
   )
 }
 
-// 2026-09-04: renamed from TotalPnlRow -- was the muted summary line under
-// the two prominent boxes, showing Total P&L (now Actual P&L, promoted to
-// the prominent box below) + Per Lot. Swapped per explicit user request:
-// this row now shows Realized P&L (renamed from "Realized Profit", which
-// used to be one of the two prominent boxes) instead. Per Lot now divides
-// actualPnl (net of cost), not this row's own realizedPnl -- see
-// ScopeMetrics.perLotPnl's own comment for why.
-function RealizedPnlRow({ metrics }: { metrics: ScopeMetrics }) {
+// The muted summary line squeezed into the P&L box. 2026-09-09: shows
+// Actual P&L (gross realized+unrealized, minus closed-trade cost -- see
+// ScopeMetrics.actualPnl) + Per Lot (which divides Actual), demoted here
+// from the prominent slot so the headline can be the gross Realized P&L an
+// operator expects. Per Lot now sits right next to its own numerator.
+// (History: TotalPnlRow -> RealizedPnlRow 2026-09-04 -> ActualPnlRow here.)
+function ActualPnlRow({ metrics }: { metrics: ScopeMetrics }) {
   if (metrics.sessionId === null) return null
   return (
     <div className="total-pnl-row muted">
-      Realized P&amp;L{' '}
-      <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-        {metrics.realizedPnl >= 0 ? '+' : ''}
-        {fmtAmt(metrics.realizedPnl)}
+      Actual P&amp;L{' '}
+      <span className={metrics.actualPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+        {metrics.actualPnl >= 0 ? '+' : ''}
+        {fmtAmt(metrics.actualPnl)}
       </span>
       {metrics.perLotPnl !== null && (
         <>
@@ -671,23 +673,24 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
 
   return (
     <>
-      {/* 2026-09-04: Actual P&L (left) / Unrealized P&L (middle) / Cost+Win
-          Rate (right, stacked -- same overall box height as the two main
-          columns, smaller font to fit two label+value pairs in that
-          space). Actual P&L (swapped in from the muted row, renamed from
-          "Total P&L") is the one figure on this page with cost netted in --
-          see ScopeMetrics.actualPnl's own comment. Realized P&L (renamed
-          from "Realized Profit") moved down to the muted row below,
-          alongside Per Lot -- see RealizedPnlRow. */}
+      {/* Realized P&L (left) / Unrealized P&L (middle) / Cost+Win Rate
+          (right, stacked -- same overall box height as the two main columns,
+          smaller font to fit two label+value pairs in that space).
+          2026-09-09: the prominent slot shows Realized P&L (gross, closed
+          trades -- the number an operator expects as the headline);
+          Actual P&L (the one figure with cost netted in -- see
+          ScopeMetrics.actualPnl) moved down to the muted row below, next to
+          Per Lot (which divides Actual, so they now sit together -- see
+          ActualPnlRow). Reverts the 2026-09-04 swap per operator request. */}
       <div className="metric-box metric-box-split metric-box-wide">
         <div className="metric-box-pnl-group">
           <div className="metric-box-pnl-values">
             <div className="metric-box-main">
-              <div className="metric-label">Actual P&amp;L</div>
+              <div className="metric-label">Realized P&amp;L</div>
               <div className="metric-value">
-                <span className={metrics.actualPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
-                  {metrics.actualPnl >= 0 ? '+' : ''}
-                  {fmtAmt(metrics.actualPnl)}
+                <span className={metrics.realizedPnl >= 0 ? 'pnl-positive' : 'pnl-negative'}>
+                  {metrics.realizedPnl >= 0 ? '+' : ''}
+                  {fmtAmt(metrics.realizedPnl)}
                 </span>
               </div>
             </div>
@@ -701,7 +704,7 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
               </div>
             </div>
           </div>
-          <RealizedPnlRow metrics={metrics} />
+          <ActualPnlRow metrics={metrics} />
         </div>
         <div className="metric-box-stacked">
           <div className="metric-box-stacked-item">
@@ -763,90 +766,43 @@ function ActivityMetricsBoxes({ metrics }: { metrics: ScopeMetrics }) {
 }
 
 const RUN_STATUS_LABELS: Record<string, string> = {
-  scanning: 'Scanning',
-  in_position: 'In Position',
-  paused: 'Paused',
-  stopped: 'Stopped',
+  scanning: 'scanning',
+  in_position: 'in position',
+  paused: 'paused',
+  stopped: 'stopped',
 }
 
-const FRESHNESS_BADGE_CLASS: Record<string, string> = {
-  live: 'badge-success',
-  degraded: 'badge-warning',
-  stale: 'badge-live',
-  dead: 'badge-live',
-}
+const RUN_STATUS_SUMMARY_ORDER = ['scanning', 'in_position', 'paused', 'stopped']
 
-// A strategy is healthy if it's actively working (scanning/in_position) and
-// its data isn't stale/dead -- `data_freshness === null` (no live runner
-// registered, e.g. briefly right after a restart) is treated as healthy
-// too, since it's not evidence of a problem on its own.
-function isStrategyHealthy(run: RunningStrategyOut): boolean {
-  const statusOk = run.status === 'scanning' || run.status === 'in_position'
-  const freshnessOk = run.data_freshness === null || run.data_freshness === 'live' || run.data_freshness === 'degraded'
-  return statusOk && freshnessOk
-}
-
+// 2026-09-09: collapsed to a one-line summary. The old expandable per-strategy
+// table (Status + a data_freshness "Feed" column) duplicated Market Terminal's
+// richer Signal Panel, and its freshness-based "N of M need a look" verdict
+// fired a false alarm every session open / post-restart -- `data_freshness`
+// legitimately reads stale/dead for the first minutes while a run is happily
+// Scanning. Genuine problems (a stalled runner, a dead feed during market
+// hours) still surface in the AttentionCard beside this one, off backend
+// alerts that carry their own self-healing grace. Per-run scan/reason/
+// candidate detail lives in Market Terminal's Signal Panel.
 function StrategyStatusCard({ runs }: { runs: RunningStrategyOut[] }) {
-  const unhealthy = runs.filter((r) => !isStrategyHealthy(r))
-  const [expanded, setExpanded] = useState(unhealthy.length > 0)
-
-  useEffect(() => {
-    if (unhealthy.length > 0) setExpanded(true)
-  }, [unhealthy.length])
+  const counts = runs.reduce<Record<string, number>>((acc, run) => {
+    acc[run.status] = (acc[run.status] ?? 0) + 1
+    return acc
+  }, {})
+  const summary = [
+    ...RUN_STATUS_SUMMARY_ORDER.filter((s) => counts[s]),
+    ...Object.keys(counts).filter((s) => !RUN_STATUS_SUMMARY_ORDER.includes(s)),
+  ]
+    .map((s) => `${counts[s]} ${RUN_STATUS_LABELS[s] ?? s}`)
+    .join(', ')
 
   return (
     <div className="card">
-      <div className="collapsible-header" onClick={() => setExpanded((v) => !v)}>
+      <div className="card-header">
         <h3>Strategy Status</h3>
-        <span className={`chevron ${expanded ? 'open' : ''}`}>▶</span>
       </div>
-      {runs.length === 0 ? (
-        <p className="muted">No strategies running.</p>
-      ) : unhealthy.length === 0 ? (
-        <p className="muted">
-          <span className="badge badge-success">OK</span> All {runs.length} strateg
-          {runs.length === 1 ? 'y' : 'ies'} scanning normally.
-        </p>
-      ) : (
-        <p className="muted">
-          <span className="badge badge-live">Attention</span> {unhealthy.length} of {runs.length}{' '}
-          strateg{runs.length === 1 ? 'y' : 'ies'} need{unhealthy.length === 1 ? 's' : ''} a look.
-        </p>
-      )}
-      {expanded && runs.length > 0 && (
-        <table>
-          <thead>
-            <tr>
-              <th>Strategy</th>
-              <th>Status</th>
-              <th>Feed</th>
-            </tr>
-          </thead>
-          <tbody>
-            {runs.map((run) => (
-              <tr key={run.strategy_run_id}>
-                <td>
-                  {run.strategy_name} <span className="muted">({strategyTypeLabel(run.strategy_type)})</span>
-                </td>
-                <td>
-                  <span className={isStrategyHealthy(run) ? 'badge' : 'badge badge-live'}>
-                    {RUN_STATUS_LABELS[run.status] ?? run.status}
-                  </span>
-                </td>
-                <td>
-                  {run.data_freshness !== null ? (
-                    <span className={`badge ${FRESHNESS_BADGE_CLASS[run.data_freshness] ?? 'badge'}`}>
-                      {run.data_freshness}
-                    </span>
-                  ) : (
-                    <span className="muted">—</span>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+      <p className="muted">
+        {runs.length === 0 ? 'No strategies running.' : `${runs.length} running — ${summary}`}
+      </p>
     </div>
   )
 }

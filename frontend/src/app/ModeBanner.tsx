@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '../shared/api/client'
 import { useActiveSessionMode } from '../shared/hooks/useActiveSessionMode'
 import { FeedLatencyBadge } from '../shared/components/FeedLatencyBadge'
+import { isWithinMarketHoursIST } from '../shared/time/ist'
 import type { ProviderPreferenceOut } from '../shared/api/types'
 
 // 2026-09-08 (paper/live inversion): live_enabled is now the normal resting
@@ -54,18 +55,29 @@ export function ModeBanner() {
   // Broker/REST -- the order-execution path (this is what actually places
   // orders), kept separate from WS feed health above: REST failing blocks
   // live order placement even if market data is still fine via a WS
-  // failback. Three states mapped from the two booleans /shoonya/status
-  // actually gives us: no valid session at all -> red "Not Connected";
-  // session valid and data flowing -> green "Connected"; session valid but
-  // no fresh data yet (a reconnect/retry in progress) -> amber
-  // "Connecting...". badge-live is this app's standing "something's wrong"
-  // red (reused for a stale/dead feed, a rejected trade, etc.).
-  const brokerClass = !shoonyaSessionValid ? 'badge-live' : shoonyaConnected ? 'badge-success' : 'badge-warning'
+  // failback. States mapped from the two booleans /shoonya/status actually
+  // gives us: no valid session at all -> red "Not Connected"; session valid
+  // and data flowing -> green "Connected"; session valid but no fresh data.
+  // That last case is only worth an amber "Connecting..." *during* market
+  // hours -- outside them a valid-but-quiet feed is the normal resting state
+  // every evening/weekend, so it reads as a neutral "Idle - market closed"
+  // instead of nagging indefinitely. badge-live is the standing
+  // "something's wrong" red (rejected trade, dead feed during hours, etc.).
+  const marketOpen = isWithinMarketHoursIST()
+  const brokerClass = !shoonyaSessionValid
+    ? 'badge-live'
+    : shoonyaConnected
+      ? 'badge-success'
+      : marketOpen
+        ? 'badge-warning'
+        : 'badge'
   const brokerText = !shoonyaSessionValid
     ? 'Broker: Shoonya (Not Connected)'
     : shoonyaConnected
       ? 'Broker: Shoonya (Connected)'
-      : 'Broker: Shoonya (Connecting...)'
+      : marketOpen
+        ? 'Broker: Shoonya (Connecting...)'
+        : 'Broker: Shoonya (Idle — market closed)'
 
   return (
     <div className={`mode-banner${isAlarming ? ' mode-banner-alarm' : ''}`}>

@@ -9,7 +9,7 @@ import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
 import { useReconciliationRuns, useSystemAlerts } from '../../shared/hooks/useRecovery'
 import { useDailyLimits, useSetDailyLimits } from '../../shared/hooks/useDailyLimits'
 import { type AlertIncident, groupAlertsIntoIncidents } from '../../shared/alerts/groupAlerts'
-import { strategyTypeLabel } from '../../shared/format/friendlyLabel'
+import { prettyContractSymbol, strategyTypeLabel } from '../../shared/format/friendlyLabel'
 import type {
   DailyLimitsOut,
   ExecutionMode,
@@ -1816,7 +1816,7 @@ function BackendRestartCard() {
               {blockedPositions.map((position, i) => (
                 <tr key={i}>
                   <td>{position.trading_session_id}</td>
-                  <td>{position.contract_symbol}</td>
+                  <td>{prettyContractSymbol(position.contract_symbol)}</td>
                   <td>{position.qty}</td>
                 </tr>
               ))}

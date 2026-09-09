@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { CandleOut, UnderlyingSymbol } from '../../shared/api/types'
 import { useCandles } from '../../shared/hooks/useCandles'
 import { useInstruments } from '../../shared/hooks/useInstruments'
+import { IST_OFFSET_SECONDS } from '../../shared/time/ist'
 
 const INTERVALS: { label: string; minutes: number }[] = [
   { label: '1m', minutes: 1 },
@@ -109,7 +110,13 @@ export function PriceChart({ underlying }: { underlying: UnderlyingSymbol }) {
     if (!series) return
     series.setData(
       bars.map((bar) => ({
-        time: Math.floor(new Date(bar.bucket_start).getTime() / 1000) as UTCTimestamp,
+        // lightweight-charts has no timezone option -- it renders a
+        // UTCTimestamp on the axis/crosshair in UTC. Shift by +05:30 so an
+        // intraday NSE chart reads in IST wall-clock. resample() above still
+        // buckets on the true epoch; only these display timestamps move, and
+        // nothing else in this app reads `time` back off the series.
+        time: (Math.floor(new Date(bar.bucket_start).getTime() / 1000) +
+          IST_OFFSET_SECONDS) as UTCTimestamp,
         open: bar.open,
         high: bar.high,
         low: bar.low,

@@ -740,15 +740,8 @@ tbody tr:hover {
   text-align: left;
 }
 
-/* Bottom-right footer strip holding the Paper visibility toggle -- kept to
-   a single thin row so ticking/unticking Paper never changes the card's
-   own height, only whether the substrip above this row is present. */
-.card-footer-row {
-  display: flex;
-  justify-content: flex-end;
-  margin-top: 0.6rem;
-}
-
+/* The Paper visibility toggle -- lives in the Today's Activity card header
+   (next to the scope pill) as of 2026-09-09. */
 .paper-toggle {
   display: flex;
   align-items: center;
@@ -1046,14 +1039,16 @@ tbody tr:hover {
 }
 
 /* ---------- Audit ticker ---------- */
+/* A [WIP] placeholder strip -- no live event stream behind it yet. Sits at
+   the natural end of the page (NOT position:sticky) so it can't float over
+   the trade tables above it; the opaque background is ready for when it's
+   re-pinned once the real /audit stream is wired up. */
 .audit-ticker {
   border-top: 1px solid var(--border);
-  background: rgba(11, 9, 20, 0.9);
+  background: #0b0914;
   padding: 0.45rem 0;
   overflow: hidden;
   white-space: nowrap;
-  position: sticky;
-  bottom: 0;
 }
 
 .audit-ticker-track {
