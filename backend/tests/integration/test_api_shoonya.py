@@ -791,6 +791,32 @@ def test_run_post_login_background_work_isolates_step_failures(monkeypatch, engi
     assert bootstrap_calls == [None]
 
 
+def test_run_post_login_background_work_ends_with_a_backend_restart(monkeypatch, engine):
+    """2026-09-09: a manual Shoonya reconnect (browser OAuth) always finishes
+    with a clean process restart -- the operator's explicit ask.
+    """
+    monkeypatch.setattr(shoonya_module, "sync_instrument_master", lambda *a, **k: None)
+    monkeypatch.setattr(shoonya_module, "_seed_option_anchors", lambda *a, **k: None)
+    monkeypatch.setattr("app.modules.market_data.registry.reset_for_reconnect", lambda: None)
+    import app.modules.session.bootstrapper as bootstrapper_module
+
+    monkeypatch.setattr(bootstrapper_module, "run_daily_bootstrap", lambda: None)
+
+    restart_calls: list[str] = []
+    monkeypatch.setattr(
+        "app.core.restart.schedule_backend_restart",
+        lambda reason="": restart_calls.append(reason) or True,
+    )
+
+    shoonya_module._run_post_login_background_work(
+        object(),
+        market_data_provider="shoonya",
+        session_factory=sessionmaker(bind=engine, future=True),
+    )
+
+    assert restart_calls == ["manual Shoonya reconnect"]
+
+
 def test_run_post_login_background_work_uses_its_own_session_not_the_request_session(
     monkeypatch, engine
 ):

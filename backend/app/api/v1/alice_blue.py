@@ -59,19 +59,10 @@ def _run_alice_blue_post_login_refresh() -> None:
     from app.config.settings import get_settings
 
     settings = get_settings()
-    if not settings.market_data.failover_enabled:
-        # Alice Blue as primary (no failover): rebuild the ingestion chain,
-        # same as the Shoonya callback does for a Shoonya-primary reconnect.
-        if settings.market_data.provider == "alice_blue":
-            from app.modules.market_data.registry import reset_for_reconnect
-
-            try:
-                reset_for_reconnect()
-            except Exception:
-                logger.exception("post-login Alice Blue reset_for_reconnect failed")
-        return
-
-    if settings.market_data.failover_backup_provider == "alice_blue":
+    if (
+        settings.market_data.failover_enabled
+        and settings.market_data.failover_backup_provider == "alice_blue"
+    ):
         from app.modules.market_data.provider_composition import reset_alice_blue_backup_leg
 
         try:
@@ -79,12 +70,20 @@ def _run_alice_blue_post_login_refresh() -> None:
         except Exception:
             logger.exception("post-login Alice Blue backup-leg refresh failed")
     elif settings.market_data.provider == "alice_blue":
+        # Alice Blue as primary: rebuild the ingestion chain, same as the
+        # Shoonya callback does for a Shoonya-primary reconnect.
         from app.modules.market_data.registry import reset_for_reconnect
 
         try:
             reset_for_reconnect()
         except Exception:
             logger.exception("post-login Alice Blue reset_for_reconnect failed")
+
+    # 2026-09-09: a browser OAuth login ("Manual reconnect") always finishes
+    # with a clean process restart -- same rationale as the Shoonya callback.
+    from app.core.restart import schedule_backend_restart
+
+    schedule_backend_restart(reason="manual Alice Blue reconnect")
 
 
 def _spawn_alice_blue_post_login_refresh() -> None:

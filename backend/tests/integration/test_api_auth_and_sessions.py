@@ -22,7 +22,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 
 from app.core.db.session import get_db
-from app.core.modes import transition_mode
+from app.core.modes import enter_kill_switch, transition_mode
 from app.core.security.passwords import hash_password
 from app.domain.identity.models import (
     BrokerAccount,
@@ -247,30 +247,14 @@ def test_create_session_uses_dedicated_budget_default_not_loss_cap(
     assert defaults.default_budget != defaults.daily_loss_cap
 
 
-def test_kill_switch_accepts_reason_in_json_body(api_client: TestClient, seeded_admin):
-    api_client.post(
-        "/api/v1/auth/login",
-        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
-    )
-    create_resp = api_client.post(
-        "/api/v1/sessions",
-        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
-    )
-    session_id = create_resp.json()["id"]
-
-    response = api_client.post(
-        f"/api/v1/sessions/{session_id}/kill-switch",
-        json={"reason": "api test reason"},
-    )
-    assert response.status_code == 200
-    assert response.json()["mode"] == "kill_switch"
-
-
-def test_recover_from_kill_switch_restores_paper_only(api_client: TestClient, seeded_admin):
-    """Regression test for a real live incident: entering kill_switch had a
-    button in the UI, but recovering from it (a legal edge in transitions.py
-    from day one) had no endpoint at all -- a session kill-switched by
-    mistake had no way back except this one.
+def test_kill_switch_squares_off_live_then_switches_to_paper(
+    api_client: TestClient, seeded_admin
+):
+    """2026-09-09 redesign: the manual Kill Switch button squares off open
+    LIVE positions and drops the session to paper_only -- it does NOT enter
+    the sticky `kill_switch` mode any more, so Go Live resumes with no
+    recovery step. (A fresh session has nothing live open, so
+    live_positions_closed is 0 here.)
     """
     api_client.post(
         "/api/v1/auth/login",
@@ -280,7 +264,109 @@ def test_recover_from_kill_switch_restores_paper_only(api_client: TestClient, se
         "/api/v1/sessions",
         json={"broker_account_id": str(seeded_admin["broker_account_id"])},
     ).json()["id"]
-    api_client.post(f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"})
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/kill-switch",
+        json={"reason": "api test reason"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mode"] == "paper_only"
+    assert body["live_positions_closed"] == 0
+    assert "restarting" in body
+
+    # No recovery step -- Go Live works straight away.
+    assert api_client.post(f"/api/v1/sessions/{session_id}/go-live").status_code == 200
+
+
+def test_kill_switch_schedules_a_restart_and_audits(
+    api_client: TestClient, seeded_admin, engine, monkeypatch
+):
+    import app.api.v1.sessions as sessions_module
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        sessions_module, "schedule_backend_restart", lambda reason="": calls.append(reason) or True
+    )
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+
+    body = api_client.post(
+        f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"}
+    ).json()
+    assert body["restarting"] is True
+    assert calls == ["kill switch"]
+
+    from app.domain.audit.models import AuditEvent
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        events = (
+            db.query(AuditEvent)
+            .filter(
+                AuditEvent.trading_session_id == uuid.UUID(session_id),
+                AuditEvent.event_type == "kill_switch.square_off",
+            )
+            .all()
+        )
+        assert len(events) == 1
+        assert events[0].payload["live_positions_closed"] == 0
+        assert events[0].payload["from_mode"] == "live_enabled"
+
+
+def test_kill_switch_rejects_from_an_emergency_mode(
+    api_client: TestClient, seeded_admin, engine
+):
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        ts = db.get(TradingSession, uuid.UUID(session_id))
+        assert ts is not None
+        enter_kill_switch(db, ts, TransitionTriggerType.RISK, reason="loss cap")
+        db.commit()
+
+    response = api_client.post(
+        f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"}
+    )
+    assert response.status_code == 409
+
+
+def test_recover_from_kill_switch_restores_paper_only(
+    api_client: TestClient, seeded_admin, engine
+):
+    """`recover_from_kill_switch` is still the way out of a *Risk-triggered*
+    kill_switch (daily-loss-cap breach). The manual Kill Switch button no
+    longer produces that mode, so drive the session into it directly.
+    """
+    api_client.post(
+        "/api/v1/auth/login",
+        json={"email": seeded_admin["email"], "password": ADMIN_PASSWORD},
+    )
+    session_id = api_client.post(
+        "/api/v1/sessions",
+        json={"broker_account_id": str(seeded_admin["broker_account_id"])},
+    ).json()["id"]
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        ts = db.get(TradingSession, uuid.UUID(session_id))
+        assert ts is not None
+        enter_kill_switch(db, ts, TransitionTriggerType.RISK, reason="loss cap")
+        db.commit()
 
     response = api_client.post(f"/api/v1/sessions/{session_id}/recover-from-kill-switch")
     assert response.status_code == 200
@@ -704,16 +790,24 @@ def test_go_live_is_idempotent_when_already_live(api_client: TestClient, seeded_
     assert response.json()["mode"] == "live_enabled"
 
 
-def test_go_live_rejects_from_kill_switch(api_client: TestClient, seeded_admin):
+def test_go_live_rejects_from_kill_switch(api_client: TestClient, seeded_admin, engine):
+    """A *Risk-triggered* kill_switch still needs its dedicated recovery
+    endpoint -- Go Live must not bypass it. (The manual Kill Switch button
+    no longer produces this mode; drive it directly.)
+    """
     session_id = _login_and_create_session(api_client, seeded_admin)
-    api_client.post(f"/api/v1/sessions/{session_id}/kill-switch", json={"reason": "test"})
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        ts = db.get(TradingSession, uuid.UUID(session_id))
+        assert ts is not None
+        enter_kill_switch(db, ts, TransitionTriggerType.RISK, reason="loss cap")
+        db.commit()
 
     response = api_client.post(f"/api/v1/sessions/{session_id}/go-live")
     assert response.status_code == 409
 
     # Must not have silently changed the session's mode on the way to
-    # rejecting -- the whole point is that kill_switch needs its own
-    # dedicated recovery endpoint, not a bypass through this one.
+    # rejecting -- kill_switch needs its own dedicated recovery endpoint.
     get_resp = api_client.get(f"/api/v1/sessions/{session_id}")
     assert get_resp.json()["mode"] == "kill_switch"
 

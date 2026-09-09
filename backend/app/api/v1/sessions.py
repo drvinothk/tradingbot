@@ -20,7 +20,6 @@ from app.core.db.session import get_db
 from app.core.locking import LOCK_EXECUTION_SINGLETON, advisory_lock
 from app.core.modes import (
     ModeTransitionError,
-    enter_kill_switch,
     recover_from_degraded,
     set_master_trading_mode,
     transition_mode,
@@ -28,6 +27,7 @@ from app.core.modes import (
 from app.core.modes import (
     recover_from_reconciliation_lock as sm_recover_from_reconciliation_lock,
 )
+from app.core.restart import schedule_backend_restart
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.broker.models import BrokerSyncState, ReconciliationRun, ReconciliationTrigger
@@ -44,7 +44,7 @@ from app.domain.session.models import (
 from app.domain.strategy.models import StrategyRun, StrategyRunStatus
 from app.modules.audit_service.service import record_event
 from app.modules.reconciliation.service import run_full_reconciliation
-from app.modules.scheduler.eod_square_off import run_eod_square_off
+from app.modules.scheduler.eod_square_off import run_eod_square_off, run_kill_switch_square_off
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 broker_accounts_router = APIRouter(prefix="/broker-accounts", tags=["broker-accounts"])
@@ -78,6 +78,12 @@ class BrokerAccountOut(BaseModel):
 
 class KillSwitchRequest(BaseModel):
     reason: str = "manual kill switch"
+
+
+class KillSwitchResultOut(BaseModel):
+    mode: str
+    live_positions_closed: int
+    restarting: bool
 
 
 class DailyPlanRequest(BaseModel):
@@ -543,23 +549,85 @@ def recover_from_reconciliation_lock(
     return {"recovered": True, "session": SessionOut.model_validate(trading_session).model_dump()}
 
 
-@router.post("/{session_id}/kill-switch", response_model=SessionOut)
+@router.post("/{session_id}/kill-switch", response_model=KillSwitchResultOut)
 def trigger_kill_switch(
     session_id: uuid.UUID,
     body: KillSwitchRequest,
     db: Session = Depends(get_db),
     user: User = Depends(require_permission("session.stop")),
-) -> TradingSession:
+) -> KillSwitchResultOut:
+    """The operator's manual Kill Switch (2026-09-09 redesign). Master
+    square-off of every open **LIVE** position, then drop the session to
+    `paper_only` (paper strategies keep running — use Go Live to resume
+    live), then restart the backend to clear any transient state.
+
+    Deliberately no longer enters the sticky `kill_switch` *mode* — that
+    mode still exists and is still where Risk Service's automatic
+    daily-loss-cap breach lands (a hard stop that needs
+    `/recover-from-kill-switch`). This endpoint is the low-friction manual
+    control: after it, no recovery step is needed.
+
+    Refuses (409) from `kill_switch` / `degraded_mode` / `reconciliation_lock`
+    — those have their own dedicated recovery flows — and does so **before**
+    any square-off, so a rejected call never half-executes.
+    """
     trading_session = _get_session_or_404(db, user, session_id)
-    try:
-        enter_kill_switch(
-            db, trading_session, TransitionTriggerType.MANUAL, actor_user=user, reason=body.reason
+    from_mode = SafeMode(trading_session.mode)
+
+    emergency_modes = (
+        SafeMode.KILL_SWITCH,
+        SafeMode.DEGRADED_MODE,
+        SafeMode.RECONCILIATION_LOCK,
+    )
+    if from_mode in emergency_modes:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"session is in {from_mode.value} — use its Reconciliation & Recovery flow, "
+            "not the kill switch",
         )
-    except ModeTransitionError as exc:
+
+    outcomes = run_kill_switch_square_off(db, None, trading_session)
+
+    try:
+        set_master_trading_mode(
+            db,
+            trading_session,
+            "paper",
+            TransitionTriggerType.MANUAL,
+            actor_user=user,
+            reason="kill switch — squared off live, switched to paper",
+        )
+    except ModeTransitionError as exc:  # pragma: no cover - emergency modes already 409'd above
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.MANUAL_OVERRIDE,
+        event_type="kill_switch.square_off",
+        entity_type="trading_session",
+        entity_id=trading_session.id,
+        trading_session_id=trading_session.id,
+        payload={
+            "live_positions_closed": len(outcomes),
+            "from_mode": from_mode.value,
+            "reason": body.reason,
+        },
+    )
     db.commit()
     db.refresh(trading_session)
-    return trading_session
+
+    restarting = False
+    if from_mode == SafeMode.LIVE_ENABLED:
+        restarting = schedule_backend_restart(reason="kill switch")
+
+    return KillSwitchResultOut(
+        mode=trading_session.mode,
+        live_positions_closed=len(outcomes),
+        restarting=restarting,
+    )
 
 
 @router.post("/{session_id}/go-live", response_model=SessionOut)

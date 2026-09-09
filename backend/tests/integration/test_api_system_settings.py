@@ -161,6 +161,26 @@ def _login(api_client: TestClient, seeded_admin) -> None:
     )
 
 
+def _grant_permission(engine, seeded_admin, code: str) -> None:
+    """`seeded_admin` in this file only carries `risk.override`. A few
+    endpoints (e.g. reconnect-brokers-auto) sit at the lower `session.start`
+    connectivity tier -- add it to that role for those tests. The new
+    Permission id is appended to `seeded_admin["permission_ids"]` so the
+    fixture's own teardown deletes it (otherwise it leaks a `session.start`
+    row that a later test file's own Permission insert then collides with).
+    """
+    from app.domain.identity.models import Permission, RolePermission
+
+    session_factory = sessionmaker(bind=engine, future=True)
+    with session_factory() as db:
+        perm = Permission(id=uuid.uuid4(), code=code, description="")
+        db.add(perm)
+        db.flush()
+        db.add(RolePermission(role_id=seeded_admin["role_id"], permission_id=perm.id))
+        db.commit()
+        seeded_admin["permission_ids"].append(perm.id)
+
+
 def test_get_requires_login(api_client: TestClient):
     response = api_client.get("/api/v1/system-settings/instrument-firewall")
     assert response.status_code == 401
@@ -831,3 +851,86 @@ def test_boot_status_returns_current_process_boot_id(api_client: TestClient):
 
     assert response.status_code == 200
     assert response.json()["boot_id"] == system_settings_module._BOOT_ID
+
+
+# -- POST /system-settings/reconnect-brokers-auto --------------------------------
+
+
+def test_reconnect_brokers_auto_requires_login(api_client: TestClient):
+    assert api_client.post("/api/v1/system-settings/reconnect-brokers-auto").status_code == 401
+
+
+def test_reconnect_brokers_auto_refused_off_linux(
+    api_client: TestClient, seeded_admin, monkeypatch, engine
+):
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Windows")
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+
+    resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+
+    assert resp.status_code == 400
+    assert "Manual reconnect" in resp.json()["detail"]
+
+
+def test_reconnect_brokers_auto_refused_when_engine_not_installed(
+    api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
+):
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
+    # Point BACKEND_ROOT_DIR at a dir with no autologin/ package.
+    monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+
+    resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+
+    assert resp.status_code == 400
+    assert "not installed" in resp.json()["detail"]
+
+
+def test_reconnect_brokers_auto_launches_the_engine_detached(
+    api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
+):
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
+    engine_dir = tmp_path / "autologin"
+    engine_dir.mkdir()
+    (engine_dir / "__main__.py").write_text("")
+    monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        system_settings_module.subprocess,
+        "Popen",
+        lambda argv, **kw: calls.append({"argv": list(argv), "kw": kw}),
+    )
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+
+    resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+
+    assert resp.status_code == 200
+    assert resp.json()["triggered"] is True
+    assert len(calls) == 1
+    assert calls[0]["argv"][1:] == ["-m", "autologin", "--force"]
+    assert calls[0]["kw"].get("start_new_session") is True
+
+
+def test_reconnect_brokers_auto_double_trigger_is_a_noop(
+    api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
+):
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
+    engine_dir = tmp_path / "autologin"
+    engine_dir.mkdir()
+    (engine_dir / "__main__.py").write_text("")
+    monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+    monkeypatch.setattr(system_settings_module.subprocess, "Popen", lambda argv, **kw: None)
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+    # Hold the lock as if a run were already in progress.
+    system_settings_module._reconnect_auto_lock.acquire()
+    try:
+        resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+        assert resp.status_code == 200
+        assert resp.json()["triggered"] is False
+    finally:
+        system_settings_module._reconnect_auto_lock.release()

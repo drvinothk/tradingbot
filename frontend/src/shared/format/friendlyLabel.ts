@@ -78,6 +78,7 @@ const EXIT_REASON_LABELS: Record<string, string> = {
   structure_break: 'Structure break',
   spread_blowout: 'Spread blowout',
   margin_breach: 'Margin breach',
+  kill_switch: 'Kill switch',
   reconciled: 'Reconciled',
 }
 

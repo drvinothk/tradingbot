@@ -6,6 +6,7 @@ import { useRunningStrategies } from '../../shared/hooks/useRunningStrategies'
 import { useOrders, usePositions } from '../../shared/hooks/useOrdersAndPositions'
 import { useInstruments } from '../../shared/hooks/useInstruments'
 import { useSystemAlerts } from '../../shared/hooks/useRecovery'
+import { useWaitForRestart } from '../../shared/hooks/useWaitForRestart'
 import { groupAlertsIntoIncidents } from '../../shared/alerts/groupAlerts'
 import { buildTradeRows, type TradeRow, type TradeRowStatus } from '../../shared/trades/buildTradeRows'
 import { exitReasonLabel, stagedExitSummary, strategyTypeLabel } from '../../shared/format/friendlyLabel'
@@ -221,6 +222,7 @@ function ControlRoomHeader({
   const invalidateSessions = () => queryClient.invalidateQueries({ queryKey: ['sessions'] })
 
   const [killArmed, setKillArmed] = useState(false)
+  const { isWaiting: isRestarting, message: restartMessage, waitForRestart } = useWaitForRestart()
 
   const goLiveMutation = useMutation({
     mutationFn: (sessionId: string) => api.post(`/sessions/${sessionId}/go-live`),
@@ -240,55 +242,35 @@ function ControlRoomHeader({
     onError: (err) => onError(err instanceof ApiError ? err.message : 'Go paper failed'),
   })
 
-  // Combines kill-switch + square-off into one Live-session-only action, per
-  // the plan ("Kill Switch ... combines kill-switch + square-off"). Requires
-  // an explicit "arm" click first (the .armed pulsing-border state) before
-  // the actual destructive call fires, rather than a plain window.confirm --
-  // matches the kill-switch's own dedicated visual states in the theme spec.
-  //
-  // Each step is caught independently: if kill-switch itself never reaches
-  // the broker, nothing happened and the user is told exactly that. If
-  // kill-switch succeeds but the follow-up square-off call throws, the
-  // session IS now killed (real state change) -- refetching session/
-  // position data and reporting the partial failure accurately matters
-  // more here than in the old all-or-nothing version, which surfaced a
-  // generic "Kill switch failed" and never refreshed anything, leaving the
-  // user unable to tell a real kill from a no-op.
+  // 2026-09-09 redesign: one Live-session-only call. The backend squares off
+  // every open LIVE position, drops the session to paper_only (paper
+  // strategies keep running), and restarts the backend. No separate
+  // square-off call, and no `kill_switch` mode to recover from afterward --
+  // Go Live resumes directly.
   const killSwitchMutation = useMutation({
-    mutationFn: async (sessionId: string) => {
-      await api.post(`/sessions/${sessionId}/kill-switch`, { reason: 'Control Room kill switch' })
-      try {
-        await api.post(`/sessions/${sessionId}/square-off`)
-        return { squareOffFailed: false, squareOffMessage: null as string | null }
-      } catch (err) {
-        return {
-          squareOffFailed: true,
-          squareOffMessage: err instanceof ApiError ? err.message : 'Square-off failed',
-        }
-      }
-    },
+    mutationFn: (sessionId: string) =>
+      api.post<{ mode: string; live_positions_closed: number; restarting: boolean }>(
+        `/sessions/${sessionId}/kill-switch`,
+        { reason: 'Control Room kill switch' },
+      ),
     onSuccess: (result) => {
       invalidateSessions()
       onChanged()
       setKillArmed(false)
-      onError(
-        result.squareOffFailed
-          ? `Kill switch engaged, but the follow-up square-off failed: ${result.squareOffMessage}. ` +
-              'Positions may still be open -- check Today\'s Trades and use Square Off there, or ' +
-              'Advanced -> Reconciliation & Recovery, to finish flattening them.'
-          : null,
-      )
+      onError(null)
+      if (result.restarting) {
+        void waitForRestart(
+          `Squared off ${result.live_positions_closed} live position(s) — session on Paper, restarting the backend…`,
+        )
+      }
     },
     onError: (err) => {
-      // The kill-switch call itself never went through -- nothing changed
-      // on the session, but still refresh so the UI reflects reality
-      // rather than an assumed no-op.
       invalidateSessions()
       onChanged()
       setKillArmed(false)
       onError(
         (err instanceof ApiError ? err.message : 'Kill switch request failed') +
-          ' -- nothing was changed; the session is still in its previous state.',
+          ' — nothing was changed; the session is still in its previous state.',
       )
     },
   })
@@ -369,13 +351,26 @@ function ControlRoomHeader({
         </button>
         <button
           className={killClassName}
-          disabled={!liveSession}
+          disabled={!liveSession || killSwitchMutation.isPending || isRestarting}
           onClick={handleKillSwitchClick}
           onBlur={() => setKillArmed(false)}
         >
           {killArmed ? 'Confirm Kill Switch?' : 'Kill Switch'}
         </button>
       </div>
+      {killArmed && !killSwitchMutation.isPending && (
+        <div className="muted" style={{ marginTop: '0.4rem', maxWidth: '46rem' }}>
+          Squares off <strong>every open LIVE position</strong>, switches this session to{' '}
+          <strong>Paper</strong>, and restarts the backend. Paper strategies keep running — use{' '}
+          <strong>Go Live</strong> to resume live trading. Click again to confirm, or click away to
+          cancel.
+        </div>
+      )}
+      {(isRestarting || restartMessage) && (
+        <p className="muted" style={{ marginTop: '0.4rem' }}>
+          {restartMessage}
+        </p>
+      )}
       {isEmergency && liveSession && (
         <p className="muted" style={{ marginTop: '0.4rem' }}>
           Live session is in an emergency state ({liveSession.mode.replace(/_/g, ' ')}) — Go Live/Go

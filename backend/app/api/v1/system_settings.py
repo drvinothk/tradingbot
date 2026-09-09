@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import platform
 import subprocess
+import sys
 import threading
-import time as time_module
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -28,8 +28,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.config.settings import BACKEND_ROOT_DIR
 from app.core.db.session import get_db
 from app.core.locking import LOCK_RISK_EVALUATION_QUEUE, advisory_lock
+from app.core.restart import RESTART_DELAY_SECONDS, schedule_backend_restart
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.execution.models import Order, OrderMode, Position, PositionStatus
@@ -53,14 +55,10 @@ from app.modules.risk_engine.service import (
 
 router = APIRouter(prefix="/system-settings", tags=["system-settings"])
 
-# The service unit this box's app process runs under -- the User=ubuntu
-# account it runs as already has unrestricted passwordless sudo (confirmed
-# live, 2026-08-20), so no new sudoers grant is needed for the app to
-# restart its own unit. Hardcoded, not settings-driven -- this is genuinely
-# the only deployment target today (see CLAUDE.md), and a Windows dev
-# machine hits the platform guard below long before this string matters.
-_RESTART_SERVICE_NAME = "trading-bot.service"
-_RESTART_DELAY_SECONDS = 3.0
+# The actual `systemctl restart` + delay live in `app.core.restart` now
+# (shared with the Kill Switch endpoint and the broker OAuth callbacks);
+# re-exported here only for the "Restart scheduled in ~Ns" response string.
+_RESTART_DELAY_SECONDS = RESTART_DELAY_SECONDS
 
 # Generated once per process, at import time -- i.e. once per real backend
 # boot. `POST /restart-backend` echoes this back so the frontend can remember
@@ -452,24 +450,11 @@ class OpenLivePositionOut(BaseModel):
 
 
 def _schedule_restart() -> None:
-    """Runs `systemctl restart` on a delay, in a daemon thread, so the HTTP
-    response for the request that triggered this actually reaches the
-    client before the process goes down. Goes through real `systemctl
-    restart` (not a raw self `os._exit`) so the app's own graceful-shutdown
-    path runs first -- `KillSignal=SIGINT`/`TimeoutStopSec=15` in the unit
-    file, the same clean "Process singleton lock released" shutdown this
-    box has shown on every restart tonight -- rather than a hard kill.
-    Split out as its own top-level function so tests can monkeypatch it
-    instead of a real restart ever firing under pytest.
+    """Thin wrapper over the shared `app.core.restart.schedule_backend_restart`
+    -- kept as a named local function so this module's existing tests can keep
+    monkeypatching `system_settings._schedule_restart` unchanged.
     """
-
-    def _run() -> None:
-        time_module.sleep(_RESTART_DELAY_SECONDS)
-        subprocess.run(  # noqa: S603, S607 - deliberate, fixed argv, no shell
-            ["sudo", "systemctl", "restart", _RESTART_SERVICE_NAME], check=False
-        )
-
-    threading.Thread(target=_run, daemon=True).start()
+    schedule_backend_restart(reason="restart-backend endpoint")
 
 
 @router.get("/boot-status", response_model=BootStatusOut)
@@ -557,3 +542,77 @@ def restart_backend(
         "message": f"Restart scheduled in ~{_RESTART_DELAY_SECONDS:.0f}s.",
         "boot_id": _BOOT_ID,
     }
+
+
+_reconnect_auto_lock = threading.Lock()
+
+
+class ReconnectBrokersResponse(BaseModel):
+    triggered: bool
+    message: str
+
+
+@router.post("/reconnect-brokers-auto", response_model=ReconnectBrokersResponse)
+def reconnect_brokers_auto(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_permission("session.start")),
+) -> ReconnectBrokersResponse:
+    """Re-run the isolated headless auto-login engine (`backend/autologin/`)
+    on demand — the "Reconnect" button next to each broker. Probes both
+    brokers' cached tokens and headless-logs-in only the dead one(s), so a
+    still-valid token is left exactly as it is (same tokens as the 08:55
+    scheduled run — nothing to disturb). The engine restarts `trading-bot`
+    itself, but only if it actually performed a fresh login.
+
+    A no-op fallback to the "Manual reconnect" (browser OAuth) button on any
+    host where the engine isn't installed — it's A1-only, gitignored (see
+    CLAUDE.md). Fire-and-forget: the child is fully detached and this returns
+    immediately; the frontend polls `/shoonya/status` + `/aliceblue/status`
+    (+ `/boot-status`, since the engine may restart).
+    """
+    if platform.system() != "Linux":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "auto-reconnect is only supported on the Linux deployment — use Manual reconnect.",
+        )
+
+    engine_entrypoint = BACKEND_ROOT_DIR / "autologin" / "__main__.py"
+    if not engine_entrypoint.exists():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "the auto-login engine is not installed on this host — use Manual reconnect.",
+        )
+
+    if not _reconnect_auto_lock.acquire(blocking=False):
+        return ReconnectBrokersResponse(
+            triggered=False, message="an auto-reconnect is already in progress"
+        )
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, detached
+            [sys.executable, "-m", "autologin", "--force"],
+            cwd=str(BACKEND_ROOT_DIR),
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    finally:
+        # The child is detached; the lock only guards the ~instant spawn
+        # window against a double-click, not the engine's whole run.
+        _reconnect_auto_lock.release()
+
+    record_event(
+        db,
+        workspace_id=user.workspace_id,
+        actor_type=ActorType.USER,
+        actor_id=user.id,
+        event_category=EventCategory.CREDENTIAL_CONFIG_CHANGE,
+        event_type="broker.auto_reconnect_requested",
+        payload={},
+    )
+    db.commit()
+    return ReconnectBrokersResponse(
+        triggered=True,
+        message=(
+            "headless auto-login started — the backend will restart if a fresh login was needed"
+        ),
+    )

@@ -35,7 +35,14 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.core.db.session import reuse_session
-from app.domain.execution.models import ExitReason, Position, PositionStatus, TradeOutcome
+from app.domain.execution.models import (
+    ExitReason,
+    Order,
+    OrderMode,
+    Position,
+    PositionStatus,
+    TradeOutcome,
+)
 from app.domain.market.models import OptionContract
 from app.domain.session.models import TradingSession
 from app.modules.broker_adapter.base.broker_port import BrokerPort
@@ -134,15 +141,22 @@ def _square_off_all_open_positions(
     exit_reason: ExitReason,
     *,
     market_data_provider: BaseMarketDataProvider | None = None,
+    live_only: bool = False,
 ) -> list[TradeOutcome]:
-    open_positions = (
-        db.query(Position)
-        .filter(
-            Position.trading_session_id == trading_session.id,
-            Position.status == PositionStatus.OPEN,
-        )
-        .all()
+    query = db.query(Position).filter(
+        Position.trading_session_id == trading_session.id,
+        Position.status == PositionStatus.OPEN,
     )
+    if live_only:
+        # Only positions whose *opening* order was LIVE -- never inferred from
+        # the current session mode. Same pattern api.v1.system_settings's
+        # open-live-position check uses. Multi-leg positions are paper-only in
+        # code (build_position_exit_legs returns None for LIVE), so this
+        # correctly leaves every open paper position -- staged or not -- alone.
+        query = query.join(Order, Order.id == Position.opening_order_id).filter(
+            Order.mode == OrderMode.LIVE
+        )
+    open_positions = query.all()
 
     outcomes: list[TradeOutcome] = []
     for position in open_positions:
@@ -186,6 +200,27 @@ def run_eod_square_off(
         trading_session,
         ExitReason.EOD_SQUARE_OFF,
         market_data_provider=market_data_provider,
+    )
+
+
+def run_kill_switch_square_off(
+    db: Session,
+    broker: BrokerPort | None,
+    trading_session: TradingSession,
+    *,
+    market_data_provider: BaseMarketDataProvider | None = None,
+) -> list[TradeOutcome]:
+    """The operator's manual Kill Switch flatten -- LIVE positions only. Open
+    paper positions keep being monitored (stop/target/trail) after the
+    session drops to paper_only, per the 2026-09-09 redesign.
+    """
+    return _square_off_all_open_positions(
+        db,
+        broker,
+        trading_session,
+        ExitReason.KILL_SWITCH,
+        market_data_provider=market_data_provider,
+        live_only=True,
     )
 
 

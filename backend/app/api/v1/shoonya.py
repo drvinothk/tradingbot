@@ -142,6 +142,15 @@ def _run_post_login_background_work(
             "or app login instead"
         )
 
+    # 2026-09-09: a browser OAuth login ("Manual reconnect", or a first-ever
+    # connect) always finishes with a clean process restart -- the operator's
+    # explicit ask after a manual login one day didn't fully clear a stale
+    # in-memory state. The 08:55 headless auto-login does NOT reach here (it
+    # writes the disk cache + does its own restart), so it is unaffected.
+    from app.core.restart import schedule_backend_restart
+
+    schedule_backend_restart(reason="manual Shoonya reconnect")
+
 
 def _spawn_post_login_background_work(adapter: BrokerPort, *, market_data_provider: str) -> None:
     """Non-blocking: if a previous reconnect's background work is still

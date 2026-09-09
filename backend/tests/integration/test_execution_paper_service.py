@@ -76,6 +76,7 @@ from app.modules.execution_engine.paper.service import (
 from app.modules.scheduler.eod_square_off import (
     UnresolvableOptionContractError,
     run_eod_square_off,
+    run_kill_switch_square_off,
     run_single_position_square_off,
 )
 from app.modules.strategy_engine.common_rules import BAR_TIMEFRAME
@@ -1662,6 +1663,33 @@ def test_square_off_all_open_positions_skips_a_corrupt_position_and_closes_the_r
     db.refresh(position_b)
     assert position_a.status == PositionStatus.OPEN
     assert position_b.status == PositionStatus.CLOSED
+
+
+def test_run_kill_switch_square_off_closes_only_live_positions(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """The manual Kill Switch flatten is LIVE-only -- an open paper position
+    keeps being monitored under paper mode after the session drops to
+    paper_only (2026-09-09 redesign).
+    """
+    live_position = _open_live_position(db, broker, trading_session, strategy_run, option_contract)
+
+    paper_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, paper_intent, broker=broker)
+    paper_position = (
+        db.query(Position).filter(Position.trade_intent_id == paper_intent.id).one()
+    )
+
+    outcomes = run_kill_switch_square_off(db, broker, trading_session)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].position_id == live_position.id
+    assert outcomes[0].exit_reason == ExitReason.KILL_SWITCH
+
+    db.refresh(live_position)
+    db.refresh(paper_position)
+    assert live_position.status == PositionStatus.CLOSED
+    assert paper_position.status == PositionStatus.OPEN  # untouched
 
 
 def test_close_position_does_not_update_session_pnl_for_a_paper_close(

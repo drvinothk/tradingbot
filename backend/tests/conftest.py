@@ -188,6 +188,25 @@ def _force_no_telegram_dispatch(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_backend_restart(monkeypatch) -> None:
+    """`app.core.restart.schedule_backend_restart` shells out to `sudo
+    systemctl restart trading-bot` on Linux -- which CI is. Several code
+    paths now call it (the `/restart-backend` endpoint, the Kill Switch
+    endpoint, and both brokers' post-login background work, which
+    `test_api_shoonya.py` deliberately runs inline). Neutralised suite-wide
+    to a no-op, same rationale/pattern as `_force_no_real_money_dispatch`
+    above. Patched at the source *and* at every module that `from`-imported
+    it, since a `from x import f` binding isn't reachable by patching `x.f`.
+    A test that wants to assert the call happened monkeypatches its own
+    recorder over these.
+    """
+    _noop = lambda reason="": False  # noqa: E731
+    monkeypatch.setattr("app.core.restart.schedule_backend_restart", _noop)
+    monkeypatch.setattr("app.api.v1.sessions.schedule_backend_restart", _noop)
+    monkeypatch.setattr("app.api.v1.system_settings.schedule_backend_restart", _noop)
+
+
+@pytest.fixture(autouse=True)
 def _weekend_rest_awake() -> Generator[None, None, None]:
     """`app.modules.ops.weekend_rest.is_system_awake()` returns `True`
     unconditionally Mon-Fri, but this suite must also pass when CI runs on a

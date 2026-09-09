@@ -126,6 +126,11 @@ class ExitReason(enum.StrEnum):
     # live session, distinct from EOD_SQUARE_OFF so reports can tell a
     # scheduled flatten from a forced one apart.
     MARGIN_BREACH = "margin_breach"
+    # 2026-09-09: the operator's manual Kill Switch — a master square-off of
+    # every open LIVE position, after which the session drops to paper_only.
+    # Distinct from MANUAL (a single deliberate square-off) and EOD_SQUARE_OFF
+    # (the scheduled flatten) so reports can attribute it correctly.
+    KILL_SWITCH = "kill_switch"
     # 2026-08-28: hard risk overlays independent of the premium stop/target
     # (TradeProposal.max_loss_per_lot / time_stop_minutes). MAX_LOSS = the
     # absolute per-lot INR loss cap was reached before stop_price; TIME_STOP
