@@ -1253,3 +1253,63 @@ audit; "Reconnect" button end-to-end from the UI; "Manual reconnect" → OAuth �
 **Rollback:** `cp ~/deploy-bak/ks-reconnect-20260909-160323/<file>` back (app files +
 `autologin_run.py` → `autologin/run.py`), restore `/var/www/trading-bot/dist.bak-*`,
 `sudo systemctl restart trading-bot`. No migration.
+
+---
+
+## DEPLOYED 2026-09-09 ~23:05 IST (17:35 UTC) — UI refinements batch (frontend only)
+
+`main` `<merge>` (ff-merged from `feat/ui-refinements-2026-09-09`, commit `4e3ec30`,
+pushed). Classifier did **not** block the scp/extract. **Frontend `dist` only — no
+backend touch, no `systemctl restart trading-bot`, no migration.**
+
+**What (7 items from the 2026-09-09 post-Kill-Switch UI sanity walk + operator
+refinements):**
+1. **Market-hours-aware feed state.** New `frontend/src/shared/time/ist.ts`
+   (`isWithinMarketHoursIST` — Mon-Fri ~09:10-15:35 IST; `IST_OFFSET_SECONDS`).
+   `ModeBanner` broker badge: outside market hours a valid-but-quiet Shoonya session
+   reads neutral **"Idle — market closed"** instead of amber "Connecting…" forever;
+   `FeedLatencyBadge` drops the red on a stale/dead feed outside hours. In-hours:
+   unchanged.
+2. **Audit ticker** (`index.css .audit-ticker`): dropped `position:sticky;bottom:0`
+   (+ opaque bg) so the `[WIP]` strip sits at page end, not over "Today's Paper
+   Trades".
+3. **Today's Activity**: prominent P&L slot → **Realized P&L** (gross); **Actual
+   P&L** (net of cost) + Per Lot move to the muted line. Paper toggle moved into the
+   card header next to the scope pill ("Live" / "Live + Paper"). Reverts the
+   2026-09-04 slot swap per operator request.
+4. **Market Terminal chart** (`PriceChart.tsx`): series timestamps offset by +05:30
+   (`IST_OFFSET_SECONDS`) so the axis/crosshair read IST — lightweight-charts has no
+   timezone option. `resample()` still buckets on the true epoch.
+5. **Control Room "Strategy Status"** → one-line status-count summary; dropped the
+   expandable per-strategy Feed table + its `data_freshness` "needs a look" verdict
+   (false-alarmed every session open / post-restart while runs were just Scanning).
+   Genuine problems still surface in the adjacent `AttentionCard`.
+6. **`prettyContractSymbol`** (`friendlyLabel.ts`): `NIFTY15SEP26P23500` →
+   `NIFTY 15SEP26 23500 PE` in the Control Room trade tables + the Advanced
+   blocked-positions table; non-Shoonya-shaped symbols pass through verbatim.
+7. `CLAUDE.md`: corrected the stale "option_chain_degraded 1-liner not deployed"
+   note — verified already live in `index-Dh2z6QSI.js` (shipped with `1e78b5f`).
+
+**Files:** 8 `frontend/src/**` + `frontend/src/shared/time/ist.ts` (new) + `CLAUDE.md`.
+No `backend/**`. Deployed as a `dist` tarball → `/var/www/trading-bot/dist`
+(`index-DFvuzJvF.js` / `index-DXcBo4X8.css`, sha256 box == local build:
+`2f3d6ab6fccc9098562c508817028b7b303beec33b3944dc9d9125e64cd20926` js,
+`3e1431d6e230742a9843e2b0da9ddd30f28ff2642d9a16cb46d0bf2ab0cd27f7` css,
+`be358f6987db346588ac4f6a5217f5a0c8984d88c1319102101ccf5af0d73291` index.html),
+`chown www-data`. Backup: `/var/www/trading-bot/dist.bak-20260909-173536`.
+
+**Safety gate:** 23:05 IST — market closed. Frontend-static only; no live trading
+process touched. Credentials on box untouched.
+
+**Verification:** `tsc -b` + `oxlint` clean; nginx `/` → 200 serving
+`index-DFvuzJvF.js`; live browser drive on the box confirmed all 7 —
+ModeBanner "Idle — market closed" (neutral) + WS-Feed badge neutral; chart axis
+reads 13:00–15:40 **IST** (was 07:10–10:00 UTC); Strategy Status has no
+chevron/table (`hasChevron:false, hasTable:false`); trade rows show
+`NIFTY 15SEP26 23500 PE`; Today's Activity prominent = Realized P&L, muted =
+Actual P&L, Paper toggle in header, no footer row; `.audit-ticker` `position:static`
+below the trade tables.
+
+**Rollback:** `sudo rm -rf /var/www/trading-bot/dist && sudo mv
+/var/www/trading-bot/dist.bak-20260909-173536 /var/www/trading-bot/dist && sudo
+chown -R www-data:www-data /var/www/trading-bot/dist`. No backend/migration to revert.
