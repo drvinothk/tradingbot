@@ -1193,3 +1193,63 @@ routine blips.
 **Rollback:** `cp ~/deploy-bak/autologin-fix-20260909-131933/app/... ` back over
 the 9 files (or `git checkout ff4a5fa -- backend/app/<file>` then scp the
 git-blob LF version), `sudo systemctl restart trading-bot`. No migration.
+
+---
+
+## DEPLOYED 2026-09-09 ~21:35 IST (16:03 UTC) — Kill Switch redesign + two-button broker reconnect
+
+`main` `1e78b5f` (ff-merged from `feat/kill-switch-and-reconnect-controls`, pushed).
+Isolated engine change from `local/broker-auto-login` `e1eabfa` (local-only branch,
+never pushed). Classifier did **not** block the scp/extract/restart.
+
+**What:**
+- **Kill Switch redesign.** The manual `POST /sessions/{id}/kill-switch` no longer
+  enters the sticky `kill_switch` mode. It squares off open **LIVE** positions only
+  (`run_kill_switch_square_off` → `_square_off_all_open_positions(live_only=True)`,
+  new `ExitReason.KILL_SWITCH` — no migration, `String(20)` column), drops the
+  session to `paper_only` via the existing `set_master_trading_mode` ("Go Paper")
+  path, and schedules a backend restart. No recovery step — Go Live resumes.
+  `409` (before any square-off) from `kill_switch` / `degraded_mode` /
+  `reconciliation_lock`. `kill_switch` mode + `enter_kill_switch` are untouched —
+  Risk Service's automatic daily-loss-cap breach still lands there.
+- **Two-button broker reconnect** (Market Terminal, both broker rows):
+  "Reconnect" → `POST /system-settings/reconnect-brokers-auto`, which detaches
+  `python -m autologin --force` (probes cached tokens, headless-logs-in only a dead
+  one, restarts the app itself only if a fresh login happened). Linux + engine-present
+  guarded. "Manual reconnect" → the browser OAuth flow, now always followed by a
+  backend restart (both OAuth callbacks' post-login background work ends with
+  `schedule_backend_restart`).
+- **Shared plumbing**: new `app/core/restart.py::schedule_backend_restart` (extracted
+  from `system_settings._schedule_restart`, kept as a wrapper); frontend
+  `useWaitForRestart` hook (boot-status poll) used by the Kill Switch and both
+  reconnect buttons.
+- **Engine (`local/broker-auto-login`)**: `autologin/run.py` gains `--force` —
+  bypasses the Mon-Fri IST weekday gate ONLY; still probes caches first, no forced
+  re-login.
+
+**Files:** 7 `backend/app/**` (surgical scp, sha256 box == git-blob LF:
+`ff376507…` sessions.py, `270d4d09…` system_settings.py, `2b3d8bb7…` core/restart.py,
+`769e7f79…` execution/models.py, `d9e95415…` eod_square_off.py, `6c572ffa…`
+alice_blue.py, `25e1c67d…` shoonya.py) + `autologin/run.py` (`0f109587…`) +
+frontend `dist` (`index-Dh2z6QSI.js`, box == local build). **No migration**
+(box stays `0039`). Backup: `~/deploy-bak/ks-reconnect-20260909-160323/` +
+`/var/www/trading-bot/dist.bak-20260909-*`.
+
+**Safety gate:** 21:33 IST — market closed, **0 open positions**, session
+`live_enabled`. Credentials on box untouched (5 `.env` present).
+
+**Verification:** `systemctl restart` → `active`, `NRestarts=0`; `alembic current`
+= `0039`; `/health` 200; **0 ERROR/Traceback** in the restart window;
+`/api/v1/system-settings/reconnect-brokers-auto` present in `openapi.json`;
+`python -m autologin --force` real run → both tokens still valid → "no login needed",
+**no restart** (`NRestarts` stayed 0) — confirms `--force` bypasses only the weekday
+gate. Backend 1728 tests pass, ruff/mypy clean; engine 58 tests pass; frontend build
++ lint clean.
+
+**Still to verify live (market hours / a real reconnect):** Kill Switch with a real
+open LIVE position → LIVE-only flatten + `paper_only` + restart + `kill_switch.square_off`
+audit; "Reconnect" button end-to-end from the UI; "Manual reconnect" → OAuth → restart.
+
+**Rollback:** `cp ~/deploy-bak/ks-reconnect-20260909-160323/<file>` back (app files +
+`autologin_run.py` → `autologin/run.py`), restore `/var/www/trading-bot/dist.bak-*`,
+`sudo systemctl restart trading-bot`. No migration.
