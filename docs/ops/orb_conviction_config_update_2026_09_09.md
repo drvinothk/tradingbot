@@ -31,14 +31,24 @@ Backtest arc **p17 → p18b3** (`backend/scripts/BACKTEST_LEARNINGS.md`,
 |---|---|---|
 | id | `7329fdf0-aef6-4b11-bec2-385d1c3a5c81` | `76b61473-075f-4b59-bb31-ab985195f255` |
 | strategy_type | `orb_conviction` | `orb_conviction` |
-| is_enabled / runtime_mode / _source | true / `force_paper` / `manual` | true / `force_paper` / (null) |
+| is_enabled / runtime_mode / _source (at apply) | true / `force_live` / `manual` | true / `force_paper` / (null) |
 | underlying | NIFTY | NIFTY |
 
-`runtime_mode` / `runtime_mode_source` are **not** touched. Both rows are
-`force_paper`, so they trade paper regardless of session mode — safe to apply
-mid-session (session `fbdfeccd…` is `live_enabled` + active). 0 open positions
-system-wide at apply time; all ORB_Convic StrategyRuns for the day are
-`stopped`.
+> **Concurrent change caught at apply time.** When this note was first drafted
+> (~16:00 IST) `ORB_Convic_Live` read `force_paper` / `qty_lots: 10`. Between
+> the draft and the apply (~18:12 IST) the operator armed it: `force_live` /
+> `qty_lots: 1` (the live-ramp step). `runtime_mode` was never touched by the
+> script; the first apply pass hardcoded `qty_lots: 10` from the stale read and
+> was corrected to `1` on a second idempotent pass (18:14 IST) — see
+> **Applied** below.
+
+`runtime_mode` / `runtime_mode_source` are **not** touched by the script
+(`params` only). `ORB_Convic_Live` is `force_live` in the `live_enabled`
+session `fbdfeccd…`, so it routes real orders — `qty_lots` **must** be the
+live-ramp step (1), and stays ≤ the active `per_trade_lot_cap` (3).
+`ORB_Convic_Paper` is `force_paper`. 0 open positions system-wide and 0
+non-terminal ORB_Convic StrategyRuns at apply time — nothing acted on the
+transient `qty_lots: 10`.
 
 ## The changes
 
@@ -65,8 +75,9 @@ system-wide at apply time; all ORB_Convic StrategyRuns for the day are
   Leg A's *own* leg params via `pick_collapsed_exit_leg`, not top-level — same
   net effect since top-level is set = Leg A.)
 
-**Unchanged, carried verbatim:** `qty_lots` (Live only — see note below),
-`orb_entry_cutoff_time` `"10:15"`, `require_prior_day_trend` true,
+**Unchanged, carried verbatim:** `qty_lots` (`ORB_Convic_Live` only — set to
+**1** to match the operator's live-ramp step; see the concurrent-change note
+above), `orb_entry_cutoff_time` `"10:15"`, `require_prior_day_trend` true,
 `entry_rsi_block_ce_above` 75, `entry_rsi_block_pe_below` 25,
 `entry_require_confirm_bar` true.
 
@@ -93,20 +104,26 @@ confined to signals/positions these 2 configs produce.
   changing `params` never rewrites existing legs. 0 open positions → nothing to
   half-migrate.
 
-**Pre-existing landmine, NOT touched here:** `ORB_Convic_Live` carries
-`qty_lots: 10`. Inert while `force_paper`, but active `risk_limit_configs` v18
-has `per_trade_lot_cap = 3`, and an explicit `qty_lots` is **rejected, never
-clamped**, above the cap. The moment `_Live` is armed `force_live` in a
-`live_enabled` session every live ORB intent would fail
-(`per_trade_lot_cap_exceeded`). Raise separately before arming `_Live`.
+**`qty_lots` on `ORB_Convic_Live` — the one thing that needed care.** It is
+`force_live` in a `live_enabled` session and active `risk_limit_configs` v18
+has `per_trade_lot_cap = 3`; an explicit `qty_lots` is **rejected, never
+clamped**, above the cap. `qty_lots: 1` (the operator's ramp step) is correct
+and stays under the cap. The first apply pass wrote a stale `10` and was
+corrected on a second pass (see **Applied**).
 
-## Rollback — current `params`, verbatim (2026-09-09, pre-change)
+## Rollback — `params` verbatim as they stood at apply time (2026-09-09 ~18:12 IST)
 
-### `ORB_Convic_Live` `7329fdf0-aef6-4b11-bec2-385d1c3a5c81`
+Restoring these + (for `_Live`) leaving `runtime_mode = force_live` /
+`runtime_mode_source = manual` reverts this change entirely.
+
+### `ORB_Convic_Live` `7329fdf0-aef6-4b11-bec2-385d1c3a5c81`  (was `force_live`, `qty_lots: 1`)
 
 ```json
-{"qty_lots": 10, "stop_pct": 0.22, "exit_legs": [{"kind": "core", "stop_pct": 0.18, "no_target": true, "qty_fraction": 0.25, "use_structure": true, "trail_lock_fraction": 0.6, "trail_activation_fraction": 0.12}, {"kind": "runner", "stop_pct": 0.18, "no_target": true, "qty_fraction": 0.25, "use_structure": true, "trail_lock_fraction": 0.8, "trail_activation_fraction": 0.12}, {"kind": "target", "stop_pct": 0.22, "target_pct": 0.33, "qty_fraction": 0.5, "use_structure": true, "trail_lock_fraction": 0.6, "trail_activation_fraction": 0.12}], "target_pct": 0.33, "trail_lock_fraction": 0.6, "orb_entry_cutoff_time": "10:15", "require_prior_day_trend": true, "entry_rsi_block_ce_above": 75, "entry_rsi_block_pe_below": 25, "entry_require_confirm_bar": true, "max_or_range_nifty_points": 65, "trail_activation_fraction": 0.12}
+{"qty_lots": 1, "stop_pct": 0.22, "exit_legs": [{"kind": "core", "stop_pct": 0.18, "no_target": true, "qty_fraction": 0.25, "use_structure": true, "trail_lock_fraction": 0.6, "trail_activation_fraction": 0.12}, {"kind": "runner", "stop_pct": 0.18, "no_target": true, "qty_fraction": 0.25, "use_structure": true, "trail_lock_fraction": 0.8, "trail_activation_fraction": 0.12}, {"kind": "target", "stop_pct": 0.22, "target_pct": 0.33, "qty_fraction": 0.5, "use_structure": true, "trail_lock_fraction": 0.6, "trail_activation_fraction": 0.12}], "target_pct": 0.33, "trail_lock_fraction": 0.6, "orb_entry_cutoff_time": "10:15", "require_prior_day_trend": true, "entry_rsi_block_ce_above": 75, "entry_rsi_block_pe_below": 25, "entry_require_confirm_bar": true, "max_or_range_nifty_points": 65, "trail_activation_fraction": 0.12}
 ```
+
+> `qty_lots` read `10` when this note was first drafted; it was `1` by apply
+> time. Use `1` for a rollback.
 
 ### `ORB_Convic_Paper` `76b61473-075f-4b59-bb31-ab985195f255`
 
@@ -119,7 +136,7 @@ clamped**, above the cap. The moment `_Live` is armed `force_live` in a
 ### `ORB_Convic_Live`
 
 ```json
-{"qty_lots": 10, "stop_pct": 0.2, "target_pct": 0.66, "trail_activation_fraction": 0.18, "trail_lock_fraction": 0.7, "max_or_range_nifty_points": 70, "orb_entry_cutoff_time": "10:15", "require_prior_day_trend": true, "entry_rsi_block_ce_above": 75, "entry_rsi_block_pe_below": 25, "entry_require_confirm_bar": true, "exit_legs": [{"kind": "core", "qty_fraction": 0.6, "stop_pct": 0.2, "target_pct": 0.66, "trail_activation_fraction": 0.18, "trail_lock_fraction": 0.7, "use_structure": true}, {"kind": "runner", "qty_fraction": 0.4, "stop_pct": 0.22, "target_pct": 0.5, "trail_activation_fraction": 0.24, "trail_lock_fraction": 0.8, "use_structure": true}]}
+{"qty_lots": 1, "stop_pct": 0.2, "target_pct": 0.66, "trail_activation_fraction": 0.18, "trail_lock_fraction": 0.7, "max_or_range_nifty_points": 70, "orb_entry_cutoff_time": "10:15", "require_prior_day_trend": true, "entry_rsi_block_ce_above": 75, "entry_rsi_block_pe_below": 25, "entry_require_confirm_bar": true, "exit_legs": [{"kind": "core", "qty_fraction": 0.6, "stop_pct": 0.2, "target_pct": 0.66, "trail_activation_fraction": 0.18, "trail_lock_fraction": 0.7, "use_structure": true}, {"kind": "runner", "qty_fraction": 0.4, "stop_pct": 0.22, "target_pct": 0.5, "trail_activation_fraction": 0.24, "trail_lock_fraction": 0.8, "use_structure": true}]}
 ```
 
 ### `ORB_Convic_Paper`
@@ -154,6 +171,34 @@ No restart — `auto_spawner` reads `is_enabled` + `params` per spawn and
 3. Next `auto_spawner` spawn (09:00 IST, or manual `POST /sessions/bootstrap-now`)
    → new `StrategyRun` + first `Signal.exit_legs` is the 2-leg shape.
 
-## Applied
+## Applied — 2026-09-09
 
-_(fill in on apply)_ — applied-at (IST): … · verify output: …
+- **~18:12 IST** — `ops_update_orb_conviction_2leg_exit_2026_09_09.py` run on
+  the box (`.venv/bin/python /tmp/…`). Both rows staged + committed: C1 (w70),
+  C2 (2-leg exit), C3 (top-level = Leg A). Script preflight
+  (`deserialize` + `validate_exit_leg_templates` + `_build_strategy`) passed
+  for both rows before the write. **Caught at apply:** `ORB_Convic_Live` had
+  been armed `force_live` / `qty_lots: 1` since the note was drafted; the first
+  pass wrote a stale `qty_lots: 10`.
+- **~18:14 IST** — script `qty_lots` literal corrected `10 → 1`, re-scp'd
+  (sha256 `608b3965…`, box == local worktree), re-run. Idempotent: only
+  `ORB_Convic_Live.qty_lots` moved (`10 → 1`); `ORB_Convic_Paper` = "no change".
+- **Verify (over SSH):**
+  - `ORB_Convic_Live` — `is_enabled=t`, `runtime_mode=force_live` /
+    `runtime_mode_source=manual` (**unchanged**), `qty_lots=1`, `w=70`, 2 exit
+    legs, top-level `stop_pct 0.2 / target_pct 0.66 / trail_activation 0.18 /
+    trail_lock 0.7`, entry gate intact. `updated_at` 18:14:20 UTC.
+  - `ORB_Convic_Paper` — `is_enabled=t`, `runtime_mode=force_paper` /
+    source NULL (**unchanged**), no `qty_lots`, same w70 + 2-leg + top-level.
+    `updated_at` 18:12:20 UTC.
+  - `scripts/qc_paper_configs_live.py` over all 12 enabled configs →
+    `ALL STRUCTURAL CHECKS PASSED`. Both ORB_Convic rows: `[1]` no inert keys,
+    `[2]` exit_legs OK 2 legs sum 1.0, `[3]` leg keys OK, `[4]` constructs
+    `ORBConvictionStrategy`, `[6]` n10 `[6,4]` / n3 `[2,1]` / n2 `[1,1]` /
+    n1 dominant leg (0.6). (`qc`'s `enabled=False` line is a cosmetic artifact
+    of the `||`-concatenated dump — `is_enabled` is `t` for both, confirmed
+    directly.)
+  - `ROUTES LIVE (3): EMA_Convic_Live, OI_Convic_Live, ORB_Convic_Live`.
+- **Pending:** next `auto_spawner` spawn (2026-09-10 ~09:00 IST) — confirm the
+  new `StrategyRun` picks up w70 and the first `Signal.exit_legs` is the 2-leg
+  shape.

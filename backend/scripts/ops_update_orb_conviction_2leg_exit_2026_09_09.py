@@ -21,9 +21,16 @@ Applies the 2026-09-09 p18b0-b3 backtest decision (see
          ``trail_activation_fraction`` .12->.18, ``trail_lock_fraction`` .6->.70)
 
 Touches ``params`` ONLY -- never ``runtime_mode`` / ``runtime_mode_source``.
-``ORB_Convic_Live`` keeps its existing ``qty_lots: 10`` verbatim (a separate,
-pre-existing item -- it is inert while the row is ``force_paper`` and out of
-scope here). ``ORB_Convic_Paper`` has no ``qty_lots`` key and gets none.
+``ORB_Convic_Live`` keeps ``qty_lots: 1`` (the operator's live-ramp step --
+the row is ``force_live`` in a ``live_enabled`` session; an explicit
+``qty_lots`` above the active ``per_trade_lot_cap`` is *rejected*, never
+clamped). ``ORB_Convic_Paper`` has no ``qty_lots`` key and gets none.
+
+NOTE (2026-09-09): the first run of this script hardcoded ``qty_lots: 10``
+from a read taken before the operator armed ``_Live`` (``force_paper`` /
+``qty_lots: 10`` at read time -> ``force_live`` / ``qty_lots: 1`` by apply
+time). Corrected to ``1`` and re-run (idempotent -- only ``qty_lots`` moved
+on the second pass; w70 / 2-leg exit / top-level params already matched).
 
 Every non-changed key is carried in the target literal explicitly (not a
 merge onto the live row) so the printed OLD/NEW diff is the whole story.
@@ -126,9 +133,10 @@ _COMMON: dict[str, object] = {
 ORB_CONVIC_LIVE_ID = "7329fdf0-aef6-4b11-bec2-385d1c3a5c81"
 ORB_CONVIC_PAPER_ID = "76b61473-075f-4b59-bb31-ab985195f255"
 
-# ORB_Convic_Live keeps its existing explicit qty_lots verbatim; _Paper has none.
+# ORB_Convic_Live is force_live -> qty_lots is the live-ramp step (1); _Paper
+# has no qty_lots key (paper always uses the paper default).
 TARGET_PARAMS: dict[str, dict[str, object]] = {
-    ORB_CONVIC_LIVE_ID: {"qty_lots": 10, **_COMMON},
+    ORB_CONVIC_LIVE_ID: {"qty_lots": 1, **_COMMON},
     ORB_CONVIC_PAPER_ID: dict(_COMMON),
 }
 

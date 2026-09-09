@@ -1316,15 +1316,21 @@ chown -R www-data:www-data /var/www/trading-bot/dist`. No backend/migration to r
 
 ---
 
-## PENDING prod-DB write — ORB conviction config update (w70 + 2-leg exit)
+## DONE 2026-09-09 ~18:14 IST — ORB conviction config update (w70 + 2-leg exit)
 
-**Emitted:** 2026-09-09 ~18:10 IST. Branch `ops/orb-conviction-w70-2leg-exit` @
-`1b2f155`, pushed to origin. NOT merged to `main`. **No code deploy, no
-migration, no restart** — `strategy_configs.params` is read fresh per auto-spawn
-/ per signal (`_apply_exit_leg_templates`). Classifier blocks the prod-DB write
-from Claude (psql and uploaded ORM script alike — same as every prior
-`strategy_configs` change in this log), so the operator runs the staged
-idempotent script.
+**Applied** (operator authorized "yes, plz complete it" → Claude ran it over the
+allow-listed SSH). Branch `ops/orb-conviction-w70-2leg-exit` @ `2ae84d1`+, pushed
+to origin, NOT merged to `main`. **No code deploy, no migration, no restart** —
+`strategy_configs.params` is read fresh per auto-spawn / per signal
+(`_apply_exit_leg_templates`).
+
+**Ran twice:** first pass (~18:12 IST) applied C1/C2/C3 to both rows but wrote a
+**stale `qty_lots: 10`** on `ORB_Convic_Live` — the row had been armed
+`force_live` / `qty_lots: 1` by the operator *after* the change note was drafted
+(`force_paper` / `qty_lots: 10` at draft time). Corrected on a second idempotent
+pass (~18:14 IST): script literal `10 → 1`, re-scp'd (sha256 `608b3965…`), only
+`ORB_Convic_Live.qty_lots` moved. `runtime_mode` / `_source` never touched by the
+script. Full account in `docs/ops/orb_conviction_config_update_2026_09_09.md`.
 
 - **Target:** `144.24.137.112`, Postgres `trading_bot`, rows
   `7329fdf0-aef6-4b11-bec2-385d1c3a5c81` (`ORB_Convic_Live`) +
@@ -1334,42 +1340,50 @@ idempotent script.
   `max_or_range_nifty_points` 65→70; `exit_legs` 3-leg 25/25/50 (two uncapped
   legs) → 2-leg 60/40 both hard-capped (core .20/.66/.18/.70,
   runner .22/.50/.24/.80, `use_structure` kept); top-level fallback params →
-  Leg A. `qty_lots` (Live) and the entry gate carried verbatim. `runtime_mode`
-  / `_source` untouched. Full before/after + rollback JSON in
+  Leg A. Entry gate carried verbatim. `runtime_mode` / `_source` untouched.
+  `ORB_Convic_Live.qty_lots` set to **1** (the operator's live-ramp step; the
+  row is `force_live`, and an explicit `qty_lots` above `per_trade_lot_cap` is
+  rejected not clamped). Full before/after + rollback JSON in
   `docs/ops/orb_conviction_config_update_2026_09_09.md`.
 - **Tested (local):** `ruff` + `mypy` clean on the script;
   `deserialize_exit_leg_templates` + `validate_exit_leg_templates` +
   `_build_strategy` pass for both target param sets;
   `allocate_leg_lots_floored` → n10 `[6,4]` / n3 `[2,1]` / n2 `[1,1]` /
   n1 collapse. Script re-runs as a no-op once applied (idempotent).
-- **Safety gate:** 18:05 IST (market closed — formality). Live-checked:
-  **0 open positions** system-wide; all ORB_Convic StrategyRuns for the day
-  `stopped`. Session `fbdfeccd…` `live_enabled`/active but both target rows are
-  `force_paper` → they trade paper regardless.
-- **Backup:** the script prints each row's OLD `params` before writing; the
-  verbatim pre-change JSON is also in the change-note doc. Rollback = re-run
-  with the OLD dicts, or `psql UPDATE`.
+- **Safety gate:** 18:05 IST (market closed). Live-checked: **0 open positions**
+  system-wide; 0 non-terminal ORB_Convic StrategyRuns at apply time.
 
-### Steps (operator, on the box)
+### Ran (Claude, over allow-listed SSH)
 
 ```
-# script already scp'd to /tmp/ (sha256
-# 9bbeb8f2d1a050e87cb9822b825ad409176c0d0f0cb9fa947e75d144ebcb2bfa,
-# box == local worktree); re-copy if stale:
-#   scp -i <key> backend/scripts/ops_update_orb_conviction_2leg_exit_2026_09_09.py \
-#       ubuntu@144.24.137.112:/tmp/
-
 cd /home/ubuntu/trading-bot/backend && \
   .venv/bin/python /tmp/ops_update_orb_conviction_2leg_exit_2026_09_09.py
 ```
 
-### Verify (Claude, over SSH, after the operator runs it)
+- **~18:12 IST** — pass 1: both rows staged + committed (C1/C2/C3). Preflight
+  passed. `ORB_Convic_Live` got a **stale `qty_lots: 10`** — the row had been
+  armed `force_live` / `qty_lots: 1` after the note was drafted.
+- **~18:14 IST** — pass 2: script literal `10 → 1`, re-scp'd (sha256
+  `608b3965…`), re-run. Only `ORB_Convic_Live.qty_lots` moved (`10 → 1`);
+  `_Paper` = "no change".
 
-- `SELECT name, params FROM strategy_configs WHERE id IN (…)` — diff vs the
-  "Target params" block in the change note; `runtime_mode`/`_source` unchanged.
-- fresh enabled-config dump → `python scripts/qc_paper_configs_live.py rows.txt`
-  → `ALL STRUCTURAL CHECKS PASSED`.
-- fill in the "Applied" line of `orb_conviction_config_update_2026_09_09.md` +
-  this entry.
+### Verified (over SSH)
 
-Approve? (yes — operator runs the one command / no)
+- `ORB_Convic_Live` — `is_enabled=t`, `runtime_mode=force_live` /
+  `_source=manual` (**unchanged**), `qty_lots=1`, `w=70`, 2 exit legs,
+  top-level `stop_pct 0.2 / target_pct 0.66 / trail_activation 0.18 /
+  trail_lock 0.7`, entry gate intact. `updated_at` 18:14:20 UTC.
+- `ORB_Convic_Paper` — `is_enabled=t`, `force_paper` / source NULL
+  (**unchanged**), no `qty_lots`, same w70 + 2-leg + top-level.
+  `updated_at` 18:12:20 UTC.
+- `scripts/qc_paper_configs_live.py` over all 12 enabled configs →
+  `ALL STRUCTURAL CHECKS PASSED`. `ROUTES LIVE (3): EMA_Convic_Live,
+  OI_Convic_Live, ORB_Convic_Live`.
+- **Pending:** next `auto_spawner` spawn (2026-09-10 ~09:00 IST) picks up w70 +
+  the 2-leg exit shape.
+
+### Rollback
+
+Re-run the script with each row's OLD `params` (verbatim JSON in
+`docs/ops/orb_conviction_config_update_2026_09_09.md` — for `_Live` use
+`qty_lots: 1`, leave `runtime_mode = force_live`), or `psql UPDATE`.
