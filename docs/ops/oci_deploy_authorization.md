@@ -1130,3 +1130,66 @@ one); not sha-captured before overwrite -- recoverable from git
 then `scp` that file to
 `ubuntu@144.24.137.112:/home/ubuntu/trading-bot/backend/scripts/qc_paper_configs_live.py`.
 No migration, no restart.
+
+---
+
+## DEPLOYED 2026-09-09 ~18:50 IST (13:20 UTC) — auto-login morning resilience (anchors + AB failback + anti-flap)
+
+`main` `4f21f5e` (ff-merged from `fix/autologin-morning-resilience`, pushed).
+Classifier did **not** block the scp/extract/restart (allow-rules already in
+`.claude/settings.local.json`).
+
+**What:** three seams that opened when the broker auto-login engine replaced the
+manual morning "Connect Shoonya" click —
+1. **Option-chain anchors seeded on the restart path.** New
+   `scheduler.instrument_sync.seed_option_anchors_from_db` (the logic lifted from
+   `api.v1.shoonya._seed_option_anchors`, which now delegates); called at startup
+   right after the token-cache warm-up (`app.main._seed_shoonya_option_anchors_from_db`)
+   and after every `ContractSyncScheduler` run. Removes the dependency on a flaky
+   live `SearchScrip` that caused the 2026-09-09 "no strikes at open" outage.
+2. **Alice Blue manual login self-wires.** `reset_shoonya_backup_leg` generalised
+   to `refresh_failover_backup_leg(name)` (+ thin `reset_shoonya_backup_leg` /
+   new `reset_alice_blue_backup_leg` wrappers); `api.v1.alice_blue.oauth_callback`
+   now spawns a background backup-leg refresh — no more backend restart needed
+   after a mid-session AB login.
+3. **Failover anti-flap.** `failover_threshold_seconds` 10 → 30;
+   `FailoverMarketDataProvider` now tracks `_last_backup_tick_at` (a silent backup
+   collapses the recovery dwell to 0 / no oscillation if both legs silent) +
+   adaptive dwell escalation 90→300→900s on repeated primary flaps;
+   `MarketDataScheduler` raises a proactive `market_data_failover_backup_unavailable`
+   WARNING when failover is enabled but Alice Blue has no live session.
+
+**Files (9 backend, surgical, 0 credentials):** `app/api/v1/alice_blue.py`,
+`app/api/v1/shoonya.py`, `app/config/settings.py`, `app/main.py`,
+`app/modules/market_data/market_data_scheduler.py`,
+`app/modules/market_data/provider_composition.py`,
+`app/modules/market_data/providers/failover.py`,
+`app/modules/scheduler/contract_sync_scheduler.py`,
+`app/modules/scheduler/instrument_sync.py`.
+**No migration** (box stays `0039`). Service restarted.
+
+**Safety gate:** 18:49 IST — market closed. Open-position check confirmed
+**0 open positions** (skip permitted off-hours per
+`feedback_preflight_check_market_hours_only`, checked anyway). Credentials on box
+untouched (5 `.env` files present and left as-is). Backup:
+`~/deploy-bak/autologin-fix-20260909-131933/`.
+
+**Verification:** sha256 **box == git-blob LF staging** for all 9 files
+(`8808015d…` failover.py, `f8016fea…` main.py, `9ee4ec3f…` instrument_sync.py,
+etc.); `ast.parse` OK; `systemctl restart` → `active`, `NRestarts=0`;
+`alembic current` = `0039 (head)`; `/health` → 200; **0 ERROR/Traceback/CRITICAL**
+in the restart window. Live-confirmed the new Fix 1 log line:
+`Shoonya option-anchor warm-up: seeded 24 (underlying, expiry) anchors from the
+DB before strategy resume.` (token-cache warm-up `replayed 6226` unchanged;
+`session restored from disk cache`; startup recovery clean).
+
+**Still to verify (needs a real market-hours session):** Fix 1 end-to-end on the
+next auto-login morning (13 runs spawn on the 09:00 tick with no manual login
+even if `SearchScrip` is flaky, `auto_spawn_broker_error` count 0); Fix 2 by a
+real mid-session AB reconnect (no restart, `refresh_failover_backup_leg` log
+line, override→ticks); Fix 3 threshold reads 30 and no spurious trips from
+routine blips.
+
+**Rollback:** `cp ~/deploy-bak/autologin-fix-20260909-131933/app/... ` back over
+the 9 files (or `git checkout ff4a5fa -- backend/app/<file>` then scp the
+git-blob LF version), `sudo systemctl restart trading-bot`. No migration.
