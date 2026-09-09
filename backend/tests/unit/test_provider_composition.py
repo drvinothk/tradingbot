@@ -321,3 +321,66 @@ def test_reset_shoonya_backup_leg_noop_when_provider_not_yet_constructed(monkeyp
     # Deliberately never calling get_market_data_provider() first -- the
     # singleton is None, same as a fresh process before first use.
     provider_composition.reset_shoonya_backup_leg()
+
+
+# -- refresh_failover_backup_leg / reset_alice_blue_backup_leg (2026-09-09) --
+
+
+def test_reset_alice_blue_backup_leg_replaces_backup_without_touching_primary(monkeypatch):
+    """A mid-session manual Alice Blue login must refresh the (Shoonya-
+    primary /) Alice-Blue-backup leg without a restart -- the generalised
+    mirror of `reset_shoonya_backup_leg`. "truedata" primary here for the
+    same import-safety reason the sibling tests use it.
+    """
+    from app.modules.market_data.providers.failover import FailoverMarketDataProvider
+
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "alice_blue"),
+    )
+    provider = provider_composition.get_market_data_provider()
+    inner = provider._inner  # noqa: SLF001
+    assert isinstance(inner, FailoverMarketDataProvider)
+    original_primary = inner._primary  # noqa: SLF001
+    original_backup = inner._backup  # noqa: SLF001
+
+    provider_composition.reset_alice_blue_backup_leg()
+
+    assert inner._primary is original_primary  # noqa: SLF001
+    assert inner._backup is not original_backup  # noqa: SLF001
+
+
+def test_refresh_failover_backup_leg_noop_when_backup_name_mismatches(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "shoonya"),
+    )
+    provider = provider_composition.get_market_data_provider()
+    inner = provider._inner  # noqa: SLF001
+    original_backup = inner._backup  # noqa: SLF001
+
+    provider_composition.refresh_failover_backup_leg("alice_blue")  # backup is "shoonya"
+
+    assert inner._backup is original_backup  # noqa: SLF001
+
+
+def test_refresh_failover_backup_leg_noop_when_failover_disabled(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "alice_blue", enabled=False),
+    )
+    provider_composition.get_market_data_provider()
+
+    provider_composition.reset_alice_blue_backup_leg()  # must not raise
+
+
+def test_refresh_failover_backup_leg_noop_when_provider_not_yet_constructed(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_failover("truedata", "alice_blue"),
+    )
+    provider_composition.reset_alice_blue_backup_leg()  # singleton is None -- no raise

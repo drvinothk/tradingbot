@@ -27,7 +27,10 @@ from app.domain.market.models import SyncStatus
 from app.modules.broker_adapter.composition import get_broker, is_execution_broker_connected
 from app.modules.ops import weekend_rest
 from app.modules.scheduler.base import DailyAtTimeScheduler
-from app.modules.scheduler.instrument_sync import sync_instrument_master
+from app.modules.scheduler.instrument_sync import (
+    seed_option_anchors_from_db,
+    sync_instrument_master,
+)
 
 logger = logging.getLogger("app.scheduler.contract_sync_scheduler")
 
@@ -48,19 +51,31 @@ def run_contract_sync() -> None:
         )
         return
 
+    broker = get_broker()
     with session_scope() as db:
-        log = sync_instrument_master(db, get_broker(), ["NFO"])
+        log = sync_instrument_master(db, broker, ["NFO"])
+        # Re-seed the Shoonya adapter's in-process option-anchor cache from
+        # the rows we just refreshed -- keeps `resolve_option_anchor` off the
+        # unreliable live `SearchScrip` fallback mid-day, and self-heals a
+        # missing/wrong anchor without a login or restart (see
+        # `seed_option_anchors_from_db`'s own docstring; no-ops for a
+        # non-Shoonya broker). Skipped only on an outright FAILED sync, where
+        # the rows may be mid-write.
+        anchors_seeded = 0
+        if log.status != SyncStatus.FAILED:
+            anchors_seeded = seed_option_anchors_from_db(db, broker)
         # .info for a normal success -- routine daily status, not something
         # worth interrupting a WARNING+-only view of the logs for; a real
         # PARTIAL/FAILED sync still logs at .warning so it stays visible.
         log_fn = logger.info if log.status == SyncStatus.SUCCESS else logger.warning
         log_fn(
             "Contract sync: status=%s instruments_updated=%d contracts_added=%d "
-            "contracts_expired=%d",
+            "contracts_expired=%d option_anchors_seeded=%d",
             log.status,
             log.instruments_updated,
             log.contracts_added,
             log.contracts_expired,
+            anchors_seeded,
         )
 
 

@@ -110,6 +110,14 @@ DepthCallback = Callable[[DepthSnapshot], None]
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 
+# Anti-flap dwell escalation (2026-09-09). The effective recovery
+# stabilization window = base * multiplier[flap_level]. With the default 90s
+# base that is ~90s / ~300s / ~900s. Capped at level 2 so a persistently
+# on/off primary settles on a *streaming* backup instead of thrashing; a
+# silent backup collapses the dwell to 0 regardless (see `_check_recovery`).
+_MAX_FLAP_LEVEL = 2
+_FLAP_DWELL_MULTIPLIERS = (1.0, 10.0 / 3.0, 10.0)
+
 
 class FailoverMarketDataProvider(BaseMarketDataProvider):
     def __init__(
@@ -161,6 +169,22 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         self._recovery_started_at: float | None = None
         self._backup_subscribed = False
         self._next_backup_attempt_at: float | None = None
+        # 2026-09-09 anti-flap hardening (see the 2026-09-08 Shoonya WS 502
+        # storm in this file's history). `_last_backup_tick_at`: the backup
+        # analogue of `_last_primary_tick_at`, so `_check_recovery` can tell
+        # whether the backup it's sitting on is *actually streaming* -- a
+        # successful subscribe is not the same as ticks flowing (the 502
+        # storm tripped to Alice Blue, which then delivered nothing).
+        # `_backup_active_since`: when the backup last became the active leg,
+        # for a first-tick grace window (mirrors `_subscribed_at` for the
+        # primary). `_flap_count` / `_primary_promoted_at`: escalate the
+        # recovery dwell when the primary keeps recovering then failing again
+        # within ~2x the base dwell, so a 502-storming primary stops yanking
+        # the feed back and forth.
+        self._last_backup_tick_at: float | None = None
+        self._backup_active_since: float | None = None
+        self._flap_count = 0
+        self._primary_promoted_at: float | None = None
         # Ops-Hardening Phase 4: a manual override on top of everything
         # above, not a replacement for it -- see set_manual_override's own
         # docstring.
@@ -332,6 +356,12 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
         with self._lock:
             if provider_name is not None:
                 self._active = provider_name
+            if provider_name == self._backup_name:
+                # Forced onto the backup -- give it the same first-tick grace
+                # window an automatic trip does, so a later override-clear
+                # doesn't immediately read it as "silent" (see _check_recovery).
+                self._backup_active_since = self._clock()
+                self._last_backup_tick_at = None
             self._manual_override = provider_name
         logger.warning("Market-data provider manual override set to %r", provider_name)
 
@@ -378,6 +408,13 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             self._backup = new_backup
 
         if was_subscribed:
+            # The fresh instance hasn't delivered anything yet -- reset its
+            # stream-health window so `_check_recovery` grants it the same
+            # first-tick grace a brand-new trip gets, rather than judging it
+            # by the old instance's last tick.
+            with self._lock:
+                self._last_backup_tick_at = None
+                self._backup_active_since = self._clock()
             try:
                 new_backup.subscribe_ticks(
                     symbols,
@@ -387,7 +424,7 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             except Exception:
                 logger.critical(
                     "New backup provider %r failed to subscribe after being refreshed for "
-                    "a Shoonya reconnect -- both market-data feeds may now be unavailable",
+                    "a reconnect -- both market-data feeds may now be unavailable",
                     self._backup_name,
                     exc_info=True,
                 )
@@ -416,6 +453,10 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             self._active = self._primary_name
             self._subscribed_at = None
             self._recovery_started_at = None
+            self._last_backup_tick_at = None
+            self._backup_active_since = None
+            self._primary_promoted_at = None
+            self._flap_count = 0
         self._backup_subscribed = False
 
     def subscribe_ticks(
@@ -511,6 +552,8 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             with self._lock:
                 if source_name == self._primary_name:
                     self._last_primary_tick_at = self._clock()
+                elif source_name == self._backup_name:
+                    self._last_backup_tick_at = self._clock()
                 if self._active == source_name:
                     callback = self._on_tick_by_symbol.get(tick.contract_symbol)
             if callback is not None:
@@ -615,13 +658,45 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
                 now - subscribed_at
             ) <= self._failover_threshold_seconds
         if healthy:
+            # Decay the flap counter once the primary has held healthy for
+            # well past the base dwell since its last promotion -- a genuine
+            # recovery, not a flap. One level per clean stretch.
+            with self._lock:
+                promoted_at = self._primary_promoted_at
+                if (
+                    promoted_at is not None
+                    and (now - promoted_at) >= 2 * self._recovery_stabilization_seconds
+                ):
+                    self._flap_count = max(self._flap_count - 1, 0)
+                    self._primary_promoted_at = now if self._flap_count > 0 else None
             return
+
+        # Primary is unhealthy. If it went unhealthy again very soon after
+        # being promoted back to active, that's a flap -- `_check_recovery`
+        # uses `_flap_count` to escalate its stabilization dwell.
+        with self._lock:
+            promoted_at = self._primary_promoted_at
+            if (
+                promoted_at is not None
+                and (now - promoted_at) < 2 * self._recovery_stabilization_seconds
+            ):
+                self._flap_count = min(self._flap_count + 1, _MAX_FLAP_LEVEL)
+                logger.warning(
+                    "Failover: %r went unhealthy again %.0fs after recovering — flap #%d; "
+                    "recovery dwell will escalate",
+                    self._primary_name,
+                    now - promoted_at,
+                    self._flap_count,
+                )
+            self._primary_promoted_at = None
 
         if not self._ensure_backup_subscribed(now):
             return
         with self._lock:
             self._active = self._backup_name
             self._recovery_started_at = None
+            self._backup_active_since = now
+            self._last_backup_tick_at = None
         message = (
             f"No tick from {self._primary_name!r} for > {self._failover_threshold_seconds:.0f}s "
             f"— switched active market-data provider to {self._backup_name!r}."
@@ -765,6 +840,37 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             )
         self._backup_subscribed = False
         self._next_backup_attempt_at = None
+        # The backup is no longer active -- its stream-health timestamps must
+        # not carry over to a later, fresh trip (a stale `_last_backup_tick_at`
+        # would make `_check_recovery` think a brand-new backup was already
+        # streaming).
+        with self._lock:
+            self._last_backup_tick_at = None
+            self._backup_active_since = None
+
+    def _promote_primary(self, now: float, *, reason: str) -> None:
+        """Switch the active leg back to primary: record the promotion time
+        (so `_check_primary_health` can detect a subsequent quick failure as
+        a flap), reset the recovery timer, alert (WARNING -- good news, stays
+        DB-only per `send_alert`'s CRITICAL-only Telegram gate), and tear
+        down the backup.
+        """
+        with self._lock:
+            self._active = self._primary_name
+            self._recovery_started_at = None
+            self._primary_promoted_at = now
+
+        recovery_message = (
+            f"{reason} — switching active market-data provider back to {self._primary_name!r}."
+        )
+        logger.warning("FAILOVER RECOVERY: %s", recovery_message)
+        self._alert(
+            category="market_data_failover_switch",
+            severity=AlertSeverity.WARNING,
+            message=recovery_message,
+            dedup_suffix="recovered",
+        )
+        self._stop_backup(reason="primary recovered")
 
     def _check_recovery(self, now: float) -> None:
         if not is_data_flow_expected(self._now_ist_provider()):
@@ -775,8 +881,54 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             # yet would be premature either way.
             return
         with self._lock:
-            last = self._last_primary_tick_at
-        primary_healthy = last is not None and (now - last) <= self._failover_threshold_seconds
+            last_primary = self._last_primary_tick_at
+            last_backup = self._last_backup_tick_at
+            backup_active_since = self._backup_active_since
+            flap_level = min(self._flap_count, _MAX_FLAP_LEVEL)
+
+        primary_healthy = (
+            last_primary is not None
+            and (now - last_primary) <= self._failover_threshold_seconds
+        )
+        # Is the backup we're currently sitting on actually delivering? A
+        # successful subscribe is not the same as ticks flowing (2026-09-08:
+        # failover tripped to Alice Blue, which then delivered nothing, and
+        # the fixed 90s dwell kept flipping back to a 502-storming Shoonya).
+        # Grace the first `failover_threshold_seconds` after the backup
+        # became active, same "no tick yet" reasoning `_check_primary_health`
+        # uses for the primary.
+        if last_backup is not None:
+            backup_streaming = (now - last_backup) <= self._failover_threshold_seconds
+        else:
+            backup_streaming = (
+                backup_active_since is not None
+                and (now - backup_active_since) <= self._failover_threshold_seconds
+            )
+
+        if not backup_streaming:
+            # Nothing is gained by dwelling on a silent backup.
+            if primary_healthy:
+                self._promote_primary(
+                    now,
+                    reason=(
+                        f"backup {self._backup_name!r} is delivering no ticks and "
+                        f"{self._primary_name!r} is back"
+                    ),
+                )
+            else:
+                # Both legs silent -- do NOT oscillate onto a dead primary.
+                # The existing "both_down" alert and
+                # HealthCheckScheduler._check_market_data_staleness (5-min
+                # CRITICAL) already cover this; flipping would only add churn.
+                with self._lock:
+                    self._recovery_started_at = None
+            return
+
+        # Backup is streaming -- the normal anti-flap dwell applies, scaled
+        # up by how many times the primary has recently flapped.
+        effective_dwell = (
+            self._recovery_stabilization_seconds * _FLAP_DWELL_MULTIPLIERS[flap_level]
+        )
 
         with self._lock:
             if not primary_healthy:
@@ -792,32 +944,17 @@ class FailoverMarketDataProvider(BaseMarketDataProvider):
             if self._recovery_started_at is None:
                 self._recovery_started_at = now
                 logger.info(
-                    "Failover recovery: %r is back online — starting %.0fs "
-                    "stabilization window before switching back",
+                    "Failover recovery: %r is back online — starting %.0fs stabilization "
+                    "window before switching back (flap level %d)",
                     self._primary_name,
-                    self._recovery_stabilization_seconds,
+                    effective_dwell,
+                    flap_level,
                 )
                 return
 
-            if (now - self._recovery_started_at) < self._recovery_stabilization_seconds:
+            if (now - self._recovery_started_at) < effective_dwell:
                 return
 
-            self._active = self._primary_name
-            self._recovery_started_at = None
-
-        recovery_message = (
-            f"{self._primary_name!r} stable for {self._recovery_stabilization_seconds:.0f}s "
-            f"— switching active market-data provider back to {self._primary_name!r}."
+        self._promote_primary(
+            now, reason=f"{self._primary_name!r} stable for {effective_dwell:.0f}s"
         )
-        logger.warning("FAILOVER RECOVERY: %s", recovery_message)
-        # WARNING, not CRITICAL -- good news (the earlier disconnection
-        # resolved itself), stays DB-only per send_alert's own
-        # CRITICAL-only Telegram gate; the outage itself already pushed via
-        # the "switched"/"both_down" alerts above.
-        self._alert(
-            category="market_data_failover_switch",
-            severity=AlertSeverity.WARNING,
-            message=recovery_message,
-            dedup_suffix="recovered",
-        )
-        self._stop_backup(reason="primary recovered")

@@ -335,6 +335,67 @@ class MarketDataScheduler:
         except Exception:  # noqa: BLE001 - a background loop must never die silently-crashed
             logger.exception("Health check: provider connect failed")
         self._subscribe_known_underlyings_if_ready()
+        self._alert_if_failover_backup_unavailable()
+
+    def _alert_if_failover_backup_unavailable(self) -> None:
+        """Proactive warning: failover is enabled but the backup provider has
+        no live session, so an automatic failover would be impossible if the
+        primary drops. Without this the operator only finds out when the
+        primary *has* dropped and `_ensure_backup_subscribed` fires
+        `backup_not_ready` mid-outage. Scoped to `alice_blue` (the only
+        backup whose auth can't self-recover -- see
+        `AliceBlueMarketDataProvider.is_ready`); covers vendor-app expiry,
+        token expiry and never-logged-in uniformly. WARNING, self-resolving
+        (stops re-firing the moment the backup is live again);
+        `send_alert`'s 15-min dedup makes it once-per-window.
+        """
+        if self._alert_session_factory is None:
+            return
+
+        from app.config.settings import get_settings
+
+        settings = get_settings()
+        if not settings.market_data.failover_enabled:
+            return
+        if settings.market_data.failover_backup_provider != "alice_blue":
+            return
+
+        from app.modules.market_data.providers.alice_blue_session import (
+            alice_blue_connection_live,
+        )
+
+        if alice_blue_connection_live():
+            return
+
+        from app.domain.ops.models import AlertSeverity
+        from app.domain.session.models import TradingSession, TradingSessionStatus
+        from app.modules.alerting.manager import send_alert
+
+        with self._alert_session_factory() as db:
+            workspace_ids = {
+                row[0]
+                for row in db.query(TradingSession.workspace_id)
+                .filter(TradingSession.status == TradingSessionStatus.ACTIVE)
+                .distinct()
+                .all()
+            }
+            for workspace_id in workspace_ids:
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.WARNING,
+                    category="market_data_failover_backup_unavailable",
+                    message=(
+                        "Failover backup 'alice_blue' has no live session — automatic "
+                        "failover is unavailable if the primary drops. Reconnect Alice Blue "
+                        "(Market Terminal); if its vendor app has expired, re-register it in "
+                        "the Alice Blue portal first."
+                    ),
+                    dedup_key=f"market_data_failover_backup_unavailable:{workspace_id}",
+                )
+            # No explicit commit -- the production `_alert_session_factory` is
+            # `session_scope`, which commits on context exit; the sibling
+            # `_alert_if_no_session_anywhere` relies on the same.
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

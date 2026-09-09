@@ -148,3 +148,55 @@ def test_run_contract_sync_calls_sync_when_shoonya_connected(monkeypatch):
     contract_sync_module.run_contract_sync()
 
     assert len(sync_calls) == 1
+
+
+def _patch_sync_env(monkeypatch, *, log):
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(contract_sync_module, "is_execution_broker_connected", lambda: True)
+    broker = object()
+    monkeypatch.setattr(contract_sync_module, "get_broker", lambda: broker)
+    monkeypatch.setattr(
+        contract_sync_module, "sync_instrument_master", lambda db, b, exchanges: log
+    )
+
+    @contextmanager
+    def _fake_session_scope():
+        yield object()
+
+    monkeypatch.setattr(contract_sync_module, "session_scope", _fake_session_scope)
+    seed_calls: list[object] = []
+    monkeypatch.setattr(
+        contract_sync_module,
+        "seed_option_anchors_from_db",
+        lambda db, adapter: seed_calls.append(adapter) or 3,
+    )
+    return broker, seed_calls
+
+
+def test_run_contract_sync_seeds_option_anchors_after_a_successful_sync(monkeypatch):
+    class _FakeLog:
+        status = contract_sync_module.SyncStatus.SUCCESS
+        instruments_updated = 0
+        contracts_added = 0
+        contracts_expired = 0
+
+    broker, seed_calls = _patch_sync_env(monkeypatch, log=_FakeLog())
+
+    contract_sync_module.run_contract_sync()
+
+    assert seed_calls == [broker]  # re-seeded from the rows just refreshed
+
+
+def test_run_contract_sync_skips_anchor_seed_on_a_failed_sync(monkeypatch):
+    class _FailedLog:
+        status = contract_sync_module.SyncStatus.FAILED
+        instruments_updated = 0
+        contracts_added = 0
+        contracts_expired = 0
+
+    _broker, seed_calls = _patch_sync_env(monkeypatch, log=_FailedLog())
+
+    contract_sync_module.run_contract_sync()
+
+    assert seed_calls == []  # rows may be mid-write -- don't seed off them

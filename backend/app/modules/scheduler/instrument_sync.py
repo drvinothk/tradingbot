@@ -277,3 +277,57 @@ def sync_instrument_master(
     db.add(log)
     db.flush()
     return log
+
+
+# Underlyings this system trades -- kept local (not imported from
+# broker_adapter.shoonya.adapter.KNOWN_UNDERLYINGS) so this module never
+# eagerly imports the httpx/websockets-touching Shoonya adapter package,
+# the same reasoning api.v1.shoonya keeps its own local copy for.
+_ANCHOR_SEED_UNDERLYINGS = ("NIFTY", "BANKNIFTY")
+
+
+def seed_option_anchors_from_db(db: Session, adapter: object) -> int:
+    """Pre-populate a Shoonya adapter's in-process `_option_anchor_cache`
+    (see `ShoonyaBrokerAdapter._resolve_option_anchor_tsym`) from this
+    system's own already-synced `option_contracts`, for every active expiry
+    of each traded underlying.
+
+    Why this exists: when that cache is empty, `_resolve_option_anchor_tsym`
+    has only one fallback -- a live `SearchScrip` call -- which Shoonya
+    returns *empty* for a real, currently-listed underlying often enough to
+    have caused a full "no strikes at open" outage on 2026-09-09. The
+    auto-login-driven restart re-adopts the token but never seeded this
+    cache; the manual OAuth path did (via `api.v1.shoonya._seed_option_anchors`,
+    which now delegates here). Seeding from the DB -- the source of truth for
+    `option_contracts` -- removes the `SearchScrip` dependency for any synced
+    expiry. An exact calendar expiry's anchor never goes stale, so a seeded
+    entry is reused for the process lifetime.
+
+    `adapter` is typed `object` and `seed_option_anchor` is reached via
+    `getattr` so a non-Shoonya broker (the mock, at startup before a real
+    login) is silently skipped rather than crashing the caller. Read-only:
+    no `db.commit()`. Returns the count of (underlying, expiry) anchors
+    seeded, for the caller's log line.
+    """
+    seed = getattr(adapter, "seed_option_anchor", None)
+    if seed is None:
+        return 0
+    seeded = 0
+    for symbol in _ANCHOR_SEED_UNDERLYINGS:
+        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
+        if instrument is None:
+            continue
+        rows = (
+            db.query(OptionContract.expiry_date, OptionContract.symbol)
+            .filter(
+                OptionContract.instrument_id == instrument.id,
+                OptionContract.is_active.is_(True),
+            )
+            .order_by(OptionContract.expiry_date)
+            .distinct(OptionContract.expiry_date)
+            .all()
+        )
+        for expiry_date, tsym in rows:
+            seed(symbol, expiry_date, tsym)
+            seeded += 1
+    return seeded

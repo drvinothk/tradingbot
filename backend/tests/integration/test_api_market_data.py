@@ -554,3 +554,122 @@ def test_aliceblue_status_ttl_cache_collapses_repeat_probes(
     api_client.get("/aliceblue/status")
 
     assert len(calls) == 1
+
+
+# --- /aliceblue/callback triggers the failover-backup-leg refresh ----------
+
+
+def test_aliceblue_callback_spawns_the_post_login_refresh(
+    api_client: TestClient, seeded_admin, monkeypatch, _isolate_alice_blue_cache_file
+):
+    from app.api.v1 import alice_blue as alice_blue_api
+    from app.modules.market_data.providers.alice_blue_auth import AliceBlueSession
+
+    monkeypatch.setattr(
+        alice_blue_api,
+        "exchange_for_session",
+        lambda *a, **k: AliceBlueSession(client_id="288866", user_session="tok"),
+    )
+    spawned: list[int] = []
+    monkeypatch.setattr(
+        alice_blue_api, "_spawn_alice_blue_post_login_refresh", lambda: spawned.append(1)
+    )
+    _login(api_client, seeded_admin)
+
+    resp = api_client.get("/aliceblue/callback?authCode=abc&userId=288866")
+
+    assert resp.status_code == 200
+    assert spawned == [1]  # a mid-session login self-wires, no restart needed
+
+
+class _MDSettings:
+    def __init__(self, *, failover_enabled: bool, backup: str, provider: str) -> None:
+        self.failover_enabled = failover_enabled
+        self.failover_backup_provider = backup
+        self.provider = provider
+
+
+class _Settings:
+    def __init__(self, md: _MDSettings) -> None:
+        self.market_data = md
+
+
+def _patch_refresh_targets(monkeypatch, md: _MDSettings) -> list[str]:
+    monkeypatch.setattr("app.config.settings.get_settings", lambda: _Settings(md))
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.reset_alice_blue_backup_leg",
+        lambda: calls.append("backup_leg"),
+    )
+    monkeypatch.setattr(
+        "app.modules.market_data.registry.reset_for_reconnect",
+        lambda: calls.append("reconnect"),
+    )
+    return calls
+
+
+def test_alice_blue_refresh_hits_the_backup_leg_when_ab_is_the_failover_backup(monkeypatch):
+    from app.api.v1 import alice_blue as alice_blue_api
+
+    calls = _patch_refresh_targets(
+        monkeypatch,
+        _MDSettings(failover_enabled=True, backup="alice_blue", provider="shoonya"),
+    )
+    alice_blue_api._run_alice_blue_post_login_refresh()
+    assert calls == ["backup_leg"]
+
+
+def test_alice_blue_refresh_reconnects_when_ab_is_primary_and_no_failover(monkeypatch):
+    from app.api.v1 import alice_blue as alice_blue_api
+
+    calls = _patch_refresh_targets(
+        monkeypatch,
+        _MDSettings(failover_enabled=False, backup="alice_blue", provider="alice_blue"),
+    )
+    alice_blue_api._run_alice_blue_post_login_refresh()
+    assert calls == ["reconnect"]
+
+
+def test_alice_blue_refresh_is_a_noop_when_ab_is_not_in_the_active_chain(monkeypatch):
+    from app.api.v1 import alice_blue as alice_blue_api
+
+    calls = _patch_refresh_targets(
+        monkeypatch,
+        _MDSettings(failover_enabled=True, backup="angel_one", provider="shoonya"),
+    )
+    alice_blue_api._run_alice_blue_post_login_refresh()
+    assert calls == []
+
+
+def test_alice_blue_refresh_survives_the_refresh_raising(monkeypatch):
+    from app.api.v1 import alice_blue as alice_blue_api
+
+    monkeypatch.setattr(
+        "app.config.settings.get_settings",
+        lambda: _Settings(
+            _MDSettings(failover_enabled=True, backup="alice_blue", provider="shoonya")
+        ),
+    )
+
+    def _boom() -> None:
+        raise RuntimeError("replace_backup blew up")
+
+    monkeypatch.setattr(
+        "app.modules.market_data.provider_composition.reset_alice_blue_backup_leg", _boom
+    )
+    alice_blue_api._run_alice_blue_post_login_refresh()  # must not raise
+
+
+def test_alice_blue_spawn_skips_a_duplicate_while_one_is_running(monkeypatch):
+    from app.api.v1 import alice_blue as alice_blue_api
+
+    alice_blue_api._post_login_background_lock.acquire()
+    try:
+        ran: list[int] = []
+        monkeypatch.setattr(
+            alice_blue_api, "_run_alice_blue_post_login_refresh", lambda: ran.append(1)
+        )
+        alice_blue_api._spawn_alice_blue_post_login_refresh()
+        assert ran == []  # lock held -> skipped, not queued
+    finally:
+        alice_blue_api._post_login_background_lock.release()

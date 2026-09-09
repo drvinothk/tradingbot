@@ -30,7 +30,6 @@ from app.core.db.session import get_db, session_scope
 from app.core.security.rbac import require_permission
 from app.domain.audit.models import ActorType, EventCategory
 from app.domain.identity.models import User
-from app.domain.market.models import Instrument, OptionContract
 from app.modules.audit_service.service import record_event
 from app.modules.broker_adapter.base.broker_port import BrokerPort
 from app.modules.broker_adapter.composition import (
@@ -41,51 +40,26 @@ from app.modules.broker_adapter.composition import (
 )
 from app.modules.broker_adapter.shoonya.auth import build_authorize_url, exchange_code_for_token
 from app.modules.broker_adapter.shoonya.session_cache import set_cached_shoonya_session
-from app.modules.scheduler.instrument_sync import sync_instrument_master
+from app.modules.scheduler.instrument_sync import (
+    seed_option_anchors_from_db,
+    sync_instrument_master,
+)
 
 logger = logging.getLogger("app.api.shoonya")
 
 router = APIRouter(prefix="/shoonya", tags=["shoonya"])
 
-# This system only ever trades these two underlyings — see
-# `broker_adapter/shoonya/adapter.py`'s own `KNOWN_UNDERLYINGS` for the
-# identical scoping decision on the sync side.
-_KNOWN_UNDERLYINGS = ("NIFTY", "BANKNIFTY")
-
-
 def _seed_option_anchors(db: Session, adapter: object) -> None:
-    """Pre-warms `ShoonyaBrokerAdapter._resolve_option_anchor_tsym`'s cache
-    from this system's own already-synced `option_contracts`, for every
-    expiry `sync_instrument_master` (just called before this) confirmed
-    active — see `ShoonyaBrokerAdapter.seed_option_anchor`'s own docstring
-    for why: a live `SearchScrip` call for something already known correct
-    is pure unreliability with no correctness upside. `adapter` is typed
-    `object` (not `ShoonyaBrokerAdapter`) so this function's signature
-    doesn't force an eager import of `broker_adapter.shoonya` at module
-    scope — see this module's own top-level docstring for why that's
-    deliberately avoided; `seed_option_anchor` is called via `getattr` so
-    a non-Shoonya broker (never expected here, but safe regardless) is
-    simply skipped rather than crashing OAuth login over a warm-up step.
+    """Thin delegation to
+    `scheduler.instrument_sync.seed_option_anchors_from_db` — kept as a
+    named function here so `_run_post_login_background_work`'s call site and
+    its tests read unchanged. The same helper is now also called at startup
+    (`app.main._seed_shoonya_option_anchors_from_db`) and after every daily
+    contract sync, so the auto-login restart path gets the anchor cache a
+    manual OAuth login used to be the only source of. See that helper's own
+    docstring.
     """
-    seed = getattr(adapter, "seed_option_anchor", None)
-    if seed is None:
-        return
-    for symbol in _KNOWN_UNDERLYINGS:
-        instrument = db.query(Instrument).filter(Instrument.symbol == symbol).one_or_none()
-        if instrument is None:
-            continue
-        rows = (
-            db.query(OptionContract.expiry_date, OptionContract.symbol)
-            .filter(
-                OptionContract.instrument_id == instrument.id,
-                OptionContract.is_active.is_(True),
-            )
-            .order_by(OptionContract.expiry_date)
-            .distinct(OptionContract.expiry_date)
-            .all()
-        )
-        for expiry_date, tsym in rows:
-            seed(symbol, expiry_date, tsym)
+    seed_option_anchors_from_db(db, adapter)
 
 
 # Matches `market_data.registry`'s own local definition of this same alias

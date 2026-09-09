@@ -232,56 +232,65 @@ def get_market_data_provider() -> BaseMarketDataProvider:
     return _provider
 
 
-def reset_shoonya_backup_leg() -> None:
-    """2026-08-20: a Shoonya reconnect must refresh the failover backup
-    leg's stale reference even when Shoonya isn't the *primary* provider —
-    `market_data.registry.reset_for_reconnect` only fires `if
-    get_settings().market_data.provider == "shoonya"`, so today's actual
-    TrueData-primary/Shoonya-backup configuration (and equally, a future
-    Angel One- or Alice Blue-primary/Shoonya-backup one — nothing about
-    this bug is specific to any one primary provider) never triggers it at
-    all. Root cause: `BrokerPortMarketDataAdapter.__init__` captures
-    `self._broker = broker` once and never re-fetches it, so the backup
-    leg stays pointed at whatever adapter object existed *before* this
-    reconnect — often the mock, since `FailoverMarketDataProvider` is
-    typically constructed early in process startup, before any real
-    Shoonya login has completed.
+def refresh_failover_backup_leg(provider_name: str) -> None:
+    """A broker/data reconnect must refresh the failover *backup* leg's
+    stale reference — `market_data.registry.reset_for_reconnect` only rebuilds
+    the whole chain when that provider is the *primary*, so a
+    `<primary>-primary / <provider_name>-backup` configuration would otherwise
+    never pick up the reconnect at all. Root cause: a provider built early in
+    process startup (before any real login) captures its session/broker
+    reference once — `BrokerPortMarketDataAdapter` captures `get_broker()`,
+    `AliceBlueMarketDataProvider` builds its `_ws` once against whatever
+    `get_alice_blue_session()` held then — and never re-fetches it.
 
     Deliberately narrower than `reset_for_reconnect`: only replaces
-    `FailoverMarketDataProvider.backup` (see that method's own docstring),
-    never tears down or reconstructs the primary leg — a healthy
-    TrueData/Angel One connection must never be disturbed just because
-    Shoonya, the backup, reconnected.
+    `FailoverMarketDataProvider.backup` (see that method's own docstring for
+    the dormant vs. mid-trip handling), never touches the primary leg — a
+    healthy primary must not be disturbed just because the backup reconnected.
 
-    Called from `api.v1.shoonya.oauth_callback` unconditionally (cheap
-    no-op checks below handle every case where it doesn't apply) —
-    deliberately the mirror image of `reset_for_reconnect`'s own gating,
-    so between the two of them every "Shoonya is configured somewhere in
-    the active market-data chain" case is covered, regardless of which
-    provider is primary.
+    Called (via the thin `reset_shoonya_backup_leg` / `reset_alice_blue_backup_leg`
+    wrappers) from the respective OAuth callbacks unconditionally; the cheap
+    no-op checks below handle every case where it doesn't apply, so between
+    this and `reset_for_reconnect` every "this provider is somewhere in the
+    active market-data chain" case is covered regardless of which is primary.
     """
     settings = get_settings()
     if not settings.market_data.failover_enabled:
         return
-    if settings.market_data.failover_backup_provider != "shoonya":
+    if settings.market_data.failover_backup_provider != provider_name:
         return
     if _provider is None:
         # Nothing constructed yet -- the eventual first construction reads
-        # get_broker() fresh at that point, so there's nothing stale to fix.
+        # the fresh session/broker at that point, so there's nothing stale.
         return
 
     inner: BaseMarketDataProvider = _provider
     # MarketHoursGatedProvider wraps FailoverMarketDataProvider whenever
     # provider != "mock" -- see get_market_data_provider's own construction.
-    # "shoonya" as a *backup* (this function's whole reason to exist) only
-    # ever occurs in that shape.
     if isinstance(inner, MarketHoursGatedProvider):
         inner = inner._inner  # noqa: SLF001 - same composition-root reach as elsewhere in this module
     if not isinstance(inner, FailoverMarketDataProvider):
         return
 
-    fresh_backup = _build_provider("shoonya", settings)
+    fresh_backup = _build_provider(provider_name, settings)
     inner.replace_backup(fresh_backup)
+
+
+def reset_shoonya_backup_leg() -> None:
+    """Thin wrapper — refreshes the failover backup leg when Shoonya is the
+    *backup* (e.g. an Alice Blue- or Angel One-primary / Shoonya-backup
+    setup). Called from `api.v1.shoonya.oauth_callback`.
+    """
+    refresh_failover_backup_leg("shoonya")
+
+
+def reset_alice_blue_backup_leg() -> None:
+    """Thin wrapper — refreshes the failover backup leg when Alice Blue is
+    the *backup* (today's production config: Shoonya primary, Alice Blue
+    backup). Called from `api.v1.alice_blue.oauth_callback` so a mid-session
+    manual Alice Blue login takes effect without a backend restart.
+    """
+    refresh_failover_backup_leg("alice_blue")
 
 
 def is_shoonya_market_data_ready() -> bool:

@@ -9,6 +9,7 @@ from app.domain.market.models import Instrument, InstrumentMasterSyncLog, Option
 from app.modules.broker_adapter.base.contracts import InstrumentInfo, OptionType
 from app.modules.broker_adapter.mock import MockBrokerAdapter
 from app.modules.scheduler import sync_instrument_master
+from app.modules.scheduler.instrument_sync import seed_option_anchors_from_db
 
 EXPIRY = date(2026, 7, 31)
 
@@ -258,3 +259,67 @@ def test_sync_records_failure_log_on_broker_error(db: Session):
     assert log.status == SyncStatus.FAILED
     assert "simulated broker outage" in log.detail
     assert db.query(InstrumentMasterSyncLog).count() == 1
+
+
+# --- seed_option_anchors_from_db --------------------------------------------
+
+_FUTURE_EXPIRY = date.today() + timedelta(days=10)
+
+
+class _AnchorRecorder:
+    """Stand-in for a Shoonya adapter -- captures `seed_option_anchor` calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, date, str]] = []
+
+    def seed_option_anchor(self, underlying: str, expiry: date, tsym: str) -> None:
+        self.calls.append((underlying, expiry, tsym))
+
+
+def test_seed_option_anchors_seeds_one_real_tsym_per_distinct_expiry(db: Session):
+    broker = MockBrokerAdapter(instruments=build_mock_universe(_FUTURE_EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+    rec = _AnchorRecorder()
+
+    seeded = seed_option_anchors_from_db(db, rec)
+
+    assert seeded == 2  # one per (underlying, distinct expiry)
+    assert {(u, e) for (u, e, _t) in rec.calls} == {
+        ("NIFTY", _FUTURE_EXPIRY),
+        ("BANKNIFTY", _FUTURE_EXPIRY),
+    }
+    for _u, _e, tsym in rec.calls:
+        # every seeded tsym is a real, currently-active contract symbol
+        assert (
+            db.query(OptionContract)
+            .filter(OptionContract.symbol == tsym, OptionContract.is_active.is_(True))
+            .count()
+            == 1
+        )
+
+
+def test_seed_option_anchors_ignores_inactive_contracts(db: Session):
+    broker = MockBrokerAdapter(instruments=build_mock_universe(_FUTURE_EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.query(OptionContract).update({OptionContract.is_active: False})
+    db.flush()
+    rec = _AnchorRecorder()
+
+    assert seed_option_anchors_from_db(db, rec) == 0
+    assert rec.calls == []
+
+
+def test_seed_option_anchors_noop_for_a_non_shoonya_broker(db: Session):
+    broker = MockBrokerAdapter(instruments=build_mock_universe(_FUTURE_EXPIRY), seed=1)
+    sync_instrument_master(db, broker, exchanges=["NFO"])
+    db.flush()
+
+    # a plain object has no `seed_option_anchor` -- must be skipped, not crash
+    assert seed_option_anchors_from_db(db, object()) == 0
+
+
+def test_seed_option_anchors_noop_when_underlyings_not_synced(db: Session):
+    rec = _AnchorRecorder()
+    assert seed_option_anchors_from_db(db, rec) == 0
+    assert rec.calls == []

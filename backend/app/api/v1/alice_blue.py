@@ -14,6 +14,7 @@ reason: `BaseMarketDataProvider`'s interface has no order methods at all).
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -37,6 +38,76 @@ from app.modules.market_data.providers.alice_blue_session import set_alice_blue_
 logger = logging.getLogger("app.api.alice_blue")
 
 router = APIRouter(prefix="/aliceblue", tags=["alice-blue"])
+
+_post_login_background_lock = threading.Lock()
+
+
+def _run_alice_blue_post_login_refresh() -> None:
+    """The market-data-wiring half of a successful Alice Blue login, run in a
+    background thread (see `_spawn_alice_blue_post_login_refresh`). Mirrors
+    `api.v1.shoonya._run_post_login_background_work` but far narrower: Alice
+    Blue is market-data-only, so there is no `sync_instrument_master` /
+    `run_daily_bootstrap` to do — only the failover backup leg (or, if Alice
+    Blue is ever the *primary* provider, the ingestion chain) needs to pick
+    up the fresh session, which before this it only did on a full backend
+    restart (`AliceBlueMarketDataProvider` builds its `_ws` once against the
+    session that existed at construction).
+
+    Each step guards itself — an uncaught exception in a daemon thread has no
+    request left to fail loudly.
+    """
+    from app.config.settings import get_settings
+
+    settings = get_settings()
+    if not settings.market_data.failover_enabled:
+        # Alice Blue as primary (no failover): rebuild the ingestion chain,
+        # same as the Shoonya callback does for a Shoonya-primary reconnect.
+        if settings.market_data.provider == "alice_blue":
+            from app.modules.market_data.registry import reset_for_reconnect
+
+            try:
+                reset_for_reconnect()
+            except Exception:
+                logger.exception("post-login Alice Blue reset_for_reconnect failed")
+        return
+
+    if settings.market_data.failover_backup_provider == "alice_blue":
+        from app.modules.market_data.provider_composition import reset_alice_blue_backup_leg
+
+        try:
+            reset_alice_blue_backup_leg()
+        except Exception:
+            logger.exception("post-login Alice Blue backup-leg refresh failed")
+    elif settings.market_data.provider == "alice_blue":
+        from app.modules.market_data.registry import reset_for_reconnect
+
+        try:
+            reset_for_reconnect()
+        except Exception:
+            logger.exception("post-login Alice Blue reset_for_reconnect failed")
+
+
+def _spawn_alice_blue_post_login_refresh() -> None:
+    """Non-blocking. Skips (logs) if a previous reconnect's refresh is still
+    running rather than racing two `replace_backup` passes — the in-flight
+    one already covers the same work. Split out so tests can monkeypatch this
+    single call to run inline, the same precedent
+    `api.v1.shoonya._spawn_post_login_background_work` established.
+    """
+    if not _post_login_background_lock.acquire(blocking=False):
+        logger.warning(
+            "aliceblue.oauth_callback: post-login refresh already in progress -- skipping a "
+            "duplicate run"
+        )
+        return
+
+    def _run() -> None:
+        try:
+            _run_alice_blue_post_login_refresh()
+        finally:
+            _post_login_background_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @router.get("/login-url")
@@ -101,6 +172,11 @@ def oauth_callback(
         )
 
     set_alice_blue_session(session)
+    # Refresh the live failover backup leg (or the ingestion chain, if Alice
+    # Blue is primary) so this login takes effect without a backend restart —
+    # backgrounded so a slow `replace_backup` never holds the browser
+    # response. See `_run_alice_blue_post_login_refresh`.
+    _spawn_alice_blue_post_login_refresh()
 
     record_event(
         db,

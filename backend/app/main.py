@@ -187,6 +187,17 @@ def _attempt_shoonya_reconnect_from_cache() -> None:
     `provider_composition.get_market_data_provider()` is first constructed
     later in `lifespan` — no explicit `reset_for_reconnect()` call is needed
     here the way `oauth_callback`'s *mid-session* reconnect case needs one.
+
+    One piece of `oauth_callback`'s work *does* have to be replicated on this
+    path, just not here: seeding `ShoonyaBrokerAdapter._option_anchor_cache`
+    (`_seed_option_anchors`). That cache is per-process — wiped on every
+    restart, NOT a DB row — and its only other source is a live `SearchScrip`
+    call that Shoonya returns empty often enough to have caused a full "no
+    strikes at open" outage on 2026-09-09 (the auto-login restart re-adopted
+    the token fine, but nothing seeded the anchor cache and `SearchScrip`
+    was down). `lifespan` calls `_seed_shoonya_option_anchors_from_db()`
+    immediately after this, and `ContractSyncScheduler.run_contract_sync`
+    re-seeds it after every daily sync.
     """
     from app.config.settings import get_settings
     from app.modules.broker_adapter.composition import set_broker
@@ -303,6 +314,54 @@ def _warm_shoonya_token_cache_from_db() -> None:
         logger.warning(
             "Shoonya token-cache warm-up failed (non-fatal) — the feed will still recover "
             "lazily, just slower.",
+            exc_info=True,
+        )
+
+
+def _seed_shoonya_option_anchors_from_db() -> None:
+    """Sibling of `_warm_shoonya_token_cache_from_db` above — seeds the
+    Shoonya adapter's in-process `_option_anchor_cache` from the DB's
+    already-synced `option_contracts`, so `get_option_chain` /
+    `resolve_option_anchor` never has to fall back to a live `SearchScrip`
+    call for a real NIFTY/BANKNIFTY near expiry. Closes the gap that caused
+    the 2026-09-09 "no strikes at open" outage: the auto-login-driven
+    restart re-adopts the token via `_attempt_shoonya_reconnect_from_cache`,
+    but that path (unlike a manual OAuth login) never ran
+    `api.v1.shoonya._seed_option_anchors`, so the only anchor source left
+    was `SearchScrip`, which returned empty that morning.
+
+    Best-effort, synchronous (must finish before the strategy-resume storm),
+    never raises — identical discipline to `_warm_shoonya_token_cache_from_db`.
+    """
+    from app.core.db.session import session_scope
+    from app.modules.broker_adapter.composition import (
+        get_broker,
+        is_shoonya_configured,
+        unwrap_broker,
+    )
+    from app.modules.scheduler.instrument_sync import seed_option_anchors_from_db
+
+    if not is_shoonya_configured():
+        return
+
+    from app.modules.broker_adapter.shoonya.adapter import ShoonyaBrokerAdapter
+
+    inner = unwrap_broker(get_broker())
+    if not isinstance(inner, ShoonyaBrokerAdapter):
+        return
+
+    try:
+        with session_scope() as db:
+            seeded = seed_option_anchors_from_db(db, inner)
+        logger.info(
+            "Shoonya option-anchor warm-up: seeded %d (underlying, expiry) anchors from the "
+            "DB before strategy resume.",
+            seeded,
+        )
+    except Exception:
+        logger.warning(
+            "Shoonya option-anchor warm-up failed (non-fatal) — get_option_chain will fall "
+            "back to a live SearchScrip resolve, just less reliably.",
             exc_info=True,
         )
 
@@ -510,6 +569,7 @@ async def lifespan(app: FastAPI):
     try:
         _attempt_shoonya_reconnect_from_cache()
         _warm_shoonya_token_cache_from_db()
+        _seed_shoonya_option_anchors_from_db()
         _sync_mock_instrument_universe()
         _sync_angel_one_scrip_master()
         _rebuild_execution_mock_position_book()

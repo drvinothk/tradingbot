@@ -573,3 +573,78 @@ def test_no_alert_when_at_least_one_broker_is_live(monkeypatch):
     sched.run_once()
 
     assert alert_calls == []
+
+
+# --- 2026-09-09: proactive "failover backup unavailable" WARNING -----------
+
+
+class _FoMD:
+    def __init__(self, *, enabled: bool, backup: str) -> None:
+        self.failover_enabled = enabled
+        self.failover_backup_provider = backup
+
+
+class _FoSettings:
+    def __init__(self, md: _FoMD) -> None:
+        self.market_data = md
+
+
+def _run_backup_unavailable_check(monkeypatch, *, md: _FoMD, ab_live: bool, factory=True):
+    import app.modules.alerting.manager as alerting_manager
+    import app.modules.market_data.providers.alice_blue_session as alice_blue_session_module
+
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr("app.config.settings.get_settings", lambda: _FoSettings(md))
+    monkeypatch.setattr(
+        alice_blue_session_module, "alice_blue_connection_live", lambda: ab_live
+    )
+    alert_calls: list[dict] = []
+    monkeypatch.setattr(
+        alerting_manager, "send_alert", lambda db, **kwargs: alert_calls.append(kwargs)
+    )
+    if factory:
+        sched._alert_session_factory = lambda: _FakeAlertDB(["ws-1"])  # noqa: SLF001
+    sched._alert_if_failover_backup_unavailable()  # noqa: SLF001
+    return alert_calls
+
+
+def test_warns_when_failover_backup_alice_blue_has_no_session(monkeypatch):
+    calls = _run_backup_unavailable_check(
+        monkeypatch, md=_FoMD(enabled=True, backup="alice_blue"), ab_live=False
+    )
+    assert len(calls) == 1
+    assert calls[0]["category"] == "market_data_failover_backup_unavailable"
+    assert calls[0]["severity"].name == "WARNING"
+    assert calls[0]["workspace_id"] == "ws-1"
+
+
+def test_no_warn_when_alice_blue_backup_is_live(monkeypatch):
+    calls = _run_backup_unavailable_check(
+        monkeypatch, md=_FoMD(enabled=True, backup="alice_blue"), ab_live=True
+    )
+    assert calls == []
+
+
+def test_no_warn_when_failover_disabled(monkeypatch):
+    calls = _run_backup_unavailable_check(
+        monkeypatch, md=_FoMD(enabled=False, backup="alice_blue"), ab_live=False
+    )
+    assert calls == []
+
+
+def test_no_warn_when_backup_is_not_alice_blue(monkeypatch):
+    calls = _run_backup_unavailable_check(
+        monkeypatch, md=_FoMD(enabled=True, backup="angel_one"), ab_live=False
+    )
+    assert calls == []
+
+
+def test_no_warn_without_an_alert_session_factory(monkeypatch):
+    calls = _run_backup_unavailable_check(
+        monkeypatch,
+        md=_FoMD(enabled=True, backup="alice_blue"),
+        ab_live=False,
+        factory=False,
+    )
+    assert calls == []

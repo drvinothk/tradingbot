@@ -423,19 +423,25 @@ def test_recovery_requires_the_full_stabilization_window(make_provider):
     _subscribe_and_trip_to_backup(provider, primary, clock)
 
     # First healthy observation after the trip starts the recovery timer.
+    # The backup keeps streaming throughout -- that's what makes the full
+    # anti-flap dwell apply (a *silent* backup collapses the dwell to 0, see
+    # test_silent_backup_switches_back_immediately).
     recovery_start = clock.now
+    backup.fire_tick(_tick())
     primary.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "angel_one"
 
     # A fresh tick just short of the full window -- still not recovered.
     clock.now = recovery_start + _RECOVERY - 1.0
+    backup.fire_tick(_tick())
     primary.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "angel_one"
 
     # Cross the full window.
     clock.now = recovery_start + _RECOVERY + 1.0
+    backup.fire_tick(_tick())
     primary.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "shoonya"
@@ -446,8 +452,9 @@ def test_recovery_timer_resets_on_a_drop_mid_window(make_provider):
     provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
     _subscribe_and_trip_to_backup(provider, primary, clock)
 
-    # Recovery starts...
+    # Recovery starts (backup streaming throughout -- see the note above)...
     recovery_start = clock.now
+    backup.fire_tick(_tick())
     primary.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "angel_one"
@@ -455,6 +462,7 @@ def test_recovery_timer_resets_on_a_drop_mid_window(make_provider):
     # ...then primary drops again before the window completes -- a genuine
     # gap longer than failover_threshold_seconds with no tick at all.
     clock.now = recovery_start + _THRESHOLD + 1.0
+    backup.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "angel_one"  # timer reset, not recovered
 
@@ -462,6 +470,7 @@ def test_recovery_timer_resets_on_a_drop_mid_window(make_provider):
     # recovery start would already exceed the stabilization window. Since it
     # did reset, one fresh tick this soon after the drop isn't enough yet.
     clock.now = recovery_start + _RECOVERY - 1.0
+    backup.fire_tick(_tick())
     primary.fire_tick(_tick())
     provider.run_once()
     assert provider.active_provider_name == "angel_one"
@@ -496,6 +505,158 @@ def test_recovery_disconnects_backup_and_flips_back(make_provider):
     provider.run_once()
     assert provider.active_provider_name == "angel_one"
     assert backup.subscribe_calls == [["NIFTY"], ["NIFTY"]]
+
+
+# --- 2026-09-09 anti-flap hardening ----------------------------------------
+
+
+def test_silent_backup_with_healthy_primary_switches_back_immediately(make_provider):
+    """The 2026-09-08 hole: failover tripped to a backup that then delivered
+    no ticks, and the fixed dwell kept the feed there while a recovering
+    primary was ignored. A silent backup collapses the recovery dwell to 0.
+    """
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    # Past the backup's first-tick grace, still no backup tick ever.
+    clock.advance(_THRESHOLD + 1.0)
+    primary.fire_tick(_tick())
+    provider.run_once()
+
+    # No dwell -- straight back to primary the moment it has a tick.
+    assert provider.active_provider_name == "shoonya"
+    assert backup.disconnect_calls == 1
+
+
+def test_both_legs_silent_does_not_oscillate(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    # Neither leg produces a tick for a long time.
+    clock.advance(_THRESHOLD + 1.0)
+    for _ in range(5):
+        clock.advance(_THRESHOLD)
+        provider.run_once()
+        # Stays on backup -- flipping to a dead primary would only add churn;
+        # the both_down / HealthCheckScheduler CRITICAL path covers alerting.
+        assert provider.active_provider_name == "angel_one"
+
+
+def _fire_both(primary, backup):
+    backup.fire_tick(_tick())
+    primary.fire_tick(_tick())
+
+
+def test_recovery_dwell_escalates_after_repeated_primary_flaps(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    def _recover(dwell: float) -> None:
+        start = clock.now
+        _fire_both(primary, backup)
+        provider.run_once()  # arm the recovery timer
+        clock.now = start + dwell + 1.0
+        _fire_both(primary, backup)
+        provider.run_once()  # cross the (effective) dwell
+        assert provider.active_provider_name == "shoonya"
+
+    def _flap_primary() -> None:
+        # Fail the primary again very soon after it was promoted (< 2x base).
+        clock.advance(_THRESHOLD + 1.0)
+        provider.run_once()
+        assert provider.active_provider_name == "angel_one"
+
+    # Flap 0 -> base dwell (20s).
+    _recover(_RECOVERY)
+    _flap_primary()
+    # Flap 1 -> ~3.33x base (~66.7s): a 20s window is NOT enough now.
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"  # still dwelling
+    clock.now = start + _RECOVERY * (10.0 / 3.0) + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+
+    _flap_primary()
+    # Flap 2 -> 10x base (200s), capped.
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY * (10.0 / 3.0) + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"  # 66s not enough at level 2
+    clock.now = start + _RECOVERY * 10.0 + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+
+
+def test_flap_counter_decays_after_a_long_clean_stretch(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+
+    # Build up one flap.
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()  # flap #1
+    assert provider.active_provider_name == "angel_one"
+
+    # Recover at the escalated dwell, then hold the primary healthy well past
+    # 2x base so `_check_primary_health` decays the flap counter.
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY * (10.0 / 3.0) + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+    for i in range(1, 5):
+        clock.now = start + _RECOVERY * (10.0 / 3.0) + 1.0 + i * 2 * _RECOVERY
+        primary.fire_tick(_tick())
+        provider.run_once()
+
+    # A fresh flap now should only need the *base* dwell again (decayed to 0).
+    clock.advance(_THRESHOLD + 1.0)
+    provider.run_once()
+    assert provider.active_provider_name == "angel_one"
+    start = clock.now
+    _fire_both(primary, backup)
+    provider.run_once()
+    clock.now = start + _RECOVERY + 1.0
+    _fire_both(primary, backup)
+    provider.run_once()
+    assert provider.active_provider_name == "shoonya"
+
+
+def test_disconnect_resets_flap_and_backup_stream_state(make_provider):
+    primary, backup, clock = _FakeProvider(), _FakeProvider(), _FakeClock()
+    provider = make_provider(primary, backup, clock, recovery_stabilization_seconds=_RECOVERY)
+    _subscribe_and_trip_to_backup(provider, primary, clock)
+    _fire_both(primary, backup)
+    provider.run_once()
+
+    provider.disconnect()
+
+    assert provider._flap_count == 0  # noqa: SLF001
+    assert provider._last_backup_tick_at is None  # noqa: SLF001
+    assert provider._backup_active_since is None  # noqa: SLF001
+    assert provider._primary_promoted_at is None  # noqa: SLF001
 
 
 def test_get_latest_tick_and_get_price_history_reflect_active_leg(make_provider):

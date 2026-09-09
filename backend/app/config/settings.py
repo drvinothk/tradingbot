@@ -186,14 +186,17 @@ class MarketDataSettings(BaseSettings):
     # setup with failover quietly inert.
     failover_backup_provider: str = "alice_blue"
     # How long the primary may go without a tick before failing over. Raised
-    # 5.0 -> 10.0 on 2026-08-25, before ever enabling failover live, per
-    # explicit user judgment: both Shoonya and Alice Blue are brokers first,
-    # not dedicated market-data vendors, and the real comparison data
-    # (CLAUDE.md's 2026-08-25 entry -- Shoonya alone saw 86 short drops in a
-    # single day) shows brief broker-side reconnect blips are routine, not
-    # exceptional. 10s rides those out without flapping while staying far
-    # below the seconds-to-minutes cadence any strategy actually acts on.
-    failover_threshold_seconds: float = 10.0
+    # 5.0 -> 10.0 on 2026-08-25, then 10.0 -> 30.0 on 2026-09-09 after the
+    # 2026-09-08 Shoonya WS `HTTP 502` storm: Shoonya's endpoint 502'd for
+    # ~30-60s, recovered for ~90s, then 502'd again, and a 10s trip made
+    # failover thrash back and forth ~5x in 20 minutes (each flip is itself a
+    # data gap). Both Shoonya and Alice Blue are brokers first, not dedicated
+    # market-data vendors, and Shoonya alone saw 86 short reconnect blips in
+    # one day -- 30s rides every routine blip out and only a genuinely
+    # sustained outage trips, still far below the 1-min-bar cadence any
+    # strategy acts on. Paired with the adaptive anti-flap dwell and the
+    # backup-stream-awareness in `providers/failover.py`.
+    failover_threshold_seconds: float = 30.0
     # How long the primary must stream continuously-healthy ticks again
     # before failover switches back -- anti-flap, same reasoning as above.
     failover_recovery_stabilization_seconds: float = 90.0

@@ -295,3 +295,55 @@ def test_warm_up_is_non_fatal_when_adapter_call_raises(monkeypatch):
     _patch_warm_common(monkeypatch, inner=inner)
 
     main_module._warm_shoonya_token_cache_from_db()  # must not raise
+
+
+# --- _seed_shoonya_option_anchors_from_db (restart option-anchor warm-up) -----
+
+from app.modules.scheduler import instrument_sync as instrument_sync_module  # noqa: E402
+
+
+def _patch_anchor_common(monkeypatch, *, configured=True, inner=None, seed_result=0):
+    monkeypatch.setattr(composition_module, "is_shoonya_configured", lambda: configured)
+    monkeypatch.setattr(composition_module, "get_broker", lambda: object())
+    monkeypatch.setattr(composition_module, "unwrap_broker", lambda _b: inner)
+    monkeypatch.setattr(shoonya_adapter_module, "ShoonyaBrokerAdapter", _FakeShoonyaAdapter)
+    monkeypatch.setattr(
+        "app.core.db.session.session_scope", lambda: contextlib.nullcontext(None)
+    )
+    seed_calls = []
+
+    def _fake_seed(db, adapter):
+        seed_calls.append(adapter)
+        if isinstance(seed_result, Exception):
+            raise seed_result
+        return seed_result
+
+    monkeypatch.setattr(instrument_sync_module, "seed_option_anchors_from_db", _fake_seed)
+    return seed_calls
+
+
+def test_anchor_seed_noop_when_not_shoonya_configured(monkeypatch):
+    seed_calls = _patch_anchor_common(
+        monkeypatch, configured=False, inner=_FakeShoonyaAdapter()
+    )
+    main_module._seed_shoonya_option_anchors_from_db()
+    assert seed_calls == []
+
+
+def test_anchor_seed_noop_when_broker_is_not_a_shoonya_adapter(monkeypatch):
+    seed_calls = _patch_anchor_common(monkeypatch, inner=object())
+    main_module._seed_shoonya_option_anchors_from_db()
+    assert seed_calls == []
+
+
+def test_anchor_seed_calls_the_helper_with_the_inner_adapter(monkeypatch):
+    inner = _FakeShoonyaAdapter()
+    seed_calls = _patch_anchor_common(monkeypatch, inner=inner, seed_result=7)
+    main_module._seed_shoonya_option_anchors_from_db()
+    assert seed_calls == [inner]
+
+
+def test_anchor_seed_is_non_fatal_when_the_helper_raises(monkeypatch):
+    inner = _FakeShoonyaAdapter()
+    _patch_anchor_common(monkeypatch, inner=inner, seed_result=RuntimeError("db down"))
+    main_module._seed_shoonya_option_anchors_from_db()  # must not raise
