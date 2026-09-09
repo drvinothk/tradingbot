@@ -1258,8 +1258,8 @@ audit; "Reconnect" button end-to-end from the UI; "Manual reconnect" → OAuth �
 
 ## DEPLOYED 2026-09-09 ~23:05 IST (17:35 UTC) — UI refinements batch (frontend only)
 
-`main` `<merge>` (ff-merged from `feat/ui-refinements-2026-09-09`, commit `4e3ec30`,
-pushed). Classifier did **not** block the scp/extract. **Frontend `dist` only — no
+`main` `4e3ec30` (ff-merged from `feat/ui-refinements-2026-09-09`; deploy-log commit
+`caace8c` on top; pushed). Classifier did **not** block the scp/extract. **Frontend `dist` only — no
 backend touch, no `systemctl restart trading-bot`, no migration.**
 
 **What (7 items from the 2026-09-09 post-Kill-Switch UI sanity walk + operator
