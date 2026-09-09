@@ -1387,3 +1387,108 @@ cd /home/ubuntu/trading-bot/backend && \
 Re-run the script with each row's OLD `params` (verbatim JSON in
 `docs/ops/orb_conviction_config_update_2026_09_09.md` — for `_Live` use
 `qty_lots: 1`, leave `runtime_mode = force_live`), or `psql UPDATE`.
+
+---
+
+## DEPLOYED 2026-09-10 ~02:52 IST (20:52 UTC 09-09) — reconnect UI + failover anti-flap batch
+
+`main` `49e5314` (ff-merged from `fix/reconnect-ui-and-failover-hardening`, pushed).
+Classifier did **not** block the ssh/scp/restart (already allow-listed).
+
+**What (3 commits):**
+1. `5d0e743` — **Reconnect buttons poll from click, not a connected-edge.**
+   `useWaitForRestart` gains `{expectRestart, timeoutMs}`; Kill Switch call site
+   unchanged (no opts). `BrokerConnectionRow`: manual reconnect now calls
+   `waitForRestart` directly from the click handler (fixes: reconnecting an
+   *already-connected* broker never fired the old `connected` false→true edge, so
+   zero restart feedback ever showed) with `expectRestart:false, timeoutMs:180_000`
+   (OAuth completion timing in another tab is genuinely uncertain, but a restart is
+   guaranteed once it completes — self-heals silently past the window). Auto
+   reconnect: `expectRestart:false, timeoutMs:120_000` (the engine only restarts on
+   a fresh login — previously showed a false "check the server logs" alarm on the
+   routine "no relogin needed" outcome).
+2. `13a7908` — **Failover: hold the base stabilization window on a silent backup**
+   (was collapsing to 0 — a flapping primary + silent backup thrashed on every
+   healthy blip, the 2026-09-08 hole). QC pass confirmed the base-window-only
+   policy is intentional even when the recovery timer was armed while the backup
+   was genuinely streaming and only later goes silent mid-dwell — an attempted fix
+   to preserve that escalation credit broke 2 existing tests
+   (`test_recovery_disconnects_backup_and_flips_back`,
+   `test_clearing_override_resumes_automatic_recovery_not_instant_snapback`), both
+   relying on the identical cross-regime carryover for a backup that never ticks at
+   all. Reverted the fix; added
+   `test_silent_backup_mid_dwell_discards_flap_escalation_credit` to document the
+   behavior explicitly instead.
+3. `49e5314` — **`reconnect-brokers-auto`: real 120s cooldown instead of a
+   spawn-window lock** (the old lock released right after `Popen` returned, ~1s,
+   not the engine's real ~90s run — two triggers a few seconds apart, e.g. the
+   other broker row's button, could launch overlapping headless logins/restarts).
+   Plus: Kill Switch docstring/comment clarifies the restart is conditional on
+   `from_mode == live_enabled` (no behavior change); fixed a pre-existing mypy
+   failure in `test_api_auth_and_sessions.py` (`lambda ... or True` trips
+   func-returns-value) with a typed helper, no behavior change — `mypy app tests`
+   was red on `main` before this.
+
+**Files:** backend (3, surgical scp): `app/api/v1/sessions.py`,
+`app/api/v1/system_settings.py`, `app/modules/market_data/providers/failover.py`.
+Frontend (rebuild `dist`): `useWaitForRestart.ts`, `BrokerConnectionRow.tsx`.
+**No migration** (box stayed `0039`).
+
+**Tested (local, pre-deploy):** 1730 backend pytest pass (was 1729 on `main`; +1 new
+failover test), `ruff` clean, `mypy` clean (287 files — the fix above), frontend
+`tsc -b && vite build` clean, `oxlint` clean (1 pre-existing warning in an untouched
+file). Failover suite specifically: 44/44 pass (unchanged count after reverting the
+attempted fix, +1 net from the documenting test).
+
+**Drift check first:** box hashes for all 3 backend files matched the last logged
+deploy exactly (`sessions.py`/`system_settings.py` from the 2026-09-09 ks-reconnect
+deploy, `failover.py` unchanged since WS1-6) — no out-of-band drift.
+
+**Safety gate (checked live, box's own clock):** `Wed Sep 9 20:50:43 UTC 2026` =
+02:20 IST Thu 09-10 (outside 09:15-15:30 IST — formality). Session
+`42472919-17c1-40ba-991d-cf71d3303502` `live_enabled`/active, **0 open positions**
+(live or otherwise). Alembic `0039` (head, unchanged). Backend backup
+`~/deploy-bak/reconnect-failover-20260909-205149/` (3 files). Frontend backup
+`/var/www/trading-bot/dist.bak-20260909-205219`.
+
+**Commands run (backend):** tarball 3 files (0 credentials) → scp → per-file backup
+→ extract → credentials-survived check (14 files) → `import app.main` sanity check
+→ `sudo systemctl restart trading-bot` → `active`, `NRestarts=0`, `/health` →
+`{"status":"ok"}`. Startup log: Shoonya session restored from disk cache, token/
+option-anchor warm-up, startup recovery "1 active session, none with open
+positions", strategy-runner recovery "no stale active runs", zero errors/
+tracebacks. Post-restart sha256 of all 3 files: **box == local working tree**,
+exact match (per the CRLF-worktree-not-git-blob convention).
+
+**Commands run (frontend):** `npm run build` → tarball `dist/` → `sudo cp -a`
+backup → extract to a staging dir → swap into `/var/www/trading-bot/dist` →
+`chown www-data`. Verified live: `/` → `200`, `/market-terminal` → `200`, served
+`index-CEMr8g2w.js`/`index-DXcBo4X8.css` (CSS hash unchanged from the prior deploy —
+correct, this batch is JS-only) matching the local build exactly.
+
+**Content verification (structural, in lieu of a live click-through — see below):**
+grepped the live JS bundle for `"finalising with a backend restart"` /
+`"checking for a restart"` (both present); grepped the live backend for
+`"wait ~2 min before retrying"` / `_AUTO_RECONNECT_COOLDOWN_SECONDS = 120.0` /
+`"Only a live session carries transient live state"` (all present);
+`openapi.json` still lists `reconnect-brokers-auto`.
+
+**Deliberately NOT exercised live**: a real click-through of "Reconnect" / "Manual
+reconnect" — both would trigger a real headless login or open a real broker OAuth
+tab against production credentials, which needs the operator physically present,
+not something to script/simulate unattended. Verified by content/behavior-path
+inspection instead (above), consistent with every other structural-only
+verification in this log. **Also not yet exercised**: Kill Switch against a real
+open LIVE position (still pending from the 2026-09-09 ks-reconnect deploy entry —
+unrelated to this batch, carried forward).
+
+**Rollback:** `cd ~/trading-bot/backend && cp
+~/deploy-bak/reconnect-failover-20260909-205149/app/api/v1/sessions.py
+app/api/v1/sessions.py && cp
+~/deploy-bak/reconnect-failover-20260909-205149/app/api/v1/system_settings.py
+app/api/v1/system_settings.py && cp
+~/deploy-bak/reconnect-failover-20260909-205149/app/modules/market_data/providers/failover.py
+app/modules/market_data/providers/failover.py && sudo systemctl restart
+trading-bot`. Frontend: `sudo rm -rf /var/www/trading-bot/dist && sudo mv
+/var/www/trading-bot/dist.bak-20260909-205219 /var/www/trading-bot/dist && sudo
+chown -R www-data:www-data /var/www/trading-bot/dist`. No migration to revert.
