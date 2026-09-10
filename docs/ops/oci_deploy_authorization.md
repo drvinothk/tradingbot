@@ -1492,3 +1492,111 @@ app/modules/market_data/providers/failover.py && sudo systemctl restart
 trading-bot`. Frontend: `sudo rm -rf /var/www/trading-bot/dist && sudo mv
 /var/www/trading-bot/dist.bak-20260909-205219 /var/www/trading-bot/dist && sudo
 chown -R www-data:www-data /var/www/trading-bot/dist`. No migration to revert.
+
+---
+
+## DEPLOYED 2026-09-10 ~21:52 IST (16:22 UTC) — market-data feed-override hardening + AB-reconnect / auto-reconnect fixes
+
+`main` `49a91bc` (ff-merged from `fix/md-override-hardening`, pushed). Classifier
+did **not** block the ssh/scp/restart (already allow-listed).
+
+**Why (root cause of the 2026-09-10 ~13:43–14:01 IST feed blackout — 20 min, no
+`price_bars` for NIFTY/BANKNIFTY during market hours):** a leftover `alice_blue`
+row in `market_data_provider_preferences` (operator set it 13:42:47 IST via the
+Advanced "feed override" dropdown) was re-applied by
+`provider_composition._seed_manual_override` on the restart that an Alice Blue
+"Manual reconnect" triggered at 13:43 IST. That pinned the live feed to a backup
+whose WS streams nothing (one auth attempt, zero ticks — separate AB-WS regression,
+`865a62d`) **and** whose `get_price_history` is unimplemented, so the WS→REST
+fallback also returned `[]`. Shoonya REST was healthy the entire time but bypassed.
+Feed only recovered when a later Shoonya-reconnect restart came up *after* the
+override had been cleared by hand at 13:49 IST.
+
+**What (2 commits):**
+1. `ab75cba` (backend) —
+   - **A1** `_seed_manual_override`: a persisted override that is not the
+     configured primary (`MARKET_DATA_PROVIDER`) or `null` is **no longer applied**
+     on restart — it is dropped, the DB row cleared, an `ERROR` logged. A durable
+     provider choice belongs in `.env`; a runtime override is temporary by
+     definition. New `get_failover_provider()` helper.
+   - **A2** new `market_data_override_active` **CRITICAL** alert (per active
+     workspace, self-resolving, 15-min dedup, Telegram-allowlisted, in Control
+     Room's attention set) whenever a manual feed override is set — a live pin can
+     no longer be silently forgotten.
+   - **B** `api.v1.alice_blue._run_alice_blue_post_login_refresh` **no longer calls
+     `schedule_backend_restart`**. AB is market-data-only; `reset_alice_blue_backup_leg`
+     already re-wires the live provider with zero downtime. The Shoonya manual
+     reconnect keeps its restart.
+   - **C** `/system-settings/reconnect-brokers-auto`: the detached `autologin
+     --force` child's stdout/stderr now goes to `backend/logs/on_demand_autologin.log`
+     (was `DEVNULL` — a run that "did nothing" or failed left no trace). New
+     `GET /system-settings/last-auto-reconnect-log` tails it; response gains
+     `log_path`.
+2. `49a91bc` (frontend) — "Feed pinned: <provider>" amber pill in `ModeBanner`
+   whenever `provider-preference.active_provider` is non-null; Advanced dropdown
+   relabelled "Feed override (temporary)" + cleared-on-restart note;
+   `market_data_override_active` added to `ControlRoomPage` attention set; auto
+   "Reconnect" tooltip now says it re-checks *both* logins and does NOT fix a
+   stalled feed (→ Advanced); collapsible engine-log viewer after an auto run.
+
+**Files:** backend (5, surgical scp): `app/api/v1/alice_blue.py`,
+`app/api/v1/system_settings.py`, `app/modules/alerting/manager.py`,
+`app/modules/market_data/market_data_scheduler.py`,
+`app/modules/market_data/provider_composition.py`. Frontend (rebuild `dist`):
+`ModeBanner.tsx`, `AdvancedPage.tsx`, `ControlRoomPage.tsx`, `BrokerConnectionRow.tsx`.
+**No migration** (box stays `0039`).
+
+**Tested (local, pre-deploy):** 1747 backend pytest pass (was 1730 on `main`; +17
+new: 3 `test_provider_composition`, 4 `test_market_data_scheduler`, 3
+`test_api_system_settings`, +1 rewritten `test_api_market_data` AB-callback test).
+`ruff` clean, `mypy app tests` clean (287 files). Frontend `tsc -b && vite build`
+clean, `oxlint` clean (1 pre-existing warning, untouched file).
+
+**Safety gate (box clock):** `2026-09-10 16:21 UTC` = **21:51 IST** — market long
+closed. `positions where status<>'closed'` = **0** (0 live-mode). `market_data_provider_preferences.active_provider`
+= **`(null)`** (cleared by hand 13:49 IST — A1's clear-path had nothing to do on
+this deploy). Alembic `0039 (head)`. Backend backup
+`~/deploy-bak/md-override-20260910-215140/` (5 files). Frontend backup
+`/var/www/trading-bot/dist.bak-20260910-162245`.
+
+**Commands run (backend):** per-file backup → surgical `scp` of the 5 LF-normalized
+files → `sha256sum` **box == local working tree, exact match** for all 5
+(`cf47e5ce…` alice_blue, `ab1e8f70…` system_settings, `a0a27370…` manager,
+`a44a1c9c…` market_data_scheduler, `9b524c29…` provider_composition) →
+`ast.parse OK` + `import app.api.v1.system_settings, …provider_composition,
+…market_data_scheduler` OK → `sudo systemctl restart trading-bot` → `active`,
+`NRestarts=0`, `/health` → `200`. Startup log: Shoonya session restored from disk
+cache, 24 option-anchors seeded, "Application startup complete", **zero
+ERROR/Traceback/CRITICAL** in the restart window. `openapi.json` lists
+`last-auto-reconnect-log`; the endpoint returns `401` unauthenticated (correct —
+`session.start` gated). `market_data_provider_preferences` still `(null)`.
+
+**Commands run (frontend):** `npm run build` (`index-DNmklKEI.js` +
+`index-DXcBo4X8.css`, CSS hash unchanged — JS-only batch) → tarball `dist/` →
+`sudo cp -r` backup → `rm -rf dist/*` + extract staging → `chown www-data`.
+Verified live: nginx `/` → `200`, serves `index-DNmklKEI.js`; sha256 box == local
+build (`f8c97b79…` js, `0e1e87cf…` index.html). Stale `index-CEMr8g2w.js` removed.
+
+**Deliberately NOT exercised live:** a real click-through of "Reconnect" / "Manual
+reconnect" (needs the operator present — real headless login / real OAuth tab
+against production creds), and A1's drop-and-clear path (no non-null override in
+the DB to trigger it). Verified by content/behavior-path inspection + the local
+suite instead.
+
+**Not deployed here (operator-owned):** disabling failover
+(`MARKET_DATA_FAILOVER_ENABLED=false`) — operator said they'll pin the feed to
+"Shoonya only" for now. Note: doing so via the Advanced dropdown persists an
+`active_provider=shoonya` override which (per A1, since it equals the primary) IS
+re-applied on restart AND fires the new `market_data_override_active` CRITICAL
+alert every ~15 min while set. A clean, alert-free "no failover" is the `.env`
+`MARKET_DATA_FAILOVER_ENABLED=false` route instead.
+
+**Rollback:** `cd ~/trading-bot/backend && for f in api/v1/alice_blue.py
+api/v1/system_settings.py modules/alerting/manager.py
+modules/market_data/market_data_scheduler.py
+modules/market_data/provider_composition.py; do cp
+~/deploy-bak/md-override-20260910-215140/*/$(basename $f) app/$f; done` (paths per
+the backup's `api/ alert/ md/` layout) `&& sudo systemctl restart trading-bot`.
+Frontend: `sudo rm -rf /var/www/trading-bot/dist && sudo mv
+/var/www/trading-bot/dist.bak-20260910-162245 /var/www/trading-bot/dist && sudo
+chown -R www-data:www-data /var/www/trading-bot/dist`. No migration to revert.
