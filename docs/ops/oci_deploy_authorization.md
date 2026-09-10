@@ -1639,3 +1639,65 @@ AB as the failover backup. Until then AB failover is operator-disabled from the 
 **Rollback:** `cp ~/cred-bak/alice_blue.env.20260910-<ts>
 app/config/credentials/alice_blue.env && cp ~/cred-bak/.alice_blue_session_cache.json.<ts>
 app/config/credentials/.alice_blue_session_cache.json && sudo systemctl restart trading-bot`.
+
+---
+
+## DEPLOYED 2026-09-11 ~02:12 IST (2026-09-10 20:42 UTC) — provenance-tagged option pricing (`PriceRead`) + Rail 6 wiring (flag-off)
+
+`main` `40de648` (ff-merged from `feat/option-price-provenance`, pushed).
+Classifier blocked the SSH-key stage into this session's scratchpad; operator
+approved **yes + add-allow-rules** (session `a0e47359-…` `cp`/`chmod`/`mkdir`
+paths added to `.claude/settings.local.json`).
+
+**What (1 commit, 9 backend `app/` files + 1 new):** follow-up to the QC of the
+2026-09-10 spot-leak batch (`cf50b80`).
+- **`market_data/price_read.py`** (new): `PriceRead` (`tick|None` + `source` ∈
+  `LIVE_FEED`/`CHAIN_SNAPSHOT`/`BROKER_QUOTE`/`NONE` + `freshness` + `plausible`).
+- **`current_contract_price`** returns `PriceRead`; **every rung** now
+  freshness+plausibility gated. Flag-off single-feed fast path still
+  short-circuits before `ensure_fresh_option_chain` (byte-identical). A `STALE`
+  snapshot is returned *labelled* → `PositionManager` skips it (O1: was acted on
+  ungated at old step 3); `PriceRead.none()` replaces the "return a spot-shaped
+  number" contract.
+- **`_run_cycle`** acts only on `price.is_actionable`, else logs source/freshness
+  + skips the cycle (broker SL-LMT stays the floor). Replaces `cf50b80` Change C.
+- **`eod_square_off`**: `NONE` read → `NoUsableSquareOffPriceError` +
+  `option_chain_degraded` alert (mode LIVE→Telegram / PAPER→DB-only), position
+  left OPEN, price **never** fabricated (`close_position`'s LIVE fire-now trigger
+  derives from `intended_price`, so `0.0` there never fires). Batch sweep + the
+  manual endpoint (`POST /positions/{id}/square-off`, new `no_usable_price`
+  reason) handle it.
+- **Rail 6 wiring** behind `MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED` (default
+  `off` → `get_secondary_price_feeds()` returns `[]` → **zero runtime change**).
+  `PositionManager` / `current_contract_price` rung 1 read any secondary leg;
+  disagreement with the snapshot beyond `PRICE_DRIFT_TOLERANCE_PCT` drops the
+  candidate; a secondary `BrokerAuthError` is pricing degradation only (never
+  reaches `_handle_broker_auth_error`). **NOT enabled** — flag flip pends a
+  market-hours AB per-contract-tick check.
+- Cleanups: O3 (`_CHAIN_QUOTE_MAX_RETRY_ATTEMPTS` rename — it counts attempts),
+  O5 (`_seed_manual_override` docstring), O10 (`_find_failover_provider`
+  delegates to `get_failover_provider`).
+
+**Tested (local):** 1771 backend pytest pass (was 1747; +24), `ruff` clean,
+`mypy app tests` clean (289 files). **No migration** (box stays `0039`), no deps,
+no API response-shape change, frontend untouched.
+
+**Safety gate (box):** 20:42 UTC = **02:12 IST** — market long closed.
+`positions WHERE status<>'closed'` = **0**. Active session `paper_only`. Alembic
+`0039 (head)` unchanged after deploy. Backup `app.bak-20260910-204239`.
+
+**Commands run:** credential-excluded tarball (`--exclude='app/config/credentials'`,
+verified 0 credential entries, 215 files, `price_read.py` present) → `scp` →
+`cp -a app app.bak-20260910-204239` → extract → credentials-survived check (14
+files intact) → `import app.main` OK → `alembic current` = `0039 (head)` →
+`sudo systemctl restart trading-bot` → `active`, `NRestarts=0`, `/health` →
+`{"status":"ok"}`. Restart-window `journalctl`: **zero error/traceback/critical**;
+"Shoonya session restored from disk cache", "1 active session, none with open
+positions", "no stale active runs", "Application startup complete". Post-restart
+**sha256 of all 9 files: box == local working tree, exact match**;
+`price_read.py` parses OK on the box; `execution_price_secondary_feed` present in
+deployed `settings.py`.
+
+**Rollback:** `cd /home/ubuntu/trading-bot/backend && rm -rf app && mv
+app.bak-20260910-204239 app && sudo systemctl restart trading-bot`. No migration
+to revert.
