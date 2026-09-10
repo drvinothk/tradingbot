@@ -67,6 +67,7 @@ from app.modules.execution_engine.paper.service import (
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
 from app.modules.market_data.provider_composition import get_market_data_provider
 from app.modules.market_data.providers.base import BaseMarketDataProvider
+from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 from app.modules.reconciliation.service import run_full_reconciliation
 from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
@@ -478,6 +479,33 @@ class PositionManager:
                     market_data_provider=market_data_provider,
                     session_factory=same_session,
                 )
+                if not is_plausible_option_tick(
+                    tick.ltp, tick.bid, tick.ask, tick.volume
+                ):
+                    # 2026-09-10 -- current_contract_price must always return
+                    # *something*; when Shoonya is returning spot-for-a-valid
+                    # token (docs/ops/shoonya_option_chain_spot_leak.md) and
+                    # no plausible snapshot exists to fall back to, that
+                    # "something" can be a spot-shaped premium. Acting on it
+                    # -- archiving it as this contract's LTP, or feeding it to
+                    # evaluate_open_position, where for a long option it
+                    # clears the hard target and fires a fabricated exit --
+                    # is worse than skipping this poll. The broker-side
+                    # resting protective stop is untouched and still owns
+                    # capital protection; the next cycle (~3s) re-reads a
+                    # fresh price. Rail 4's option_chain_degraded CRITICAL
+                    # alert already notifies the operator when a held
+                    # contract is the one being dropped.
+                    logger.warning(
+                        "implausible price for %s (ltp=%.2f bid=%.2f ask=%.2f vol=%d) -- "
+                        "skipping stop/target/trail this cycle",
+                        option_contract.symbol,
+                        tick.ltp,
+                        tick.bid,
+                        tick.ask,
+                        tick.volume,
+                    )
+                    continue
                 self._archive_option_tick(db, option_contract.id, tick)
 
                 cache_key = (option_contract.instrument_id, id(broker))

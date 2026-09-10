@@ -1,8 +1,60 @@
 # Shoonya option-chain spot-price leak — problem & solution roadmap
 
-**Opened:** 2026-09-08. **Status:** Rails 1+2+4 **built** on branch
-`fix/option-chain-plausibility-rails` (not yet merged/deployed). Monitoring window
-opens once deployed. Guard (`tick_plausibility.py`) stays regardless.
+**Opened:** 2026-09-08. **Status:** Rails 1+2+4 merged (`d8b1ca0`) + deployed
+2026-09-08. **Root cause confirmed 2026-09-10** (see "Root cause — RESOLVED"
+below) and a follow-up mitigation (`fix/option-chain-degenerate-quote-safety`,
+Changes A/B/C) built. Guard (`tick_plausibility.py`) stays regardless.
+
+## Root cause — RESOLVED 2026-09-10 (was hypothesis 2)
+
+A full session's OCI logs + the live DB token map settle it:
+
+- **Rail 1 substitution log: completely silent.** Every `GetOptionChain` row
+  `token` already equals the trusted scrip-master token.
+- **DB token map is clean.** `NIFTY15SEP26P23500 → 47298`, `C23500 → 47297`,
+  contiguous `47289–47306` across the ATM strikes, all distinct, **none** equal
+  the NSE index tokens `26000`/`26009` or a futures token, zero collisions, zero
+  empty `broker_token`s.
+- **Every drop tagged `no_book`** (`bp1=sp1=v=0`), with `ltp` tracking the NIFTY
+  spot as it drifts through the session.
+- **Affected strikes are ATM** (`C23400`/`P23500`/`P23550`…), the most liquid
+  contracts on the exchange — not deep-OTM illiquid rows.
+- **222 chain fetches with ≥1 drop on 2026-09-10** — essentially every ~60s
+  cycle, 1–10 of the 28 ATM-window strikes, rotating.
+- Request path verified: fresh body/headers per call, `httpx.Client` thread-safe,
+  `parse_option_chain_entry` reads `ltp` **only** from the `GetQuotes` response.
+
+**So:** we send a correct `GetQuotes(uid, "NFO", <correct token>)`; Shoonya's
+Noren backend intermittently returns a valid HTTP-200 body with an **empty book
+and `lp` = underlying spot** for that correct NFO option token. Hypothesis 1
+(wrong token) and hypothesis 3 (stale cached token) are **disproven**. Rail 1 and
+Rail 5 (targeted re-sync) therefore cannot help — the tokens are already right.
+This is a Shoonya feed-quality defect.
+
+### Follow-up mitigation — `fix/option-chain-degenerate-quote-safety`
+
+- **Change A** (`shoonya/adapter.py::get_option_chain`): when a row's `GetQuotes`
+  comes back with an empty book on a token we hold, retry that single strike
+  (`_CHAIN_QUOTE_RETRY_ATTEMPTS=2`, `_CHAIN_QUOTE_RETRY_SLEEP_S=0.15`), bounded to
+  `_CHAIN_QUOTE_MAX_RETRIED_ROWS=10` per fetch. One aggregated WARNING per fetch
+  (`… N/M rows came back with an empty book … retried R, recovered K`). Attacks
+  the source so the persisted snapshot stays whole for ranking / Control Room /
+  drift checks / `current_contract_price`'s fallback.
+- **Change B** (`execution_engine/paper/service.py::current_contract_price`): if
+  the last-resort `broker.get_quote()` is itself implausible
+  (`is_plausible_option_tick`), return the last persisted snapshot tick (ungated
+  by freshness — Rail 2 guarantees it was plausible when written); only if
+  nothing plausible exists anywhere is the implausible quote returned. Covers
+  both callers (`PositionManager`, `eod_square_off`).
+- **Change C** (`execution_engine/paper/position_manager.py::_run_cycle`): if the
+  price `current_contract_price` returned is *still* implausible, log a WARNING
+  and `continue` — skip archiving it as LTP and skip `evaluate_open_position` for
+  that position that cycle (broker-side resting stop unaffected; next ~3s cycle
+  retries). Hard guarantee a spot-shaped premium can never fire a fabricated
+  `TARGET`/`SPREAD`/`TRAIL` exit.
+- **Deferred (2B):** Alice Blue per-contract WS as a Shoonya-independent price
+  source for open positions — needs a market-hours test that AB's WS delivers
+  per-*contract* option ticks (the "no per-contract WS" note is Shoonya-specific).
 
 **Rail 1 was redesigned during QC** — the original "check the GetQuotes response's
 echo fields" plan had a logic gap (it compared the response against the token we
@@ -44,19 +96,20 @@ contracts on the exchange and should never have an empty book. So this is not
 The leaked value therefore comes back **inside a `GetQuotes` response** whose `lp`
 is spot-shaped and whose book is empty.
 
-### Root-cause hypotheses (ranked; needs one live data point to confirm)
+### Root-cause hypotheses (ranked) — SETTLED 2026-09-10
 
-1. **Wrong `token` from `GetOptionChain`** (most likely). Recurrence of the
-   2026-08-12 weekly-token class of bug — `GetOptionChain` hands back a `token`
-   that isn't that option's (stale/recycled NFO token, or index token). `GetQuotes`
-   then faithfully prices *that* instrument. Plausibly worsened this cycle by the
-   `api.shoonya.com` HTTP 502s during the restart's token warm-up leaving the
-   scrip-master / SearchScrip map partially stale.
-2. **Noren `GetQuotes` degenerate default** for a never-traded contract — returns
-   `lp` = underlying last price instead of `0` / theoretical. Known Noren quirk;
-   fits the far-OTM rows but not the ~ATM ones.
-3. **Stale cached token** — `_remember_token` cached a token that has since been
-   recycled to another instrument.
+**See "Root cause — RESOLVED 2026-09-10" at the top of this file.** The live
+evidence lands squarely on a variant of hypothesis 2, and disproves 1 and 3
+(tokens verified correct in the DB and by Rail 1's silence). Kept here for the
+record:
+
+1. ~~**Wrong `token` from `GetOptionChain`**~~ — **disproven.** Rail 1 never
+   fired; DB `broker_token`s are the correct contiguous NFO block.
+2. **Noren `GetQuotes` degenerate response** — **confirmed**, but broader than
+   "never-traded contract": it hits *ATM* strikes too, intermittently, ~every
+   60s fetch, rotating. Returns `lp` = underlying spot with an empty book for a
+   correct token.
+3. ~~**Stale cached token**~~ — **disproven**, same evidence as (1).
 
 ### Impact today
 
@@ -129,32 +182,44 @@ QC refinements (post-implementation review):
   token is *missing* (the exact 2026-08-12 empty-`broker_token` bug), not only
   when it disagrees.
 
-### Rail 5 — self-healing re-sync  *(LATER, if it persists)*
+### Rail 5 — self-healing re-sync  *(RULED OUT 2026-09-10)*
 
-When >X% of a chain's ATM window is implausible for N consecutive fetches, trigger
-a targeted `scrip_master` / `sync_instrument_master` refresh for that
-underlying+expiry instead of waiting for the daily contract-sync scheduler.
+Would trigger a targeted `scrip_master` / `sync_instrument_master` refresh when
+>X% of the ATM window is implausible for N consecutive fetches. **Not useful
+here** — the tokens are already correct (Rail 1 silent, DB map clean), so a
+re-sync changes nothing. Kept documented only in case a genuine token-corruption
+recurrence (the 2026-08-12 class) ever shows up again with Rail 1 firing.
 
-### Rail 6 — source diversity  *(LATER / bigger lift)*
+### Rail 6 — source diversity  *(the real structural fix; deferred)*
 
-A broker echoing spot on unquoted strikes is a broker-feed limitation.
-CLAUDE.md already designates **TrueData `getoptionchain`** as the fallback for
-exactly this; Alice Blue is a market-data provider now. Requires a
-provider-agnostic seam for `get_option_chain` (today it is Shoonya-only, on
-`BrokerPort`, independent of `MARKET_DATA_PROVIDER`). WS / order updates are
-unaffected — order-update pushes over Shoonya WS are an accelerator only, not
-load-bearing (REST `OrderBook` poll + ack-timeout idempotency check are the real
-nets).
+A broker returning spot on ATM strikes is a broker-feed limitation with no
+in-Shoonya fix. TrueData `getoptionchain` was the designated fallback but
+**TrueData is not currently subscribed**; **Alice Blue** is the only backup
+provider today. Alice Blue has no `get_option_chain`, but it *can* subscribe to
+individual NFO option tokens over its Noren-family WS (`alice_blue_scrip_master`
+already maps them). Path: prove AB's WS delivers per-*contract* option ticks
+during market hours (untested — the "no per-contract WS" note is Shoonya-only),
+then have `current_contract_price`'s first branch / `PositionManager` prefer the
+AB feed for open-position pricing. This removes the dependency on Shoonya's
+flaky REST for anything safety-critical and is the reason AB exists as a backup.
+Order-update pushes over Shoonya WS are unaffected (an accelerator only — REST
+`OrderBook` poll + ack-timeout idempotency check are the real nets).
 
 ## Monitoring plan
 
-After Rails 1+2+4 deploy, watch the logs for a couple of days:
-- `GetOptionChain … rows carried a token that disagreed with the trusted
-  scrip-master token` — Rail 1 firing. Frequent → hypothesis 1/3 confirmed;
-  expect the `record_option_chain_snapshot` drop count to fall toward ~0.
-- `option chain … dropped N/M entries as implausible (no_book=…, no_arb=…)` —
-  the `no_arb` count persisting *after* Rail 1 means hypothesis 2 (Noren returns
-  spot for a *correct* token) — that's the Rail 5/6 case.
-- Any `option_chain_degraded` CRITICAL alert (bad price on an open position).
+After `fix/option-chain-degenerate-quote-safety` (Changes A/B/C) deploys, watch:
+- `GetOptionChain … rows came back with an empty book … retried R, recovered K`
+  — Change A firing. `recovered ≈ retried` → an immediate retry clears it, and
+  the `record_option_chain_snapshot` `dropped N/M` count should fall toward ~0.
+  `recovered ≪ retried` → the retry needs a longer delay or Shoonya is genuinely
+  down for that strike for seconds → tune `_CHAIN_QUOTE_RETRY_*` or escalate to
+  Rail 6 (Alice Blue).
+- `last-resort broker quote for … was implausible … using the last persisted
+  option-chain snapshot instead` — Change B catching what A missed.
+- `implausible price for … skipping stop/target/trail this cycle` — Change C, the
+  hard stop. Should be rare; if frequent, the snapshot is also going stale →
+  Rail 6.
+- Any `option_chain_degraded` CRITICAL alert (a dropped entry on an open
+  position) — unchanged canary.
 
-If drops stay materially non-zero after a few days, proceed to Rail 5, then Rail 6.
+If drops stay materially non-zero after a few days, proceed to Rail 6.

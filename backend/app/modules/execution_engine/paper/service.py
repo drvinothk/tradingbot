@@ -2357,4 +2357,41 @@ def current_contract_price(
         "broker.get_quote as a last resort",
         option_contract.symbol,
     )
-    return broker.get_quote(option_contract.symbol)
+    quote = broker.get_quote(option_contract.symbol)
+    if is_plausible_option_tick(quote.ltp, quote.bid, quote.ask, quote.volume):
+        return quote
+
+    # 2026-09-10 -- this last-resort path is the *same* Shoonya GetQuotes
+    # call the option chain uses per strike, so on a session where Shoonya
+    # is returning spot-for-a-valid-token (see
+    # docs/ops/shoonya_option_chain_spot_leak.md) it can be exactly as
+    # implausible as the chain entry that was just dropped. A slightly stale
+    # but real snapshot premium beats a spot-shaped number: re-read the last
+    # persisted snapshot tick with no freshness gate (Rail 2 guarantees
+    # every persisted entry was plausible when written) and prefer it.
+    # Only if nothing plausible exists anywhere is the implausible quote
+    # returned -- PositionManager's own pre-evaluate plausibility gate then
+    # skips acting on it for that cycle. `eod_square_off` still force-closes
+    # (a stale-real reference price is the best it can do; a genuine LIVE
+    # exit fill comes from the broker regardless).
+    stale_snapshot = latest_snapshot_tick(
+        db, option_contract.instrument_id, option_contract.expiry_date, option_contract.symbol
+    )
+    if stale_snapshot is not None and is_plausible_option_tick(
+        stale_snapshot.ltp, stale_snapshot.bid, stale_snapshot.ask, stale_snapshot.volume
+    ):
+        logger.warning(
+            "last-resort broker quote for %s was implausible (ltp=%.2f); using the last "
+            "persisted option-chain snapshot instead",
+            option_contract.symbol,
+            quote.ltp,
+        )
+        return stale_snapshot
+
+    logger.error(
+        "no plausible price anywhere for %s (broker quote ltp=%.2f, no usable snapshot); "
+        "returning the implausible quote -- the caller must gate on it before acting",
+        option_contract.symbol,
+        quote.ltp,
+    )
+    return quote

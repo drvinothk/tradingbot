@@ -430,6 +430,45 @@ def test_run_once_rejects_an_implausible_option_tick_below_its_own_strike(
     assert position.status == PositionStatus.OPEN
 
 
+def test_run_once_skips_the_cycle_when_the_only_price_available_is_implausible(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """2026-09-10 (docs/ops/shoonya_option_chain_spot_leak.md): when Shoonya
+    returns spot-for-a-valid-token and there is no plausible snapshot to
+    fall back to, `current_contract_price` is contractually obliged to
+    return *something* -- a spot-shaped premium. PositionManager must skip
+    stop/target/trail for that cycle rather than archive it as LTP or feed
+    it to `evaluate_open_position`, where for a long option it would clear
+    the hard target (23670.5 >= 92.0) and fire a fabricated exit.
+    """
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    # Spot-shaped last-resort quote, empty book -- the degenerate-GetQuotes
+    # signature. Mock get_quote reports a non-zero book, but 23670.5 is far
+    # past is_plausible_option_tick's flat ceiling either way.
+    broker._prices[option_contract.symbol] = 23670.5  # noqa: SLF001
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    # nothing archived from the implausible tick
+    archived = (
+        db.query(QuoteTick)
+        .filter(QuoteTick.option_contract_id == option_contract.id)
+        .count()
+    )
+    assert archived == 0
+
+
 def test_run_once_exits_on_stop_hit(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

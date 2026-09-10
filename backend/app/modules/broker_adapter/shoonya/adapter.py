@@ -58,6 +58,7 @@ from app.modules.broker_adapter.base.contracts import (
     DepthSnapshot,
     InstrumentInfo,
     MarginInfo,
+    OptionChainEntry,
     OptionChainSnapshot,
     OrderRequest,
     OrderResult,
@@ -246,6 +247,33 @@ _UNDERLYING_INDEX_SEARCH_TEXT: dict[str, str] = {
 # truncate it the same way the original bug did.
 _CHAIN_QUOTE_STRIKE_RADIUS = 7
 
+# 2026-09-10 -- Shoonya's per-strike GetQuotes (inside get_option_chain)
+# intermittently returns a valid HTTP-200 body with an *empty book*
+# (bp1=sp1=v=0) and `lp` set to the underlying spot, for a *correct* NFO
+# option token (token map + Rail 1 both verified clean live). Live logs:
+# ~every 60s fetch, 1-10 of the 28 ATM-window strikes affected, rotating,
+# including strikes this system holds open. An immediate single-strike
+# retry recovers a real book the large majority of the time. Bounded two
+# ways so a genuinely dead feed can't turn one fetch into a retry storm:
+# at most _CHAIN_QUOTE_RETRY_ATTEMPTS per row, and
+# _CHAIN_QUOTE_MAX_RETRIED_ROWS across the whole fetch. Worst-case added
+# latency ~= attempts * sleep * max_rows ~ 3s on one fetch cycle (the
+# existing 8/s chain-quote limiter already makes a full fetch take ~3.5s).
+# See docs/ops/shoonya_option_chain_spot_leak.md.
+_CHAIN_QUOTE_RETRY_ATTEMPTS = 2
+_CHAIN_QUOTE_RETRY_SLEEP_S = 0.15
+_CHAIN_QUOTE_MAX_RETRIED_ROWS = 10
+
+
+def _is_empty_book(entry: OptionChainEntry) -> bool:
+    """No bid, no ask, no traded volume — the signature of Shoonya's
+    degenerate GetQuotes response (also a genuinely dead far strike). Same
+    zero-book test `market_data.tick_plausibility` applies one layer up;
+    kept as a local predicate here to avoid the broker adapter importing
+    from the market-data module.
+    """
+    return entry.bid == 0 and entry.ask == 0 and entry.volume == 0
+
 # Re-exported for callers that only import from adapter.py — the actual
 # class lives in rest_client.py now (session-expiry classification happens
 # right where the raw Not_Ok response is parsed, not one layer up).
@@ -348,6 +376,36 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 "get_instrument_master/get_option_chain for it first",
             )
         return resolved
+
+    def _fetch_chain_row_quote(self, symbol: str, exchange: str, token: str) -> dict:
+        """One `GetQuotes` for a single option-chain row, through the
+        chain-quote limiter. Returns ``{}`` (caller builds an all-zero
+        entry) on an empty token, a limiter timeout, or a Shoonya API
+        error — the exact pre-2026-09-10 inline behaviour, factored out so
+        `get_option_chain` can call it again to retry a degenerate response.
+        """
+        if not token:
+            return {}
+        # Second, tighter gate in series with ShoonyaRestClient's own
+        # general-purpose bucket inside _post() -- see
+        # make_option_chain_quote_limiter's own docstring for why narrowing
+        # the row count isn't sufficient on its own.
+        if not self._chain_quote_limiter.acquire_blocking(timeout=10.0):
+            logger.warning(
+                "Chain-quote limiter timed out waiting to fetch %s (token=%s); using zeros",
+                symbol,
+                token,
+            )
+            return {}
+        try:
+            return self._rest.get_quotes(self._uid, exchange, token)
+        except ShoonyaApiError:
+            logger.warning(
+                "Failed to fetch live quote for %s (token=%s); using zeros",
+                symbol,
+                token,
+            )
+            return {}
 
     # -- BrokerPort: session --------------------------------------------------
 
@@ -493,6 +551,9 @@ class ShoonyaBrokerAdapter(BrokerPort):
         # discarding the whole snapshot over one bad call.
         entries = []
         token_substitutions: list[tuple[str, str, str]] = []
+        degenerate_rows = 0
+        retried_rows = 0
+        recovered_rows = 0
         for row in rows:
             symbol = str(row.get("tsym", ""))
             row_token = str(row.get("token", ""))
@@ -521,29 +582,50 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 exch_for_row, token = exchange, row_token
                 self._remember_token(symbol, exch_for_row, token)
 
-            quote: dict = {}
-            if token:
-                # Second, tighter gate in series with ShoonyaRestClient's own
-                # general-purpose bucket inside _request() -- see
-                # make_option_chain_quote_limiter's own docstring for why
-                # narrowing the row count above isn't sufficient on its own.
-                if not self._chain_quote_limiter.acquire_blocking(timeout=10.0):
-                    logger.warning(
-                        "Chain-quote limiter timed out waiting to fetch %s (token=%s); "
-                        "using zeros",
-                        symbol,
-                        token,
+            raw_quote = self._fetch_chain_row_quote(symbol, exch_for_row, token)
+            entry = normalizer.parse_option_chain_entry(row, symbol, raw_quote)
+
+            # `raw_quote` non-empty but the *book* is empty -> Shoonya
+            # returned a real body with `lp` (typically = spot) and
+            # bp1=sp1=v=0 for a token we actually hold: the spot-leak
+            # signature (see _CHAIN_QUOTE_RETRY_ATTEMPTS' comment above and
+            # docs/ops/shoonya_option_chain_spot_leak.md). Retry that one
+            # strike, bounded per-row and per-fetch. A `raw_quote` of `{}`
+            # is a transport failure (limiter timeout / API error), *not*
+            # retried here -- it degrades to a zero entry exactly as before.
+            # A genuinely illiquid far strike with a real empty-book body
+            # also lands here but simply doesn't recover.
+            if token and raw_quote and _is_empty_book(entry):
+                degenerate_rows += 1
+                attempt = 0
+                while (
+                    _is_empty_book(entry)
+                    and attempt < _CHAIN_QUOTE_RETRY_ATTEMPTS
+                    and retried_rows < _CHAIN_QUOTE_MAX_RETRIED_ROWS
+                ):
+                    attempt += 1
+                    retried_rows += 1
+                    time.sleep(_CHAIN_QUOTE_RETRY_SLEEP_S)
+                    entry = normalizer.parse_option_chain_entry(
+                        row, symbol, self._fetch_chain_row_quote(symbol, exch_for_row, token)
                     )
-                else:
-                    try:
-                        quote = self._rest.get_quotes(self._uid, exch_for_row, token)
-                    except ShoonyaApiError:
-                        logger.warning(
-                            "Failed to fetch live quote for %s (token=%s); using zeros",
-                            symbol,
-                            token,
-                        )
-            entries.append(normalizer.parse_option_chain_entry(row, symbol, quote))
+                if not _is_empty_book(entry):
+                    recovered_rows += 1
+
+            entries.append(entry)
+
+        if degenerate_rows:
+            logger.warning(
+                "GetOptionChain %s expiry %s: %d/%d rows came back with an empty book "
+                "(likely Shoonya returning spot for a valid token); retried %d row-fetches, "
+                "recovered %d",
+                underlying,
+                expiry,
+                degenerate_rows,
+                len(rows),
+                retried_rows,
+                recovered_rows,
+            )
 
         if token_substitutions:
             logger.warning(

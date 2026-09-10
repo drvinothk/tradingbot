@@ -17,8 +17,10 @@ from app.modules.broker_adapter.base.contracts import (
     OrderSide,
     OrderType,
 )
+from app.modules.broker_adapter.shoonya import adapter as adapter_module
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.adapter import (
+    _CHAIN_QUOTE_MAX_RETRIED_ROWS,
     _CHAIN_QUOTE_STRIKE_RADIUS,
     ShoonyaBrokerAdapter,
 )
@@ -63,6 +65,12 @@ class _FakeRestClient:
         # get_quotes_response — simulates a single bad per-strike quote call
         # without aborting the whole chain fetch.
         self.raise_on_get_quotes_tokens: set[str] = set()
+        # Per-token response *queue*: each get_quotes(token) pops the next
+        # entry; once drained, falls through to get_quotes_response. Lets a
+        # test model Shoonya returning a degenerate empty-book body first and
+        # a real book on the retry (see get_option_chain's degenerate-quote
+        # retry).
+        self.get_quotes_responses_by_token: dict[str, list[dict]] = {}
         # GetOptionChain rows are purely structural (no live quote fields) —
         # see normalizer.parse_option_chain_entry's own docstring.
         self.get_option_chain_response: list[dict] = []
@@ -92,6 +100,9 @@ class _FakeRestClient:
         self._record("get_quotes", uid, exchange, token)
         if token in self.raise_on_get_quotes_tokens:
             raise ShoonyaApiError("GetQuotes", "simulated failure")
+        queued = self.get_quotes_responses_by_token.get(token)
+        if queued:
+            return queued.pop(0)
         return self.get_quotes_response
 
     def get_option_chain(self, uid, exchange, tradingsymbol, strike_price, count=10):
@@ -1362,6 +1373,111 @@ def test_get_option_chain_zero_fills_entry_when_chain_quote_limiter_times_out():
         call for call in rest.calls if call[0] == "get_quotes" and call[1][1] == "NFO"
     ]
     assert nfo_quote_calls == []
+
+
+_REAL_BOOK = {"lp": "142.35", "bp1": "142.00", "sp1": "142.70", "v": "125000", "oi": "980000"}
+_EMPTY_BOOK_SPOT = {"lp": "23670.50", "bp1": "0", "sp1": "0", "v": "0", "oi": "0"}
+
+
+def test_get_option_chain_retries_a_degenerate_empty_book_quote_and_recovers(monkeypatch):
+    """2026-09-10 (docs/ops/shoonya_option_chain_spot_leak.md): Shoonya's
+    per-strike GetQuotes intermittently returns a real body with `lp` = spot
+    and bp1=sp1=v=0 for a *correct* token. get_option_chain retries that one
+    strike; a retry that comes back with a real book is used.
+    """
+    monkeypatch.setattr(adapter_module, "_CHAIN_QUOTE_RETRY_SLEEP_S", 0.0)
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_option_chain_response = [
+        {"tsym": "NIFTY30JUL26C24000", "token": "111", "strprc": "24000.00",
+         "optt": "CE", "instname": "OPTIDX"},
+    ]
+    # First per-strike call degenerate, second (the retry) has a real book.
+    rest.get_quotes_responses_by_token = {"111": [dict(_EMPTY_BOOK_SPOT), dict(_REAL_BOOK)]}
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert snapshot.entries[0].ltp == 142.35
+    assert snapshot.entries[0].bid == 142.00
+    assert snapshot.entries[0].volume == 125000
+    strike_quote_calls = [c for c in rest.calls if c[0] == "get_quotes" and c[1][1] == "NFO"]
+    assert len(strike_quote_calls) == 2  # original + one retry
+
+
+def test_get_option_chain_leaves_the_degenerate_entry_untouched_when_retries_dont_recover(
+    monkeypatch,
+):
+    """If every retry stays degenerate, the entry is left exactly as the
+    last body said (spot-shaped `lp`, empty book) -- `get_option_chain`
+    never fabricates a price. Rail 2 (is_plausible_option_entry) downstream
+    then drops it on the empty book, same as before this feature. The retry
+    count is bounded to _CHAIN_QUOTE_RETRY_ATTEMPTS for the one row.
+    """
+    monkeypatch.setattr(adapter_module, "_CHAIN_QUOTE_RETRY_SLEEP_S", 0.0)
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_option_chain_response = [
+        {"tsym": "NIFTY30JUL26C24000", "token": "111", "strprc": "24000.00",
+         "optt": "CE", "instname": "OPTIDX"},
+    ]
+    rest.get_quotes_response = dict(_EMPTY_BOOK_SPOT)  # every call degenerate
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert snapshot.entries[0].bid == 0.0
+    assert snapshot.entries[0].ask == 0.0
+    assert snapshot.entries[0].volume == 0
+    assert snapshot.entries[0].ltp == 23670.50  # unchanged from the last body, not fabricated
+    strike_quote_calls = [c for c in rest.calls if c[0] == "get_quotes" and c[1][1] == "NFO"]
+    assert len(strike_quote_calls) == 1 + 2  # original + _CHAIN_QUOTE_RETRY_ATTEMPTS
+
+
+def test_get_option_chain_bounds_total_degenerate_retries_per_fetch(monkeypatch):
+    """A whole-chain outage must not turn one fetch into an unbounded retry
+    storm -- retries are capped at _CHAIN_QUOTE_MAX_RETRIED_ROWS across the
+    fetch, regardless of how many rows come back degenerate.
+    """
+    monkeypatch.setattr(adapter_module, "_CHAIN_QUOTE_RETRY_SLEEP_S", 0.0)
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_option_chain_response = [
+        {"tsym": f"NIFTY30JUL26C{24000 + i * 50}", "token": str(900 + i),
+         "strprc": f"{24000 + i * 50}.00", "optt": "CE", "instname": "OPTIDX"}
+        for i in range(20)
+    ]
+    rest.get_quotes_response = dict(_EMPTY_BOOK_SPOT)  # every strike degenerate
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert len(snapshot.entries) == 20
+    retry_calls = [c for c in rest.calls if c[0] == "get_quotes" and c[1][1] == "NFO"]
+    # 20 original per-strike calls + at most the per-fetch retry cap
+    assert len(retry_calls) == 20 + _CHAIN_QUOTE_MAX_RETRIED_ROWS
+
+
+def test_get_option_chain_does_not_retry_a_transport_failure(monkeypatch):
+    """A `{}` from the per-strike fetch (limiter timeout / ShoonyaApiError)
+    is a transport failure, not the spot-leak signature -- it degrades to a
+    zero entry without triggering the degenerate-quote retry.
+    """
+    monkeypatch.setattr(adapter_module, "_CHAIN_QUOTE_RETRY_SLEEP_S", 0.0)
+    rest = _FakeRestClient()
+    adapter, _ = _adapter(rest)
+    _configure_search_scrip_for_option_chain(rest)
+    rest.get_option_chain_response = [
+        {"tsym": "NIFTY30JUL26C24000", "token": "111", "strprc": "24000.00",
+         "optt": "CE", "instname": "OPTIDX"},
+    ]
+    rest.raise_on_get_quotes_tokens = {"111"}
+
+    snapshot = adapter.get_option_chain("NIFTY", date(2026, 7, 30))
+
+    assert snapshot.entries[0].ltp == 0.0
+    strike_quote_calls = [c for c in rest.calls if c[0] == "get_quotes" and c[1][1] == "NFO"]
+    assert len(strike_quote_calls) == 1  # no retry
 
 
 def test_get_price_history_resolves_underlying_and_calls_tpseries():

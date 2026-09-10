@@ -55,11 +55,13 @@ from app.modules.broker_adapter.base.contracts import (
     BrokerOrderStatus,
     OrderRequest,
     OrderResult,
+    Tick,
     TradeFill,
 )
 from app.modules.broker_adapter.base.contracts import OrderSide as ContractOrderSide
 from app.modules.broker_adapter.base.errors import BrokerError, ConfigurationError
 from app.modules.broker_adapter.mock.adapter import FillScenario, MockBrokerAdapter
+from app.modules.execution_engine.paper import service as paper_service
 from app.modules.execution_engine.paper.protective_stop import (
     resize_resting_protective_stop,
     sync_resting_protective_stop,
@@ -68,11 +70,13 @@ from app.modules.execution_engine.paper.service import (
     _MAX_EXIT_ORDER_ATTEMPTS,
     close_position,
     close_position_from_external_fill,
+    current_contract_price,
     dispatch_trade_intent,
     evaluate_open_position,
     reconcile_pending_live_exit_orders,
     reconcile_pending_live_orders,
 )
+from app.modules.market_data.freshness import FreshnessState
 from app.modules.scheduler.eod_square_off import (
     UnresolvableOptionContractError,
     run_eod_square_off,
@@ -3087,3 +3091,63 @@ def test_evaluate_open_position_no_spread_blowout_exit_within_tolerance(
     )
 
     assert outcome is None
+
+
+# --- current_contract_price: last-resort implausible-quote handling (2026-09-10) ---
+# docs/ops/shoonya_option_chain_spot_leak.md -- Shoonya's per-strike GetQuotes
+# can return spot-for-a-valid-token, and the last-resort broker.get_quote() is
+# that same call. current_contract_price must not hand a spot-shaped premium
+# back to its callers when a real (if stale) snapshot price exists.
+
+
+class _SpotLeakQuoteBroker(MockBrokerAdapter):
+    """A real MockBrokerAdapter whose get_quote returns a spot-shaped
+    premium with an empty book -- the exact shape Shoonya's degenerate
+    GetQuotes response parses to (docs/ops/shoonya_option_chain_spot_leak.md).
+    """
+
+    def __init__(self, ltp: float = 23670.5) -> None:
+        super().__init__()
+        self._leaked_ltp = ltp
+
+    def get_quote(self, contract_symbol: str) -> Tick:
+        return Tick(
+            contract_symbol=contract_symbol,
+            ltp=self._leaked_ltp, bid=0.0, ask=0.0, volume=0, oi=0, ts=datetime.now(UTC),
+        )
+
+
+def test_current_contract_price_prefers_a_stale_real_snapshot_over_an_implausible_quote(
+    db: Session, instrument, option_contract, monkeypatch
+):
+    # Force the "no live tick, snapshot not fresh" path so the last-resort
+    # broker.get_quote() branch is reached...
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.DEAD
+    )
+    # ...and a real, plausible (if stale) snapshot price does exist.
+    real_snapshot_tick = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=91.0, bid=90.5, ask=91.5, volume=4000, oi=15000, ts=datetime.now(UTC),
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: real_snapshot_tick)
+
+    result = current_contract_price(db, option_contract, _SpotLeakQuoteBroker())
+
+    assert result.ltp == 91.0  # the stale-but-real snapshot, not the 23670.5 spot leak
+
+
+def test_current_contract_price_returns_the_implausible_quote_only_when_nothing_else_exists(
+    db: Session, instrument, option_contract, monkeypatch
+):
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.DEAD
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: None)
+
+    result = current_contract_price(db, option_contract, _SpotLeakQuoteBroker(ltp=23670.5))
+
+    # Contract: current_contract_price always returns *something*; with no
+    # plausible source anywhere it returns the implausible quote and logs an
+    # ERROR -- the caller (PositionManager) is what gates on it.
+    assert result.ltp == 23670.5
