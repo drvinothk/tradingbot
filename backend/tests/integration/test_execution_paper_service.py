@@ -77,7 +77,10 @@ from app.modules.execution_engine.paper.service import (
     reconcile_pending_live_orders,
 )
 from app.modules.market_data.freshness import FreshnessState
+from app.modules.market_data.price_read import PriceRead, PriceSource
+from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.scheduler.eod_square_off import (
+    NoUsableSquareOffPriceError,
     UnresolvableOptionContractError,
     run_eod_square_off,
     run_kill_switch_square_off,
@@ -1669,6 +1672,121 @@ def test_square_off_all_open_positions_skips_a_corrupt_position_and_closes_the_r
     assert position_b.status == PositionStatus.CLOSED
 
 
+# --- forced square-off: mode-aware "no usable price" policy (2026-09-11, P1) ---
+
+
+def test_square_off_paper_position_with_no_usable_price_is_left_open_and_alerts(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """PAPER + PriceRead.none() -> leave the position OPEN, raise
+    NoUsableSquareOffPriceError, write an option_chain_degraded alert. A paper
+    close cannot invent an exit price; a spot-shaped number would book a
+    fabricated P&L.
+    """
+    import app.modules.scheduler.eod_square_off as eod_square_off_module
+    from app.domain.ops.models import SystemAlert
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    monkeypatch.setattr(
+        eod_square_off_module, "current_contract_price", lambda *a, **k: PriceRead.none()
+    )
+
+    with pytest.raises(NoUsableSquareOffPriceError) as exc_info:
+        run_single_position_square_off(
+            db, broker, trading_session, position, ExitReason.EOD_SQUARE_OFF
+        )
+    assert exc_info.value.position_id == position.id
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.category == "option_chain_degraded")
+        .filter(SystemAlert.dedup_key == f"no_squareoff_price:{position.id}")
+        .one()
+    )
+    assert alert.is_resolved is False
+
+
+def test_square_off_batch_skips_the_no_price_paper_position_and_flattens_the_rest(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    import app.modules.scheduler.eod_square_off as eod_square_off_module
+
+    ti_a = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, ti_a, broker=broker)
+    position_a = db.query(Position).filter(Position.trade_intent_id == ti_a.id).one()
+
+    ti_b = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, ti_b, broker=broker)
+    position_b = db.query(Position).filter(Position.trade_intent_id == ti_b.id).one()
+
+    real_ccp = eod_square_off_module.current_contract_price
+
+    def _ccp(db_, oc, brk, **kw):
+        # position_a's contract prices as unusable; position_b is real.
+        # Both use the same option_contract fixture, so key on which position
+        # is being priced is not possible here -- instead fail the FIRST call
+        # only (position_a is dispatched/iterated first).
+        if not getattr(_ccp, "_fired", False):
+            _ccp._fired = True  # type: ignore[attr-defined]
+            return PriceRead.none()
+        return real_ccp(db_, oc, brk, **kw)
+
+    monkeypatch.setattr(eod_square_off_module, "current_contract_price", _ccp)
+
+    outcomes = run_eod_square_off(db, broker, trading_session)
+
+    db.refresh(position_a)
+    db.refresh(position_b)
+    assert position_a.status == PositionStatus.OPEN
+    assert position_b.status == PositionStatus.CLOSED
+    assert [o.position_id for o in outcomes] == [position_b.id]
+
+
+def test_square_off_live_position_with_no_usable_price_raises_and_alerts_for_telegram(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """LIVE + PriceRead.none() -> we do NOT fabricate a price to force a
+    close (`close_position`'s LIVE fire-now trigger derives from
+    `intended_price`; 0.0 there never fires -- a silent non-exit). Raise
+    NoUsableSquareOffPriceError, alert with mode=LIVE so it reaches Telegram;
+    the broker resting stop + exchange intraday square-off are the backstops.
+    """
+    import app.modules.scheduler.eod_square_off as eod_square_off_module
+    from app.domain.execution.models import OrderMode
+    from app.domain.ops.models import SystemAlert
+
+    trade_intent = _make_trade_intent(db, trading_session, strategy_run, option_contract)
+    dispatch_trade_intent(db, trading_session, trade_intent, broker=broker)
+    position = db.query(Position).filter(Position.trade_intent_id == trade_intent.id).one()
+
+    monkeypatch.setattr(
+        eod_square_off_module, "current_contract_price", lambda *a, **k: PriceRead.none()
+    )
+    monkeypatch.setattr(
+        eod_square_off_module, "is_execution_broker_live", lambda _broker: True
+    )
+
+    with pytest.raises(NoUsableSquareOffPriceError):
+        run_single_position_square_off(
+            db, broker, trading_session, position, ExitReason.EOD_SQUARE_OFF
+        )
+
+    db.refresh(position)
+    assert position.status == PositionStatus.OPEN
+    alert = (
+        db.query(SystemAlert)
+        .filter(SystemAlert.dedup_key == f"no_squareoff_price:{position.id}")
+        .one()
+    )
+    assert alert.category == "option_chain_degraded"
+    assert alert.mode == OrderMode.LIVE  # -> passes the paper-suppression Telegram gate
+
+
 def test_run_kill_switch_square_off_closes_only_live_positions(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):
@@ -3093,11 +3211,10 @@ def test_evaluate_open_position_no_spread_blowout_exit_within_tolerance(
     assert outcome is None
 
 
-# --- current_contract_price: last-resort implausible-quote handling (2026-09-10) ---
-# docs/ops/shoonya_option_chain_spot_leak.md -- Shoonya's per-strike GetQuotes
-# can return spot-for-a-valid-token, and the last-resort broker.get_quote() is
-# that same call. current_contract_price must not hand a spot-shaped premium
-# back to its callers when a real (if stale) snapshot price exists.
+# --- current_contract_price -> PriceRead: rung coverage (2026-09-11) --------
+# docs/ops/shoonya_option_chain_spot_leak.md -- every rung is now gated on
+# freshness AND plausibility, and the result is a provenance-tagged PriceRead
+# so callers gate on (source, freshness), never a bare number.
 
 
 class _SpotLeakQuoteBroker(MockBrokerAdapter):
@@ -3117,27 +3234,93 @@ class _SpotLeakQuoteBroker(MockBrokerAdapter):
         )
 
 
-def test_current_contract_price_prefers_a_stale_real_snapshot_over_an_implausible_quote(
+class _CacheFeed(BaseMarketDataProvider):
+    """Minimal BaseMarketDataProvider whose get_latest_tick returns a fixed
+    tick -- for exercising current_contract_price's rung-1 live-feed path."""
+
+    def __init__(self, tick: Tick | None) -> None:
+        self._tick = tick
+
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def subscribe_ticks(self, symbols, on_tick, on_depth=None) -> None: ...
+    def unsubscribe_ticks(self, symbols) -> None: ...
+    def get_price_history(self, underlying, start, end, timeframe_seconds=60):  # noqa: ANN001
+        return []
+
+    def get_latest_tick(self, symbol: str) -> Tick | None:
+        return self._tick
+
+
+def test_current_contract_price_rung1_live_feed_fresh_and_plausible(
+    db: Session, instrument, option_contract
+):
+    feed = _CacheFeed(
+        Tick(
+            contract_symbol=option_contract.symbol,
+            ltp=88.0, bid=87.5, ask=88.5, volume=3000, oi=9000, ts=datetime.now(UTC),
+        )
+    )
+    result = current_contract_price(
+        db, option_contract, _SpotLeakQuoteBroker(), market_data_provider=feed
+    )
+    assert result.source == PriceSource.LIVE_FEED
+    assert result.is_actionable
+    assert result.tick is not None and result.tick.ltp == 88.0
+
+
+def test_current_contract_price_rung1_stale_live_tick_falls_through(
     db: Session, instrument, option_contract, monkeypatch
 ):
-    # Force the "no live tick, snapshot not fresh" path so the last-resort
-    # broker.get_quote() branch is reached...
-    monkeypatch.setattr(
-        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.DEAD
+    stale = _CacheFeed(
+        Tick(
+            contract_symbol=option_contract.symbol,
+            ltp=88.0, bid=87.5, ask=88.5, volume=3000, oi=9000,
+            ts=datetime.now(UTC) - timedelta(minutes=5),  # past TICK_THRESHOLDS stale
+        )
     )
-    # ...and a real, plausible (if stale) snapshot price does exist.
-    real_snapshot_tick = Tick(
+    snap = Tick(
         contract_symbol=option_contract.symbol,
         ltp=91.0, bid=90.5, ask=91.5, volume=4000, oi=15000, ts=datetime.now(UTC),
     )
-    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: real_snapshot_tick)
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.LIVE
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: snap)
+
+    result = current_contract_price(
+        db, option_contract, _SpotLeakQuoteBroker(), market_data_provider=stale
+    )
+    assert result.source == PriceSource.CHAIN_SNAPSHOT
+    assert result.freshness == FreshnessState.LIVE
+    assert result.is_actionable
+    assert result.tick is not None and result.tick.ltp == 91.0
+
+
+def test_current_contract_price_rung4_stale_snapshot_is_labelled_not_actionable(
+    db: Session, instrument, option_contract, monkeypatch
+):
+    # ensure_fresh_option_chain reports the chain as unusable, broker.get_quote
+    # is a spot leak -- the only real number left is a >10-min-old snapshot.
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.DEAD
+    )
+    stale_snapshot = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=91.0, bid=90.5, ask=91.5, volume=4000, oi=15000,
+        ts=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: stale_snapshot)
 
     result = current_contract_price(db, option_contract, _SpotLeakQuoteBroker())
 
-    assert result.ltp == 91.0  # the stale-but-real snapshot, not the 23670.5 spot leak
+    assert result.source == PriceSource.CHAIN_SNAPSHOT
+    assert result.freshness == FreshnessState.STALE
+    assert not result.is_actionable  # PositionManager skips; eod_square_off may still use it
+    assert result.tick is not None and result.tick.ltp == 91.0  # not the 23670.5 spot leak
 
 
-def test_current_contract_price_returns_the_implausible_quote_only_when_nothing_else_exists(
+def test_current_contract_price_rung5_none_when_nothing_usable_anywhere(
     db: Session, instrument, option_contract, monkeypatch
 ):
     monkeypatch.setattr(
@@ -3147,7 +3330,70 @@ def test_current_contract_price_returns_the_implausible_quote_only_when_nothing_
 
     result = current_contract_price(db, option_contract, _SpotLeakQuoteBroker(ltp=23670.5))
 
-    # Contract: current_contract_price always returns *something*; with no
-    # plausible source anywhere it returns the implausible quote and logs an
-    # ERROR -- the caller (PositionManager) is what gates on it.
-    assert result.ltp == 23670.5
+    # Never a fabricated / spot-shaped number: PriceRead.none(), the caller gates on it.
+    assert result.source == PriceSource.NONE
+    assert result.tick is None
+    assert not result.is_actionable
+    assert result.ltp_or_none is None
+
+
+def test_current_contract_price_p6_secondary_feed_disagreeing_with_snapshot_is_dropped(
+    db: Session, instrument, option_contract, monkeypatch
+):
+    # Primary feed silent; a secondary feed reports a price wildly off the
+    # snapshot (a mis-mapped token) -> dropped, resolver falls to the snapshot.
+    primary = _CacheFeed(None)
+    bad_secondary = _CacheFeed(
+        Tick(
+            contract_symbol=option_contract.symbol,
+            ltp=800.0, bid=790.0, ask=810.0, volume=100, oi=100, ts=datetime.now(UTC),
+        )
+    )
+    snap = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=90.0, bid=89.5, ask=90.5, volume=4000, oi=15000, ts=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.LIVE
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: snap)
+
+    result = current_contract_price(
+        db,
+        option_contract,
+        _SpotLeakQuoteBroker(),
+        market_data_provider=primary,
+        extra_price_feeds=[bad_secondary],
+    )
+    assert result.source == PriceSource.CHAIN_SNAPSHOT
+    assert result.tick is not None and result.tick.ltp == 90.0
+
+
+def test_current_contract_price_p6_secondary_feed_agreeing_with_snapshot_is_used(
+    db: Session, instrument, option_contract, monkeypatch
+):
+    primary = _CacheFeed(None)
+    good_secondary = _CacheFeed(
+        Tick(
+            contract_symbol=option_contract.symbol,
+            ltp=91.5, bid=91.0, ask=92.0, volume=2500, oi=8000, ts=datetime.now(UTC),
+        )
+    )
+    snap = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=90.0, bid=89.5, ask=90.5, volume=4000, oi=15000, ts=datetime.now(UTC),
+    )
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.LIVE
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: snap)
+
+    result = current_contract_price(
+        db,
+        option_contract,
+        _SpotLeakQuoteBroker(),
+        market_data_provider=primary,
+        extra_price_feeds=[good_secondary],
+    )
+    assert result.source == PriceSource.LIVE_FEED
+    assert result.tick is not None and result.tick.ltp == 91.5

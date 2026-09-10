@@ -469,6 +469,113 @@ def test_run_once_skips_the_cycle_when_the_only_price_available_is_implausible(
     assert archived == 0
 
 
+def test_run_once_skips_the_cycle_on_a_stale_only_snapshot_read(
+    db: Session, broker, trading_session, strategy_run, option_contract, monkeypatch
+):
+    """2026-09-11: `current_contract_price` returns a plausible-but-STALE
+    snapshot *labelled* (source=CHAIN_SNAPSHOT, freshness=STALE) rather than
+    ungated (the pre-rework step-3 bug, QC O1). `PriceRead.is_actionable` is
+    False for it, so PositionManager skips stop/target/trail this cycle
+    instead of acting on a 20-minute-old premium.
+    """
+    from app.modules.broker_adapter.base.contracts import Tick
+    from app.modules.execution_engine.paper import service as paper_service
+    from app.modules.market_data.freshness import FreshnessState
+
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    # broker.get_quote() is a spot leak -> rung 3 fails; only a stale snapshot
+    # remains.
+    broker._prices[option_contract.symbol] = 23670.5  # noqa: SLF001
+    stale = Tick(
+        contract_symbol=option_contract.symbol,
+        ltp=40.0, bid=39.5, ask=40.5, volume=1000, oi=5000,
+        ts=datetime.now(UTC) - timedelta(minutes=20),
+    )
+    monkeypatch.setattr(
+        paper_service, "ensure_fresh_option_chain", lambda *a, **k: FreshnessState.DEAD
+    )
+    monkeypatch.setattr(paper_service, "latest_snapshot_tick", lambda *a, **k: stale)
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()
+
+    db.refresh(position)
+    # 40.0 < stop 72.0 -- had the stale snapshot been acted on, the stop
+    # would have fired. It must not.
+    assert position.status == PositionStatus.OPEN
+    archived = (
+        db.query(QuoteTick)
+        .filter(QuoteTick.option_contract_id == option_contract.id)
+        .count()
+    )
+    assert archived == 0
+
+
+class _AuthFailingFeed(BaseMarketDataProvider):
+    """A secondary EXECUTION_PRICE_SECONDARY_FEED leg with no live session --
+    subscribe_ticks raises BrokerAuthError. P5: this is pricing degradation
+    only and must never reach _run_cycle's `except BrokerAuthError`, which
+    would move a live session to degraded_mode.
+    """
+
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def unsubscribe_ticks(self, symbols) -> None: ...
+    def get_price_history(self, underlying, start, end, timeframe_seconds=60):
+        return []
+
+    def get_latest_tick(self, symbol):
+        return None
+
+    def subscribe_ticks(self, symbols, on_tick, on_depth=None) -> None:
+        raise BrokerAuthError("no Alice Blue session yet")
+
+
+def test_run_once_secondary_price_feed_auth_failure_is_pricing_degradation_only(
+    db: Session, broker, trading_session, strategy_run, option_contract
+):
+    """P5: a secondary pricing feed that can't subscribe (no session) must
+    not crash the cycle or trip the session mode -- pricing falls through to
+    the normal path (broker.get_quote here), the position is still evaluated.
+    """
+    trading_session.mode = SafeMode.LIVE_ENABLED
+    db.flush()
+    position = _dispatch_position(
+        db, trading_session, strategy_run, option_contract, broker,
+        stop_price=72.0, target_price=92.0,
+    )
+    broker._prices[option_contract.symbol] = 80.0  # noqa: SLF001 - between stop/target, no exit
+
+    manager = PositionManager(
+        trading_session.id,
+        broker=broker,
+        market_data_provider=_NullMarketDataProvider(),
+        secondary_price_feeds=[_AuthFailingFeed()],
+        session_factory=_session_factory_for(db),
+    )
+    manager.run_once()  # must not raise
+
+    db.refresh(trading_session)
+    db.refresh(position)
+    assert trading_session.mode == SafeMode.LIVE_ENABLED  # NOT degraded_mode
+    assert position.status == PositionStatus.OPEN
+    # the normal price path still ran -> the tick was archived
+    archived = (
+        db.query(QuoteTick)
+        .filter(QuoteTick.option_contract_id == option_contract.id)
+        .count()
+    )
+    assert archived == 1
+
+
 def test_run_once_exits_on_stop_hit(
     db: Session, broker, trading_session, strategy_run, option_contract
 ):

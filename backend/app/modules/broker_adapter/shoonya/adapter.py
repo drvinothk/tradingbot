@@ -256,13 +256,15 @@ _CHAIN_QUOTE_STRIKE_RADIUS = 7
 # retry recovers a real book the large majority of the time. Bounded two
 # ways so a genuinely dead feed can't turn one fetch into a retry storm:
 # at most _CHAIN_QUOTE_RETRY_ATTEMPTS per row, and
-# _CHAIN_QUOTE_MAX_RETRIED_ROWS across the whole fetch. Worst-case added
-# latency ~= attempts * sleep * max_rows ~ 3s on one fetch cycle (the
-# existing 8/s chain-quote limiter already makes a full fetch take ~3.5s).
-# See docs/ops/shoonya_option_chain_spot_leak.md.
+# _CHAIN_QUOTE_MAX_RETRY_ATTEMPTS re-fetches across the whole fetch (a
+# per-*attempt* cap, not per row -- so ~5 rows get the full 2-attempt
+# treatment before the budget is spent). Worst-case added latency ~=
+# max_attempts * sleep ~= 1.5s of sleeps plus limiter time on one fetch
+# cycle (the existing 8/s chain-quote limiter already makes a full fetch
+# take ~3.5s). See docs/ops/shoonya_option_chain_spot_leak.md.
 _CHAIN_QUOTE_RETRY_ATTEMPTS = 2
 _CHAIN_QUOTE_RETRY_SLEEP_S = 0.15
-_CHAIN_QUOTE_MAX_RETRIED_ROWS = 10
+_CHAIN_QUOTE_MAX_RETRY_ATTEMPTS = 10
 
 
 def _is_empty_book(entry: OptionChainEntry) -> bool:
@@ -552,7 +554,7 @@ class ShoonyaBrokerAdapter(BrokerPort):
         entries = []
         token_substitutions: list[tuple[str, str, str]] = []
         degenerate_rows = 0
-        retried_rows = 0
+        retry_attempts = 0
         recovered_rows = 0
         for row in rows:
             symbol = str(row.get("tsym", ""))
@@ -601,10 +603,10 @@ class ShoonyaBrokerAdapter(BrokerPort):
                 while (
                     _is_empty_book(entry)
                     and attempt < _CHAIN_QUOTE_RETRY_ATTEMPTS
-                    and retried_rows < _CHAIN_QUOTE_MAX_RETRIED_ROWS
+                    and retry_attempts < _CHAIN_QUOTE_MAX_RETRY_ATTEMPTS
                 ):
                     attempt += 1
-                    retried_rows += 1
+                    retry_attempts += 1
                     time.sleep(_CHAIN_QUOTE_RETRY_SLEEP_S)
                     entry = normalizer.parse_option_chain_entry(
                         row, symbol, self._fetch_chain_row_quote(symbol, exch_for_row, token)
@@ -617,13 +619,13 @@ class ShoonyaBrokerAdapter(BrokerPort):
         if degenerate_rows:
             logger.warning(
                 "GetOptionChain %s expiry %s: %d/%d rows came back with an empty book "
-                "(likely Shoonya returning spot for a valid token); retried %d row-fetches, "
+                "(likely Shoonya returning spot for a valid token); %d retry re-fetches, "
                 "recovered %d",
                 underlying,
                 expiry,
                 degenerate_rows,
                 len(rows),
-                retried_rows,
+                retry_attempts,
                 recovered_rows,
             )
 

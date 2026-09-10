@@ -532,6 +532,44 @@ def test_square_off_position_denies_unknown_or_cross_workspace_position_id(
     assert resp.status_code == 404
 
 
+def test_square_off_position_reports_no_usable_price_for_a_degraded_paper_feed(
+    api_client: TestClient, seeded_admin, engine, monkeypatch
+):
+    """2026-09-11 (P1): a PAPER position whose price cannot be resolved
+    (`PriceRead.none()`) is left open and surfaced as `success: false` with a
+    distinct `reason` -- not a 5xx, not a misleading "wait and retry".
+    """
+    from app.modules.market_data.price_read import PriceRead
+
+    monkeypatch.setattr(
+        "app.modules.scheduler.eod_square_off.current_contract_price",
+        lambda *a, **k: PriceRead.none(),
+    )
+
+    _login(api_client, seeded_admin)
+    session_id = api_client.post(
+        "/api/v1/sessions", json={"broker_account_id": str(seeded_admin["broker_account_id"])}
+    ).json()["id"]
+    instrument_id = _dispatch_one_position(engine, seeded_admin, session_id)
+    try:
+        position_id = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()[0]["id"]
+
+        resp = api_client.post(f"/api/v1/positions/{position_id}/square-off")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is False
+        assert body["reason"] == "no_usable_price"
+
+        positions_after = api_client.get(
+            "/api/v1/positions", params={"trading_session_id": session_id}
+        ).json()
+        assert positions_after[0]["status"] == "open"
+    finally:
+        _cleanup_instrument_and_dependents(engine, instrument_id)
+
+
 # -- POST /positions/{id}/manual-reconcile (2026-09-02) -----------------------
 
 

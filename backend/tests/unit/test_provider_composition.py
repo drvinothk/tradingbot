@@ -22,6 +22,7 @@ class _FakeMarketDataSettings:
     failover_threshold_seconds: float = 5.0
     failover_recovery_stabilization_seconds: float = 90.0
     failover_backup_retry_seconds: float = 30.0
+    execution_price_secondary_feed: str = "off"
 
 
 @dataclass
@@ -462,3 +463,66 @@ def test_seed_manual_override_noop_when_no_preference_row(monkeypatch):
     provider_composition._seed_manual_override(fo)  # type: ignore[arg-type]  # noqa: SLF001
 
     assert fo.override_calls == []
+
+
+# --- get_secondary_price_feeds: Rail 6, EXECUTION_PRICE_SECONDARY_FEED ------
+# (2026-09-11) Extra Shoonya-independent feed for open-position pricing only.
+# Default "off" -> [] -> byte-identical to before it existed.
+
+
+def _settings_with_secondary(primary: str, secondary: str) -> _FakeSettings:
+    return _FakeSettings(
+        market_data=_FakeMarketDataSettings(
+            provider=primary, execution_price_secondary_feed=secondary
+        )
+    )
+
+
+def test_secondary_price_feeds_empty_when_off(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("shoonya")
+    )
+    assert provider_composition.get_secondary_price_feeds() == []
+
+
+def test_secondary_price_feeds_empty_for_unrecognised_name(monkeypatch, caplog):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_secondary("shoonya", "bloomberg"),
+    )
+    with caplog.at_level("ERROR"):
+        assert provider_composition.get_secondary_price_feeds() == []
+    assert any("not a recognised provider" in r.getMessage() for r in caplog.records)
+
+
+def test_secondary_price_feeds_empty_when_equal_to_primary(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_secondary("alice_blue", "alice_blue"),
+    )
+    assert provider_composition.get_secondary_price_feeds() == []
+
+
+def test_secondary_price_feeds_builds_a_dedicated_instance_when_opted_in(monkeypatch):
+    sentinel = object()
+    built: list[str] = []
+
+    def _fake_build(name, settings):  # noqa: ANN001
+        built.append(name)
+        return sentinel
+
+    monkeypatch.setattr(
+        provider_composition,
+        "get_settings",
+        lambda: _settings_with_secondary("shoonya", "alice_blue"),
+    )
+    monkeypatch.setattr(provider_composition, "_build_provider", _fake_build)
+
+    first = provider_composition.get_secondary_price_feeds()
+    second = provider_composition.get_secondary_price_feeds()
+
+    assert first == [sentinel]
+    assert second == [sentinel]  # cached singleton
+    assert built == ["alice_blue"]  # built exactly once

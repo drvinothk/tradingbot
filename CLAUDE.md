@@ -328,6 +328,31 @@ work, or vice versa.
   (`MockBrokerAdapter` through Phase 5) — this reuses Phase 1's already-built
   order/position simulation and gives Reconciliation Service a genuine broker-side
   book to diff against, so Phase 6's real-broker case is a DI swap, not a rewrite.
+- **Execution-path option pricing returns a `PriceRead`, never a bare number**
+  (2026-09-11, `feat/option-price-provenance`).
+  `execution_engine/paper/service.py::current_contract_price` returns
+  `market_data/price_read.py`'s `PriceRead` — `tick` (`Tick | None`) + `source`
+  (`LIVE_FEED`/`CHAIN_SNAPSHOT`/`BROKER_QUOTE`/`NONE`) + `freshness`
+  (`FreshnessState`) + `plausible`. **Every rung is gated on freshness AND
+  plausibility** (before this, only the live-feed rung was), and it never
+  fabricates or returns a spot-shaped number — a resolver that finds nothing
+  usable returns `PriceRead.none()`. Consumers gate on `price.is_actionable`
+  (`plausible` + `LIVE`/`DEGRADED` + non-null tick): `PositionManager._run_cycle`
+  skips the cycle otherwise (broker-side SL-LMT remains the floor);
+  `eod_square_off.run_single_position_square_off` on a `NONE` read raises
+  `NoUsableSquareOffPriceError` + an `option_chain_degraded` alert and leaves
+  the position OPEN (never fabricates a price — `close_position`'s LIVE
+  fire-now trigger derives from `intended_price`, so `0.0` there would set a
+  never-firing trigger; the broker resting SL-LMT + exchange intraday
+  square-off are the real backstops). The alert's `mode` is `LIVE` for a
+  live-broker position (reaches Telegram) / `PAPER` otherwise (DB-only). Rung 1
+  also reads any
+  `provider_composition.get_secondary_price_feeds()` leg
+  (`MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED`, default `off` — Rail 6, see
+  `docs/ops/shoonya_option_chain_spot_leak.md`); a secondary tick disagreeing
+  with the chain snapshot beyond `PRICE_DRIFT_TOLERANCE_PCT` is dropped. A
+  secondary feed's `BrokerAuthError` is pricing degradation only — it must never
+  reach `_handle_broker_auth_error` (`_ensure_symbol_subscribed` contains it).
 - **`orders` ↔ `positions` is a circular FK pair**: an entry `Order` opens a
   `Position`; the `Position`'s `closing_order_id` then points back at the exit
   `Order`. Break the cycle via `positions.closing_order_id` (nullable) when
@@ -624,6 +649,27 @@ work, or vice versa.
   this file.
 
 ## Known open items
+
+- **2026-09-11: price-provenance rework (`feat/option-price-provenance`) —
+  `PriceRead` + every rung gated + Rail 6 wiring flag-off.** Follow-up to the
+  QC of the 2026-09-10 batch (O1/O2). `current_contract_price` now returns a
+  provenance-tagged `PriceRead` (`market_data/price_read.py`); every fallback
+  rung is freshness+plausibility gated (a `STALE` snapshot is returned
+  *labelled* — `PositionManager` skips it, was: acted on ungated at old step 3);
+  `PriceRead.none()` replaces the "return a spot-shaped number" contract.
+  `eod_square_off` on a no-price read raises `NoUsableSquareOffPriceError` +
+  `option_chain_degraded` alert (mode LIVE→Telegram / PAPER→DB-only), leaves the
+  position OPEN, never fabricates a price. Rail 6 (`MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED`,
+  default `off`): rung 1 reads any `get_secondary_price_feeds()` leg, cross-checked
+  against the snapshot within `PRICE_DRIFT_TOLERANCE_PCT`. Also folded in:
+  `_CHAIN_QUOTE_MAX_RETRIED_ROWS` → `_CHAIN_QUOTE_MAX_RETRY_ATTEMPTS` (it counts
+  attempts), `_seed_manual_override` docstring (`override==primary` is NOT a
+  harmless no-op), `_find_failover_provider` delegates to the shared
+  `get_failover_provider`. 1769 backend tests pass (+22), ruff/mypy clean, no
+  migration. **Not deployed; Rail 6 flag stays off until AB per-contract WS
+  ticks are verified live.** Convention added above ("Execution-path option
+  pricing returns a `PriceRead`…"); full write-up in
+  [docs/ops/shoonya_option_chain_spot_leak.md](docs/ops/shoonya_option_chain_spot_leak.md).
 
 - **2026-09-08: option-chain plausibility "rails" (Rails 1+2+4) — MERGED to
   `main` (`d8b1ca0`) + DEPLOYED to OCI (5 backend files, no migration) +

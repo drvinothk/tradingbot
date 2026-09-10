@@ -44,8 +44,11 @@ from app.domain.execution.models import (
     TradeOutcome,
 )
 from app.domain.market.models import OptionContract
+from app.domain.ops.models import AlertSeverity
 from app.domain.session.models import TradingSession
+from app.modules.alerting.manager import send_alert
 from app.modules.broker_adapter.base.broker_port import BrokerPort
+from app.modules.broker_adapter.composition import is_execution_broker_live
 from app.modules.execution_engine.paper.service import (
     close_position,
     current_contract_price,
@@ -73,6 +76,33 @@ class UnresolvableOptionContractError(Exception):
     def __init__(self, option_contract_id: uuid.UUID) -> None:
         self.option_contract_id = option_contract_id
         super().__init__(f"unknown option_contract_id {option_contract_id}")
+
+
+class NoUsableSquareOffPriceError(Exception):
+    """Raised by `run_single_position_square_off` when `current_contract_price`
+    can resolve no usable price anywhere (`PriceRead.none()` — a total,
+    sustained option-chain blackout for this contract; Shoonya spot-leak with
+    no fresh feed and no plausible snapshot, even stale,
+    docs/ops/shoonya_option_chain_spot_leak.md).
+
+    We deliberately do NOT fabricate a price to force a close: `close_position`
+    derives its LIVE fire-now SL-LMT trigger from `intended_price`, so a `0.0`
+    there sets a trigger that never fires (a silent non-exit), and for a paper
+    position a spot-shaped number would book a fabricated P&L. Both are worse
+    than an honest "left OPEN + loud". Real risk is not stranded — a
+    broker-side resting SL-LMT stays live and the exchange force-squares-off
+    every intraday option position at ~15:15-15:20 IST regardless.
+
+    The batch sweep (`_square_off_all_open_positions`) catches this, logs, and
+    keeps flattening the rest; `api.v1.execution.square_off_position` surfaces
+    it as `success: false` with a distinct `reason`. The `option_chain_
+    degraded` alert raised alongside is `mode=LIVE` for a live-broker position
+    (reaches Telegram) / `mode=PAPER` otherwise (DB / Control Room only).
+    """
+
+    def __init__(self, position_id: uuid.UUID) -> None:
+        self.position_id = position_id
+        super().__init__(f"no usable square-off price for position {position_id}")
 
 
 def run_single_position_square_off(
@@ -117,20 +147,67 @@ def run_single_position_square_off(
     # Instrument/OptionContract).
     same_session = reuse_session(db)
 
-    # Same REST-option-chain-snapshot-preferring price source as every
-    # other paper-execution price decision -- was broker.get_quote()
-    # directly, which (since get_execution_broker() always resolves to
-    # the mock) returned the mock's own synthetic, strategy-independent
-    # price, same as the bug current_contract_price exists to close.
-    tick = current_contract_price(
+    # Same provenance-gated price source (`PriceRead`) as PositionManager's
+    # stop/target/trail path.
+    price = current_contract_price(
         db,
         option_contract,
         position_broker,
         market_data_provider=market_data_provider,
         session_factory=same_session,
     )
+    if price.tick is None:
+        # No usable price anywhere -- not actionable, not even a stale
+        # snapshot (a total, sustained option-chain blackout for this
+        # contract). We deliberately do NOT fabricate a price to force a
+        # close: `close_position`'s LIVE fire-now path derives the SL-LMT
+        # trigger from `intended_price`, so a `0.0` there would set a trigger
+        # that never fires -- a silent non-exit, worse than an honest "left
+        # OPEN + loud". Real risk is not stranded: any broker-side resting
+        # SL-LMT stays live, and the exchange force-squares-off every
+        # intraday option position at ~15:15-15:20 IST regardless. Leave it
+        # OPEN, alert, and let the next PositionManager cycle / the operator
+        # act once a price returns.
+        is_live = is_execution_broker_live(position_broker)
+        logger.error(
+            "square-off of %s position %s: no usable price anywhere -- leaving it OPEN "
+            "and raising NoUsableSquareOffPriceError (broker resting stop + exchange "
+            "intraday square-off remain the backstops)",
+            "LIVE" if is_live else "PAPER",
+            position.id,
+        )
+        send_alert(
+            db,
+            workspace_id=trading_session.workspace_id,
+            trading_session_id=trading_session.id,
+            severity=AlertSeverity.CRITICAL,
+            category="option_chain_degraded",
+            message=(
+                f"Forced square-off of {'LIVE' if is_live else 'paper'} position "
+                f"{position.id} could not resolve any usable option price "
+                f"({option_contract.symbol}); the position is left OPEN. Check the "
+                "market-data feed / option chain; square off in the broker app if LIVE."
+            )[:500],
+            # LIVE -> reaches Telegram (CRITICAL + non-paper mode passes the
+            # paper-suppression gate); paper -> DB/Control-Room only.
+            mode=OrderMode.LIVE if is_live else OrderMode.PAPER,
+            dedup_key=f"no_squareoff_price:{position.id}",
+        )
+        raise NoUsableSquareOffPriceError(position.id)
+
+    exit_ltp = price.tick.ltp
+    if not price.is_actionable:
+        logger.warning(
+            "square-off of position %s pricing from a %s/%s read (ltp=%.2f) -- "
+            "reference price / slippage may be stale",
+            position.id,
+            price.source.value,
+            price.freshness.value,
+            exit_ltp,
+        )
+
     return close_position(
-        db, trading_session, position, exit_reason, tick.ltp, broker=position_broker, force=True
+        db, trading_session, position, exit_reason, exit_ltp, broker=position_broker, force=True
     )
 
 
@@ -181,6 +258,14 @@ def _square_off_all_open_positions(
                 position.id,
                 position.option_contract_id,
             )
+            continue
+        except NoUsableSquareOffPriceError:
+            # No resolvable price for this contract (spot-leak blackout).
+            # Already logged + alerted in run_single_position_square_off;
+            # leave it OPEN and keep flattening the rest. Self-heals on the
+            # next PositionManager cycle once a real price returns; a LIVE
+            # position is also backstopped by its resting stop + the
+            # exchange's own intraday square-off.
             continue
         if outcome is not None:
             outcomes.append(outcome)

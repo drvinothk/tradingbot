@@ -65,9 +65,11 @@ from app.modules.execution_engine.paper.service import (
     resolve_broker_for_position,
 )
 from app.modules.market_data.freshness import TICK_THRESHOLDS, FreshnessState, classify_age
-from app.modules.market_data.provider_composition import get_market_data_provider
+from app.modules.market_data.provider_composition import (
+    get_market_data_provider,
+    get_secondary_price_feeds,
+)
 from app.modules.market_data.providers.base import BaseMarketDataProvider
-from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 from app.modules.reconciliation.service import run_full_reconciliation
 from app.modules.strategy_engine.service import expire_stale_pending_approvals
 
@@ -92,6 +94,7 @@ class PositionManager:
         trading_session_id: uuid.UUID,
         broker: BrokerPort | None = None,
         market_data_provider: BaseMarketDataProvider | None = None,
+        secondary_price_feeds: list[BaseMarketDataProvider] | None = None,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         reconcile_every_n_cycles: int = DEFAULT_RECONCILE_EVERY_N_CYCLES,
         order_poll_every_n_cycles: int = DEFAULT_ORDER_POLL_EVERY_N_CYCLES,
@@ -112,6 +115,12 @@ class PositionManager:
         # reasons (tests construct this class directly, before any DB
         # session/composition-root state exists).
         self._market_data_provider_override = market_data_provider
+        # EXECUTION_PRICE_SECONDARY_FEED legs (Rail 6). `None` -> resolved via
+        # get_secondary_price_feeds() each cycle (empty unless the flag is
+        # set); an explicit list (tests) is used as-is. A pinned
+        # market_data_provider with no explicit secondaries means "isolate" ->
+        # no secondaries, so every existing test stays byte-identical.
+        self._secondary_price_feeds_override = secondary_price_feeds
         self._poll_interval_seconds = poll_interval_seconds
         self._reconcile_every_n_cycles = reconcile_every_n_cycles
         self._order_poll_every_n_cycles = order_poll_every_n_cycles
@@ -119,11 +128,13 @@ class PositionManager:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._cycle_count = 0
-        # Symbols this instance has successfully subscribed on the market-
-        # data provider for pricing (see _ensure_symbol_subscribed) — a
-        # symbol that fails to subscribe is *not* added, so it's retried on
-        # the next cycle rather than silently given up on forever.
-        self._subscribed_symbols: set[str] = set()
+        # (provider identity, symbol) pairs this instance has successfully
+        # subscribed for pricing (see _ensure_symbol_subscribed) — keyed per
+        # provider so an EXECUTION_PRICE_SECONDARY_FEED leg gets its own
+        # subscribe even for a symbol the primary already has. A pair that
+        # fails to subscribe is *not* added, so it's retried next cycle
+        # rather than silently given up on forever.
+        self._subscribed_symbols: set[tuple[int, str]] = set()
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -305,17 +316,24 @@ class PositionManager:
         `market_data_provider` (or accepting the safe "mock" default) stays
         fully isolated regardless.
 
-        Idempotent per instance (`_subscribed_symbols`) and best-effort: a
-        symbol that fails to subscribe is *not* recorded, so it's retried on
-        the next cycle rather than silently given up on forever — the
-        `_live_tick` fallback to `broker.get_quote` covers pricing in the
-        meantime.
+        Idempotent per (provider, symbol) pair and best-effort: a pair that
+        fails to subscribe is *not* recorded, so it's retried on the next
+        cycle rather than silently given up on forever — the `_live_tick`
+        fallback to `broker.get_quote` covers pricing in the meantime.
+
+        Best-effort also means a raised `BrokerAuthError` (a secondary
+        EXECUTION_PRICE_SECONDARY_FEED leg with no live session yet) is
+        swallowed here, NOT re-raised — a secondary pricing feed being down
+        is pricing degradation only and must never reach `_run_cycle`'s
+        `except BrokerAuthError` / `_handle_broker_auth_error`, which is for
+        the *execution* broker and moves a live session to `degraded_mode`.
         """
-        if symbol in self._subscribed_symbols:
+        key = (id(provider), symbol)
+        if key in self._subscribed_symbols:
             return
         try:
             provider.subscribe_ticks([symbol], on_tick=lambda _tick: None)
-            self._subscribed_symbols.add(symbol)
+            self._subscribed_symbols.add(key)
         except Exception:
             logger.exception(
                 "Failed to subscribe %s for live pricing; will retry next cycle", symbol
@@ -418,6 +436,18 @@ class PositionManager:
 
     def _run_cycle(self, db: Session, trading_session: TradingSession) -> None:
         market_data_provider = self._market_data_provider_override or get_market_data_provider()
+        # Extra Shoonya-independent feeds consulted ONLY for open-position
+        # option-contract pricing (EXECUTION_PRICE_SECONDARY_FEED — Rail 6),
+        # never for underlyings. Empty unless the flag names a recognised,
+        # non-primary provider, so the default path is byte-identical. A test
+        # that pins `market_data_provider` (and gives no explicit secondaries)
+        # wants isolation -> no secondaries.
+        if self._secondary_price_feeds_override is not None:
+            secondary_feeds: list[BaseMarketDataProvider] = self._secondary_price_feeds_override
+        elif self._market_data_provider_override is not None:
+            secondary_feeds = []
+        else:
+            secondary_feeds = get_secondary_price_feeds()
         open_positions = (
             db.query(Position)
             .filter(
@@ -457,54 +487,51 @@ class PositionManager:
                 option_contract = db.get(OptionContract, position.option_contract_id)
                 if option_contract is None:
                     continue
-                # Still subscribe (idempotent, tracked in self._subscribed_symbols)
+                # Still subscribe (idempotent, tracked per (provider, symbol))
                 # even though this deployment's per-contract WS never actually
                 # delivers anything today — current_contract_price only *reads*
                 # the provider's cache, it doesn't subscribe, so without this the
                 # "try live tick first" branch could never succeed even after a
-                # future WS-for-contracts fix landed.
+                # future WS-for-contracts fix landed. Secondary feeds are gated
+                # on is_ready() so an unconnected leg isn't hammered every cycle.
                 self._ensure_symbol_subscribed(market_data_provider, option_contract.symbol)
-                # Option-contract pricing: prefers a live WS tick (works today
-                # for free if a future per-contract WS fix lands), otherwise
-                # falls back to the same REST OptionChainSnapshot the strategy
-                # itself proposed this trade from — not broker.get_quote()
-                # directly, which (get_execution_broker() always being the
-                # mock) would price this contract from the mock's own
-                # synthetic, strategy-independent seed. See
-                # current_contract_price's own docstring.
-                tick = current_contract_price(
+                for feed in secondary_feeds:
+                    if feed.is_ready():
+                        self._ensure_symbol_subscribed(feed, option_contract.symbol)
+                # Option-contract pricing returns a provenance-tagged PriceRead
+                # (source / freshness / plausible). See current_contract_price's
+                # own docstring for the rung order and why broker.get_quote()
+                # is only a last resort.
+                price = current_contract_price(
                     db,
                     option_contract,
                     broker,
                     market_data_provider=market_data_provider,
+                    extra_price_feeds=secondary_feeds,
                     session_factory=same_session,
                 )
-                if not is_plausible_option_tick(
-                    tick.ltp, tick.bid, tick.ask, tick.volume
-                ):
-                    # 2026-09-10 -- current_contract_price must always return
-                    # *something*; when Shoonya is returning spot-for-a-valid
-                    # token (docs/ops/shoonya_option_chain_spot_leak.md) and
-                    # no plausible snapshot exists to fall back to, that
-                    # "something" can be a spot-shaped premium. Acting on it
+                if not price.is_actionable:
+                    # A spot-shaped / stale / absent read (Shoonya spot-leak,
+                    # docs/ops/shoonya_option_chain_spot_leak.md). Acting on it
                     # -- archiving it as this contract's LTP, or feeding it to
-                    # evaluate_open_position, where for a long option it
-                    # clears the hard target and fires a fabricated exit --
-                    # is worse than skipping this poll. The broker-side
-                    # resting protective stop is untouched and still owns
-                    # capital protection; the next cycle (~3s) re-reads a
-                    # fresh price. Rail 4's option_chain_degraded CRITICAL
-                    # alert already notifies the operator when a held
-                    # contract is the one being dropped.
+                    # evaluate_open_position, where for a long option it clears
+                    # the hard target and fires a fabricated exit -- is worse
+                    # than skipping this poll. The broker-side resting
+                    # protective stop is untouched and still owns capital
+                    # protection; the next cycle (~3s) re-reads a fresh price.
+                    # Rail 4's option_chain_degraded CRITICAL alert already
+                    # notifies the operator when a held contract is dropped.
                     logger.warning(
-                        "implausible price for %s (ltp=%.2f bid=%.2f ask=%.2f vol=%d) -- "
+                        "price for %s not actionable (source=%s freshness=%s plausible=%s) -- "
                         "skipping stop/target/trail this cycle",
                         option_contract.symbol,
-                        tick.ltp,
-                        tick.bid,
-                        tick.ask,
-                        tick.volume,
+                        price.source.value,
+                        price.freshness.value,
+                        price.plausible,
                     )
+                    continue
+                tick = price.tick
+                if tick is None:  # unreachable given is_actionable — narrows the type
                     continue
                 self._archive_option_tick(db, option_contract.id, tick)
 

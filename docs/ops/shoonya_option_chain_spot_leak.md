@@ -2,8 +2,12 @@
 
 **Opened:** 2026-09-08. **Status:** Rails 1+2+4 merged (`d8b1ca0`) + deployed
 2026-09-08. **Root cause confirmed 2026-09-10** (see "Root cause — RESOLVED"
-below) and a follow-up mitigation (`fix/option-chain-degenerate-quote-safety`,
-Changes A/B/C) built. Guard (`tick_plausibility.py`) stays regardless.
+below); mitigation `fix/option-chain-degenerate-quote-safety` (Changes A/B/C)
+merged (`cf50b80`) + deployed 2026-09-10. **2026-09-11
+(`feat/option-price-provenance`):** the price-resolution layer reworked into a
+provenance-tagged `PriceRead` with every rung freshness+plausibility gated, and
+Rail 6 wiring (`MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED`) shipped **flag-off**
+— see "Rail 6" below. Guard (`tick_plausibility.py`) stays regardless.
 
 ## Root cause — RESOLVED 2026-09-10 (was hypothesis 2)
 
@@ -190,20 +194,43 @@ here** — the tokens are already correct (Rail 1 silent, DB map clean), so a
 re-sync changes nothing. Kept documented only in case a genuine token-corruption
 recurrence (the 2026-08-12 class) ever shows up again with Rail 1 firing.
 
-### Rail 6 — source diversity  *(the real structural fix; deferred)*
+### Rail 6 — source diversity  *(the real structural fix — wiring shipped 2026-09-11, flag-gated OFF)*
 
 A broker returning spot on ATM strikes is a broker-feed limitation with no
 in-Shoonya fix. TrueData `getoptionchain` was the designated fallback but
 **TrueData is not currently subscribed**; **Alice Blue** is the only backup
 provider today. Alice Blue has no `get_option_chain`, but it *can* subscribe to
 individual NFO option tokens over its Noren-family WS (`alice_blue_scrip_master`
-already maps them). Path: prove AB's WS delivers per-*contract* option ticks
-during market hours (untested — the "no per-contract WS" note is Shoonya-only),
-then have `current_contract_price`'s first branch / `PositionManager` prefer the
-AB feed for open-position pricing. This removes the dependency on Shoonya's
-flaky REST for anything safety-critical and is the reason AB exists as a backup.
-Order-update pushes over Shoonya WS are unaffected (an accelerator only — REST
-`OrderBook` poll + ack-timeout idempotency check are the real nets).
+already maps them).
+
+**2026-09-11 (`feat/option-price-provenance`):** the price-resolution layer was
+reworked so plugging in an independent per-contract feed is now a config flip,
+not a code change:
+
+- `current_contract_price` returns a provenance-tagged `PriceRead`
+  (`market_data/price_read.py`: `tick` + `source` ∈ {`LIVE_FEED`,
+  `CHAIN_SNAPSHOT`, `BROKER_QUOTE`, `NONE`} + `freshness` + `plausible`), and
+  **every rung is now gated on freshness AND plausibility** — closing the QC
+  gaps (O1: a `STALE` snapshot is returned *labelled*, not acted on ungated;
+  O2: `eod_square_off` on a no-price read raises `NoUsableSquareOffPriceError`
+  + `option_chain_degraded` alert and leaves the position OPEN — it never
+  fabricates a price; the broker resting stop + exchange intraday square-off
+  are the backstops).
+- `PositionManager` / `current_contract_price` rung 1 already take the freshest
+  plausible tick across **`get_market_data_provider()` plus any
+  `get_secondary_price_feeds()`** legs; a secondary tick that disagrees with the
+  chain snapshot beyond `PRICE_DRIFT_TOLERANCE_PCT` is dropped (guards a
+  mis-mapped token).
+- **`MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED`** (default `off`) names the
+  independent feed. A dedicated provider instance, lifecycle owned by
+  `provider_composition`, separate from the failover backup leg.
+
+**Still gated on live verification before the flag is flipped:** a market-hours
+session must prove Alice Blue's WS delivers per-*contract* option `tk`/`tf`
+frames for a held contract (`865a62d` diagnostics + the operator's 2026-09-11
+AB manual-OAuth window). Order-update pushes over Shoonya WS are unaffected (an
+accelerator only — REST `OrderBook` poll + ack-timeout idempotency check are the
+real nets).
 
 ## Monitoring plan
 
@@ -215,11 +242,19 @@ After `fix/option-chain-degenerate-quote-safety` (Changes A/B/C) deploys, watch:
   down for that strike for seconds → tune `_CHAIN_QUOTE_RETRY_*` or escalate to
   Rail 6 (Alice Blue).
 - `last-resort broker quote for … was implausible … using the last persisted
-  option-chain snapshot instead` — Change B catching what A missed.
-- `implausible price for … skipping stop/target/trail this cycle` — Change C, the
-  hard stop. Should be rare; if frequent, the snapshot is also going stale →
-  Rail 6.
+  option-chain snapshot instead (freshness=…)` — Change B / rung 4 catching what
+  A missed. A `freshness=stale` here means `PositionManager` skips that cycle.
+- `price for … not actionable (source=… freshness=… plausible=…) -- skipping
+  stop/target/trail this cycle` — the `PriceRead` gate (post-2026-09-11; was
+  `implausible price for … skipping …`). Should be rare; if frequent, the
+  snapshot is also going stale → flip `MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED`
+  once AB per-contract ticks are verified.
+- `Forced square-off of paper position … could not resolve any usable option
+  price` — `NoUsableSquareOffPriceError`: an EOD flatten left a paper position
+  OPEN because the feed was degraded. Investigate the feed, then Manual
+  Reconcile.
 - Any `option_chain_degraded` CRITICAL alert (a dropped entry on an open
-  position) — unchanged canary.
+  position, or a paper EOD with no price) — unchanged canary.
 
-If drops stay materially non-zero after a few days, proceed to Rail 6.
+If drops stay materially non-zero after a few days, verify AB per-contract ticks
+and set `MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED=alice_blue` (Rail 6).

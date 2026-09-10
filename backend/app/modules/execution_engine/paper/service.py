@@ -136,12 +136,16 @@ from app.modules.execution_engine.paper.protective_stop import (
 )
 from app.modules.market_data.freshness import (
     OPTION_CHAIN_THRESHOLDS,
+    PRICE_DRIFT_TOLERANCE_PCT,
+    TICK_THRESHOLDS,
     FreshnessState,
+    check_price_drift,
+    classify_age,
     classify_option_chain,
     ensure_fresh_option_chain,
-    fresh_tick_or_none,
     latest_snapshot_tick,
 )
+from app.modules.market_data.price_read import PriceRead, PriceSource
 from app.modules.market_data.providers.base import BaseMarketDataProvider
 from app.modules.market_data.tick_plausibility import is_plausible_option_tick
 from app.modules.reconciliation.service import _attempt_auto_repair, run_reconciliation
@@ -2256,43 +2260,55 @@ def evaluate_open_position(
     return None
 
 
+_LIVE_FEED_RANK = {FreshnessState.LIVE: 0, FreshnessState.DEGRADED: 1}
+
+
 def current_contract_price(
     db: Session,
     option_contract: OptionContract,
     broker: BrokerPort,
     *,
     market_data_provider: BaseMarketDataProvider | None = None,
+    extra_price_feeds: list[BaseMarketDataProvider] | None = None,
     session_factory: SessionFactory | None = None,
-) -> Tick:
-    """The current price for one option contract, preferring a live WS tick
-    and otherwise falling back to the same REST-based `OptionChainSnapshot`
-    every strategy's own `rank_from_latest_snapshot` already reads
-    (refreshed via `market_data.freshness.ensure_fresh_option_chain`,
-    threshold-gated -- not a REST call every poll) rather than
-    `broker.get_quote()`. That fallback matters: for a paper-routed position
-    `get_execution_broker()` resolves the mock, whose `get_quote()` returns
-    its own synthetic, strategy-independent price -- the exact price-source
-    mismatch this whole change exists to close (a genuinely live position's
-    real broker quote wouldn't have this problem, but this function doesn't
-    know which case it's in without checking, so it always prefers the
-    snapshot). Shared by
-    `PositionManager._run_cycle` (open-position stop/target/trail pricing)
-    and `scheduler.eod_square_off._square_off_all_open_positions` (forced
-    square-off pricing) so the fallback chain lives in exactly one place.
+) -> PriceRead:
+    """The current price for one option contract as a **provenance-tagged
+    `PriceRead`** (`market_data.price_read`) — `(tick, source, freshness,
+    plausible)` — so every caller makes one explicit decision instead of
+    re-deriving "is this safe to act on?" itself. Never returns a fabricated
+    or spot-shaped number: when nothing usable exists anywhere the result is
+    `PriceRead.none()` (`source == NONE`, `tick is None`) and the caller must
+    gate on it (`PositionManager` skips the cycle; `eod_square_off` is
+    mode-aware — see those call sites).
 
-    This function only *reads* `market_data_provider`'s cache -- it never
-    subscribes. `PositionManager` calls its own idempotent
-    `_ensure_symbol_subscribed` first, so its live-tick branch has a real
-    chance of succeeding (today, or automatically once a future per-contract
-    WS fix lands, with no re-work needed here). `eod_square_off.py` doesn't
-    subscribe before calling this -- a one-shot square-off subscribing
-    right before immediately reading wouldn't have a tick ready anyway -- so
-    its live-tick branch is normally a harmless no-op, straight to the
-    REST-snapshot fallback.
+    Resolution rungs, each gated on freshness **and** plausibility (the
+    2026-09-11 rework — before it, only the live-feed rung was gated on both;
+    see docs/ops/shoonya_option_chain_spot_leak.md):
 
-    Only ever falls through to `broker.get_quote()` as an absolute last
-    resort, matching `evaluate_open_position`'s own "never leave a stop
-    check silently unevaluated" discipline -- always returns *something*.
+    1. **`LIVE_FEED`** — the freshest plausible tick across
+       `market_data_provider` plus any `extra_price_feeds` (an
+       EXECUTION_PRICE_SECONDARY_FEED leg — Rail 6). LIVE/DEGRADED by
+       `TICK_THRESHOLDS`. With a secondary feed in play, a candidate that
+       disagrees with the chain snapshot beyond `PRICE_DRIFT_TOLERANCE_PCT`
+       is dropped (guards a mis-mapped secondary token).
+    2. **`CHAIN_SNAPSHOT`** (LIVE/DEGRADED) — the same REST
+       `OptionChainSnapshot` every strategy's `rank_from_latest_snapshot`
+       reads, refreshed via `ensure_fresh_option_chain` (threshold-gated).
+       Preferred over `broker.get_quote()` because for a paper position the
+       broker is the mock (synthetic price) and for a live one it is
+       Shoonya's own spot-leak-prone GetQuotes.
+    3. **`BROKER_QUOTE`** — last-resort `broker.get_quote()`, if plausible.
+    4. **`CHAIN_SNAPSHOT`** (STALE, ≤ `DEAD_AFTER_SECONDS`) — a plausible but
+       stale snapshot still beats a spot-shaped broker quote (`cf50b80`
+       Change B), returned **labelled** so `PositionManager` skips it while
+       `eod_square_off` may still use it knowingly.
+    5. **`PriceRead.none()`** — nothing plausible anywhere.
+
+    This function only *reads* the providers' caches — it never subscribes.
+    `PositionManager` calls its own idempotent `_ensure_symbol_subscribed`
+    first (on every pricing provider). `eod_square_off.py` doesn't subscribe
+    before calling this, so its rung-1 branch is normally a harmless no-op
+    straight to the REST-snapshot fallback.
 
     **Live incident 2026-09-02**: `BrokerPortMarketDataAdapter._handle_tick`
     caches whatever `tick.contract_symbol` the broker reports with zero
@@ -2315,29 +2331,57 @@ def current_contract_price(
     broker.get_quote fallback chain already used for a missing/stale tick,
     never fabricates a price.
     """
-    if market_data_provider is not None:
-        fresh_tick = fresh_tick_or_none(
-            market_data_provider.get_latest_tick(option_contract.symbol), _utcnow()
-        )
-        if fresh_tick is not None:
-            if not is_plausible_option_tick(
-                fresh_tick.ltp, fresh_tick.bid, fresh_tick.ask, fresh_tick.volume
-            ):
-                logger.error(
-                    "REJECTED implausible live tick for option %s: ltp=%.4f bid=%.4f ask=%.4f "
-                    "volume=%d -- likely a token-resolution mismatch (see this function's own "
-                    "docstring); falling back to REST snapshot/broker.get_quote instead of "
-                    "trusting it",
-                    option_contract.symbol,
-                    fresh_tick.ltp,
-                    fresh_tick.bid,
-                    fresh_tick.ask,
-                    fresh_tick.volume,
-                )
-            else:
-                return fresh_tick
+    now = _utcnow()
+    symbol = option_contract.symbol
 
-    freshness_state = ensure_fresh_option_chain(
+    # --- Rung 1: independent live feed(s) -------------------------------------
+    feeds: list[BaseMarketDataProvider] = []
+    if market_data_provider is not None:
+        feeds.append(market_data_provider)
+    if extra_price_feeds:
+        feeds.extend(extra_price_feeds)
+
+    live_candidates: list[tuple[Tick, FreshnessState]] = []
+    for feed in feeds:
+        raw = feed.get_latest_tick(symbol)
+        if raw is None:
+            continue
+        state = classify_age(raw.ts, now, TICK_THRESHOLDS)
+        if state not in (FreshnessState.LIVE, FreshnessState.DEGRADED):
+            continue
+        if not is_plausible_option_tick(raw.ltp, raw.bid, raw.ask, raw.volume):
+            logger.error(
+                "REJECTED implausible live tick for option %s: ltp=%.4f bid=%.4f ask=%.4f "
+                "volume=%d -- likely a token-resolution mismatch (see this function's own "
+                "docstring); falling back to REST snapshot/broker.get_quote instead of "
+                "trusting it",
+                symbol,
+                raw.ltp,
+                raw.bid,
+                raw.ask,
+                raw.volume,
+            )
+            continue
+        live_candidates.append((raw, state))
+
+    def _best_live() -> PriceRead:
+        best_tick, best_state = min(
+            live_candidates,
+            key=lambda c: (_LIVE_FEED_RANK[c[1]], -c[0].ts.timestamp()),
+        )
+        return PriceRead(best_tick, PriceSource.LIVE_FEED, best_state, plausible=True)
+
+    # Fast path: the single default feed has a winner -> return without ever
+    # touching the snapshot. Preserves the pre-2026-09-11 short-circuit
+    # (ensure_fresh_option_chain stays a no-call when a fresh tick is in hand).
+    if live_candidates and len(feeds) <= 1:
+        return _best_live()
+
+    # --- chain snapshot: needed as rung 2, rung 4, and (with >1 feed) the
+    #     rung-1 cross-check reference. ensure_fresh_option_chain is
+    #     threshold-gated + coalesced, so this is a cheap DB read on a warm
+    #     chain and only a broker round-trip when it is genuinely stale.
+    snapshot_state = ensure_fresh_option_chain(
         db,
         get_broker(),
         option_contract.instrument_id,
@@ -2345,53 +2389,82 @@ def current_contract_price(
         thresholds=OPTION_CHAIN_THRESHOLDS,
         session_factory=session_factory,
     )
-    if freshness_state not in (FreshnessState.STALE, FreshnessState.DEAD):
-        snapshot_tick = latest_snapshot_tick(
-            db, option_contract.instrument_id, option_contract.expiry_date, option_contract.symbol
-        )
-        if snapshot_tick is not None:
-            return snapshot_tick
-
-    logger.warning(
-        "no live tick or usable option-chain snapshot for %s; falling back to "
-        "broker.get_quote as a last resort",
-        option_contract.symbol,
+    snapshot_tick = latest_snapshot_tick(
+        db, option_contract.instrument_id, option_contract.expiry_date, symbol
     )
-    quote = broker.get_quote(option_contract.symbol)
-    if is_plausible_option_tick(quote.ltp, quote.bid, quote.ask, quote.volume):
-        return quote
-
-    # 2026-09-10 -- this last-resort path is the *same* Shoonya GetQuotes
-    # call the option chain uses per strike, so on a session where Shoonya
-    # is returning spot-for-a-valid-token (see
-    # docs/ops/shoonya_option_chain_spot_leak.md) it can be exactly as
-    # implausible as the chain entry that was just dropped. A slightly stale
-    # but real snapshot premium beats a spot-shaped number: re-read the last
-    # persisted snapshot tick with no freshness gate (Rail 2 guarantees
-    # every persisted entry was plausible when written) and prefer it.
-    # Only if nothing plausible exists anywhere is the implausible quote
-    # returned -- PositionManager's own pre-evaluate plausibility gate then
-    # skips acting on it for that cycle. `eod_square_off` still force-closes
-    # (a stale-real reference price is the best it can do; a genuine LIVE
-    # exit fill comes from the broker regardless).
-    stale_snapshot = latest_snapshot_tick(
-        db, option_contract.instrument_id, option_contract.expiry_date, option_contract.symbol
+    snapshot_plausible = snapshot_tick is not None and is_plausible_option_tick(
+        snapshot_tick.ltp, snapshot_tick.bid, snapshot_tick.ask, snapshot_tick.volume
     )
-    if stale_snapshot is not None and is_plausible_option_tick(
-        stale_snapshot.ltp, stale_snapshot.bid, stale_snapshot.ask, stale_snapshot.volume
+
+    if live_candidates:
+        # P6 cross-check -- reached only with a real secondary feed in play
+        # (len(feeds) > 1). Drop any candidate that disagrees with a plausible
+        # snapshot beyond tolerance (a mis-mapped secondary token).
+        if snapshot_tick is not None and snapshot_plausible:
+            kept = [
+                (t, s)
+                for (t, s) in live_candidates
+                if not check_price_drift(
+                    t.ltp, snapshot_tick.ltp, tolerance_pct=PRICE_DRIFT_TOLERANCE_PCT
+                )
+            ]
+            if len(kept) != len(live_candidates):
+                logger.warning(
+                    "a secondary live feed for %s disagreed with the chain snapshot "
+                    "(snapshot ltp=%.2f, tolerance %.0f%%) -- preferring the snapshot",
+                    symbol,
+                    snapshot_tick.ltp,
+                    PRICE_DRIFT_TOLERANCE_PCT * 100,
+                )
+            live_candidates = kept
+        if live_candidates:
+            return _best_live()
+
+    # --- Rung 2: a fresh (LIVE/DEGRADED), plausible chain snapshot ----------
+    if (
+        snapshot_tick is not None
+        and snapshot_plausible
+        and snapshot_state in (FreshnessState.LIVE, FreshnessState.DEGRADED)
     ):
-        logger.warning(
-            "last-resort broker quote for %s was implausible (ltp=%.2f); using the last "
-            "persisted option-chain snapshot instead",
-            option_contract.symbol,
-            quote.ltp,
+        return PriceRead(
+            snapshot_tick, PriceSource.CHAIN_SNAPSHOT, snapshot_state, plausible=True
         )
-        return stale_snapshot
 
+    # --- Rung 3: last-resort broker.get_quote() ----------------------------
+    logger.warning(
+        "no live tick or fresh option-chain snapshot for %s; falling back to "
+        "broker.get_quote as a last resort",
+        symbol,
+    )
+    quote = broker.get_quote(symbol)
+    if is_plausible_option_tick(quote.ltp, quote.bid, quote.ask, quote.volume):
+        return PriceRead(quote, PriceSource.BROKER_QUOTE, FreshnessState.LIVE, plausible=True)
+
+    # --- Rung 4: a plausible-but-STALE snapshot beats a spot-shaped quote --
+    # (cf50b80 Change B) -- the last-resort path IS the same Shoonya GetQuotes
+    # call the chain uses per strike, so on a spot-leak session it can be just
+    # as degenerate. Returned *labelled* STALE: PositionManager skips acting
+    # on it; eod_square_off may still use it knowingly. A snapshot older than
+    # DEAD_AFTER_SECONDS has no useful age left and is not returned.
+    if snapshot_tick is not None and snapshot_plausible:
+        stale_state = classify_age(snapshot_tick.ts, now, OPTION_CHAIN_THRESHOLDS)
+        if stale_state != FreshnessState.DEAD:
+            logger.warning(
+                "last-resort broker quote for %s was implausible (ltp=%.2f); using the last "
+                "persisted option-chain snapshot instead (freshness=%s)",
+                symbol,
+                quote.ltp,
+                stale_state.value,
+            )
+            return PriceRead(
+                snapshot_tick, PriceSource.CHAIN_SNAPSHOT, stale_state, plausible=True
+            )
+
+    # --- Rung 5: nothing usable anywhere ---------------------------------
     logger.error(
         "no plausible price anywhere for %s (broker quote ltp=%.2f, no usable snapshot); "
-        "returning the implausible quote -- the caller must gate on it before acting",
-        option_contract.symbol,
+        "returning PriceRead.none() -- the caller must gate on it before acting",
+        symbol,
         quote.ltp,
     )
-    return quote
+    return PriceRead.none()

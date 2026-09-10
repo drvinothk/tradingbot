@@ -142,9 +142,14 @@ def _seed_manual_override(failover: FailoverMarketDataProvider) -> None:
     20-minute market-hours blackout that only cleared on a manual restart
     after the override was cleared by hand. A durable provider choice belongs
     in `MARKET_DATA_PROVIDER` (`.env`), not a runtime override; a runtime
-    override is temporary by definition and must not outlive the process. A
-    persisted override equal to the configured primary is still applied (a
-    harmless no-op), as is `null`.
+    override is temporary by definition and must not outlive the process.
+    `null` is left as-is. A persisted override equal to the configured
+    primary IS still re-applied -- but that is **not** a harmless no-op: it
+    still disables automatic failover and (via
+    `MarketDataScheduler._alert_if_manual_override_active`) fires the
+    `market_data_override_active` CRITICAL every ~15 min. The clean,
+    alert-free way to run without failover is `MARKET_DATA_FAILOVER_ENABLED=
+    false` in `.env`, not this override.
 
     `session_scope` is a module-level import (not local), specifically so
     tests can monkeypatch `provider_composition.session_scope` to a fake
@@ -259,13 +264,54 @@ def get_market_data_provider() -> BaseMarketDataProvider:
 def get_failover_provider() -> FailoverMarketDataProvider | None:
     """The live `FailoverMarketDataProvider` inside the current market-data
     singleton, or `None` when failover isn't in the chain (disabled, or
-    provider is `"mock"`). Mirrors `api.v1.market_data._find_failover_provider`
-    -- exposed here so non-api callers (the market-data scheduler's
-    override-active health check) don't have to import an api module.
+    provider is `"mock"`). `api.v1.market_data._find_failover_provider`
+    delegates here so the unwrap logic lives in exactly one place.
     """
     provider = get_market_data_provider()
     inner = getattr(provider, "_inner", provider)
     return inner if isinstance(inner, FailoverMarketDataProvider) else None
+
+
+_secondary_price_feed: BaseMarketDataProvider | None = None
+
+
+def get_secondary_price_feeds() -> list[BaseMarketDataProvider]:
+    """Rail 6 (2026-09-11): extra, Shoonya-independent providers consulted
+    ONLY for open-position option-contract pricing
+    (`PositionManager._run_cycle` / `current_contract_price` rung 1) -- never
+    for underlyings, strategy ranking, or ingestion.
+
+    Empty unless `MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED` names a
+    recognised provider (not `"mock"`, not `"off"`) different from the active
+    `MARKET_DATA_PROVIDER` -- so the default is `[]` and every existing
+    test/local/live path is byte-identical. The instance is a dedicated lazy
+    singleton whose lifecycle is owned here (connected on first
+    `subscribe_ticks` by the caller, never torn down by
+    `FailoverMarketDataProvider`'s trip/recover logic), deliberately separate
+    from the failover backup leg even when they name the same provider.
+
+    Do not flip the flag live until a market-hours session has proven the
+    named provider streams per-*contract* option ticks -- see
+    docs/ops/shoonya_option_chain_spot_leak.md.
+    """
+    global _secondary_price_feed
+    settings = get_settings()
+    name = settings.market_data.execution_price_secondary_feed
+    if not name or name in ("off", "mock"):
+        return []
+    if name not in _RECOGNIZED_PROVIDERS:
+        logger.error(
+            "MARKET_DATA_EXECUTION_PRICE_SECONDARY_FEED=%r is not a recognised provider "
+            "-- ignoring (no secondary price feed).",
+            name,
+        )
+        return []
+    if name == settings.market_data.provider:
+        # Already the active feed -- rung 1 reads it anyway, nothing to add.
+        return []
+    if _secondary_price_feed is None:
+        _secondary_price_feed = _build_provider(name, settings)
+    return [_secondary_price_feed]
 
 
 def refresh_failover_backup_leg(provider_name: str) -> None:
@@ -379,11 +425,13 @@ def set_market_data_provider(provider: BaseMarketDataProvider | None) -> None:
 
 
 def reset_for_tests() -> None:
-    global _provider, _scrip_master, _alice_blue_scrip_master
-    if _provider is not None:
-        close = getattr(_provider, "close", None)
-        if callable(close):
-            close()
+    global _provider, _scrip_master, _alice_blue_scrip_master, _secondary_price_feed
+    for singleton in (_provider, _secondary_price_feed):
+        if singleton is not None:
+            close = getattr(singleton, "close", None)
+            if callable(close):
+                close()
     _provider = None
+    _secondary_price_feed = None
     _scrip_master = None
     _alice_blue_scrip_master = None

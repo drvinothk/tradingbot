@@ -256,11 +256,10 @@ def test_patch_without_a_live_failover_provider_still_persists(
 ):
     import app.api.v1.market_data as market_data_api
 
-    # market_data.py does `from ... import get_market_data_provider`, so its
-    # own imported name (not provider_composition's) must be patched --
-    # monkeypatching the origin module doesn't affect an already-bound
-    # `from X import Y` reference in a different module's namespace.
-    monkeypatch.setattr(market_data_api, "get_market_data_provider", lambda: _FakeProvider())
+    # No failover provider in the chain (disabled / mock). `_find_failover_
+    # provider` delegates to provider_composition.get_failover_provider (O10,
+    # 2026-09-11); patch the endpoint module's own alias.
+    monkeypatch.setattr(market_data_api, "_find_failover_provider", lambda: None)
     _login(api_client, seeded_admin)
 
     response = api_client.patch(
@@ -290,7 +289,7 @@ def test_patch_applies_live_to_an_existing_failover_provider(
 
     import app.api.v1.market_data as market_data_api
 
-    monkeypatch.setattr(market_data_api, "get_market_data_provider", lambda: failover)
+    monkeypatch.setattr(market_data_api, "_find_failover_provider", lambda: failover)
     _login(api_client, seeded_admin)
 
     response = api_client.patch(

@@ -205,6 +205,17 @@ class MarketDataSettings(BaseSettings):
     # watchdog poll interval so a real backup outage doesn't hammer a
     # failing login endpoint every cycle.
     failover_backup_retry_seconds: float = 30.0
+    # Rail 6 (2026-09-11): an extra, Shoonya-independent provider consulted
+    # ONLY for open-position option-contract pricing (PositionManager /
+    # current_contract_price rung 1) -- never for underlyings or strategy
+    # ranking. A *dedicated* instance, its lifecycle owned by
+    # provider_composition, separate from the failover backup leg above.
+    # "off" (default) -> get_secondary_price_feeds() returns [] -> byte-
+    # identical to before this existed. A recognised provider name
+    # ("alice_blue", ...) different from `provider` opts in. Do not flip this
+    # live until a market-hours session has proven that provider streams
+    # per-*contract* option ticks -- see docs/ops/shoonya_option_chain_spot_leak.md.
+    execution_price_secondary_feed: str = "off"
 
 
 class AngelOneSettings(BaseSettings):

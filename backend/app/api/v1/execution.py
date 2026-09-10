@@ -46,6 +46,7 @@ from app.modules.market_data.freshness import (
     latest_ticks_by_contract,
 )
 from app.modules.scheduler.eod_square_off import (
+    NoUsableSquareOffPriceError,
     UnresolvableOptionContractError,
     run_single_position_square_off,
 )
@@ -504,6 +505,31 @@ def square_off_position(
                 f"position references option_contract_id {exc.option_contract_id}, which "
                 "no longer resolves to a real option contract -- a data-integrity problem, "
                 "not a timing issue; reconciliation/retry will not fix this on its own"
+            ),
+        }
+    except NoUsableSquareOffPriceError:
+        record_event(
+            db,
+            workspace_id=user.workspace_id,
+            actor_type=ActorType.USER,
+            actor_id=user.id,
+            event_category=EventCategory.MANUAL_OVERRIDE,
+            event_type="position.manual_square_off_requested",
+            entity_type="position",
+            entity_id=position.id,
+            trading_session_id=trading_session.id,
+            payload={"success": False, "reason": "no_usable_price"},
+        )
+        db.commit()
+        return {
+            "success": False,
+            "position_id": str(position.id),
+            "reason": "no_usable_price",
+            "detail": (
+                "no usable option price could be resolved for this position "
+                "(market-data feed / option chain degraded); it is left open. Retry once "
+                "the feed recovers, or use Manual Reconcile with a real fill price. If "
+                "LIVE, square off in the broker app"
             ),
         }
 

@@ -29,7 +29,7 @@ from app.domain.ops.models import MarketDataProviderPreference
 from app.modules.audit_service.service import record_event
 from app.modules.market_data import diagnostic_session
 from app.modules.market_data import registry as market_data_registry
-from app.modules.market_data.provider_composition import get_market_data_provider
+from app.modules.market_data.provider_composition import get_failover_provider
 from app.modules.market_data.providers.failover import FailoverMarketDataProvider
 
 logger = logging.getLogger("app.api.market_data")
@@ -68,9 +68,9 @@ class SetProviderPreferenceRequest(BaseModel):
 
 
 def _find_failover_provider() -> FailoverMarketDataProvider | None:
-    provider = get_market_data_provider()
-    inner = getattr(provider, "_inner", provider)
-    return inner if isinstance(inner, FailoverMarketDataProvider) else None
+    # Thin alias kept for this module's existing call sites; the unwrap
+    # logic lives once in provider_composition.get_failover_provider (O10).
+    return get_failover_provider()
 
 
 @router.get("/provider-preference", response_model=ProviderPreferenceOut)

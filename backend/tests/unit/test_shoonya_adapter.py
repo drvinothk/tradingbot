@@ -20,7 +20,7 @@ from app.modules.broker_adapter.base.contracts import (
 from app.modules.broker_adapter.shoonya import adapter as adapter_module
 from app.modules.broker_adapter.shoonya import scrip_master as shoonya_scrip_master
 from app.modules.broker_adapter.shoonya.adapter import (
-    _CHAIN_QUOTE_MAX_RETRIED_ROWS,
+    _CHAIN_QUOTE_MAX_RETRY_ATTEMPTS,
     _CHAIN_QUOTE_STRIKE_RADIUS,
     ShoonyaBrokerAdapter,
 )
@@ -1436,7 +1436,7 @@ def test_get_option_chain_leaves_the_degenerate_entry_untouched_when_retries_don
 
 def test_get_option_chain_bounds_total_degenerate_retries_per_fetch(monkeypatch):
     """A whole-chain outage must not turn one fetch into an unbounded retry
-    storm -- retries are capped at _CHAIN_QUOTE_MAX_RETRIED_ROWS across the
+    storm -- retries are capped at _CHAIN_QUOTE_MAX_RETRY_ATTEMPTS across the
     fetch, regardless of how many rows come back degenerate.
     """
     monkeypatch.setattr(adapter_module, "_CHAIN_QUOTE_RETRY_SLEEP_S", 0.0)
@@ -1455,7 +1455,7 @@ def test_get_option_chain_bounds_total_degenerate_retries_per_fetch(monkeypatch)
     assert len(snapshot.entries) == 20
     retry_calls = [c for c in rest.calls if c[0] == "get_quotes" and c[1][1] == "NFO"]
     # 20 original per-strike calls + at most the per-fetch retry cap
-    assert len(retry_calls) == 20 + _CHAIN_QUOTE_MAX_RETRIED_ROWS
+    assert len(retry_calls) == 20 + _CHAIN_QUOTE_MAX_RETRY_ATTEMPTS
 
 
 def test_get_option_chain_does_not_retry_a_transport_failure(monkeypatch):
