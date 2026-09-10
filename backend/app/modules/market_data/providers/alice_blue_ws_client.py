@@ -184,6 +184,15 @@ class AliceBlueWSClient:
         self.last_tick_at: float | None = None
         self.tick_count = 0
 
+        # 2026-09-10 diagnostics -- AB WS auth succeeds but no ticks flow
+        # (silent since ~Sep 9; worked Sep 8). These make the post-auth path
+        # observable: raw frame samples per connection, and a running count
+        # of inbound frames that matched no live subscription (candidate
+        # cause: the `e|tk` key the server sends != the `exchange|token` key
+        # we subscribed under). Bounded log volume -- see _handle_message.
+        self._frames_logged_this_conn = 0
+        self._unmatched_frame_count = 0
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -254,6 +263,7 @@ class AliceBlueWSClient:
                     self._authenticate(ws)
                     with self._send_lock:
                         self._live_ws = ws
+                    self._frames_logged_this_conn = 0
                     self._resubscribe_all()
                     if self._ever_connected:
                         self.reconnect_count += 1
@@ -312,6 +322,7 @@ class AliceBlueWSClient:
         # match the real server response at all).
         if ack.get("t") != "ck" or ack.get("s") != "OK":
             raise ConnectionError(f"Alice Blue WebSocket auth rejected: {ack!r}")
+        logger.warning("Alice Blue WebSocket auth OK: %r", ack)
 
     def _resubscribe_all(self) -> None:
         with self._lock:
@@ -323,6 +334,14 @@ class AliceBlueWSClient:
         if not entries:
             return
         keys = "#".join(entry.key for entry in entries)
+        with self._send_lock:
+            has_live_ws = self._live_ws is not None
+        logger.warning(
+            "Alice Blue WebSocket subscribe: %d entr(ies), keys=%s, live_ws=%s",
+            len(entries),
+            keys,
+            has_live_ws,
+        )
         self._send({"k": keys, "t": "t"})
 
     def _send_unsubscribe(self, entries: list[_SubscriptionEntry]) -> None:
@@ -364,11 +383,34 @@ class AliceBlueWSClient:
             logger.warning("Alice Blue WebSocket sent non-JSON frame: %r", raw)
             return
 
+        # 2026-09-10 diagnostics: log the first few raw frames per
+        # connection so the actual server frame shape (`t`/`e`/`tk`/...) is
+        # visible when debugging "auth OK but no ticks".
+        if self._frames_logged_this_conn < 5:
+            self._frames_logged_this_conn += 1
+            logger.warning(
+                "Alice Blue WebSocket inbound frame #%d: %r",
+                self._frames_logged_this_conn,
+                message,
+            )
+
         msg_type = message.get("t")
         key = f"{message.get('e', '')}|{message.get('tk', '')}"
         with self._lock:
             entry = self._entries_by_key.get(key)
             if entry is None:
+                # 2026-09-10 diagnostics: a frame that matched no live
+                # subscription. If this climbs while tick_count stays 0, the
+                # server's `e|tk` key shape != our `exchange|token` key.
+                self._unmatched_frame_count += 1
+                if self._unmatched_frame_count <= 3 or self._unmatched_frame_count % 100 == 0:
+                    logger.warning(
+                        "Alice Blue WebSocket frame matched no subscription "
+                        "(count=%d): frame_key=%r, subscribed_keys=%r",
+                        self._unmatched_frame_count,
+                        key,
+                        list(self._entries_by_key.keys()),
+                    )
                 return
             merged = {**self._last_known_by_key.get(key, {}), **message}
             self._last_known_by_key[key] = merged
