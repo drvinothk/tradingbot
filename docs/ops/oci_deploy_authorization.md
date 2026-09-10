@@ -1600,3 +1600,42 @@ the backup's `api/ alert/ md/` layout) `&& sudo systemctl restart trading-bot`.
 Frontend: `sudo rm -rf /var/www/trading-bot/dist && sudo mv
 /var/www/trading-bot/dist.bak-20260910-162245 /var/www/trading-bot/dist && sudo
 chown -R www-data:www-data /var/www/trading-bot/dist`. No migration to revert.
+
+---
+
+## DONE 2026-09-10 ~22:03 IST (16:33 UTC) — Alice Blue API app regenerated + AB auto-login paused
+
+No code / no migration. Credentials + config only.
+
+**Why:** operator regenerated the Alice Blue developer-portal API app (5th time —
+see the AB-vendor-expiry history) to try to clear the 2026-09-10 WS-silent
+regression (`865a62d` diagnostics; root cause still market-hours-pending).
+
+**What:**
+- New `ALICEBLUE_APP_CODE` (`cs5ljPRgxq`, len 10) + `ALICEBLUE_API_SECRET` (len 100)
+  + `ALICEBLUE_LOGIN_USERID` / `_PASSWORD` / `_TOTP_SECRET` from
+  `D:\Documents\Trading Bot_Oracle\Alice Blue credentials.txt`. Redirect URL + IP
+  unchanged.
+- Applied to OCI `app/config/credentials/alice_blue.env` (`chmod 600`; old copy
+  `~/cred-bak/alice_blue.env.20260910-*`) **and** the local repo copy (gitignored,
+  4 app keys only — no `_LOGIN_*` since the local box doesn't run the engine).
+- Stale `.alice_blue_session_cache.json` removed on the box (backed up to
+  `~/cred-bak/`) — it was minted against the old app; operator does a fresh manual
+  OAuth on 2026-09-11.
+- **`ALICEBLUE_AUTO_LOGIN_ENABLED=false`** — tomorrow's 08:55 IST `broker-autologin`
+  run does Shoonya only. `SHOONYA_AUTO_LOGIN_ENABLED=true` untouched;
+  `broker-autologin.timer` enabled, next Fri 2026-09-11 03:25 UTC.
+- `trading-bot` restarted (market closed, 0 open positions) so `get_settings()`
+  picks up the new keys — verified `app_code` len 10 / `api_secret` len 100 /
+  redirect correct, `/health` 200, zero errors, `NRestarts=0`.
+
+**Verified:** `python -m autologin --dry-run` on the box →
+`Shoonya: session still valid -- no login needed` / `Alice Blue: disabled (kill switch)`.
+
+**Plan:** operator does the AB manual browser OAuth 2026-09-11; if the new app +
+WS tick stream check out, re-enable `ALICEBLUE_AUTO_LOGIN_ENABLED=true` and resume
+AB as the failover backup. Until then AB failover is operator-disabled from the UI.
+
+**Rollback:** `cp ~/cred-bak/alice_blue.env.20260910-<ts>
+app/config/credentials/alice_blue.env && cp ~/cred-bak/.alice_blue_session_cache.json.<ts>
+app/config/credentials/.alice_blue_session_cache.json && sudo systemctl restart trading-bot`.
