@@ -47,18 +47,25 @@ export function BrokerConnectionRow({
 
   const connected = statusQuery.data?.connected ?? false
 
+  // Only the Shoonya OAuth callback restarts the backend now (2026-09-10:
+  // the Alice Blue one no longer does -- AB is market-data-only and re-wires
+  // its live provider in place). So the message must not promise a restart
+  // for AB, and neither message should claim the broker is "reconnected" --
+  // this fires when the login *tab opens*, not when OAuth completes.
+  const manualRestartsBackend = queryKeyPrefix === 'shoonya'
+
   const manualReconnectMutation = useMutation({
     mutationFn: () => shoonyaApi.get<ShoonyaLoginUrlOut>(loginUrlPath),
     onSuccess: (data) => {
       window.open(data.authorize_url, '_blank', 'noopener,noreferrer')
-      // Every manual OAuth callback ends by scheduling a backend restart, but
-      // its timing depends on the user finishing login in the other tab.
-      // Poll from now with a wide window; clear quietly if they never do
-      // (the restart, if it lands later, is harmless and self-heals).
-      void waitForRestart(`${brokerLabel} reconnected — finalising with a backend restart…`, {
-        expectRestart: false,
-        timeoutMs: 180_000,
-      })
+      // Poll from now with a wide window; clears quietly if the user never
+      // completes login in the other tab (any later restart self-heals).
+      void waitForRestart(
+        manualRestartsBackend
+          ? `${brokerLabel} login opened — the backend restarts once you finish it in the other tab…`
+          : `${brokerLabel} login opened in a new tab — complete it there; this row updates on return.`,
+        { expectRestart: false, timeoutMs: 180_000 },
+      )
       queryClient.invalidateQueries({ queryKey: [queryKeyPrefix, 'status'] })
     },
     onError: (err) => setError(err instanceof ApiError ? err.message : 'Could not start login'),
