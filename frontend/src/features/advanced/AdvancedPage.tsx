@@ -1469,7 +1469,7 @@ function GlobalSettingsCard() {
         </div>
 
         <div className="form-row" style={{ marginBottom: 0 }}>
-          <label htmlFor="failover-override">Main data provider</label>
+          <label htmlFor="failover-override">Feed override (temporary)</label>
           <select
             id="failover-override"
             value={providerPrefQuery.data?.active_provider ?? ''}
@@ -1492,7 +1492,9 @@ function GlobalSettingsCard() {
       <p className="muted" style={{ fontSize: '0.75rem', margin: '0.5rem 0 0' }}>
         Automatic is the only self-healing mode. "Shoonya only" / "Alice Blue only" pin the feed and
         disable switching both ways. "Alice Blue only" needs a live Alice Blue session — connect it
-        on the Market Terminal first.
+        on the Market Terminal first. A non-Automatic pin is <strong>cleared on the next backend
+        restart</strong> (it is a live diagnostic, not a durable setting) and raises a standing
+        alert while it is set.
       </p>
     </div>
   )

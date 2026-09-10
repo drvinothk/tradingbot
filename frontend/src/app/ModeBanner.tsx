@@ -51,6 +51,11 @@ export function ModeBanner() {
 
   const activeLeg = providerQuery.data?.live_active_leg ?? null
   const providerSuffix = activeLeg ? ` (${PROVIDER_LABELS[activeLeg] ?? activeLeg})` : ''
+  // A manual feed override (Advanced -> Market Data, or a leftover persisted
+  // preference) pins the feed to one leg and disables automatic failover
+  // entirely -- and on 2026-09-10 a stale `alice_blue` pin blacked out the
+  // live feed. Surface it on every page, not just buried in Advanced.
+  const pinnedProvider = providerQuery.data?.active_provider ?? null
 
   // Broker/REST -- the order-execution path (this is what actually places
   // orders), kept separate from WS feed health above: REST failing blocks
@@ -94,6 +99,14 @@ export function ModeBanner() {
           <FeedLatencyBadge feedAgeSeconds={feedAgeSeconds} feedState={feedState} />
           {providerSuffix}
         </span>
+        {pinnedProvider && (
+          <span
+            className="badge badge-warning"
+            title="A manual override is pinning the market-data feed to this provider. Automatic failover is disabled while it is set — clear it to 'Automatic' in Advanced → Market Data."
+          >
+            Feed pinned: {PROVIDER_LABELS[pinnedProvider] ?? pinnedProvider}
+          </span>
+        )}
         <span className={`badge ${brokerClass}`}>{brokerText}</span>
       </span>
     </div>

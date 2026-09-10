@@ -830,6 +830,7 @@ const ATTENTION_ALERT_CATEGORIES = new Set([
   'broker_disconnected',
   'market_data_stale',
   'market_data_failover_switch',
+  'market_data_override_active',
   'option_chain_degraded',
 ])
 

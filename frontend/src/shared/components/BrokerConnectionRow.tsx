@@ -23,12 +23,26 @@ export function BrokerConnectionRow({
 }: BrokerConnectionRowProps) {
   const queryClient = useQueryClient()
   const [error, setError] = useState<string | null>(null)
+  // Set once an auto-reconnect is fired from this row, so the engine-log
+  // viewer only appears where it was triggered (the log itself is global).
+  const [autoTriggered, setAutoTriggered] = useState(false)
+  const [logOpen, setLogOpen] = useState(false)
   const { isWaiting: isRestarting, message: restartMessage, waitForRestart } = useWaitForRestart()
 
   const statusQuery = useQuery({
     queryKey: [queryKeyPrefix, 'status'],
     queryFn: () => shoonyaApi.get<ShoonyaStatusOut>(statusPath),
     refetchOnWindowFocus: true,
+  })
+
+  const engineLogQuery = useQuery({
+    queryKey: ['auto-reconnect-log'],
+    queryFn: () =>
+      api.get<{ exists: boolean; lines: string[]; note: string | null }>(
+        '/system-settings/last-auto-reconnect-log',
+      ),
+    enabled: autoTriggered && logOpen,
+    refetchInterval: autoTriggered && logOpen ? 5000 : false,
   })
 
   const connected = statusQuery.data?.connected ?? false
@@ -57,6 +71,7 @@ export function BrokerConnectionRow({
       ),
     onSuccess: (data) => {
       setError(null)
+      setAutoTriggered(true)
       // The engine restarts the backend only if it did a fresh login; poll
       // either way. `expectRestart: false` so "no boot_id change" clears
       // quietly instead of a spurious "check the server logs" after 2 min.
@@ -84,7 +99,7 @@ export function BrokerConnectionRow({
       <button
         className="btn-ghost"
         disabled={busy}
-        title="Re-run the headless auto-login for both brokers (keeps the current tokens if still valid)"
+        title="Re-checks BOTH brokers' login tokens and headless-logs-in only a dead one. Does not fix a stalled market-data feed — for that, check Advanced → Market Data."
         onClick={() => autoReconnectMutation.mutate()}
       >
         Reconnect
@@ -92,13 +107,36 @@ export function BrokerConnectionRow({
       <button
         className="btn-ghost"
         disabled={busy}
-        title="Browser login, then restart the backend for a guaranteed-clean state"
+        title="Browser login for this broker, then (Shoonya only) restart the backend for a guaranteed-clean state"
         onClick={() => manualReconnectMutation.mutate()}
       >
         {connected ? 'Manual reconnect' : 'Connect'}
       </button>
       {restartMessage && <span className="muted">{restartMessage}</span>}
       {error && <span className="error">{error}</span>}
+      {autoTriggered && (
+        <details
+          style={{ flexBasis: '100%' }}
+          onToggle={(e) => setLogOpen((e.currentTarget as HTMLDetailsElement).open)}
+        >
+          <summary className="muted" style={{ cursor: 'pointer', fontSize: '0.8rem' }}>
+            Auto-reconnect engine log
+          </summary>
+          <pre
+            style={{
+              fontSize: '0.72rem',
+              maxHeight: '12rem',
+              overflow: 'auto',
+              margin: '0.3rem 0 0',
+              whiteSpace: 'pre-wrap',
+            }}
+          >
+            {engineLogQuery.data?.note ||
+              (engineLogQuery.data?.lines ?? []).join('\n') ||
+              'loading…'}
+          </pre>
+        </details>
+      )}
     </div>
   )
 }
