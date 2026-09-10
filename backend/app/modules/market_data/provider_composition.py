@@ -134,6 +134,18 @@ def _seed_manual_override(failover: FailoverMarketDataProvider) -> None:
     market-data ingestion from starting at all -- falls back to no override
     (normal automatic failover) and logs a warning instead.
 
+    2026-09-10: a persisted override that pins the feed to a *non-primary*
+    leg (e.g. a leftover "test Alice Blue" toggle from the Advanced page) is
+    NOT re-applied here anymore -- it is dropped and the row cleared, loudly.
+    On 2026-09-10 a re-seeded `alice_blue` pin sat the live feed on a backup
+    that streams nothing *and* bypassed the working Shoonya REST fallback, a
+    20-minute market-hours blackout that only cleared on a manual restart
+    after the override was cleared by hand. A durable provider choice belongs
+    in `MARKET_DATA_PROVIDER` (`.env`), not a runtime override; a runtime
+    override is temporary by definition and must not outlive the process. A
+    persisted override equal to the configured primary is still applied (a
+    harmless no-op), as is `null`.
+
     `session_scope` is a module-level import (not local), specifically so
     tests can monkeypatch `provider_composition.session_scope` to a fake
     that never touches the real engine -- the module-level `_reset_broker_
@@ -142,10 +154,22 @@ def _seed_manual_override(failover: FailoverMarketDataProvider) -> None:
     production DB inside a test" discipline this project's own CLAUDE.md
     already documents hitting as a real incident once before.
     """
+    primary = get_settings().market_data.provider
     try:
         with session_scope() as db:
             pref = db.query(MarketDataProviderPreference).first()
             override = pref.active_provider if pref is not None else None
+            if override is not None and override != primary:
+                logger.error(
+                    "Persisted market-data override %r pins the feed to a non-primary "
+                    "leg and would survive every restart -- dropping it and restoring "
+                    "automatic failover. Use MARKET_DATA_PROVIDER (.env) for a durable "
+                    "provider change.",
+                    override,
+                )
+                if pref is not None:
+                    pref.active_provider = None
+                override = None
         if override is not None:
             failover.set_manual_override(override)
     except Exception:  # noqa: BLE001 - best-effort seeding, never blocks startup
@@ -230,6 +254,18 @@ def get_market_data_provider() -> BaseMarketDataProvider:
             inner, allow_offhours=settings.market_data.allow_offhours_testing
         )
     return _provider
+
+
+def get_failover_provider() -> FailoverMarketDataProvider | None:
+    """The live `FailoverMarketDataProvider` inside the current market-data
+    singleton, or `None` when failover isn't in the chain (disabled, or
+    provider is `"mock"`). Mirrors `api.v1.market_data._find_failover_provider`
+    -- exposed here so non-api callers (the market-data scheduler's
+    override-active health check) don't have to import an api module.
+    """
+    provider = get_market_data_provider()
+    inner = getattr(provider, "_inner", provider)
+    return inner if isinstance(inner, FailoverMarketDataProvider) else None
 
 
 def refresh_failover_backup_leg(provider_name: str) -> None:

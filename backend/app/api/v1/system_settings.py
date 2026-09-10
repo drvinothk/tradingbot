@@ -17,12 +17,15 @@ the full design.
 
 from __future__ import annotations
 
+import logging
 import platform
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from datetime import UTC, datetime
+from typing import IO
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -545,6 +548,8 @@ def restart_backend(
     }
 
 
+logger = logging.getLogger("app.api.system_settings")
+
 _reconnect_auto_lock = threading.Lock()
 _last_auto_reconnect_at: float = 0.0
 # The isolated engine's own run (up to 2 headless-login attempts 30s apart,
@@ -555,10 +560,76 @@ _last_auto_reconnect_at: float = 0.0
 # second tab. Refuse a repeat trigger for a cooldown that covers one run.
 _AUTO_RECONNECT_COOLDOWN_SECONDS = 120.0
 
+# 2026-09-10: the detached `autologin --force` child used to write to DEVNULL,
+# so an on-demand reconnect that "did nothing" (Shoonya token still valid) or
+# failed left no trace anywhere -- diagnosing one meant SSH + journalctl. Now
+# its output goes here; `GET /system-settings/last-auto-reconnect-log` tails it.
+_ON_DEMAND_AUTOLOGIN_LOG_MAX_BYTES = 256 * 1024
+
+
+def _on_demand_autologin_log_path():
+    """Computed at call time (not a module constant) so a test that
+    monkeypatches `BACKEND_ROOT_DIR` at `tmp_path` doesn't write into the
+    real `backend/logs/`.
+    """
+    return BACKEND_ROOT_DIR / "logs" / "on_demand_autologin.log"
+
+
+def _open_autologin_log_sink() -> IO[str] | None:
+    """Best-effort append sink for the detached child's stdout/stderr.
+    Truncates first if the file has grown past the cap. Returns an open file
+    object, or `None` -> caller falls back to `DEVNULL`. Never raises.
+    """
+    path = _on_demand_autologin_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _ON_DEMAND_AUTOLOGIN_LOG_MAX_BYTES:
+            path.write_text("")
+        sink = path.open("a", buffering=1)
+        sink.write(
+            f"\n===== on-demand `autologin --force` @ {datetime.now(UTC).isoformat()} =====\n"
+        )
+        sink.flush()
+        return sink
+    except OSError:
+        logger.warning(
+            "Could not open the on-demand auto-login log sink -- child output discarded.",
+            exc_info=True,
+        )
+        return None
+
 
 class ReconnectBrokersResponse(BaseModel):
     triggered: bool
     message: str
+    log_path: str | None = None
+
+
+class AutoReconnectLogOut(BaseModel):
+    exists: bool
+    lines: list[str]
+    note: str | None = None
+
+
+@router.get("/last-auto-reconnect-log", response_model=AutoReconnectLogOut)
+def last_auto_reconnect_log(
+    user: User = Depends(require_permission("session.start")),
+) -> AutoReconnectLogOut:
+    """Tail of the most recent on-demand `autologin --force` run(s) (see
+    `reconnect_brokers_auto`). Read-only; empty note when nothing has run.
+    """
+    path = _on_demand_autologin_log_path()
+    if not path.exists():
+        return AutoReconnectLogOut(
+            exists=False, lines=[], note="no on-demand reconnect has run on this host"
+        )
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, f"could not read the log: {exc}"
+        ) from exc
+    return AutoReconnectLogOut(exists=True, lines=text.splitlines()[-200:])
 
 
 @router.post("/reconnect-brokers-auto", response_model=ReconnectBrokersResponse)
@@ -602,13 +673,18 @@ def reconnect_brokers_auto(
             )
         _last_auto_reconnect_at = monotonic_now
 
-    subprocess.Popen(  # noqa: S603 - fixed argv, no shell, detached
-        [sys.executable, "-m", "autologin", "--force"],
-        cwd=str(BACKEND_ROOT_DIR),
-        start_new_session=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    sink = _open_autologin_log_sink()
+    try:
+        subprocess.Popen(  # noqa: S603 - fixed argv, no shell, detached
+            [sys.executable, "-m", "autologin", "--force"],
+            cwd=str(BACKEND_ROOT_DIR),
+            start_new_session=True,
+            stdout=sink if sink is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if sink is not None else subprocess.DEVNULL,
+        )
+    finally:
+        if sink is not None:
+            sink.close()  # the child holds its own dup'd fd
 
     record_event(
         db,
@@ -625,4 +701,5 @@ def reconnect_brokers_auto(
         message=(
             "headless auto-login started — the backend will restart if a fresh login was needed"
         ),
+        log_path=str(_on_demand_autologin_log_path()) if sink is not None else None,
     )

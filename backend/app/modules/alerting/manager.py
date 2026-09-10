@@ -158,6 +158,7 @@ TELEGRAM_ALLOWED_CATEGORIES = frozenset(
         "broker_disconnected",
         "market_data_stale",
         "market_data_failover_switch",
+        "market_data_override_active",
         "market_data_no_session",
         "option_chain_degraded",
         "trade_approval_pending",
@@ -240,6 +241,11 @@ TELEGRAM_SUGGESTED_ACTIONS: dict[str, str] = {
     "market_data_failover_switch": (
         "The backup market-data provider is now active -- confirm the primary "
         "provider's health before switching back."
+    ),
+    "market_data_override_active": (
+        "The market-data feed is pinned to a provider by a manual override "
+        "(Advanced -> Market Data). Automatic failover is disabled while it is "
+        "set -- clear it to 'Automatic' unless you are actively testing."
     ),
     "market_data_no_session": (
         "Neither Shoonya nor the failback provider has a live session yet -- "

@@ -958,3 +958,56 @@ def test_reconnect_brokers_auto_cooldown_refuses_a_rapid_repeat(
     assert third.status_code == 200
     assert third.json()["triggered"] is True
     assert len(spawns) == 2
+
+
+def test_reconnect_brokers_auto_writes_a_diagnosable_child_log(
+    api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
+):
+    """2026-09-10: the detached child's stdout/stderr now goes to a file
+    (was DEVNULL), and `GET /last-auto-reconnect-log` tails it.
+    """
+    monkeypatch.setattr(system_settings_module.platform, "system", lambda: "Linux")
+    (tmp_path / "autologin").mkdir()
+    (tmp_path / "autologin" / "__main__.py").write_text("")
+    monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+    monkeypatch.setattr(system_settings_module, "_last_auto_reconnect_at", 0.0)
+    monkeypatch.setattr(system_settings_module.time, "monotonic", lambda: 10_000.0)
+    monkeypatch.setattr(system_settings_module.subprocess, "Popen", lambda argv, **kw: None)
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+
+    resp = api_client.post("/api/v1/system-settings/reconnect-brokers-auto")
+    assert resp.status_code == 200
+    assert resp.json()["triggered"] is True
+    assert resp.json()["log_path"].endswith("on_demand_autologin.log")
+
+    log_file = tmp_path / "logs" / "on_demand_autologin.log"
+    assert log_file.exists()
+    assert "on-demand `autologin --force`" in log_file.read_text()
+
+    tail = api_client.get("/api/v1/system-settings/last-auto-reconnect-log")
+    assert tail.status_code == 200
+    assert tail.json()["exists"] is True
+    assert any("autologin --force" in ln for ln in tail.json()["lines"])
+
+
+def test_last_auto_reconnect_log_empty_note_when_nothing_has_run(
+    api_client: TestClient, seeded_admin, monkeypatch, tmp_path, engine
+):
+    monkeypatch.setattr(system_settings_module, "BACKEND_ROOT_DIR", tmp_path)
+    _login(api_client, seeded_admin)
+    _grant_permission(engine, seeded_admin, "session.start")
+
+    resp = api_client.get("/api/v1/system-settings/last-auto-reconnect-log")
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "exists": False,
+        "lines": [],
+        "note": "no on-demand reconnect has run on this host",
+    }
+
+
+def test_last_auto_reconnect_log_requires_login(api_client: TestClient):
+    assert (
+        api_client.get("/api/v1/system-settings/last-auto-reconnect-log").status_code == 401
+    )

@@ -384,3 +384,81 @@ def test_refresh_failover_backup_leg_noop_when_provider_not_yet_constructed(monk
         lambda: _settings_with_failover("truedata", "alice_blue"),
     )
     provider_composition.reset_alice_blue_backup_leg()  # singleton is None -- no raise
+
+
+# --- _seed_manual_override: a persisted feed pin must not survive a restart ---
+# (2026-09-10 incident -- a re-seeded `alice_blue` pin blacked out the live
+# feed for 20 minutes; see the function's own docstring.)
+
+
+class _RecordingFailover:
+    def __init__(self) -> None:
+        self.override_calls: list[str | None] = []
+
+    def set_manual_override(self, name: str | None) -> None:
+        self.override_calls.append(name)
+
+
+class _Pref:
+    def __init__(self, active_provider: str | None) -> None:
+        self.active_provider = active_provider
+
+
+def _scope_returning(pref: object):
+    from contextlib import contextmanager
+
+    class _Q:
+        def first(self):
+            return pref
+
+    class _S:
+        def query(self, *a, **k):
+            return _Q()
+
+    @contextmanager
+    def _scope():
+        yield _S()
+
+    return _scope
+
+
+def test_seed_manual_override_applies_a_primary_matching_preference(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("shoonya")
+    )
+    pref = _Pref("shoonya")
+    monkeypatch.setattr(provider_composition, "session_scope", _scope_returning(pref))
+    fo = _RecordingFailover()
+
+    provider_composition._seed_manual_override(fo)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert fo.override_calls == ["shoonya"]
+    assert pref.active_provider == "shoonya"  # untouched
+
+
+def test_seed_manual_override_drops_and_clears_a_non_primary_preference(monkeypatch, caplog):
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("shoonya")
+    )
+    pref = _Pref("alice_blue")
+    monkeypatch.setattr(provider_composition, "session_scope", _scope_returning(pref))
+    fo = _RecordingFailover()
+
+    with caplog.at_level("ERROR"):
+        provider_composition._seed_manual_override(fo)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert fo.override_calls == []  # NOT applied
+    assert pref.active_provider is None  # row cleared so the UI reflects reality
+    assert any("non-primary leg" in r.getMessage() for r in caplog.records)
+
+
+def test_seed_manual_override_noop_when_no_preference_row(monkeypatch):
+    monkeypatch.setattr(
+        provider_composition, "get_settings", lambda: _settings_with_provider("shoonya")
+    )
+    monkeypatch.setattr(provider_composition, "session_scope", _scope_returning(None))
+    fo = _RecordingFailover()
+
+    provider_composition._seed_manual_override(fo)  # type: ignore[arg-type]  # noqa: SLF001
+
+    assert fo.override_calls == []

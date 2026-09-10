@@ -336,6 +336,55 @@ class MarketDataScheduler:
             logger.exception("Health check: provider connect failed")
         self._subscribe_known_underlyings_if_ready()
         self._alert_if_failover_backup_unavailable()
+        self._alert_if_manual_override_active()
+
+    def _alert_if_manual_override_active(self) -> None:
+        """A manual market-data provider override (Advanced -> Market Data, or
+        a leftover persisted preference) pins the feed to one leg and
+        *disables automatic failover entirely* while it is set -- and if it
+        pins to a leg that isn't streaming, the feed goes dark with only the
+        generic `market_data_stale` to show for it (2026-09-10 incident: a
+        re-seeded `alice_blue` pin = a 20-min blackout). Surface it directly,
+        CRITICAL, self-resolving the moment the override is cleared;
+        `send_alert`'s 15-min dedup keeps it to once-per-window.
+        """
+        if self._alert_session_factory is None:
+            return
+
+        from app.modules.market_data.provider_composition import get_failover_provider
+
+        failover = get_failover_provider()
+        if failover is None:
+            return
+        override = failover.manual_override
+        if override is None:
+            return
+
+        from app.domain.ops.models import AlertSeverity
+        from app.domain.session.models import TradingSession, TradingSessionStatus
+        from app.modules.alerting.manager import send_alert
+
+        with self._alert_session_factory() as db:
+            workspace_ids = {
+                row[0]
+                for row in db.query(TradingSession.workspace_id)
+                .filter(TradingSession.status == TradingSessionStatus.ACTIVE)
+                .distinct()
+                .all()
+            }
+            for workspace_id in workspace_ids:
+                send_alert(
+                    db,
+                    workspace_id=workspace_id,
+                    severity=AlertSeverity.CRITICAL,
+                    category="market_data_override_active",
+                    message=(
+                        f"Market-data feed is pinned to {override!r} by a manual override "
+                        "— automatic failover is disabled. Clear it to 'Automatic' "
+                        "(Advanced → Market Data) unless you are actively testing."
+                    ),
+                    dedup_key=f"market_data_override_active:{workspace_id}",
+                )
 
     def _alert_if_failover_backup_unavailable(self) -> None:
         """Proactive warning: failover is enabled but the backup provider has

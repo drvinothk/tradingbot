@@ -660,27 +660,30 @@ def test_alice_blue_refresh_survives_the_refresh_raising(monkeypatch):
     alice_blue_api._run_alice_blue_post_login_refresh()  # must not raise
 
 
-def test_alice_blue_refresh_ends_with_a_backend_restart(monkeypatch):
-    """2026-09-09: a manual Alice Blue reconnect always finishes with a clean
-    restart -- fires even when the leg-refresh branch is a no-op.
+def test_alice_blue_refresh_does_not_restart_the_backend(monkeypatch):
+    """2026-09-10 (reverses the 2026-09-09 behavior): a manual Alice Blue
+    reconnect no longer restarts the backend. `reset_alice_blue_backup_leg`
+    already re-wires the live provider against the fresh session; the restart
+    added nothing functional and had a real cost -- on 2026-09-10 an
+    AB-reconnect restart re-seeded a stale `alice_blue` feed override and
+    blacked out the live market-data feed for 20 minutes.
     """
     from app.api.v1 import alice_blue as alice_blue_api
 
-    monkeypatch.setattr(
-        "app.config.settings.get_settings",
-        lambda: _Settings(
-            _MDSettings(failover_enabled=True, backup="angel_one", provider="shoonya")
-        ),
+    calls = _patch_refresh_targets(
+        monkeypatch,
+        _MDSettings(failover_enabled=True, backup="alice_blue", provider="shoonya"),
     )
     restart_calls: list[str] = []
     monkeypatch.setattr(
         "app.core.restart.schedule_backend_restart",
-        lambda reason="": restart_calls.append(reason) or True,
+        lambda reason="": restart_calls.append(reason),
     )
 
     alice_blue_api._run_alice_blue_post_login_refresh()
 
-    assert restart_calls == ["manual Alice Blue reconnect"]
+    assert calls == ["backup_leg"]  # live leg still re-wired, no downtime
+    assert restart_calls == []  # ...but NO backend restart
 
 
 def test_alice_blue_spawn_skips_a_duplicate_while_one_is_running(monkeypatch):

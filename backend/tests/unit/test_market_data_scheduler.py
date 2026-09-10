@@ -648,3 +648,60 @@ def test_no_warn_without_an_alert_session_factory(monkeypatch):
         factory=False,
     )
     assert calls == []
+
+
+# --- 2026-09-10: "market-data override active" CRITICAL -------------------
+# A manual feed pin disables automatic failover and, if it points at a
+# non-streaming leg, blacks out the feed silently (2026-09-10 incident).
+
+
+class _FoOverride:
+    def __init__(self, override: str | None) -> None:
+        self._o = override
+
+    @property
+    def manual_override(self) -> str | None:
+        return self._o
+
+
+def _run_override_active_check(monkeypatch, *, failover, factory: bool = True):
+    import app.modules.alerting.manager as alerting_manager
+    import app.modules.market_data.provider_composition as pc
+
+    provider = _FakeProvider()
+    sched = _scheduler_with_phase_sequence(monkeypatch, [MarketPhase.PRE_MARKET], provider)
+    monkeypatch.setattr(pc, "get_failover_provider", lambda: failover)
+    alert_calls: list[dict] = []
+    monkeypatch.setattr(
+        alerting_manager, "send_alert", lambda db, **kwargs: alert_calls.append(kwargs)
+    )
+    if factory:
+        sched._alert_session_factory = lambda: _FakeAlertDB(["ws-1"])  # noqa: SLF001
+    sched._alert_if_manual_override_active()  # noqa: SLF001
+    return alert_calls
+
+
+def test_critical_alert_when_a_manual_feed_override_is_active(monkeypatch):
+    calls = _run_override_active_check(monkeypatch, failover=_FoOverride("alice_blue"))
+    assert len(calls) == 1
+    assert calls[0]["category"] == "market_data_override_active"
+    assert calls[0]["severity"].name == "CRITICAL"
+    assert calls[0]["workspace_id"] == "ws-1"
+    assert "alice_blue" in calls[0]["message"]
+
+
+def test_no_override_alert_when_override_is_none(monkeypatch):
+    assert _run_override_active_check(monkeypatch, failover=_FoOverride(None)) == []
+
+
+def test_no_override_alert_when_no_failover_provider(monkeypatch):
+    assert _run_override_active_check(monkeypatch, failover=None) == []
+
+
+def test_no_override_alert_without_an_alert_session_factory(monkeypatch):
+    assert (
+        _run_override_active_check(
+            monkeypatch, failover=_FoOverride("alice_blue"), factory=False
+        )
+        == []
+    )

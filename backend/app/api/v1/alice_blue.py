@@ -79,11 +79,14 @@ def _run_alice_blue_post_login_refresh() -> None:
         except Exception:
             logger.exception("post-login Alice Blue reset_for_reconnect failed")
 
-    # 2026-09-09: a browser OAuth login ("Manual reconnect") always finishes
-    # with a clean process restart -- same rationale as the Shoonya callback.
-    from app.core.restart import schedule_backend_restart
-
-    schedule_backend_restart(reason="manual Alice Blue reconnect")
+    # 2026-09-10: deliberately NO backend restart here (the 2026-09-09 version
+    # scheduled one). Alice Blue is market-data-only; `reset_alice_blue_backup_leg`
+    # / `reset_for_reconnect` above already re-wire the live provider against
+    # the fresh session with zero downtime. The restart added nothing
+    # functional and had a real cost -- on 2026-09-10 an AB-reconnect restart
+    # re-seeded a stale `alice_blue` feed override and blacked out the live
+    # market-data feed for 20 minutes. The Shoonya callback keeps its restart
+    # (execution adapter / PositionManager / singletons genuinely benefit).
 
 
 def _spawn_alice_blue_post_login_refresh() -> None:
